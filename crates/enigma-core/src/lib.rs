@@ -70,6 +70,28 @@ pub enum ModelError {
     DuplicateTurnover(char),
     /// A wheel name must not be empty.
     EmptyWiringName,
+    /// A topology must contain at least one slot.
+    EmptySlots,
+    /// A slot identifier must not be empty.
+    EmptySlotId,
+    /// Slot identifiers must be unique within a topology.
+    DuplicateSlotId(String),
+    /// Wheel definition names must be unique within a topology.
+    DuplicateWheelName(String),
+    /// A slot references no declared wheel.
+    UnknownWheel(String),
+    /// A wheel was constructed over an alphabet with different symbol order.
+    WheelAlphabetMismatch(String),
+    /// A reflector wheel must map each symbol back to itself after two applications.
+    ReflectorMustBeInvolutive(String),
+    /// At most one reflector slot is permitted.
+    MultipleReflectors,
+    /// A reflector slot must be the leftmost slot.
+    ReflectorNotLeftmost,
+    /// A topology must contain at least one rotor slot.
+    NoRotorSlots,
+    /// A slot position or ring setting is not in the topology alphabet.
+    UnknownSlotSymbol(char),
 }
 
 impl fmt::Display for ModelError {
@@ -94,6 +116,30 @@ impl fmt::Display for ModelError {
                 "turnover position {symbol:?} occurs more than once"
             ),
             Self::EmptyWiringName => write!(formatter, "wiring name must not be empty"),
+            Self::EmptySlots => write!(formatter, "topology must contain at least one slot"),
+            Self::EmptySlotId => write!(formatter, "slot identifier must not be empty"),
+            Self::DuplicateSlotId(id) => write!(formatter, "duplicate slot identifier {id:?}"),
+            Self::DuplicateWheelName(name) => write!(formatter, "duplicate wheel name {name:?}"),
+            Self::UnknownWheel(name) => write!(formatter, "unknown wheel {name:?}"),
+            Self::WheelAlphabetMismatch(name) => {
+                write!(
+                    formatter,
+                    "wheel {name:?} uses a different ordered alphabet"
+                )
+            }
+            Self::ReflectorMustBeInvolutive(name) => {
+                write!(formatter, "reflector wheel {name:?} must be involutive")
+            }
+            Self::MultipleReflectors => {
+                write!(formatter, "topology may contain at most one reflector")
+            }
+            Self::ReflectorNotLeftmost => write!(formatter, "reflector slot must be leftmost"),
+            Self::NoRotorSlots => {
+                write!(formatter, "topology must contain at least one rotor slot")
+            }
+            Self::UnknownSlotSymbol(symbol) => {
+                write!(formatter, "slot symbol {symbol:?} is not in the alphabet")
+            }
         }
     }
 }
@@ -142,6 +188,189 @@ impl Alphabet {
     /// Returns the index of a symbol without normalization, if present.
     pub fn index_of(&self, symbol: char) -> Option<usize> {
         self.indices.get(&symbol).copied()
+    }
+}
+
+/// Whether a slot may change position under a stepping rule.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Movement {
+    /// The slot's position is stationary.
+    Fixed,
+    /// The slot's position may advance.
+    Movable,
+}
+
+/// The machine role assigned to a physical slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SlotRole {
+    /// A wheel traversed as a rotor, whether fixed or movable.
+    Rotor,
+    /// An optional reflector, constrained to be leftmost and involutive.
+    Reflector,
+}
+
+/// A physical left-to-right machine slot configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Slot {
+    id: String,
+    wheel: String,
+    role: SlotRole,
+    movement: Movement,
+    position: char,
+    ring: char,
+}
+
+impl Slot {
+    /// Creates a slot; topology construction validates its wheel reference and symbols.
+    pub fn new(
+        id: impl Into<String>,
+        wheel: impl Into<String>,
+        role: SlotRole,
+        movement: Movement,
+        position: char,
+        ring: char,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            wheel: wheel.into(),
+            role,
+            movement,
+            position,
+            ring,
+        }
+    }
+
+    /// Stable slot identifier.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Referenced wheel definition name.
+    pub fn wheel(&self) -> &str {
+        &self.wheel
+    }
+
+    /// Slot role.
+    pub fn role(&self) -> SlotRole {
+        self.role
+    }
+
+    /// Whether this slot is stationary or may move.
+    pub fn movement(&self) -> Movement {
+        self.movement
+    }
+
+    /// Displayed position symbol.
+    pub fn position(&self) -> char {
+        self.position
+    }
+
+    /// Ring setting symbol.
+    pub fn ring(&self) -> char {
+        self.ring
+    }
+}
+
+/// Validated in-memory wheel definitions and physical machine slot topology.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MachineTopology {
+    alphabet: Alphabet,
+    wheels: Vec<Wiring>,
+    wheel_indices: HashMap<String, usize>,
+    slots: Vec<Slot>,
+}
+
+impl MachineTopology {
+    /// Builds a validated topology. Slots remain in physical left-to-right order.
+    pub fn new(
+        alphabet: Alphabet,
+        wheels: Vec<Wiring>,
+        slots: Vec<Slot>,
+    ) -> Result<Self, ModelError> {
+        if slots.is_empty() {
+            return Err(ModelError::EmptySlots);
+        }
+        let mut wheel_indices = HashMap::with_capacity(wheels.len());
+        for (index, wheel) in wheels.iter().enumerate() {
+            if wheel.alphabet != alphabet {
+                return Err(ModelError::WheelAlphabetMismatch(wheel.name.clone()));
+            }
+            if wheel_indices.insert(wheel.name.clone(), index).is_some() {
+                return Err(ModelError::DuplicateWheelName(wheel.name.clone()));
+            }
+        }
+
+        let mut slot_ids = HashSet::with_capacity(slots.len());
+        let mut reflector_index = None;
+        let mut rotor_count = 0;
+        for (index, slot) in slots.iter().enumerate() {
+            if slot.id.is_empty() {
+                return Err(ModelError::EmptySlotId);
+            }
+            if !slot_ids.insert(slot.id.as_str()) {
+                return Err(ModelError::DuplicateSlotId(slot.id.clone()));
+            }
+            let wheel_index = *wheel_indices
+                .get(&slot.wheel)
+                .ok_or_else(|| ModelError::UnknownWheel(slot.wheel.clone()))?;
+            if alphabet.index_of(slot.position).is_none() {
+                return Err(ModelError::UnknownSlotSymbol(slot.position));
+            }
+            if alphabet.index_of(slot.ring).is_none() {
+                return Err(ModelError::UnknownSlotSymbol(slot.ring));
+            }
+            match slot.role {
+                SlotRole::Rotor => rotor_count += 1,
+                SlotRole::Reflector => {
+                    if reflector_index.replace(index).is_some() {
+                        return Err(ModelError::MultipleReflectors);
+                    }
+                    let wheel = &wheels[wheel_index];
+                    if wheel
+                        .forward
+                        .iter()
+                        .enumerate()
+                        .any(|(input, &output)| wheel.forward[output] != input)
+                    {
+                        return Err(ModelError::ReflectorMustBeInvolutive(wheel.name.clone()));
+                    }
+                }
+            }
+        }
+        if reflector_index.is_some_and(|index| index != 0) {
+            return Err(ModelError::ReflectorNotLeftmost);
+        }
+        if rotor_count == 0 {
+            return Err(ModelError::NoRotorSlots);
+        }
+        Ok(Self {
+            alphabet,
+            wheels,
+            wheel_indices,
+            slots,
+        })
+    }
+
+    /// The ordered symbol alphabet carried by this topology.
+    pub fn alphabet(&self) -> &Alphabet {
+        &self.alphabet
+    }
+
+    /// Declared wheel definitions in their supplied order.
+    pub fn wheels(&self) -> &[Wiring] {
+        &self.wheels
+    }
+
+    /// Physical slots in left-to-right order.
+    pub fn slots(&self) -> &[Slot] {
+        &self.slots
+    }
+
+    /// Looks up a declared wheel by its unique name.
+    pub fn wheel(&self, name: &str) -> Option<&Wiring> {
+        self.wheel_indices
+            .get(name)
+            .map(|&index| &self.wheels[index])
     }
 }
 
@@ -252,7 +481,204 @@ impl Wiring {
 
 #[cfg(test)]
 mod tests {
-    use super::{Alphabet, ModelError, Wiring};
+    use super::{Alphabet, MachineTopology, ModelError, Movement, Slot, SlotRole, Wiring};
+
+    fn identity_wiring(alphabet: &Alphabet, name: &str) -> Wiring {
+        let mapping: Vec<_> = (0..alphabet.len())
+            .map(|index| alphabet.symbol_at(index).unwrap())
+            .collect();
+        Wiring::new(name, alphabet, &mapping, &[]).unwrap()
+    }
+
+    #[test]
+    fn topology_accepts_one_rotor_and_seven_rotors() {
+        let alphabet = Alphabet::new(vec!['A', 'B', 'C']).unwrap();
+        let wheel = identity_wiring(&alphabet, "rotor");
+        let one = MachineTopology::new(
+            alphabet.clone(),
+            vec![wheel.clone()],
+            vec![Slot::new(
+                "right",
+                "rotor",
+                SlotRole::Rotor,
+                Movement::Movable,
+                'A',
+                'A',
+            )],
+        )
+        .unwrap();
+        assert_eq!(one.slots().len(), 1);
+
+        let slots = (0..7)
+            .map(|index| {
+                Slot::new(
+                    format!("rotor-{index}"),
+                    "rotor",
+                    SlotRole::Rotor,
+                    Movement::Movable,
+                    'A',
+                    'A',
+                )
+            })
+            .collect();
+        let seven = MachineTopology::new(alphabet, vec![wheel], slots).unwrap();
+        assert_eq!(seven.slots().len(), 7);
+    }
+
+    #[test]
+    fn topology_rejects_invalid_references_roles_symbols_and_duplicates() {
+        let alphabet = Alphabet::new(vec!['A', 'B', 'C']).unwrap();
+        let rotor = identity_wiring(&alphabet, "rotor");
+        let slot =
+            |id: &str, wheel: &str, role| Slot::new(id, wheel, role, Movement::Fixed, 'A', 'A');
+
+        assert_eq!(
+            MachineTopology::new(alphabet.clone(), vec![rotor.clone()], vec![]),
+            Err(ModelError::EmptySlots)
+        );
+        assert_eq!(
+            MachineTopology::new(
+                alphabet.clone(),
+                vec![rotor.clone()],
+                vec![slot("x", "missing", SlotRole::Rotor)]
+            ),
+            Err(ModelError::UnknownWheel("missing".into()))
+        );
+        let non_involutive = Wiring::new("cycle", &alphabet, &['B', 'C', 'A'], &[]).unwrap();
+        assert_eq!(
+            MachineTopology::new(
+                alphabet.clone(),
+                vec![rotor.clone(), non_involutive],
+                vec![
+                    slot("reflector", "cycle", SlotRole::Reflector),
+                    slot("rotor", "rotor", SlotRole::Rotor),
+                ],
+            ),
+            Err(ModelError::ReflectorMustBeInvolutive("cycle".into()))
+        );
+        assert_eq!(
+            MachineTopology::new(
+                alphabet.clone(),
+                vec![rotor.clone()],
+                vec![
+                    slot("x", "rotor", SlotRole::Rotor),
+                    slot("x", "rotor", SlotRole::Rotor),
+                ]
+            ),
+            Err(ModelError::DuplicateSlotId("x".into()))
+        );
+        assert_eq!(
+            MachineTopology::new(
+                alphabet.clone(),
+                vec![rotor.clone(), rotor.clone()],
+                vec![slot("x", "rotor", SlotRole::Rotor)]
+            ),
+            Err(ModelError::DuplicateWheelName("rotor".into()))
+        );
+        assert_eq!(
+            MachineTopology::new(
+                alphabet.clone(),
+                vec![rotor.clone()],
+                vec![
+                    slot("left", "rotor", SlotRole::Rotor),
+                    slot("reflector", "rotor", SlotRole::Reflector),
+                ]
+            ),
+            Err(ModelError::ReflectorNotLeftmost)
+        );
+        assert_eq!(
+            MachineTopology::new(
+                alphabet.clone(),
+                vec![rotor.clone()],
+                vec![
+                    slot("reflector-1", "rotor", SlotRole::Reflector),
+                    slot("reflector-2", "rotor", SlotRole::Reflector),
+                    slot("right", "rotor", SlotRole::Rotor),
+                ]
+            ),
+            Err(ModelError::MultipleReflectors)
+        );
+        assert_eq!(
+            MachineTopology::new(
+                alphabet.clone(),
+                vec![rotor.clone()],
+                vec![Slot::new(
+                    "x",
+                    "rotor",
+                    SlotRole::Rotor,
+                    Movement::Movable,
+                    'Z',
+                    'A'
+                ),]
+            ),
+            Err(ModelError::UnknownSlotSymbol('Z'))
+        );
+        assert_eq!(
+            MachineTopology::new(
+                alphabet.clone(),
+                vec![rotor],
+                vec![slot("x", "rotor", SlotRole::Reflector)]
+            ),
+            Err(ModelError::NoRotorSlots)
+        );
+    }
+
+    #[test]
+    fn topology_accepts_leftmost_involutive_reflector_and_exposes_bound_alphabet() {
+        let alphabet = Alphabet::new(vec!['A', 'B', 'C']).unwrap();
+        let rotor = identity_wiring(&alphabet, "rotor");
+        let reflector = Wiring::new("reflector", &alphabet, &['B', 'A', 'C'], &[]).unwrap();
+        let topology = MachineTopology::new(
+            alphabet.clone(),
+            vec![rotor, reflector],
+            vec![
+                Slot::new(
+                    "ukw",
+                    "reflector",
+                    SlotRole::Reflector,
+                    Movement::Fixed,
+                    'A',
+                    'B',
+                ),
+                Slot::new(
+                    "left",
+                    "rotor",
+                    SlotRole::Rotor,
+                    Movement::Movable,
+                    'C',
+                    'A',
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(topology.alphabet(), &alphabet);
+        assert_eq!(topology.slots()[0].id(), "ukw");
+        assert_eq!(topology.slots()[0].movement(), Movement::Fixed);
+        assert_eq!(topology.slots()[0].ring(), 'B');
+        assert_eq!(topology.wheel("reflector").unwrap().name(), "reflector");
+    }
+
+    #[test]
+    fn topology_rejects_wheels_built_for_a_different_ordered_alphabet() {
+        let alphabet = Alphabet::new(vec!['A', 'B', 'C']).unwrap();
+        let mismatched = Alphabet::new(vec!['B', 'A', 'C']).unwrap();
+        let wheel = identity_wiring(&mismatched, "rotor");
+        assert_eq!(
+            MachineTopology::new(
+                alphabet,
+                vec![wheel],
+                vec![Slot::new(
+                    "x",
+                    "rotor",
+                    SlotRole::Rotor,
+                    Movement::Fixed,
+                    'A',
+                    'A'
+                )],
+            ),
+            Err(ModelError::WheelAlphabetMismatch("rotor".into()))
+        );
+    }
 
     #[test]
     fn alphabet_preserves_non_ascii_scalar_order_without_normalizing() {
