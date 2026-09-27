@@ -45,6 +45,10 @@
 /// Must match `docs/protocol.md` §10. A breaking change to the protocol bumps this.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+mod engine;
+
+pub use engine::{Direction, Engine};
+
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 
@@ -96,6 +100,8 @@ pub enum ModelError {
     PlugboardSelfPair(char),
     /// A plugboard symbol occurs in more than one pair.
     DuplicatePlugboardSymbol(char),
+    /// A plugboard was built over an alphabet ordered differently from the topology.
+    PlugboardAlphabetMismatch,
     /// A stepping rule set declares more rules than the grammar allows.
     TooManyStepRules {
         /// Maximum permitted number of rules.
@@ -189,6 +195,12 @@ impl fmt::Display for ModelError {
                 write!(
                     formatter,
                     "plugboard symbol {symbol:?} occurs in more than one pair"
+                )
+            }
+            Self::PlugboardAlphabetMismatch => {
+                write!(
+                    formatter,
+                    "plugboard uses a different ordered alphabet than the machine topology"
                 )
             }
             Self::TooManyStepRules { max } => {
