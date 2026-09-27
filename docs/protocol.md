@@ -1,45 +1,29 @@
 # Engine Protocol
 
-Status: **Stage 1 protocol design frozen; Rust implementation pending.** "Frozen"
-refers to the intended interface, not to shipped engine functionality. Versioning
-of future changes follows §10.
+Status: **Protocol v1 is a revised pre-implementation design; Rust implementation is
+pending.** It is not a shipped interface. This explicitly agreed redesign replaces the
+previous frozen superset-of-`bomm` request promise. Backwards compatibility with `bomm`
+query files is not a requirement; parity remains a test obligation using equivalent
+configurations expressed in each tool's own format (see §9).
 
-This document specifies the target contract between the cryptanalysis engine and
-any client; examples and guarantees below describe intended behavior, not current
-Rust capabilities. It is deliberately independent of both the transport and the
-implementation. It exists so that the TUI, the local web client (§8, Stage 2), the
-test harness, and the future GPU backend (Stage 4) can all be built and replaced
-without touching each other.
-
-The stage vocabulary below (`Stage N`, "planned", "future", "unscheduled") names the
-release intended to deliver a feature. It never implies shipped support: in this
-repository the engine itself is still being built (see `odd/tasks/enigma-engine.md`).
-
----
+This document specifies the target contract between the cryptanalysis engine and its
+clients. It is independent of transport and implementation. Stage 1 uses `stdin` and
+`stdout`; a later local listener can carry the same messages. Examples and guarantees
+describe intended behavior, not current Rust capabilities. See
+`odd/tasks/enigma-engine.md` for implementation status and work units.
 
 ## 1. Design principles
 
-1. **Transport-agnostic.** The protocol defines *messages*, not a transport. Stage 1
-   uses `stdin`/`stdout`. A local listener (§8, Stage 2) carries the same messages over
-   HTTP. The TUI and the web client therefore share one protocol and differ only in
-   plumbing.
-2. **Superset of `bomm`.** Any query file that `bomm` accepts must be accepted here,
-   unchanged, with the same meaning. Extension fields are version-gated (§10): request
-   extensions require the protocol version that defines them, output extensions stay
-   ignorable.
-3. **Strict input, lenient output.** An unrecognised field in a *request* is a hard
-   error (fail closed): silently ignoring a requested feature produces plausible but
-   wrong cryptanalytic results, which is the worst possible failure. An unrecognised
-   *event* or field in an event is ignored by clients, so new events and new event
-   fields can be added without breaking older clients. This asymmetry is exactly why
-   request and output versioning differ (§10).
-4. **Deterministic and reproducible.** A run is fully described by its request. Two
-   runs of the same request must produce the same enumeration order and the same
-   scores, on any backend.
-5. **Checkpoint-first.** Attacks take tens of hours. Progress, cancellation and resume
-   are protocol features, not client features.
-
----
+1. **Transport-agnostic.** The protocol defines messages, not transport.
+2. **Strict requests, tolerant event consumers.** Unknown request fields, versions,
+   enum values, or unsupported DSL forms fail closed. Clients may ignore unknown event
+   names and event fields.
+3. **Declarative machine model.** Alphabet, wheels, slots, stepping, and jobs are
+   represented as data. The protocol does not imply that every representable topology
+   has a preset or is supported by every search pass.
+4. **Deterministic and reproducible.** A request fully determines enumeration order and
+   scores; backend differences must not change results.
+5. **Checkpoint-first.** Progress, cancellation, and resume are protocol features.
 
 ## 2. Transport
 
@@ -48,399 +32,348 @@ repository the engine itself is still being built (see `odd/tasks/enigma-engine.
 | `stdio` (default) | TUI, scripts, tests | — | 1 |
 | local listener | web client | `--listen 127.0.0.1:<port>` | 2 (planned) |
 
-Rules:
+`stdout` contains only one JSON object per line (JSONL), without embedded newlines.
+Diagnostics, warnings, and logs go to `stderr`. A request is supplied by path argument,
+`--request -` (read from `stdin`), or as an HTTP POST body in listener mode.
 
-- **`stdout` carries only the event stream**, one JSON object per line (JSONL), with no
-  embedded newlines. Every diagnostic, warning and log message goes to `stderr`.
-- The request is supplied as a file path argument, as `--request -` (read from `stdin`),
-  or as the body of an HTTP POST in listener mode.
+## 3. Request (input)
 
----
-
-## 3. Job request (input)
-
-The request is a single JSON object. Fields below marked **[bomm]** are exactly
-`bomm`'s; fields marked **[+]** are additive extensions.
-
-### Root
-
-| Field | Type | Req | Notes |
-| --- | --- | --- | --- |
-| `ciphertext` | string | yes | **[bomm]** Letters of the alphabet only; spaces are stripped |
-| `space` | object | yes | **[bomm]** §3.1 |
-| `alphabet` | string | no | **[bomm]** Expected alphabet. **Changed:** validated against the *runtime* alphabet, not a compile-time constant |
-| `passes` | array | no | **[bomm]** §3.2 |
-| `wheels` | array | no | **[bomm]** Custom wheels: `{name, wiring, turnovers?}` |
-| `measures` | object | no | **[bomm]** `{trie: {baseMeasure, trie}}` |
-| `frequencies` | object | no | **[bomm]** File paths for `monogram`..`hexagram` Sinkov maps |
-| `protocol_version` | integer | no | **[+]** Defaults to `1`. Only fields defined by the requested version are accepted; an unknown version is rejected (§10) |
-| `job` | object | no | **[+]** Free-form metadata for client display: `{label?, notes?, source?}` |
-
-### 3.1 `space`
-
-| Field | Type | Notes |
-| --- | --- | --- |
-| `slots` | array | **required.** Physical order, **left to right**, including the reflector at index `0` and the entry wheel (if any) at the last index |
-| `slots[].wheels` | string[] | required. Wheel names resolved from the built-in library or root `wheels` |
-| `slots[].rotating` | bool | default `false` |
-| `slots[].rings` | lettermask | default `"a"`. `"*"` selects the whole alphabet |
-| `slots[].positions` | lettermask | default `"a"`. `"*"` selects the whole alphabet |
-| `mechanism` | enum | **[bomm]** `stepping` \| `odometer` \| `none`; **[+]** `cog` (Stage 5, planned) |
-| `plugboard` | string | **[bomm]** Fixed plug pairs, e.g. `"aberbfch"` |
-| `plugs` | lettermask | **[bomm]** Which letters may be plugged |
-| `offset` | integer | **[bomm]** Keys to skip at the start of the enumeration |
-| `limit` | integer | **[bomm]** Maximum keys to enumerate (excluding `offset`) |
-| `variants` | array | **[+]** §3.1.1; Stage 1 planned extension over the search space |
-
-A *lettermask* is a set of letters drawn from the alphabet, or `"*"` for all of them.
-
-#### 3.1.1 `variants` — multi-variant search **[+], Stage 1 planned extension**
-
-For uncertain-machine cases (`bomm` requires running the query once per hypothesis —
-see its `kr-blitz-*.json` set). `variants` is an array of alternative `slots`
-definitions searched in a single run and ranked in one shared hold. It extends the
-Stage 1 goal of describing the search space as data; it does not add a search
-technique. Enumeration stays fully determined (§7.1), ordered variant-major, and every
-`candidate` event carries the `variant` index that produced it:
+A request is one JSON object with exactly three root fields: `protocol_version`,
+`machine`, and `job`. Version 1 requires all three; unknown fields are errors. JSON
+object member order has no meaning. The schema below is the v1 target, not an assertion
+that a parser or any listed job already exists.
 
 ```json
-"space": {
-  "variants": [
-    { "slots": [ { "wheels": ["UKW-B"] }, { "wheels": ["I","II","III"], "rotating": true, "positions": "*" } ] },
-    { "slots": [ { "wheels": ["B207-UKW"] }, { "wheels": ["B207-I","B207-II","B207-III"], "rotating": true, "positions": "*" } ] }
-  ]
+{
+  "protocol_version": 1,
+  "machine": {
+    "alphabet": ["A", "B", "C", "D"],
+    "wheels": [
+      {"name": "entry", "wiring": ["A", "B", "C", "D"], "turnovers": []},
+      {"name": "rotor", "wiring": ["B", "A", "D", "C"], "turnovers": ["B"]},
+      {"name": "reflector", "wiring": ["B", "A", "D", "C"], "turnovers": []}
+    ],
+    "slots": [
+      {"id": "ukw", "wheel": "reflector", "role": "reflector", "movement": "fixed", "position": "A", "ring": "A"},
+      {"id": "slow", "wheel": "rotor", "role": "rotor", "movement": "movable", "position": "A", "ring": "A"},
+      {"id": "entry", "wheel": "entry", "role": "rotor", "movement": "fixed", "position": "A", "ring": "A"}
+    ],
+    "plugboard": [["A", "B"]],
+    "stepping": {"rules": [
+      {"when": {"at_turnover": "slow"}, "advance": ["slow"]},
+      {"when": {"always": true}, "advance": ["slow"]}
+    ]}
+  },
+  "job": {"kind": "transform", "text": "ABCD", "direction": "encrypt"}
 }
 ```
 
-`space.slots` and `space.variants` are mutually exclusive. The second entry above is an
-**illustrative Stage 5 exotic wheel set** (B207-style), shown only to fix the shape of
-the field; it is not a claim of Stage 1 support for those wheels.
+This four-symbol illustration is valid JSON and a valid transform configuration. Its
+small arbitrary wiring is a protocol-shape example, not a historical Enigma preset.
 
-### 3.2 `passes`
+### 3.1 Machine
 
-The four **[bomm]** passes below exist in `bomm` and are targets for the Rust port.
-**[+]** passes are additions to that baseline. None of these passes is implemented
-in this Rust project yet; the stage labels describe the plan, not current support.
-Stage 1 must cover all four `[bomm]` passes plus `partial_exhaustion`; the remaining
-`[+]` passes belong to Stages 3 and 5.
+#### Alphabet and symbols
 
-| `type` | Fields | Baseline / Rust target |
-| --- | --- | --- |
-| `hill_climb` | **[bomm]** `measure`, `finalMeasure`, `finalMeasureMinNumPlugs`, `backtrackingMinNumPlugs` | `bomm` exists; Rust Stage 1 planned |
-| `reswapping` | **[bomm]** `measure` | `bomm` exists; Rust Stage 1 planned |
-| `trie` | **[bomm]** `baseMeasure`, `trie` | `bomm` exists; Rust Stage 1 planned |
-| `measure` | **[bomm]** `measure` | `bomm` exists; Rust Stage 1 planned |
-| `partial_exhaustion` | **[+]** `exhaustMeasure`, `exhaustDepth`, then `hill_climb` parameters | Rust Stage 1 planned |
-| `simulated_annealing` | **[+]** `measure`, `temperature`, `cooling`, `seed` | Rust Stage 5 planned |
-| `genetic` | **[+]** `measure`, `population`, `generations`, `seed` | Rust Stage 5 planned |
-| `crib_attack` | **[+]** `crib`, `cribOffset`, `maxFalsestops` | Rust Stage 3 planned |
+`machine.alphabet` is a non-empty ordered array of unique single Unicode scalar values.
+The order defines symbol indices and is semantically significant. ASCII letters and
+digits are permitted. A symbol is exactly one scalar value: combining sequences count
+as multiple scalars and are rejected. The engine does not trim, case-fold, normalize,
+or otherwise rewrite symbols or text. Implementations must reject invalid Unicode
+scalar encodings, duplicate symbols, and an alphabet too large for the supported
+implementation before execution; the supported maximum size must be documented by the
+implementation and reported as a validation error when exceeded.
 
-Once request handling is available, a pass unsupported by that release must be
-**rejected** with `error.code = "unsupported_pass"`, never silently skipped. A pass
-listed for a future stage is recognized by this design but unsupported until that stage
-is activated; it is not an unknown request field.
+Every symbol in wiring arrays, turnover arrays, positions, rings, plug pairs, and job
+text must be a member of this alphabet. Arrays preserve order except where explicitly
+specified as sets.
 
-### 3.3 `measure` enum
+#### Wheels
 
-**[bomm]** `entropy`, `ic`, `sinkov_*` each in `monogram`..`hexagram`, plus `trie`.
+`machine.wheels` is a non-empty array of named wheel definitions:
 
-**[+]** `chi_squared`, `chi_squared_bigram`, `chi_squared_trigram`,
-`chi_squared_quadgram` — additive but **unscheduled**: they are not Stage 1 targets and
-no stage is currently assigned to them.
+- `name`: non-empty unique string.
+- `wiring`: array with exactly one alphabet symbol per alphabet symbol. At input index
+  `i`, the symbol at `wiring[i]` is the output. It must be a bijection; its inverse is
+  derived by the engine.
+- `turnovers`: array of distinct alphabet symbols. These are displayed pre-step
+  symbols at which this wheel's slot satisfies `at_turnover`; they are not adjusted for
+  the ring setting.
 
----
+A reflector-role slot's referenced wheel must additionally be involutive (`wiring` is
+its own inverse). Other wheels may be any bijection.
+
+#### Slots and topology
+
+`machine` has exactly `alphabet`, `wheels`, `slots`, `stepping`, and optional
+`plugboard`; omitted `plugboard` means the identity mapping. A machine may have any
+number of `role: "rotor"` slots starting at one, plus an optional `role: "reflector"`
+slot. The engine must support configurations with at least six rotor slots (plus an
+optional reflector); six is a capacity requirement, not a minimum configuration size
+or a maximum. Implementations may impose a documented upper resource limit and must
+reject requests over it before work starts.
+
+`machine.slots` is a non-empty array in physical left-to-right order. Each slot has
+exactly `id`, `wheel`, `role`, `movement`, `position`, and `ring`:
+
+- `id`: non-empty unique stable slot identifier.
+- `wheel`: reference to one declared wheel.
+- `role`: `rotor` or `reflector`. A stationary entry wheel is represented as a `rotor`
+  slot with `movement: "fixed"`; no third role is implied.
+- `movement`: `fixed` or `movable`. Movement is explicit and independent of role, so a
+  reflector can move only when configured as movable.
+- `position` and `ring`: one alphabet symbol each.
+
+At most one reflector slot is permitted, and if present it must be the leftmost slot.
+A reflector is optional. Every slot without reflector role is traversed as a rotor
+(whether fixed or movable). A step rule may target only movable slots; attempting to
+advance a fixed slot is invalid configuration, never silently ignored. This supports a
+stationary historical entry wheel and a movable reflector when explicitly configured,
+without promising exotic preset/mechanism paths.
+
+`machine.plugboard` is an array of two-symbol arrays. Each symbol occurs in at most
+one pair; pairs therefore define a disjoint involution, and unpaired symbols map to
+themselves. The empty array means identity. A symbol paired with itself is invalid.
+Plugboard transformation is applied at both ends of every traversal.
+
+#### Declarative stepping rules
+
+`machine.stepping` has exactly one field, `rules`, an ordered array of rules. A rule is
+`{"when": CONDITION, "advance": [SLOT_ID, ...]}`. The following is grammar notation,
+not one JSON document; quoted values such as `"slot-id"` and `"A"` stand for ordinary
+JSON strings containing a declared slot ID and alphabet symbol respectively:
+
+```text
+condition := {"always": true}
+           | {"at_turnover": slot_id}
+           | {"at_position": {"slot": slot_id, "symbol": symbol}}
+           | {"all": [condition, ...]}
+           | {"any": [condition, ...]}
+           | {"not": condition}
+
+slot_id   := JSON string naming a declared slot
+symbol    := JSON string containing one alphabet symbol
+```
+
+Each condition object has exactly one operator. `all` and `any` require non-empty
+arrays; `not` contains one condition. `always` must be literal `true`. Conditions refer
+to declared slot IDs; `at_turnover` is true when that slot's wheel turnover set contains
+the slot's displayed pre-keypress position. `at_position` compares that same displayed
+position with its symbol. Ring setting affects electrical offset only; it does not
+subtract from the turnover position.
+
+All conditions for every rule are evaluated against the same state before the
+keypress. The target slot IDs from all matching rules are unioned, then each target is
+advanced exactly once, simultaneously, before electrical traversal. Rule order does
+not change the result. An empty `rules` array means no slots move. Empty `advance`
+arrays are permitted and have no effect. Unknown slot references, unknown operators,
+invalid symbols, duplicate/unknown fields, non-movable targets, and malformed
+conditions are validation errors; no DSL element is ignored and arbitrary executable
+code is not permitted.
+
+Implementations must enforce grammar limits before starting: at most 64 rules, at most
+256 condition nodes total, maximum nesting depth 16, and at most 64 distinct advance
+targets across the rules. Exceeding a bound is an actionable validation error. These
+limits constrain parsing/evaluation resources, not machine size.
+
+### 3.2 Jobs
+
+All work-specific fields live under `job`; `job.kind` selects a defined job. Unknown or
+unsupported kinds fail validation before work starts. Version 1 defines these shapes:
+
+- **Transform:** `{"kind":"transform","text":"...","direction":"encrypt"}`;
+  `direction` is `encrypt` or `decrypt`. Before processing each symbol, apply the
+  configured stepping rules once, independent of direction. Let `N` be the alphabet
+  length, and encode alphabet symbols as zero-based indices. For each rotor slot let
+  `p` be its current displayed position index and `r` its ring index; define the modular
+  offset `o = (p - r) mod N`. Interpret every wheel wiring entry as an alphabet index.
+  Its forward electrical mapping is
+  `forward(x) = (wiring[(x + o) mod N] - o) mod N`; its reverse mapping substitutes
+  the inverse wiring for `wiring` in that formula. Thus reverse is the mathematical
+  inverse of forward at the same position and ring.
+
+  With a reflector, begin with the input plugboard mapping, traverse rotor slots from
+  rightmost toward leftmost using forward mappings, apply the reflector exactly once
+  using its own `p`, `r`, and offset-adjusted forward mapping, then traverse rotor slots
+  left-to-right using reverse mappings, and apply the output plugboard mapping. The
+  reflector must be involutive as validated in §3.1. Encrypt and decrypt use this same
+  reciprocal traversal and therefore produce the same transform.
+
+  Without a reflector, encrypt applies the input plugboard, traverses all rotor slots
+  rightmost-to-leftmost using forward mappings, then applies the output plugboard.
+  Decrypt applies the input plugboard, traverses slots leftmost-to-rightmost using
+  reverse mappings, then applies the output plugboard. It uses the same stepping
+  schedule as encrypt; only the electrical traversal reverses. No general involution or
+  no-self-encryption guarantee is made.
+- **Search (Stage 1 planned):** fields are `kind: "search"`, `text` (ciphertext),
+  `space`, `passes`, `measures`, and optional `resources`. These stay nested in `job`,
+  not at the request root. `space` describes the key enumeration using the machine's
+  slots and includes `offset`, `limit`, and optional `variants`; each variant supplies
+  an alternate slot configuration over declared wheels. `passes` is an ordered array
+  using the pass definitions in §3.3; `measures` names/configures scoring measures;
+  `resources` declares external scoring inputs such as frequency maps or trie data.
+  Search must reject a topology, pass, measure, or resource unsupported by that release
+  before enumeration. This schema reserves no implicit access to files: resource paths
+  and their readability/content must be validated before work starts. Exact per-pass,
+  key-space, scoring-resource, and checkpoint compatibility fields require definition
+  before their implementation; they must not be inferred from old `bomm` root fields.
+
+The search field inventory above locates the established concepts consistently; it is
+not a claim that their detailed v1 sub-schemas or parser exist. Any field needing a
+separate incompatible evolution must be introduced by a protocol version change, not
+silently added to v1 after it ships.
+
+A topology's representability does not guarantee presets or search support for it.
+Stage 1 targets Enigma I, M3, and M4 presets plus the explicitly listed search work;
+search support for arbitrary runtime alphabets, wheel counts, or stepping rules must be
+stated and validated by implementation rather than inferred from this declarative
+schema.
+
+### 3.3 Search pass and measure plan
+
+Search targets the four `bomm` pass concepts—`hill_climb`, `reswapping`, `trie`, and
+`measure`—plus `partial_exhaustion` in Stage 1. Measures target index of coincidence,
+Sinkov n-gram statistics, Shannon entropy, and trie scoring. Their detailed request
+fields and resource formats must be specified before those implementations; this list
+is a plan, not parser support. A pass or measure unavailable in a release must be
+rejected, never skipped. Stage 3 crib attacks and Stage 5 simulated annealing, genetic
+search, exotic presets, and `cog` are not implied by v1 implementation support.
 
 ## 4. Event stream (output)
 
-Every line is one JSON object. Every event, without exception, carries these four
-fields:
+Every line is a JSON object with `event`, `protocol_version`, `seq`, and `ts`. `seq` is
+monotonic from 1; `ts` is RFC 3339 UTC. Field order is illustrative. Events retain the
+existing envelopes and ordering guarantees while job-specific fields (for example,
+search totals and candidate topology) are adapted to variable alphabet size, topology,
+and `job` nesting. No event may fabricate a value for a field that is not meaningful
+for that job.
 
-| Field | Type | Notes |
-| --- | --- | --- |
-| `event` | string | Event name |
-| `protocol_version` | integer | Version of the stream. Present on every event, including a pre-validation `error` (§4.4) |
-| `seq` | integer | Monotonic, starting at `1`. Clients can detect gaps and drops |
-| `ts` | string | RFC 3339 UTC timestamp |
+### 4.1 Events and ordering
 
-Field order inside an example is illustrative; JSON objects are unordered. The examples
-below form one coherent happy-path run, followed by a rejected request.
+- `started`: exactly once and first for a run that passed validation. It identifies the
+  job and reports applicable run metadata.
+- `progress`: zero or more rate-limited progress reports, expressed in completed work
+  units.
+- `candidate`: zero or more search results, emitted when the hold changes, not per
+  evaluation. It is not emitted for transform jobs.
+- `checkpoint`: zero or more durable checkpoint notifications.
+- `hold`: for started search jobs, emitted once on completion, cancellation, or
+  shutdown. It is not fabricated for transform jobs.
+- `done`: exactly once and last on normal completion/cancellation/bounded completion.
+- `error`: terminal and always last; pre-validation errors are described below.
 
-### 4.1 Event catalogue
+Exactly one `started` is first except for a pre-validation error, which has no
+`started`. Exactly one terminal event (`done` or `error`) is last. `seq` strictly
+increases; candidates occur only after `started` and before terminal. Existing
+cancellation, hold, checkpoint, and deterministic-order guarantees continue to apply
+to jobs for which they are meaningful.
 
-**`started`** — exactly once, and always first, unless the run never starts (§4.4).
+### 4.2 Validation errors
 
-```json
-{"event":"started","seq":1,"ts":"2026-01-01T00:00:00Z","protocol_version":1,
- "job_id":"kr-blitz","alphabet":"abcdefghijklmnopqrstuvwxyz",
- "total_keys":27418560,"variants":1,"seed":null,
- "backend":{"kind":"cpu"},
- "resumed_from":null}
-```
+Before any work starts, validate JSON syntax; exact fields and version; alphabet and
+symbol constraints; wheel wiring permutations and inverses; reflector involution;
+plugboard pairs; slot topology and named references; stepping grammar, limits and
+movement compatibility; job kind/direction and topology compatibility; text alphabet
+membership; and, for search, key-space, pass, scoring measure, and resource constraints.
+No work starts until all validation succeeds.
 
-`variants` is the size of `space.variants` (`1` when `space.slots` is used). `seed` is
-`null` unless a stochastic pass is used (§7.4). `backend` is informational only and
-never carries thread counts, workgroup sizes or dispatch geometry (§11).
+On invalid input, emit exactly one terminal JSONL `error` with `seq: 1`, this engine's
+`protocol_version`, a stable `code`, human-actionable `message`, and JSON Pointer
+`location` identifying the offending value (or the closest containing value for a
+syntax error). `expected` and `hint` may additionally be supplied. Write a diagnostic
+to `stderr`, exit nonzero, and emit no `started`, progress, candidate, hold, or done.
+Unknown protocol versions are rejected the same way; the emitted version is the
+engine's supported version. Validation error codes include `invalid_json`,
+`invalid_request`, `unsupported_version`, `unknown_field`, `invalid_alphabet`,
+`invalid_symbol`, `invalid_wiring`, `invalid_reflector`, `invalid_plugboard`,
+`invalid_slot`, `invalid_rule`, `unsupported_job`, `unsupported_pass`,
+`unsupported_measure`, `unsupported_resource`, `invalid_text`, and
+`unsupported_topology`. Implementations may define further stable codes. Runtime
+failures after `started` use terminal `error` and preserve the event ordering contract.
 
-**`progress`** — rate-limited (default: at most one every 500 ms, `--progress-interval`).
-It is never emitted per key, and the rate limit is part of the contract.
-
-```json
-{"event":"progress","seq":2,"ts":"2026-01-01T00:03:44Z","protocol_version":1,
- "keys_done":62500,"total_keys":27418560,
- "elapsed_ms":224100,"eta_ms":97800000,"rate_keys_per_s":278.9}
-```
-
-**`candidate`** — a key that entered the hold, emitted on *change* of the hold, never
-per evaluation. The universal envelope is inlined with the candidate object's fields
-(§4.2).
-
-```json
-{"event":"candidate","seq":3,"ts":"2026-01-01T00:04:00Z","protocol_version":1,
- "rank":1,"score":-8.702661,"variant":0,
- "settings":"UKW-B,III,IV,V aaaa aber bf ch dt in kv or ps qz wy",
- "wheels":["UKW-B","III","IV","V"],"positions":"aaaa","rings":"aaaa",
- "plugboard":"aberbfchdtinkvorpsqz",
- "plaintext":"tgenpjnrjdqubenahrbefohsamtjnenexsiesgalieldninsnptcqssenidfqxan"}
-```
-
-**`checkpoint`** — emitted when durable state is written (§6).
-
-```json
-{"event":"checkpoint","seq":4,"ts":"2026-01-01T00:59:50Z","protocol_version":1,
- "path":"kr-blitz.ckpt.json","keys_done":1048576,"state_digest":"sha256:…"}
-```
-
-**`hold`** — the full hold, emitted once on completion, cancellation and shutdown of a
-run that emitted `started`. A pre-validation error has no hold (§4.4).
+A representative error (all fields are JSON values):
 
 ```json
-{"event":"hold","seq":5,"ts":"2026-01-02T02:01:12Z","protocol_version":1,
- "entries":[ /* candidate objects, §4.2, best first */ ]}
+{"event":"error","protocol_version":1,"seq":1,"ts":"2026-01-01T00:00:00Z",
+ "code":"invalid_symbol","message":"position is not a member of machine.alphabet",
+ "location":"/machine/slots/1/position","expected":"one alphabet symbol"}
 ```
-
-**`done`** — exactly once, and always last, unless replaced by `error`.
-
-```json
-{"event":"done","seq":6,"ts":"2026-01-02T02:01:12Z","protocol_version":1,
- "reason":"completed","stats":{"keys_done":27418560,
- "elapsed_ms":93672000,"rate_keys_per_s":292.7},"best":{ /* candidate object, §4.2 */ }}
-```
-
-`reason` is one of `completed`, `cancelled`, `limit_reached`, `offset_end`.
-
-**`error`** — terminal, and always last.
-
-```json
-{"event":"error","seq":1,"ts":"2026-01-01T00:00:00Z","protocol_version":1,
- "code":"unsupported_pass","message":"pass 'genetic' is declared but not implemented before Stage 5"}
-```
-
-`code` values: `invalid_request`, `unsupported_pass`, `unsupported_measure`,
-`unsupported_mechanism`, `unknown_wheel`, `alphabet_mismatch`, `ciphertext_not_in_alphabet`,
-`checkpoint_mismatch`, `internal`. Which of them may appear before `started` is defined
-in §4.4.
-
-### 4.2 Candidate object
-
-A **candidate object** is the payload of a `candidate` event, an element of
-`hold.entries`, or the `done.best` value. It carries the resolved key and has **no
-universal envelope**: no `event`, `seq`, `ts` or `protocol_version`. In a `candidate`
-event its fields are inlined next to the envelope, not nested.
-
-| Field | Type | Notes |
-| --- | --- | --- |
-| `rank` | integer | 1-based within the hold |
-| `score` | number | Final score under the pass `measure` |
-| `variant` | integer | Index into `space.variants`; `0` when `space.slots` is used |
-| `settings` | string | Human-readable rendering of the whole key |
-| `wheels` | string[] | Wheel names, left to right |
-| `positions` | string | Rotor positions, left to right |
-| `rings` | string | Ring settings, left to right |
-| `plugboard` | string | Plug pairs, canonicalised |
-| `plaintext` | string | Text decrypted under this key |
-
-### 4.3 Ordering guarantees
-
-1. Exactly one `started`, first — except for a request rejected before computation
-   (§4.4), which emits no `started` at all.
-2. Exactly one terminal event (`done` or `error`), last.
-3. `seq` strictly increases.
-4. `candidate` events never appear before `started` or after the terminal event.
-5. Zero or more `progress` and `checkpoint` events in between.
-
-### 4.4 Pre-validation errors
-
-An `error` may terminate a run before `started` exists. That happens exactly when the
-request is rejected during validation, before any key is enumerated:
-
-`invalid_request`, `alphabet_mismatch`, `ciphertext_not_in_alphabet`,
-`unsupported_pass`, `unsupported_measure`, `unsupported_mechanism`, `unknown_wheel`,
-`checkpoint_mismatch`.
-
-Such an `error` is the whole stream: `seq` is `1`, no `started` precedes it, and it
-carries the engine's own `protocol_version` (§4, §10) because the requested version may
-be unknown. Every other failure is reported as `internal` after `started`.
-
----
 
 ## 5. Control
 
 | Action | Mechanism | Result |
 | --- | --- | --- |
-| Cancel | POSIX `SIGINT`/`SIGTERM`, Windows console Ctrl+C, or `--cancel-file <path>` | For a started run, emit `hold`, write a final checkpoint, emit `done` with `reason: "cancelled"`, exit `0` |
-| Pause / resume a live job | not in Stage 1 | future extension |
+| Cancel | POSIX `SIGINT`/`SIGTERM`, Windows console Ctrl+C, or `--cancel-file <path>` | A started search emits `hold`, writes a final checkpoint when configured, emits `done` with `reason: "cancelled"`, exits 0 |
+| Pause / resume a live job | Not in Stage 1 | Future extension |
 | Resume a dead job | `--resume <checkpoint>` | §6 |
-| Bound a run | `space.offset`, `space.limit`, `--max-keys` | Terminal `done` with `reason: "limit_reached"` or `"offset_end"` |
+| Bound a search | Search key-space offset/limit or `--max-keys` | `done` with `limit_reached` or `offset_end` |
 
-Cancellation is **cooperative and bounded**: the engine must observe it within one
-progress interval and must never lose the hold. The three mechanisms below are
-equivalent and always produce the same terminal sequence.
-
-- **POSIX** (`SIGINT`, `SIGTERM`): delivered by the OS.
-- **Windows**: Windows has no `SIGTERM`. Stage 1 handles console `Ctrl+C` (the Windows
-  `SIGINT`); there is no SIGTERM equivalent on that platform.
-- **`--cancel-file <path>`** — portable control for every platform, including scripts
-  and tests: the engine polls for the file once per `--progress-interval` and cancels
-  when it appears. Use it when no console signal is available; it is the only control
-  that behaves identically on Linux, macOS and Windows.
-
----
+Cancellation is cooperative and bounded: observe it within one progress interval and
+never lose the hold. Windows handles console Ctrl+C; `--cancel-file` is the portable
+control for scripts and tests.
 
 ## 6. Checkpoint and resume
 
-A started run writes checkpoints to `--checkpoint <path>` at
-`--checkpoint-interval` (default 300 s) and writes a final checkpoint on a normal
-terminal `done` (including completion, cancellation, and bounded-run endings). On an
-`internal` error after `started`, writing a final checkpoint is best-effort and only
-applies when the current state and cursor can be serialized meaningfully. A
-pre-validation error before `started` never writes a checkpoint: no run state or cursor
-exists.
+A started resumable search may write checkpoints at `--checkpoint-interval` (default
+300 s), and writes a final checkpoint on normal terminal completion when configured.
+A pre-validation error never writes one. Checkpoints include `protocol_version`, a
+canonical request digest, state digest, completed work units, elapsed time, structured
+cursor, hold, and RNG state when a stochastic pass is used. Resume requires an exact
+request digest match; a checkpoint cannot be applied to a different job or machine.
+Cursor representation must not depend on a CPU loop counter and must account for
+variable topology. A stochastic resume without reproducible RNG state is rejected.
+A resumed run reports `resumed_from` in `started`.
 
-```json
-{
-  "protocol_version": 1,
-  "request_digest": "sha256:…",
-  "state_digest": "sha256:…",
-  "keys_done": 1048576,
-  "elapsed_ms": 3590000,
-  "cursor": { "variant": 0, "slot_indices": [0, 3, 1, 7], "plugboard": "aberbf" },
-  "hold": [ /* candidate objects, best first */ ],
-  "rng": { "seed": 12345, "state": "…" }
-}
-```
-
-Resume semantics:
-
-- `request_digest` is the SHA-256 of the canonicalised request. A resume whose digest
-  does not match the current request is rejected with `checkpoint_mismatch`. **A
-  checkpoint may never be applied to a different job.**
-- The engine resumes from `cursor`, not by re-deriving progress, so `keys_done` is exact
-  and the hold is preserved.
-- `rng` is present only when a stochastic pass is used; without it, resume is not
-  reproducible and must be rejected.
-- A resumed run emits `started` with `resumed_from` set to the checkpoint path.
-
----
+The concrete checkpoint schema must track the finalized search-job schema before
+implementation; this section does not claim a parser or checkpoint implementation.
 
 ## 7. Determinism rules
 
-These are contract obligations, not implementation advice. The GPU backend (Stage 4)
-must satisfy them identically to the CPU backend.
+1. Search enumeration order is fully determined by machine, job, and search-space
+   definitions; offset and limit address that order.
+2. Scoring uses integer or fixed-point arithmetic where floating point could vary
+   between backends. Otherwise results are bit-identical.
+3. Unordered reductions may not affect scores; each candidate is scored independently.
+4. Stochastic passes record their seed in `started` and checkpoints.
+5. Search holds are totally ordered by `(score desc, enumeration index asc)`.
 
-1. **Enumeration order is fully determined** by the `space` definition. `offset` and
-   `limit` address that order.
-2. **Scoring uses integer or fixed-point arithmetic** wherever a float would introduce
-   backend-dependent rounding. Where floating point is unavoidable, the result must be
-   bit-identical across backends; otherwise the measure is not admissible.
-3. **No unordered reductions** may affect a score. Atomic accumulation into a shared
-   score is forbidden; per-candidate scores are computed independently.
-4. **Every stochastic pass records its seed** in `started` and in the checkpoint
-   (`started.seed` is `null` when no stochastic pass is used).
-5. **The hold is totally ordered** by `(score desc, enumeration index asc)`, so ties are
-   broken deterministically.
+These obligations apply only to implemented jobs and measures.
 
-Any deviation is a bug, not a variation.
+## 8. Local listener (web client) — Stage 2 planned
 
----
+Not part of Stage 1. It binds `127.0.0.1` only; binding `0.0.0.0` is forbidden. It
+requires a per-run bearer token printed once to `stderr`, validates `Origin` against an
+allow-list, and mirrors the protocol through `POST /jobs`,
+`GET /jobs/{id}/events`, and `POST /jobs/{id}/cancel`.
 
-## 8. Local listener (web client) — Stage 2 (planned)
+## 9. Compatibility and parity with `bomm`
 
-Not part of Stage 1. Required so the browser client never needs compute privileges of
-its own.
+`bomm` query JSON compatibility is not a requirement: this v1 redesign replaces the
+previous superset promise, and old query files need not parse unchanged. `bomm` remains a
+differential test oracle. Each parity test expresses equivalent machine, key, input
+text, and scoring configuration in the protocol's own request format and in `bomm`'s
+format. Compare resulting key, plaintext, and score. Compare scores only when measure,
+resources, and passes are equivalent. Tests must not claim equivalence merely because
+both tools accepted the same JSON file, and no unchanged-query obligation remains.
 
-- Binds **`127.0.0.1` only.** Binding `0.0.0.0` is forbidden: the engine has no
-  authentication beyond the token below and must never be reachable from the network.
-- Requires a bearer token, generated per run and printed once to `stderr`.
-- Validates the `Origin` header against an allow-list. A page on the open internet must
-  not be able to drive a local engine.
-- Endpoints mirror the protocol exactly: `POST /jobs` (request → `202` + `job_id`),
-  `GET /jobs/{id}/events` (the event stream as JSONL, or as SSE), `POST /jobs/{id}/cancel`.
+## 10. Versioning and status
 
----
+`protocol_version` versions the request contract. Version 1 is the redesigned,
+pre-implementation contract in this document. Unknown versions and fields are rejected
+before work. This is an explicit redesign, not a silent extension of the former
+frozen interface; historical task and commit evidence about the earlier alignment
+remains historically accurate (see `odd/tasks/enigma-engine.md`).
 
-## 9. Compatibility with `bomm`
+Once v1 ships, incompatible changes to field meaning, validation, traversal, or event
+ordering require a version bump. New request fields or enum values require an explicit
+versioned evolution; event consumers may ignore unknown event names/fields. Detailed
+search fields and any resource formats not yet specified here must be defined before
+implementation or via such a versioned evolution, never presumed to exist.
 
-Every row is a **target** for Stage 1, not shipped behavior; the table compares intended
-contracts only.
+## 11. GPU constraints (Stage 4)
 
-| `bomm` behaviour | This protocol (target) |
-| --- | --- |
-| Query JSON file as the only argument | Identical, plus `--request -`; the listener (§8) is Stage 2 |
-| ANSI TUI on `stdout`, live-updating | Replaced by the JSONL event stream on `stdout` |
-| Full hold printed on completion and on `SIGINT`/`SIGTERM` | Preserved, as the `hold` event; cancellation accepts POSIX `SIGINT`/`SIGTERM`, Windows Ctrl+C, and `--cancel-file` everywhere (§5) |
-| Alphabet fixed at compile time | Runtime `alphabet` field |
-| `mechanism`: `stepping`, `odometer`, `none` | Preserved; `cog` is a Stage 5 addition |
-| `passes`: `hill_climb`, `reswapping`, `trie`, `measure` | Preserved; `partial_exhaustion` in Stage 1, further passes later (§3.2) |
-| Measures: `entropy`, `ic`, `sinkov_*`, `trie` | Preserved; `chi_squared_*` is additive but unscheduled (§3.3) |
-| 29-wheel library, custom wheels by JSON | Preserved; exotic wheel sets (e.g. B207-style) are Stage 5 |
-| No resume | `--resume` |
-| Single hypothesis per run | `space.variants` (Stage 1 planned extension, §3.1.1) |
-
-**Verification obligation:** `bomm`'s own `data/queries/*.json` must parse and run
-unchanged, producing the same key, the same plaintext and the same score. This is
-task 12 and it is the primary correctness gate for the whole port.
-
----
-
-## 10. Versioning
-
-`protocol_version` is an integer, currently `1`. It versions the **request** contract;
-event output is versioned only in the sense that older clients ignore what they do not
-know.
-
-1. **Design status.** "Frozen" means the interface in this document is agreed; it does
-   not mean shipped. Implementation status lives in `odd/tasks/enigma-engine.md`.
-2. **Version 1 activates Stage 1 request features only.** Fields and enum members marked
-   for later stages in §3 are reserved in this design, not accepted as active v1
-   features. A known but inactive future-stage pass is rejected with
-   `unsupported_pass`; the corresponding mechanism or measure is rejected with
-   `unsupported_mechanism` or `unsupported_measure`. Truly unrecognized request fields
-   remain hard errors (§1.3).
-3. **Output-compatible additions do not bump the version.** New event types and new
-   event fields are ignored by clients (§1.3), so they may ship without negotiation.
-4. **Activating future request features after v1 ships requires version negotiation or
-   a version bump.** Adding a request field or a new member to a request enum
-   (`passes[].type`, `mechanism`, `measure`) is compatible only for clients that request
-   a version defining it, unless it is explicitly negotiated. This applies to the
-   Stage 3/5 pass entries and the Stage 5 `cog` mechanism in §3; `chi_squared*` measures
-   follow the same rule if they are scheduled and activated. `space.variants` is a
-   Stage 1 feature and is part of the v1 request design.
-5. **Breaking changes bump the version:** removing or changing the meaning of an
-   existing field, changing ordering guarantees, or changing the determinism rules.
-6. A client requesting an unsupported `protocol_version` receives `invalid_request`
-   before any computation begins, i.e. with no `started` (§4.4).
-
----
-
-## 11. Constraints inherited from the GPU backend (Stage 4)
-
-Recorded now so the protocol does not have to be rewritten later:
-
-1. `progress` must be expressible in terms of **completed work units**, not loop
-   iterations, because a GPU evaluates candidates in batched dispatches.
-2. `cursor` must identify a resumable position **without depending on a CPU loop
-   counter** — hence the structured `cursor` object rather than a single integer.
-3. Scores must be computed **per candidate independently** (§7.3), because a GPU cannot
-   maintain a global running score without non-determinism.
-4. The contract does not expose thread counts, workgroup sizes or dispatch geometry.
-   `backend` is **informational only**; clients must not branch on it.
+1. Progress is expressed in completed work units, not loop iterations.
+2. A cursor identifies a resumable position without depending on a CPU loop counter.
+3. Scores are computed per candidate independently.
+4. Thread counts, workgroup sizes, and dispatch geometry are not protocol fields;
+   backend metadata is informational only.
