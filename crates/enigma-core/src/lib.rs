@@ -45,7 +45,7 @@
 /// Must match `docs/protocol.md` §10. A breaking change to the protocol bumps this.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 /// Failure while defining an alphabet or wheel wiring.
@@ -96,6 +96,39 @@ pub enum ModelError {
     PlugboardSelfPair(char),
     /// A plugboard symbol occurs in more than one pair.
     DuplicatePlugboardSymbol(char),
+    /// A stepping rule set declares more rules than the grammar allows.
+    TooManyStepRules {
+        /// Maximum permitted number of rules.
+        max: usize,
+    },
+    /// Stepping conditions exceed the total condition-node budget.
+    TooManyStepConditionNodes {
+        /// Maximum permitted total number of condition nodes.
+        max: usize,
+    },
+    /// A stepping condition nests deeper than the grammar allows.
+    StepConditionTooDeep {
+        /// Maximum permitted nesting depth.
+        max: usize,
+    },
+    /// Stepping rules advance more distinct slots than the grammar allows.
+    TooManyStepTargets {
+        /// Maximum permitted number of distinct targets.
+        max: usize,
+    },
+    /// A stepping condition or advance list references no declared slot.
+    UnknownStepSlot(String),
+    /// A stepping rule tries to advance a slot whose movement is fixed.
+    NonMovableStepTarget(String),
+    /// An `all` or `any` condition group must contain at least one condition.
+    EmptyStepConditionGroup,
+    /// A position slice does not carry exactly one symbol per slot.
+    PositionCountMismatch {
+        /// Number of slots in the topology.
+        expected: usize,
+        /// Number of positions supplied.
+        actual: usize,
+    },
 }
 
 impl fmt::Display for ModelError {
@@ -156,6 +189,32 @@ impl fmt::Display for ModelError {
                     "plugboard symbol {symbol:?} occurs in more than one pair"
                 )
             }
+            Self::TooManyStepRules { max } => {
+                write!(formatter, "at most {max} stepping rules are permitted")
+            }
+            Self::TooManyStepConditionNodes { max } => write!(
+                formatter,
+                "at most {max} stepping condition nodes are permitted"
+            ),
+            Self::StepConditionTooDeep { max } => write!(
+                formatter,
+                "stepping condition nesting is limited to depth {max}"
+            ),
+            Self::TooManyStepTargets { max } => write!(
+                formatter,
+                "stepping rules may advance at most {max} distinct slots"
+            ),
+            Self::UnknownStepSlot(id) => write!(formatter, "unknown stepping slot {id:?}"),
+            Self::NonMovableStepTarget(id) => {
+                write!(formatter, "stepping rule may not advance fixed slot {id:?}")
+            }
+            Self::EmptyStepConditionGroup => {
+                write!(formatter, "`all` and `any` conditions must not be empty")
+            }
+            Self::PositionCountMismatch { expected, actual } => write!(
+                formatter,
+                "received {actual} positions; expected {expected} (one per slot)"
+            ),
         }
     }
 }
@@ -294,6 +353,7 @@ pub struct MachineTopology {
     wheels: Vec<Wiring>,
     wheel_indices: HashMap<String, usize>,
     slots: Vec<Slot>,
+    slot_indices: HashMap<String, usize>,
 }
 
 impl MachineTopology {
@@ -316,14 +376,14 @@ impl MachineTopology {
             }
         }
 
-        let mut slot_ids = HashSet::with_capacity(slots.len());
+        let mut slot_indices = HashMap::with_capacity(slots.len());
         let mut reflector_index = None;
         let mut rotor_count = 0;
         for (index, slot) in slots.iter().enumerate() {
             if slot.id.is_empty() {
                 return Err(ModelError::EmptySlotId);
             }
-            if !slot_ids.insert(slot.id.as_str()) {
+            if slot_indices.insert(slot.id.clone(), index).is_some() {
                 return Err(ModelError::DuplicateSlotId(slot.id.clone()));
             }
             let wheel_index = *wheel_indices
@@ -364,6 +424,7 @@ impl MachineTopology {
             wheels,
             wheel_indices,
             slots,
+            slot_indices,
         })
     }
 
@@ -387,6 +448,256 @@ impl MachineTopology {
         self.wheel_indices
             .get(name)
             .map(|&index| &self.wheels[index])
+    }
+
+    /// Looks up a slot's physical index (left-to-right) by its unique identifier.
+    pub fn slot_index(&self, id: &str) -> Option<usize> {
+        self.slot_indices.get(id).copied()
+    }
+}
+
+/// Maximum number of stepping rules a machine may declare.
+pub const MAX_STEP_RULES: usize = 64;
+
+/// Maximum total number of condition nodes across all stepping rules.
+pub const MAX_STEP_CONDITION_NODES: usize = 256;
+
+/// Maximum nesting depth of a stepping condition.
+pub const MAX_STEP_CONDITION_DEPTH: usize = 16;
+
+/// Maximum number of distinct slots that stepping rules may advance.
+pub const MAX_STEP_TARGETS: usize = 64;
+
+/// A bounded boolean condition evaluated against the pre-keypress positions.
+///
+/// Conditions are pure data: they hold no executable code and are evaluated against
+/// the same state before every keypress.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StepCondition {
+    /// Always true.
+    Always,
+    /// True when the referenced slot's displayed position is one of its wheel turnovers.
+    AtTurnover(String),
+    /// True when the referenced slot displays `symbol`.
+    AtPosition {
+        /// Referenced slot identifier.
+        slot: String,
+        /// Displayed position to compare against.
+        symbol: char,
+    },
+    /// True when every contained condition is true; the group is non-empty.
+    All(Vec<StepCondition>),
+    /// True when any contained condition is true; the group is non-empty.
+    Any(Vec<StepCondition>),
+    /// True when the contained condition is false.
+    Not(Box<StepCondition>),
+}
+
+/// One stepping rule: while `condition` holds, every listed slot advances once.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StepRule {
+    condition: StepCondition,
+    advance: Vec<String>,
+}
+
+impl StepRule {
+    /// Creates a rule; [`Stepping::new`] validates its references and bounds.
+    pub fn new(condition: StepCondition, advance: Vec<String>) -> Self {
+        Self { condition, advance }
+    }
+
+    /// The condition tested against the pre-keypress state.
+    pub fn condition(&self) -> &StepCondition {
+        &self.condition
+    }
+
+    /// Slot identifiers advanced when the condition holds.
+    pub fn advance(&self) -> &[String] {
+        &self.advance
+    }
+}
+
+/// A validated, bounded set of declarative stepping rules.
+///
+/// All conditions of every rule are evaluated against the same pre-keypress positions;
+/// the target slots of all matching rules are unioned and each advanced exactly once,
+/// simultaneously. Rule order therefore does not change the result. An empty rule set
+/// means no slot moves.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Stepping {
+    rules: Vec<StepRule>,
+}
+
+impl Stepping {
+    /// Creates an empty rule set, under which no slot moves.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Validates and assembles a rule set against `topology`.
+    ///
+    /// Rejects unknown slot references, non-movable advance targets, malformed empty
+    /// `all`/`any` groups, symbols outside the alphabet, and any rule set exceeding the
+    /// documented grammar limits.
+    pub fn new(topology: &MachineTopology, rules: Vec<StepRule>) -> Result<Self, ModelError> {
+        if rules.len() > MAX_STEP_RULES {
+            return Err(ModelError::TooManyStepRules {
+                max: MAX_STEP_RULES,
+            });
+        }
+        let mut nodes = 0usize;
+        let mut targets = BTreeSet::new();
+        for rule in &rules {
+            validate_step_condition(topology, &rule.condition, 1, &mut nodes)?;
+            for id in &rule.advance {
+                let index = topology
+                    .slot_index(id)
+                    .ok_or_else(|| ModelError::UnknownStepSlot(id.clone()))?;
+                if topology.slots()[index].movement() != Movement::Movable {
+                    return Err(ModelError::NonMovableStepTarget(id.clone()));
+                }
+                targets.insert(index);
+            }
+        }
+        if targets.len() > MAX_STEP_TARGETS {
+            return Err(ModelError::TooManyStepTargets {
+                max: MAX_STEP_TARGETS,
+            });
+        }
+        Ok(Self { rules })
+    }
+
+    /// The validated rules in their declared order.
+    pub fn rules(&self) -> &[StepRule] {
+        &self.rules
+    }
+
+    /// Computes the sorted indices of the slots to advance for the current positions.
+    ///
+    /// `positions` holds one displayed symbol per slot in physical left-to-right order.
+    /// The returned indices are deduplicated, so a slot matched by several rules appears
+    /// once; sorting keeps the result independent of rule order.
+    pub fn plan(
+        &self,
+        topology: &MachineTopology,
+        positions: &[char],
+    ) -> Result<Vec<usize>, ModelError> {
+        let expected = topology.slots().len();
+        if positions.len() != expected {
+            return Err(ModelError::PositionCountMismatch {
+                expected,
+                actual: positions.len(),
+            });
+        }
+        let mut targets = BTreeSet::new();
+        for rule in &self.rules {
+            if step_condition_holds(topology, positions, &rule.condition) {
+                for id in &rule.advance {
+                    if let Some(index) = topology.slot_index(id) {
+                        targets.insert(index);
+                    }
+                }
+            }
+        }
+        Ok(targets.into_iter().collect())
+    }
+
+    /// Applies the current step plan, advancing each target once and wrapping modulo N.
+    ///
+    /// Only the displayed positions change; ring settings affect electrical offsets and
+    /// never the turnover comparison.
+    pub fn advance(
+        &self,
+        topology: &MachineTopology,
+        positions: &mut [char],
+    ) -> Result<(), ModelError> {
+        let plan = self.plan(topology, positions)?;
+        let size = topology.alphabet().len();
+        for index in plan {
+            let symbol = positions[index];
+            let current = topology
+                .alphabet()
+                .index_of(symbol)
+                .ok_or(ModelError::UnknownSymbol(symbol))?;
+            if let Some(next) = topology.alphabet().symbol_at((current + 1) % size) {
+                positions[index] = next;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_step_condition(
+    topology: &MachineTopology,
+    condition: &StepCondition,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<(), ModelError> {
+    if depth > MAX_STEP_CONDITION_DEPTH {
+        return Err(ModelError::StepConditionTooDeep {
+            max: MAX_STEP_CONDITION_DEPTH,
+        });
+    }
+    *nodes += 1;
+    if *nodes > MAX_STEP_CONDITION_NODES {
+        return Err(ModelError::TooManyStepConditionNodes {
+            max: MAX_STEP_CONDITION_NODES,
+        });
+    }
+    match condition {
+        StepCondition::Always => Ok(()),
+        StepCondition::AtTurnover(id) => {
+            if topology.slot_index(id).is_none() {
+                return Err(ModelError::UnknownStepSlot(id.clone()));
+            }
+            Ok(())
+        }
+        StepCondition::AtPosition { slot, symbol } => {
+            if topology.slot_index(slot).is_none() {
+                return Err(ModelError::UnknownStepSlot(slot.clone()));
+            }
+            if topology.alphabet().index_of(*symbol).is_none() {
+                return Err(ModelError::UnknownSymbol(*symbol));
+            }
+            Ok(())
+        }
+        StepCondition::All(conditions) | StepCondition::Any(conditions) => {
+            if conditions.is_empty() {
+                return Err(ModelError::EmptyStepConditionGroup);
+            }
+            for condition in conditions {
+                validate_step_condition(topology, condition, depth + 1, nodes)?;
+            }
+            Ok(())
+        }
+        StepCondition::Not(condition) => {
+            validate_step_condition(topology, condition, depth + 1, nodes)
+        }
+    }
+}
+
+fn step_condition_holds(
+    topology: &MachineTopology,
+    positions: &[char],
+    condition: &StepCondition,
+) -> bool {
+    match condition {
+        StepCondition::Always => true,
+        StepCondition::AtTurnover(id) => topology.slot_index(id).is_some_and(|index| {
+            topology
+                .wheel(topology.slots()[index].wheel())
+                .is_some_and(|wheel| wheel.at_turnover(positions[index]))
+        }),
+        StepCondition::AtPosition { slot, symbol } => topology
+            .slot_index(slot)
+            .is_some_and(|index| positions[index] == *symbol),
+        StepCondition::All(conditions) => conditions
+            .iter()
+            .all(|condition| step_condition_holds(topology, positions, condition)),
+        StepCondition::Any(conditions) => conditions
+            .iter()
+            .any(|condition| step_condition_holds(topology, positions, condition)),
+        StepCondition::Not(condition) => !step_condition_holds(topology, positions, condition),
     }
 }
 
@@ -574,7 +885,9 @@ impl Wiring {
 #[cfg(test)]
 mod tests {
     use super::{
-        Alphabet, MachineTopology, ModelError, Movement, Plugboard, Slot, SlotRole, Wiring,
+        Alphabet, MachineTopology, ModelError, Movement, Plugboard, Slot, SlotRole, StepCondition,
+        StepRule, Stepping, Wiring, MAX_STEP_CONDITION_DEPTH, MAX_STEP_CONDITION_NODES,
+        MAX_STEP_RULES, MAX_STEP_TARGETS,
     };
 
     fn identity_wiring(alphabet: &Alphabet, name: &str) -> Wiring {
@@ -924,5 +1237,300 @@ mod tests {
         assert!(wiring.at_turnover('B'));
         assert!(!wiring.at_turnover('A'));
         assert!(!wiring.at_turnover('Z'));
+    }
+
+    fn stepping_topology() -> MachineTopology {
+        let alphabet = Alphabet::new(vec!['A', 'B', 'C', 'D']).unwrap();
+        let fast = Wiring::new("fast", &alphabet, &['B', 'C', 'D', 'A'], &['B']).unwrap();
+        let slow = Wiring::new("slow", &alphabet, &['A', 'B', 'C', 'D'], &['A']).unwrap();
+        MachineTopology::new(
+            alphabet,
+            vec![fast, slow],
+            vec![
+                Slot::new("slow", "slow", SlotRole::Rotor, Movement::Movable, 'A', 'A'),
+                Slot::new("fast", "fast", SlotRole::Rotor, Movement::Movable, 'A', 'A'),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn stepping_advances_the_union_of_matching_targets_exactly_once() {
+        let topology = stepping_topology();
+        let stepping = Stepping::new(
+            &topology,
+            vec![
+                StepRule::new(StepCondition::Always, vec!["fast".into()]),
+                StepRule::new(
+                    StepCondition::AtPosition {
+                        slot: "fast".into(),
+                        symbol: 'A',
+                    },
+                    vec!["fast".into(), "slow".into()],
+                ),
+            ],
+        )
+        .unwrap();
+
+        let mut positions = ['A', 'A'];
+        // Both rules match, but `fast` is advanced exactly once.
+        assert_eq!(stepping.plan(&topology, &positions).unwrap(), vec![0, 1]);
+        stepping.advance(&topology, &mut positions).unwrap();
+        assert_eq!(positions, ['B', 'B']);
+    }
+
+    #[test]
+    fn stepping_with_no_rules_never_moves() {
+        let topology = stepping_topology();
+        let stepping = Stepping::none();
+        let mut positions = ['A', 'A'];
+        assert!(stepping.plan(&topology, &positions).unwrap().is_empty());
+        stepping.advance(&topology, &mut positions).unwrap();
+        assert_eq!(positions, ['A', 'A']);
+    }
+
+    #[test]
+    fn stepping_turnover_uses_displayed_position_and_ignores_ring() {
+        let alphabet = Alphabet::new(vec!['A', 'B', 'C', 'D']).unwrap();
+        let fast = Wiring::new("fast", &alphabet, &['A', 'B', 'C', 'D'], &['B']).unwrap();
+        let topology = MachineTopology::new(
+            alphabet,
+            vec![fast],
+            vec![Slot::new(
+                "fast",
+                "fast",
+                SlotRole::Rotor,
+                Movement::Movable,
+                'B',
+                'C',
+            )],
+        )
+        .unwrap();
+        let stepping = Stepping::new(
+            &topology,
+            vec![StepRule::new(
+                StepCondition::AtTurnover("fast".into()),
+                vec!["fast".into()],
+            )],
+        )
+        .unwrap();
+
+        // The displayed position is a turnover; the ring setting does not suppress it.
+        let mut positions = ['B'];
+        stepping.advance(&topology, &mut positions).unwrap();
+        assert_eq!(positions, ['C']);
+
+        // A displayed position that is not a turnover does not advance.
+        assert!(stepping.plan(&topology, &['A']).unwrap().is_empty());
+    }
+
+    #[test]
+    fn stepping_conditions_compose_with_all_any_and_not() {
+        let topology = stepping_topology();
+        let all = StepCondition::All(vec![
+            StepCondition::AtPosition {
+                slot: "slow".into(),
+                symbol: 'A',
+            },
+            StepCondition::Not(Box::new(StepCondition::AtPosition {
+                slot: "fast".into(),
+                symbol: 'A',
+            })),
+        ]);
+        let stepping =
+            Stepping::new(&topology, vec![StepRule::new(all, vec!["slow".into()])]).unwrap();
+        assert_eq!(stepping.plan(&topology, &['A', 'B']).unwrap(), vec![0]);
+        assert_eq!(
+            stepping.plan(&topology, &['A', 'A']).unwrap(),
+            Vec::<usize>::new()
+        );
+
+        let any = StepCondition::Any(vec![
+            StepCondition::AtTurnover("fast".into()),
+            StepCondition::AtPosition {
+                slot: "slow".into(),
+                symbol: 'D',
+            },
+        ]);
+        let stepping =
+            Stepping::new(&topology, vec![StepRule::new(any, vec!["slow".into()])]).unwrap();
+        // `fast` displays its turnover even though `slow` is not at D.
+        assert_eq!(stepping.plan(&topology, &['A', 'B']).unwrap(), vec![0]);
+        assert_eq!(stepping.plan(&topology, &['D', 'A']).unwrap(), vec![0]);
+        assert_eq!(
+            stepping.plan(&topology, &['C', 'A']).unwrap(),
+            Vec::<usize>::new()
+        );
+    }
+
+    #[test]
+    fn stepping_advance_wraps_at_the_end_of_the_alphabet() {
+        let topology = stepping_topology();
+        let stepping = Stepping::new(
+            &topology,
+            vec![StepRule::new(StepCondition::Always, vec!["slow".into()])],
+        )
+        .unwrap();
+        let mut positions = ['D', 'A'];
+        stepping.advance(&topology, &mut positions).unwrap();
+        assert_eq!(positions, ['A', 'A']);
+    }
+
+    #[test]
+    fn stepping_rejects_unknown_slots_and_fixed_targets() {
+        let topology = stepping_topology();
+        assert_eq!(
+            Stepping::new(
+                &topology,
+                vec![StepRule::new(StepCondition::Always, vec!["ghost".into()])],
+            ),
+            Err(ModelError::UnknownStepSlot("ghost".into()))
+        );
+        assert_eq!(
+            Stepping::new(
+                &topology,
+                vec![StepRule::new(
+                    StepCondition::AtTurnover("ghost".into()),
+                    vec!["slow".into()],
+                )],
+            ),
+            Err(ModelError::UnknownStepSlot("ghost".into()))
+        );
+
+        let alphabet = Alphabet::new(vec!['A', 'B']).unwrap();
+        let wheel = identity_wiring(&alphabet, "wheel");
+        let fixed = MachineTopology::new(
+            alphabet,
+            vec![wheel],
+            vec![Slot::new(
+                "entry",
+                "wheel",
+                SlotRole::Rotor,
+                Movement::Fixed,
+                'A',
+                'A',
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            Stepping::new(
+                &fixed,
+                vec![StepRule::new(StepCondition::Always, vec!["entry".into()])],
+            ),
+            Err(ModelError::NonMovableStepTarget("entry".into()))
+        );
+    }
+
+    #[test]
+    fn stepping_rejects_malformed_groups_and_unknown_position_symbols() {
+        let topology = stepping_topology();
+        assert_eq!(
+            Stepping::new(
+                &topology,
+                vec![StepRule::new(StepCondition::All(vec![]), vec![])],
+            ),
+            Err(ModelError::EmptyStepConditionGroup)
+        );
+        assert_eq!(
+            Stepping::new(
+                &topology,
+                vec![StepRule::new(StepCondition::Any(vec![]), vec![])],
+            ),
+            Err(ModelError::EmptyStepConditionGroup)
+        );
+        assert_eq!(
+            Stepping::new(
+                &topology,
+                vec![StepRule::new(
+                    StepCondition::AtPosition {
+                        slot: "slow".into(),
+                        symbol: 'Z',
+                    },
+                    vec![],
+                )],
+            ),
+            Err(ModelError::UnknownSymbol('Z'))
+        );
+    }
+
+    #[test]
+    fn stepping_enforces_grammar_limits() {
+        let topology = stepping_topology();
+        let rules: Vec<_> = (0..=MAX_STEP_RULES)
+            .map(|_| StepRule::new(StepCondition::Always, vec!["slow".into()]))
+            .collect();
+        assert_eq!(
+            Stepping::new(&topology, rules),
+            Err(ModelError::TooManyStepRules {
+                max: MAX_STEP_RULES
+            })
+        );
+
+        let mut nested = StepCondition::Always;
+        for _ in 0..=MAX_STEP_CONDITION_DEPTH {
+            nested = StepCondition::Not(Box::new(nested));
+        }
+        assert_eq!(
+            Stepping::new(&topology, vec![StepRule::new(nested, vec![])]),
+            Err(ModelError::StepConditionTooDeep {
+                max: MAX_STEP_CONDITION_DEPTH
+            })
+        );
+
+        let wide = StepCondition::All(
+            (0..=MAX_STEP_CONDITION_NODES)
+                .map(|_| StepCondition::Always)
+                .collect(),
+        );
+        assert_eq!(
+            Stepping::new(&topology, vec![StepRule::new(wide, vec![])]),
+            Err(ModelError::TooManyStepConditionNodes {
+                max: MAX_STEP_CONDITION_NODES
+            })
+        );
+    }
+
+    #[test]
+    fn stepping_enforces_the_distinct_target_budget() {
+        let alphabet = Alphabet::new(vec!['A', 'B']).unwrap();
+        let wheel = identity_wiring(&alphabet, "wheel");
+        let slots: Vec<_> = (0..=MAX_STEP_TARGETS)
+            .map(|index| {
+                Slot::new(
+                    format!("s{index}"),
+                    "wheel",
+                    SlotRole::Rotor,
+                    Movement::Movable,
+                    'A',
+                    'A',
+                )
+            })
+            .collect();
+        let topology = MachineTopology::new(alphabet, vec![wheel], slots).unwrap();
+        let advance: Vec<_> = (0..=MAX_STEP_TARGETS)
+            .map(|index| format!("s{index}"))
+            .collect();
+        assert_eq!(
+            Stepping::new(
+                &topology,
+                vec![StepRule::new(StepCondition::Always, advance)],
+            ),
+            Err(ModelError::TooManyStepTargets {
+                max: MAX_STEP_TARGETS
+            })
+        );
+    }
+
+    #[test]
+    fn stepping_rejects_position_slices_that_do_not_match_the_topology() {
+        let topology = stepping_topology();
+        let stepping = Stepping::none();
+        assert_eq!(
+            stepping.plan(&topology, &['A']),
+            Err(ModelError::PositionCountMismatch {
+                expected: 2,
+                actual: 1
+            })
+        );
     }
 }
