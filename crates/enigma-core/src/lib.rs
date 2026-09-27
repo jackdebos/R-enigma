@@ -92,6 +92,10 @@ pub enum ModelError {
     NoRotorSlots,
     /// A slot position or ring setting is not in the topology alphabet.
     UnknownSlotSymbol(char),
+    /// A plugboard pair joins a symbol to itself.
+    PlugboardSelfPair(char),
+    /// A plugboard symbol occurs in more than one pair.
+    DuplicatePlugboardSymbol(char),
 }
 
 impl fmt::Display for ModelError {
@@ -139,6 +143,18 @@ impl fmt::Display for ModelError {
             }
             Self::UnknownSlotSymbol(symbol) => {
                 write!(formatter, "slot symbol {symbol:?} is not in the alphabet")
+            }
+            Self::PlugboardSelfPair(symbol) => {
+                write!(
+                    formatter,
+                    "plugboard symbol {symbol:?} must not be paired with itself"
+                )
+            }
+            Self::DuplicatePlugboardSymbol(symbol) => {
+                write!(
+                    formatter,
+                    "plugboard symbol {symbol:?} occurs in more than one pair"
+                )
             }
         }
     }
@@ -374,6 +390,82 @@ impl MachineTopology {
     }
 }
 
+/// A disjoint plugboard involution bound to an ordered alphabet.
+///
+/// Pairs are directionless: `(a, b)` and `(b, a)` describe the same mapping. Every
+/// symbol that appears in no pair maps to itself. Symbols are preserved exactly: this
+/// type does not normalize or rewrite them, and a symbol outside the bound alphabet has
+/// no mapping.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Plugboard {
+    alphabet: Alphabet,
+    mapping: Vec<usize>,
+}
+
+impl Plugboard {
+    /// Builds a plugboard over `alphabet` from unordered pairs of distinct symbols.
+    ///
+    /// Each symbol may occur in at most one pair; the pairs define a disjoint
+    /// involution, and unpaired symbols map to themselves. A symbol paired with itself,
+    /// a repeated endpoint, or a symbol outside `alphabet` is rejected.
+    pub fn new(alphabet: &Alphabet, pairs: &[(char, char)]) -> Result<Self, ModelError> {
+        let mut mapping: Vec<usize> = (0..alphabet.len()).collect();
+        for &(left, right) in pairs {
+            let left_index = alphabet
+                .index_of(left)
+                .ok_or(ModelError::UnknownSymbol(left))?;
+            let right_index = alphabet
+                .index_of(right)
+                .ok_or(ModelError::UnknownSymbol(right))?;
+            if left_index == right_index {
+                return Err(ModelError::PlugboardSelfPair(left));
+            }
+            if mapping[left_index] != left_index {
+                return Err(ModelError::DuplicatePlugboardSymbol(left));
+            }
+            if mapping[right_index] != right_index {
+                return Err(ModelError::DuplicatePlugboardSymbol(right));
+            }
+            mapping[left_index] = right_index;
+            mapping[right_index] = left_index;
+        }
+        Ok(Self {
+            alphabet: alphabet.clone(),
+            mapping,
+        })
+    }
+
+    /// Builds the identity plugboard over `alphabet`, where every symbol maps to itself.
+    pub fn identity(alphabet: &Alphabet) -> Self {
+        Self {
+            alphabet: alphabet.clone(),
+            mapping: (0..alphabet.len()).collect(),
+        }
+    }
+
+    /// The ordered alphabet this plugboard is bound to.
+    pub fn alphabet(&self) -> &Alphabet {
+        &self.alphabet
+    }
+
+    /// Returns the paired symbol, or the symbol itself when unpaired.
+    ///
+    /// Returns `None` when the symbol is not a member of the bound alphabet.
+    pub fn map(&self, symbol: char) -> Option<char> {
+        let index = self.alphabet.index_of(symbol)?;
+        self.alphabet.symbol_at(self.mapping[index])
+    }
+
+    /// Whether `symbol` is paired with a different alphabet symbol.
+    ///
+    /// Returns `false` for unpaired symbols and for symbols outside the alphabet.
+    pub fn is_paired(&self, symbol: char) -> bool {
+        self.alphabet
+            .index_of(symbol)
+            .is_some_and(|index| self.mapping[index] != index)
+    }
+}
+
 /// A named bijective wheel mapping and its inverse, with displayed-position turnovers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Wiring {
@@ -481,7 +573,9 @@ impl Wiring {
 
 #[cfg(test)]
 mod tests {
-    use super::{Alphabet, MachineTopology, ModelError, Movement, Slot, SlotRole, Wiring};
+    use super::{
+        Alphabet, MachineTopology, ModelError, Movement, Plugboard, Slot, SlotRole, Wiring,
+    };
 
     fn identity_wiring(alphabet: &Alphabet, name: &str) -> Wiring {
         let mapping: Vec<_> = (0..alphabet.len())
@@ -748,6 +842,79 @@ mod tests {
         assert_eq!(wiring.reverse('C', 'B', 'A'), Some('A'));
         // Wrapped offset -1: D shifts to C, inverse(C) is D, then unshifting yields A.
         assert_eq!(wiring.reverse('D', 'A', 'B'), Some('A'));
+    }
+
+    #[test]
+    fn plugboard_identity_maps_every_symbol_to_itself() {
+        let alphabet = Alphabet::new(vec!['A', 'B', 'C']).unwrap();
+        let plugboard = Plugboard::new(&alphabet, &[]).unwrap();
+        assert_eq!(plugboard.alphabet(), &alphabet);
+        for symbol in ['A', 'B', 'C'] {
+            assert_eq!(plugboard.map(symbol), Some(symbol));
+            assert!(!plugboard.is_paired(symbol));
+        }
+        assert_eq!(Plugboard::identity(&alphabet), plugboard);
+    }
+
+    #[test]
+    fn plugboard_is_a_disjoint_involution_with_identity_for_unpaired_symbols() {
+        let alphabet = Alphabet::new(vec!['A', 'B', 'C', 'D']).unwrap();
+        let plugboard = Plugboard::new(&alphabet, &[('A', 'B'), ('C', 'D')]).unwrap();
+        for symbol in ['A', 'B', 'C', 'D'] {
+            let mapped = plugboard.map(symbol).unwrap();
+            assert_eq!(plugboard.map(mapped), Some(symbol));
+            assert!(plugboard.is_paired(symbol));
+        }
+        assert_eq!(plugboard.map('A'), Some('B'));
+        assert_eq!(plugboard.map('B'), Some('A'));
+        assert_eq!(plugboard.map('C'), Some('D'));
+        assert_eq!(plugboard.map('D'), Some('C'));
+    }
+
+    #[test]
+    fn plugboard_ignores_pair_order_and_leaves_other_symbols_unpaired() {
+        let alphabet = Alphabet::new(vec!['A', 'B', 'C']).unwrap();
+        let forward = Plugboard::new(&alphabet, &[('A', 'B')]).unwrap();
+        let reversed = Plugboard::new(&alphabet, &[('B', 'A')]).unwrap();
+        assert_eq!(forward, reversed);
+        assert_eq!(forward.map('C'), Some('C'));
+        assert!(!forward.is_paired('C'));
+    }
+
+    #[test]
+    fn plugboard_rejects_self_pairs_repeated_endpoints_and_unknown_symbols() {
+        let alphabet = Alphabet::new(vec!['A', 'B', 'C']).unwrap();
+        assert_eq!(
+            Plugboard::new(&alphabet, &[('A', 'A')]),
+            Err(ModelError::PlugboardSelfPair('A'))
+        );
+        assert_eq!(
+            Plugboard::new(&alphabet, &[('A', 'B'), ('A', 'C')]),
+            Err(ModelError::DuplicatePlugboardSymbol('A'))
+        );
+        assert_eq!(
+            Plugboard::new(&alphabet, &[('A', 'B'), ('B', 'C')]),
+            Err(ModelError::DuplicatePlugboardSymbol('B'))
+        );
+        assert_eq!(
+            Plugboard::new(&alphabet, &[('A', 'B'), ('A', 'B')]),
+            Err(ModelError::DuplicatePlugboardSymbol('A'))
+        );
+        assert_eq!(
+            Plugboard::new(&alphabet, &[('A', 'Z')]),
+            Err(ModelError::UnknownSymbol('Z'))
+        );
+    }
+
+    #[test]
+    fn plugboard_preserves_unicode_symbols_without_normalizing() {
+        let alphabet = Alphabet::new(vec!['λ', '中', 'é']).unwrap();
+        let plugboard = Plugboard::new(&alphabet, &[('λ', '中')]).unwrap();
+        assert_eq!(plugboard.map('λ'), Some('中'));
+        assert_eq!(plugboard.map('中'), Some('λ'));
+        assert_eq!(plugboard.map('é'), Some('é'));
+        assert_eq!(plugboard.map('e'), None);
+        assert!(!plugboard.is_paired('\u{301}'));
     }
 
     #[test]
