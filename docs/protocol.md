@@ -1,29 +1,26 @@
 # Engine Protocol
 
-Status: **Protocol v1 is a revised pre-implementation design; Rust implementation is
-pending.** It is not a shipped interface. This explicitly agreed redesign replaces the
-previous frozen superset-of-`bomm` request promise. Backwards compatibility with `bomm`
-query files is not a requirement; parity remains a test obligation using equivalent
-configurations expressed in each tool's own format (see §9).
+Status: **Protocol v1 is unpublished pre-implementation design; Rust implementation is
+pending.** It replaces the former superset-of-`bomm` proposal. It makes no promise to
+accept `bomm` query files unchanged; `bomm` remains a differential oracle. See
+`odd/tasks/enigma-engine.md` for task status. No UI is in Stage 1; UI begins in Stage 2.
 
-This document specifies the target contract between the cryptanalysis engine and its
-clients. It is independent of transport and implementation. Stage 1 uses `stdin` and
-`stdout`; a later local listener can carry the same messages. Examples and guarantees
-describe intended behavior, not current Rust capabilities. See
-`odd/tasks/enigma-engine.md` for implementation status and work units.
+## 1. Normative boundary
 
-## 1. Design principles
+A request has three layers: `machine.definition` declares machine structure,
+admissible components, and slot constraints; `job.configuration` fixes known key choices
+for both job kinds; `job.space` describes the remaining variable key choices for search.
+The definition is not a key. A known machine never implies a known key. Every required
+key choice must be covered explicitly: fixed by configuration, variable in space, or
+structurally non-configurable in the definition. Omission is not a default. Bundled
+historical definitions and custom embedded definitions use the same schema and
+validation.
 
-1. **Transport-agnostic.** The protocol defines messages, not transport.
-2. **Strict requests, tolerant event consumers.** Unknown request fields, versions,
-   enum values, or unsupported DSL forms fail closed. Clients may ignore unknown event
-   names and event fields.
-3. **Declarative machine model.** Alphabet, wheels, slots, stepping, and jobs are
-   represented as data. The protocol does not imply that every representable topology
-   has a preset or is supported by every search pass.
-4. **Deterministic and reproducible.** A request fully determines enumeration order and
-   scores; backend differences must not change results.
-5. **Checkpoint-first.** Progress, cancellation, and resume are protocol features.
+This document marks protocol requirements as normative. Exact search-space grammar,
+pass fields, scoring/resource schemas, and checkpoint record layout are deferred to
+tasks 9, 10, and 16, respectively. Illustrative search concepts below are not
+executable request examples. Representability does not imply catalog availability or
+search support.
 
 ## 2. Transport
 
@@ -32,348 +29,290 @@ describe intended behavior, not current Rust capabilities. See
 | `stdio` (default) | TUI, scripts, tests | — | 1 |
 | local listener | web client | `--listen 127.0.0.1:<port>` | 2 (planned) |
 
-`stdout` contains only one JSON object per line (JSONL), without embedded newlines.
-Diagnostics, warnings, and logs go to `stderr`. A request is supplied by path argument,
-`--request -` (read from `stdin`), or as an HTTP POST body in listener mode.
+`stdout` contains one JSON object per line (JSONL), without embedded newlines.
+Diagnostics go to `stderr`. Stage 1 accepts a request file path or `--request -` for
+stdin. A future Stage 2 listener carries the same messages. No UI is part of Stage 1.
 
-## 3. Request (input)
+## 3. Request
 
-A request is one JSON object with exactly three root fields: `protocol_version`,
-`machine`, and `job`. Version 1 requires all three; unknown fields are errors. JSON
-object member order has no meaning. The schema below is the v1 target, not an assertion
-that a parser or any listed job already exists.
+A request is exactly `protocol_version`, `machine`, and `job`. Unknown fields and
+versions fail before work. JSON member order has no meaning.
 
 ```json
 {
   "protocol_version": 1,
   "machine": {
-    "alphabet": ["A", "B", "C", "D"],
-    "wheels": [
-      {"name": "entry", "wiring": ["A", "B", "C", "D"], "turnovers": []},
-      {"name": "rotor", "wiring": ["B", "A", "D", "C"], "turnovers": ["B"]},
-      {"name": "reflector", "wiring": ["B", "A", "D", "C"], "turnovers": []}
-    ],
-    "slots": [
-      {"id": "ukw", "wheel": "reflector", "role": "reflector", "movement": "fixed", "position": "A", "ring": "A"},
-      {"id": "slow", "wheel": "rotor", "role": "rotor", "movement": "movable", "position": "A", "ring": "A"},
-      {"id": "entry", "wheel": "entry", "role": "rotor", "movement": "fixed", "position": "A", "ring": "A"}
-    ],
-    "plugboard": [["A", "B"]],
-    "stepping": {"rules": [
-      {"when": {"at_turnover": "slow"}, "advance": ["slow"]},
-      {"when": {"always": true}, "advance": ["slow"]}
-    ]}
+    "definition": {"kind": "bundled", "id": "enigma-i"}
   },
-  "job": {"kind": "transform", "text": "ABCD", "direction": "encrypt"}
+  "job": {
+    "kind": "transform",
+    "configuration": {
+      "slots": [
+        {"id": "reflector", "wheel": "B", "position": "A", "ring": "A"},
+        {"id": "left", "wheel": "I", "position": "A", "ring": "A"},
+        {"id": "middle", "wheel": "II", "position": "A", "ring": "A"},
+        {"id": "right", "wheel": "III", "position": "A", "ring": "A"}
+      ],
+      "plugboard": []
+    },
+    "text": "AAAA",
+    "direction": "encrypt"
+  }
 }
 ```
 
-This four-symbol illustration is valid JSON and a valid transform configuration. Its
-small arbitrary wiring is a protocol-shape example, not a historical Enigma preset.
+This illustrates the reference-and-configuration shape only: `enigma-i` is resolved
+from the historically sourced bundled catalog, and this example is not a test vector.
+The conventional slot IDs and wheel names shown are catalog identifiers; the selected
+positions, rings, and empty plugboard are explicit illustrative key values, not
+catalog defaults. Historical wiring is supplied only by the sourced bundle, never
+reproduced or guessed in this example.
 
-### 3.1 Machine
-
-#### Alphabet and symbols
-
-`machine.alphabet` is a non-empty ordered array of unique single Unicode scalar values.
-The order defines symbol indices and is semantically significant. ASCII letters and
-digits are permitted. A symbol is exactly one scalar value: combining sequences count
-as multiple scalars and are rejected. The engine does not trim, case-fold, normalize,
-or otherwise rewrite symbols or text. Implementations must reject invalid Unicode
-scalar encodings, duplicate symbols, and an alphabet too large for the supported
-implementation before execution; the supported maximum size must be documented by the
-implementation and reported as a validation error when exceeded.
-
-Every symbol in wiring arrays, turnover arrays, positions, rings, plug pairs, and job
-text must be a member of this alphabet. Arrays preserve order except where explicitly
-specified as sets.
-
-#### Wheels
-
-`machine.wheels` is a non-empty array of named wheel definitions:
-
-- `name`: non-empty unique string.
-- `wiring`: array with exactly one alphabet symbol per alphabet symbol. At input index
-  `i`, the symbol at `wiring[i]` is the output. It must be a bijection; its inverse is
-  derived by the engine.
-- `turnovers`: array of distinct alphabet symbols. These are displayed pre-step
-  symbols at which this wheel's slot satisfies `at_turnover`; they are not adjusted for
-  the ring setting.
-
-A reflector-role slot's referenced wheel must additionally be involutive (`wiring` is
-its own inverse). Other wheels may be any bijection.
-
-#### Slots and topology
-
-`machine` has exactly `alphabet`, `wheels`, `slots`, `stepping`, and optional
-`plugboard`; omitted `plugboard` means the identity mapping. A machine may have any
-number of `role: "rotor"` slots starting at one, plus an optional `role: "reflector"`
-slot. The engine must support configurations with at least six rotor slots (plus an
-optional reflector); six is a capacity requirement, not a minimum configuration size
-or a maximum. Implementations may impose a documented upper resource limit and must
-reject requests over it before work starts.
-
-`machine.slots` is a non-empty array in physical left-to-right order. Each slot has
-exactly `id`, `wheel`, `role`, `movement`, `position`, and `ring`:
-
-- `id`: non-empty unique stable slot identifier.
-- `wheel`: reference to one declared wheel.
-- `role`: `rotor` or `reflector`. A stationary entry wheel is represented as a `rotor`
-  slot with `movement: "fixed"`; no third role is implied.
-- `movement`: `fixed` or `movable`. Movement is explicit and independent of role, so a
-  reflector can move only when configured as movable.
-- `position` and `ring`: one alphabet symbol each.
-
-At most one reflector slot is permitted, and if present it must be the leftmost slot.
-A reflector is optional. Every slot without reflector role is traversed as a rotor
-(whether fixed or movable). A step rule may target only movable slots; attempting to
-advance a fixed slot is invalid configuration, never silently ignored. This supports a
-stationary historical entry wheel and a movable reflector when explicitly configured,
-without promising exotic preset/mechanism paths.
-
-`machine.plugboard` is an array of two-symbol arrays. Each symbol occurs in at most
-one pair; pairs therefore define a disjoint involution, and unpaired symbols map to
-themselves. The empty array means identity. A symbol paired with itself is invalid.
-Plugboard transformation is applied at both ends of every traversal.
-
-#### Declarative stepping rules
-
-`machine.stepping` has exactly one field, `rules`, an ordered array of rules. A rule is
-`{"when": CONDITION, "advance": [SLOT_ID, ...]}`. The following is grammar notation,
-not one JSON document; quoted values such as `"slot-id"` and `"A"` stand for ordinary
-JSON strings containing a declared slot ID and alphabet symbol respectively:
-
-```text
-condition := {"always": true}
-           | {"at_turnover": slot_id}
-           | {"at_position": {"slot": slot_id, "symbol": symbol}}
-           | {"all": [condition, ...]}
-           | {"any": [condition, ...]}
-           | {"not": condition}
-
-slot_id   := JSON string naming a declared slot
-symbol    := JSON string containing one alphabet symbol
-```
-
-Each condition object has exactly one operator. `all` and `any` require non-empty
-arrays; `not` contains one condition. `always` must be literal `true`. Conditions refer
-to declared slot IDs; `at_turnover` is true when that slot's wheel turnover set contains
-the slot's displayed pre-keypress position. `at_position` compares that same displayed
-position with its symbol. Ring setting affects electrical offset only; it does not
-subtract from the turnover position.
-
-All conditions for every rule are evaluated against the same state before the
-keypress. The target slot IDs from all matching rules are unioned, then each target is
-advanced exactly once, simultaneously, before electrical traversal. Rule order does
-not change the result. An empty `rules` array means no slots move. Empty `advance`
-arrays are permitted and have no effect. Unknown slot references, unknown operators,
-invalid symbols, duplicate/unknown fields, non-movable targets, and malformed
-conditions are validation errors; no DSL element is ignored and arbitrary executable
-code is not permitted.
-
-Implementations must enforce grammar limits before starting: at most 64 rules, at most
-256 condition nodes total, maximum nesting depth 16, and at most 64 distinct advance
-targets across the rules. Exceeding a bound is an actionable validation error. These
-limits constrain parsing/evaluation resources, not machine size.
-
-### 3.2 Jobs
-
-All work-specific fields live under `job`; `job.kind` selects a defined job. Unknown or
-unsupported kinds fail validation before work starts. Version 1 defines these shapes:
-
-- **Transform:** `{"kind":"transform","text":"...","direction":"encrypt"}`;
-  `direction` is `encrypt` or `decrypt`. Before processing each symbol, apply the
-  configured stepping rules once, independent of direction. Let `N` be the alphabet
-  length, and encode alphabet symbols as zero-based indices. For each rotor slot let
-  `p` be its current displayed position index and `r` its ring index; define the modular
-  offset `o = (p - r) mod N`. Interpret every wheel wiring entry as an alphabet index.
-  Its forward electrical mapping is
-  `forward(x) = (wiring[(x + o) mod N] - o) mod N`; its reverse mapping substitutes
-  the inverse wiring for `wiring` in that formula. Thus reverse is the mathematical
-  inverse of forward at the same position and ring.
-
-  With a reflector, begin with the input plugboard mapping, traverse rotor slots from
-  rightmost toward leftmost using forward mappings, apply the reflector exactly once
-  using its own `p`, `r`, and offset-adjusted forward mapping, then traverse rotor slots
-  left-to-right using reverse mappings, and apply the output plugboard mapping. The
-  reflector must be involutive as validated in §3.1. Encrypt and decrypt use this same
-  reciprocal traversal and therefore produce the same transform.
-
-  Without a reflector, encrypt applies the input plugboard, traverses all rotor slots
-  rightmost-to-leftmost using forward mappings, then applies the output plugboard.
-  Decrypt applies the input plugboard, traverses slots leftmost-to-rightmost using
-  reverse mappings, then applies the output plugboard. It uses the same stepping
-  schedule as encrypt; only the electrical traversal reverses. No general involution or
-  no-self-encryption guarantee is made.
-- **Search (Stage 1 planned):** fields are `kind: "search"`, `text` (ciphertext),
-  `space`, `passes`, `measures`, and optional `resources`. These stay nested in `job`,
-  not at the request root. `space` describes the key enumeration using the machine's
-  slots and includes `offset`, `limit`, and optional `variants`; each variant supplies
-  an alternate slot configuration over declared wheels. `passes` is an ordered array
-  using the pass definitions in §3.3; `measures` names/configures scoring measures;
-  `resources` declares external scoring inputs such as frequency maps or trie data.
-  Search must reject a topology, pass, measure, or resource unsupported by that release
-  before enumeration. This schema reserves no implicit access to files: resource paths
-  and their readability/content must be validated before work starts. Exact per-pass,
-  key-space, scoring-resource, and checkpoint compatibility fields require definition
-  before their implementation; they must not be inferred from old `bomm` root fields.
-
-The search field inventory above locates the established concepts consistently; it is
-not a claim that their detailed v1 sub-schemas or parser exist. Any field needing a
-separate incompatible evolution must be introduced by a protocol version change, not
-silently added to v1 after it ships.
-
-A topology's representability does not guarantee presets or search support for it.
-Stage 1 targets Enigma I, M3, and M4 presets plus the explicitly listed search work;
-search support for arbitrary runtime alphabets, wheel counts, or stepping rules must be
-stated and validated by implementation rather than inferred from this declarative
-schema.
-
-### 3.3 Search pass and measure plan
-
-Search targets the four `bomm` pass concepts—`hill_climb`, `reswapping`, `trie`, and
-`measure`—plus `partial_exhaustion` in Stage 1. Measures target index of coincidence,
-Sinkov n-gram statistics, Shannon entropy, and trie scoring. Their detailed request
-fields and resource formats must be specified before those implementations; this list
-is a plan, not parser support. A pass or measure unavailable in a release must be
-rejected, never skipped. Stage 3 crib attacks and Stage 5 simulated annealing, genetic
-search, exotic presets, and `cog` are not implied by v1 implementation support.
-
-## 4. Event stream (output)
-
-Every line is a JSON object with `event`, `protocol_version`, `seq`, and `ts`. `seq` is
-monotonic from 1; `ts` is RFC 3339 UTC. Field order is illustrative. Events retain the
-existing envelopes and ordering guarantees while job-specific fields (for example,
-search totals and candidate topology) are adapted to variable alphabet size, topology,
-and `job` nesting. No event may fabricate a value for a field that is not meaningful
-for that job.
-
-### 4.1 Events and ordering
-
-- `started`: exactly once and first for a run that passed validation. It identifies the
-  job and reports applicable run metadata.
-- `progress`: zero or more rate-limited progress reports, expressed in completed work
-  units.
-- `candidate`: zero or more search results, emitted when the hold changes, not per
-  evaluation. It is not emitted for transform jobs.
-- `checkpoint`: zero or more durable checkpoint notifications.
-- `hold`: for started search jobs, emitted once on completion, cancellation, or
-  shutdown. It is not fabricated for transform jobs.
-- `done`: exactly once and last on normal completion/cancellation/bounded completion.
-- `error`: terminal and always last; pre-validation errors are described below.
-
-Exactly one `started` is first except for a pre-validation error, which has no
-`started`. Exactly one terminal event (`done` or `error`) is last. `seq` strictly
-increases; candidates occur only after `started` and before terminal. Existing
-cancellation, hold, checkpoint, and deterministic-order guarantees continue to apply
-to jobs for which they are meaningful.
-
-### 4.2 Validation errors
-
-Before any work starts, validate JSON syntax; exact fields and version; alphabet and
-symbol constraints; wheel wiring permutations and inverses; reflector involution;
-plugboard pairs; slot topology and named references; stepping grammar, limits and
-movement compatibility; job kind/direction and topology compatibility; text alphabet
-membership; and, for search, key-space, pass, scoring measure, and resource constraints.
-No work starts until all validation succeeds.
-
-On invalid input, emit exactly one terminal JSONL `error` with `seq: 1`, this engine's
-`protocol_version`, a stable `code`, human-actionable `message`, and JSON Pointer
-`location` identifying the offending value (or the closest containing value for a
-syntax error). `expected` and `hint` may additionally be supplied. Write a diagnostic
-to `stderr`, exit nonzero, and emit no `started`, progress, candidate, hold, or done.
-Unknown protocol versions are rejected the same way; the emitted version is the
-engine's supported version. Validation error codes include `invalid_json`,
-`invalid_request`, `unsupported_version`, `unknown_field`, `invalid_alphabet`,
-`invalid_symbol`, `invalid_wiring`, `invalid_reflector`, `invalid_plugboard`,
-`invalid_slot`, `invalid_rule`, `unsupported_job`, `unsupported_pass`,
-`unsupported_measure`, `unsupported_resource`, `invalid_text`, and
-`unsupported_topology`. Implementations may define further stable codes. Runtime
-failures after `started` use terminal `error` and preserve the event ordering contract.
-
-A representative error (all fields are JSON values):
+A custom definition is embedded under `machine.definition.value` and passes the same
+definition schema and validation as a bundled definition. This deliberately small,
+arbitrary example has complete values and is not a historical machine:
 
 ```json
-{"event":"error","protocol_version":1,"seq":1,"ts":"2026-01-01T00:00:00Z",
- "code":"invalid_symbol","message":"position is not a member of machine.alphabet",
- "location":"/machine/slots/1/position","expected":"one alphabet symbol"}
+{
+  "protocol_version": 1,
+  "machine": {
+    "definition": {
+      "kind": "custom",
+      "value": {
+        "alphabet": ["A", "B", "C", "D"],
+        "wheels": [
+          {"name": "rotor", "wiring": ["B", "A", "D", "C"], "turnovers": ["B"]},
+          {"name": "reflector", "wiring": ["B", "A", "D", "C"], "turnovers": []}
+        ],
+        "slots": [
+          {"id": "ukw", "role": "reflector", "movement": "fixed", "wheel": "reflector"},
+          {"id": "fast", "role": "rotor", "movement": "movable", "allowed_wheels": ["rotor"]}
+        ],
+        "stepping": {"rules": [{"when": {"always": true}, "advance": ["fast"]}]}
+      }
+    }
+  },
+  "job": {
+    "kind": "transform",
+    "configuration": {
+      "slots": [
+        {"id": "ukw", "wheel": "reflector", "position": "A", "ring": "A"},
+        {"id": "fast", "wheel": "rotor", "position": "B", "ring": "A"}
+      ],
+      "plugboard": []
+    },
+    "text": "ABCD",
+    "direction": "encrypt"
+  }
+}
 ```
+
+### 3.1 Machine definition
+
+`machine.definition` is a strict tagged union: bundled form has exactly `kind` and
+`id`; custom form has exactly `kind` and `value` (a complete definition object). Their
+conceptual shapes are:
+
+```text
+bundled := {"kind":"bundled", "id": BUNDLED_ID}
+custom  := {"kind":"custom", "value": DEFINITION_OBJECT}
+```
+
+The bundled `id` resolves to an immutable catalog entry shipped with the engine. The
+catalog is limited in Stage 1 to historically sourced Enigma I, M3, and M4 definitions.
+Each bundled definition is JSON conforming to the same `DEFINITION_OBJECT` schema as a
+custom definition. Catalog authors must document authoritative historical sources for
+all included alphabet, wheel wiring/turnover, reflector, slot, and stepping facts, and
+validate cross-references and structural constraints. Where sources do not establish
+a fact sufficiently, do not invent or silently normalize it; resolve the evidence
+before adding that catalog data. A bundled alias is not itself machine content and
+must not be used as checkpoint identity.
+
+A definition fixes non-key structure and admissibility, never the active key. It has
+exactly `alphabet`, `wheels`, `slots`, and `stepping`:
+
+- `alphabet`: non-empty ordered array of unique single Unicode scalar values. No trim,
+  case-fold, normalization, or rewriting. Combining sequences are multiple scalars.
+  Implementations document and enforce a maximum size.
+- `wheels`: non-empty array of named wheel objects with exactly `name`, `wiring`, and
+  `turnovers`. Names are unique non-empty strings. `wiring` is a bijection with one
+  alphabet symbol for each input symbol; the inverse is derived. `turnovers` contains
+  distinct alphabet symbols and refers to displayed pre-step positions, not ring-adjusted
+  positions. A wheel used in a reflector slot must be involutive.
+- `slots`: non-empty array in physical left-to-right order. Each slot has exactly `id`,
+  `role`, `movement`, and exactly one of `wheel` or `allowed_wheels`. IDs are unique,
+  stable, non-empty strings. `role` is `rotor` or `reflector`; `movement` is `fixed` or
+  `movable`, independent of role. `wheel` fixes the structural wheel. `allowed_wheels`
+  is a non-empty unique list of declared wheels admissible for a variable wheel choice.
+  At most one reflector is allowed and it is leftmost. A fixed entry wheel is a rotor,
+  not a third role. The model supports one or more rotor slots and at least six as a
+  capacity requirement; this is not a minimum configuration size or maximum. Any
+  documented resource limit is checked before work.
+- `stepping`: exactly `{"rules":[...]}`. Rules are non-key structure. Each is
+  `{"when": CONDITION, "advance":[SLOT_ID,...]}`. Conditions are `{"always":true}`, `{"at_turnover":SLOT_ID}`, `{"at_position":{"slot":SLOT_ID,"symbol":SYMBOL}}`, `{"all":[CONDITION,...]}`, `{"any":[CONDITION,...]}`, or `{"not":CONDITION}`. Each condition has one operator; groups are non-empty; `always` is literal true. Limits are 64 rules, 256 total condition nodes, depth 16, and 64 distinct advance targets. Every target must refer to a movable slot. All rules inspect the same pre-keypress state; targets are unioned and advanced once simultaneously. An empty rules array means no movement.
+
+The M4 Greek wheel is fixed, but is not the stationary entry wheel. The entry wheel,
+when represented, is the rightmost fixed `role: "rotor"` slot; the reflector is leftmost
+when present. Movement is explicit. Do not model the Greek wheel as the entry wheel,
+imply that a reflector moves by role, or infer key values from an M4 definition.
+
+Definition validation checks exact fields, Unicode scalar constraints, unique names/IDs,
+all wheel permutations and turnover symbols, slot/wheel references, reflector placement
+and involution, stepping grammar/limits, and movement compatibility. It performs no
+implicit normalization. The same validation applies to custom values and resolved
+bundled content.
+
+### 3.2 Configuration and transform
+
+`job.configuration` is required for **both** job kinds. For `kind: "transform"`, it has
+exactly `slots` and `plugboard`: `slots` has exactly one entry per definition slot in
+definition order, each with exactly `id`, `wheel`, `position`, and `ring`. The ID must
+match its structural slot; wheel must equal a structurally fixed `wheel` or belong to
+`allowed_wheels`; `position` and `ring` are each one alphabet symbol. `plugboard` is
+required, including when empty, and is an array of disjoint two-symbol pairs.
+Self-pairs, duplicate endpoints, and symbols outside the alphabet are invalid. No
+required value is omitted or defaulted; even structurally fixed wheels are explicitly
+repeated here and checked against their definition. A transform has no `space`.
+
+For `kind: "search"`, `configuration` expresses only the **known fixed choices**, and
+`space` expressly covers every remaining required choice (§3.3). Omission from the
+fixed portion alone means neither default nor automatic enumeration: if the same
+choice has no explicit variable domain in `space`, the request is invalid. For a
+partially known plugboard, the future search grammar must distinguish a fully fixed
+pair set (including the empty set) from known pairs plus an explicitly searched
+remainder; it must not reuse `[]` ambiguously for both. Exact partial-configuration
+syntax is finalized with `space` in task 9, before search parsing. No search object
+is claimed executable until this grammar is specified.
+
+The definition contains no position, ring, active wheel selection, or plugboard key.
+Configuration resolution combines definition structure and explicit configuration into
+a concrete topology, stepping rules, and plugboard. `Engine::new` consumes that resolved
+combination; this protocol redesign does not change Task 4's model boundary.
+
+For each symbol, step once before electrical traversal, independent of direction. Let
+`N` be alphabet length, `p` position index, `r` ring index, and `o=(p-r) mod N`. A wheel
+maps `forward(x)=(wiring[(x+o) mod N]-o) mod N`; reverse substitutes inverse wiring.
+With reflector: input plugboard, forward through rotor slots right-to-left, reflector
+once using its own position/ring, reverse through rotors left-to-right, output
+plugboard. The reflector must be involutive. Encrypt and decrypt use this reciprocal
+traversal and produce the same transform. Without reflector, encrypt traverses forward
+right-to-left and decrypt reverse left-to-right, with plugboard at both ends. No
+universal involution or no-self-encryption claim is made.
+
+### 3.3 Search job boundary (schema deferred)
+
+A search job has `kind: "search"`, required `configuration`, `text`, `space`,
+`passes`, `measures`, and optional `resources`. `configuration` contains fixed known
+choices, while `space` contains explicit variable domains over definition slots and
+bounds such as `offset` and `limit`; `passes`, `measures`, and `resources` select and
+parameterize search behavior. This inventory is normative about the job boundary,
+not an executable schema. Do not treat a schematic search object as valid v1 JSON.
+
+For every required key dimension (including wheel choice where configurable,
+position, ring, and plugboard state), validation must prove exactly one coverage path:
+fully fixed by `configuration`, or variable in `space`, possibly constrained by
+explicit fixed partial facts such as known plugboard pairs. The variable remainder
+must be explicitly identified; fixed and variable assignments cannot conflict or
+leave an unbounded omission. The candidate resolver enforces definition restrictions,
+disjoint plugboard pairs, and unique complete candidates. Task 9 must define the exact
+partial-slot/plugboard syntax, search domains, bounds, variants, coverage checks, and
+unknown-versus-omitted errors before any search parser is implemented; task 10 defines
+resource and measure syntax. Concrete candidates are bound anew to their final
+topology and stepping rules; incompatible slot/wheel combinations or unsupported
+topology/pass/measure/resource combinations fail preflight before enumeration. Search
+never silently skips unsupported work.
+
+Stage 1 plans `hill_climb`, `partial_exhaustion` with backtracking, `reswapping`, `trie`,
+and `measure`; measures include index of coincidence, Sinkov n-gram statistics,
+Shannon entropy, and trie scoring. This plan does not assert parser or search support.
+Representability by the definition schema does not imply algorithm support for arbitrary
+alphabet, wheel count, stepping rule, or topology.
+
+## 4. Events and validation errors
+
+Each stdout line is a JSON event with `event`, `protocol_version`, monotonic `seq`
+starting at 1, and RFC 3339 UTC `ts`. Unknown event names/fields may be ignored by
+clients. A successful validated job emits one `started` first, then applicable events,
+then exactly one terminal `done`; runtime failure emits terminal `error`. Search may
+emit `progress`, `candidate`, `checkpoint`, and `hold` according to job lifecycle.
+Transform emits no candidate, hold, or checkpoint event. Pre-validation failure emits
+one `error` at `seq: 1`, with no `started` or work events. Errors contain stable `code`,
+actionable `message`, and JSON Pointer `location`; `expected` and `hint` may be added.
+Exit nonzero and write diagnostics to stderr on invalid input.
+
+Validate syntax, exact root and nested fields, version, definition (including bundled
+content), complete configuration or search-space coverage, all symbols and references,
+job kind/direction, topology compatibility, text alphabet membership, and applicable
+search pass/measure/resource constraints before `started`. Unknown and omitted fields
+are distinct: unknown is an error; omission of a required value is an error, never a
+default. Example location: `/job/configuration/slots/1/position`. Error codes include
+`invalid_json`, `invalid_request`, `unsupported_version`, `unknown_field`,
+`invalid_definition`, `invalid_symbol`, `invalid_wiring`, `invalid_reflector`,
+`invalid_plugboard`, `invalid_slot`, `invalid_rule`, `unsupported_job`,
+`unsupported_pass`, `unsupported_measure`, `unsupported_resource`, `invalid_text`, and
+`unsupported_topology`. Syntax errors point to the closest available containing path.
 
 ## 5. Control
 
 | Action | Mechanism | Result |
 | --- | --- | --- |
-| Cancel | POSIX `SIGINT`/`SIGTERM`, Windows console Ctrl+C, or `--cancel-file <path>` | A started search emits `hold`, writes a final checkpoint when configured, emits `done` with `reason: "cancelled"`, exits 0 |
-| Pause / resume a live job | Not in Stage 1 | Future extension |
-| Resume a dead job | `--resume <checkpoint>` | §6 |
-| Bound a search | Search key-space offset/limit or `--max-keys` | `done` with `limit_reached` or `offset_end` |
+| Cancel | POSIX `SIGINT`/`SIGTERM`, Windows Ctrl+C, or `--cancel-file <path>` | Started search observes cancellation within a progress interval, emits hold and configured final checkpoint, then `done` with `reason: "cancelled"` |
+| Pause/resume live job | Not in Stage 1 | Future extension |
+| Resume dead job | `--resume <checkpoint>` | Search only; see §6 |
+| Bound search | `space` offset/limit or `--max-keys` | `done` with `limit_reached` or `offset_end` |
 
-Cancellation is cooperative and bounded: observe it within one progress interval and
-never lose the hold. Windows handles console Ctrl+C; `--cancel-file` is the portable
-control for scripts and tests.
+Transform has no search progress, cancellation, hold, or checkpoint contract in v1.
 
-## 6. Checkpoint and resume
+## 6. Checkpoint and resume (record schema deferred)
 
-A started resumable search may write checkpoints at `--checkpoint-interval` (default
-300 s), and writes a final checkpoint on normal terminal completion when configured.
-A pre-validation error never writes one. Checkpoints include `protocol_version`, a
-canonical request digest, state digest, completed work units, elapsed time, structured
-cursor, hold, and RNG state when a stochastic pass is used. Resume requires an exact
-request digest match; a checkpoint cannot be applied to a different job or machine.
-Cursor representation must not depend on a CPU loop counter and must account for
-variable topology. A stochastic resume without reproducible RNG state is rejected.
-A resumed run reports `resumed_from` in `started`.
+Only a resumable search may write checkpoints. A transform has no Stage 1 checkpoint.
+Checkpoint identity binds a canonical digest of the resolved definition **content**
+(not the bundled alias), the complete fixed portion of `job.configuration` **and** the
+complete `job.space` including constraints and ordering, the remaining search job
+(including passes/measures), relevant resource content, and protocol version. A bundled catalog
+update that changes resolved content therefore rejects an old checkpoint. Resource
+identity must capture relevant content, not merely a mutable path. Resume rejects any
+drift in those inputs before work. The record contains a deterministic structured
+candidate cursor, state digest, completed work units, elapsed time, hold, and RNG state
+when relevant; cursor is not a loop counter. Search ordering is deterministic and
+resume restores the same next candidate. Detailed record fields are deferred to task
+16 and must be finalized before implementation.
 
-The concrete checkpoint schema must track the finalized search-job schema before
-implementation; this section does not claim a parser or checkpoint implementation.
+## 7. Determinism
 
-## 7. Determinism rules
+Enumeration order is completely defined by the resolved search space; offset/limit
+address that order. Scoring uses integer/fixed-point arithmetic where floating point
+could vary, otherwise results are bit-identical. Unordered reductions do not affect
+scores; each candidate is scored independently. Stochastic passes record seed and RNG
+state. Holds order by `(score desc, enumeration index asc)`. These obligations apply
+only to implemented search jobs.
 
-1. Search enumeration order is fully determined by machine, job, and search-space
-   definitions; offset and limit address that order.
-2. Scoring uses integer or fixed-point arithmetic where floating point could vary
-   between backends. Otherwise results are bit-identical.
-3. Unordered reductions may not affect scores; each candidate is scored independently.
-4. Stochastic passes record their seed in `started` and checkpoints.
-5. Search holds are totally ordered by `(score desc, enumeration index asc)`.
+## 8. Local listener (Stage 2)
 
-These obligations apply only to implemented jobs and measures.
+Not Stage 1. A future listener binds `127.0.0.1` only, forbids `0.0.0.0`, uses a
+per-run bearer token printed once to stderr, validates `Origin` against an allow-list,
+and mirrors the protocol through `POST /jobs`, `GET /jobs/{id}/events`, and
+`POST /jobs/{id}/cancel`.
 
-## 8. Local listener (web client) — Stage 2 planned
+## 9. `bomm` parity
 
-Not part of Stage 1. It binds `127.0.0.1` only; binding `0.0.0.0` is forbidden. It
-requires a per-run bearer token printed once to `stderr`, validates `Origin` against an
-allow-list, and mirrors the protocol through `POST /jobs`,
-`GET /jobs/{id}/events`, and `POST /jobs/{id}/cancel`.
+No compatibility with `bomm` query JSON is required. Each differential case expresses
+equivalent machine, key, input, pass, and score configuration in each tool's own format.
+Compare resulting key/plaintext and compare scores only when measure, resources, and
+passes are equivalent. Shared acceptance of one JSON file is not evidence of parity.
+Task 17 is the differential-oracle validation task.
 
-## 9. Compatibility and parity with `bomm`
+## 10. Version and status
 
-`bomm` query JSON compatibility is not a requirement: this v1 redesign replaces the
-previous superset promise, and old query files need not parse unchanged. `bomm` remains a
-differential test oracle. Each parity test expresses equivalent machine, key, input
-text, and scoring configuration in the protocol's own request format and in `bomm`'s
-format. Compare resulting key, plaintext, and score. Compare scores only when measure,
-resources, and passes are equivalent. Tests must not claim equivalence merely because
-both tools accepted the same JSON file, and no unchanged-query obligation remains.
-
-## 10. Versioning and status
-
-`protocol_version` versions the request contract. Version 1 is the redesigned,
-pre-implementation contract in this document. Unknown versions and fields are rejected
-before work. This is an explicit redesign, not a silent extension of the former
-frozen interface; historical task and commit evidence about the earlier alignment
-remains historically accurate (see `odd/tasks/enigma-engine.md`).
-
-Once v1 ships, incompatible changes to field meaning, validation, traversal, or event
-ordering require a version bump. New request fields or enum values require an explicit
-versioned evolution; event consumers may ignore unknown event names/fields. Detailed
-search fields and any resource formats not yet specified here must be defined before
-implementation or via such a versioned evolution, never presumed to exist.
+`protocol_version: 1` denotes this unpublished, pre-implementation design. Unknown
+versions and fields fail before work. Incompatible changes to field meaning,
+validation, traversal, or event ordering after v1 ships require a version bump. Detailed
+search-space, pass, measure/resource, and checkpoint schemas remain deferred; they must
+be specified before their implementation, not presumed executable or imported from
+`bomm`. There is no Stage 1 UI; clients belong to Stage 2.
 
 ## 11. GPU constraints (Stage 4)
 
-1. Progress is expressed in completed work units, not loop iterations.
-2. A cursor identifies a resumable position without depending on a CPU loop counter.
-3. Scores are computed per candidate independently.
-4. Thread counts, workgroup sizes, and dispatch geometry are not protocol fields;
-   backend metadata is informational only.
+Progress uses completed work units. A cursor identifies a resumable position without a
+CPU loop counter. Scores are independent per candidate. Thread counts, workgroup sizes,
+and dispatch geometry are not protocol fields; backend metadata is informational only.
