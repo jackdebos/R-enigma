@@ -1,0 +1,14 @@
+[package]
+name = "enigma-core"
+description = "Universal Enigma model, scoring measures and cryptanalysis passes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Intentionally empty. Task 7 introduces the request parser, which is the first
+# justified dependency (serde/serde_json). Until then the core stays dependency-free
+# so the hot path cannot accidentally acquire a foreign call.
+
+[dev-dependencies]

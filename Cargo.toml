@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["crates/enigma-core", "crates/enigma-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.97.0"
+
+[workspace.dependencies]
+enigma-core = { path = "crates/enigma-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+# The hot loop measures nanoseconds per decrypted letter (see docs/protocol.md §7
+# and the Stage 1 risk table). Debug builds are for correctness only.
+lto = "thin"
+codegen-units = 1
+panic = "abort"
