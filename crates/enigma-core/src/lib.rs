@@ -129,6 +129,8 @@ pub enum ModelError {
         /// Number of positions supplied.
         actual: usize,
     },
+    /// A stepping rule set was evaluated against a different topology than it was built for.
+    SteppingTopologyMismatch,
 }
 
 impl fmt::Display for ModelError {
@@ -215,6 +217,12 @@ impl fmt::Display for ModelError {
                 formatter,
                 "received {actual} positions; expected {expected} (one per slot)"
             ),
+            Self::SteppingTopologyMismatch => {
+                write!(
+                    formatter,
+                    "stepping rules were built for a different machine topology"
+                )
+            }
         }
     }
 }
@@ -523,9 +531,15 @@ impl StepRule {
 /// the target slots of all matching rules are unioned and each advanced exactly once,
 /// simultaneously. Rule order therefore does not change the result. An empty rule set
 /// means no slot moves.
+///
+/// A rule set is bound to the topology it was built against: evaluating it against any
+/// other topology fails closed instead of silently skipping unresolvable targets. The
+/// unbound empty set from [`Stepping::none`] carries no rules and may be evaluated
+/// against any topology.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Stepping {
     rules: Vec<StepRule>,
+    bound_topology: Option<MachineTopology>,
 }
 
 impl Stepping {
@@ -564,7 +578,10 @@ impl Stepping {
                 max: MAX_STEP_TARGETS,
             });
         }
-        Ok(Self { rules })
+        Ok(Self {
+            rules,
+            bound_topology: Some(topology.clone()),
+        })
     }
 
     /// The validated rules in their declared order.
@@ -582,6 +599,11 @@ impl Stepping {
         topology: &MachineTopology,
         positions: &[char],
     ) -> Result<Vec<usize>, ModelError> {
+        if let Some(bound) = &self.bound_topology {
+            if bound != topology {
+                return Err(ModelError::SteppingTopologyMismatch);
+            }
+        }
         let expected = topology.slots().len();
         if positions.len() != expected {
             return Err(ModelError::PositionCountMismatch {
@@ -593,9 +615,12 @@ impl Stepping {
         for rule in &self.rules {
             if step_condition_holds(topology, positions, &rule.condition) {
                 for id in &rule.advance {
-                    if let Some(index) = topology.slot_index(id) {
-                        targets.insert(index);
-                    }
+                    // Validated against `bound_topology` at construction; resolving here
+                    // again guarantees an unknown target can never be skipped silently.
+                    let index = topology
+                        .slot_index(id)
+                        .ok_or_else(|| ModelError::UnknownStepSlot(id.clone()))?;
+                    targets.insert(index);
                 }
             }
         }
@@ -1031,6 +1056,89 @@ mod tests {
     }
 
     #[test]
+    fn topology_rejects_invalid_ring_and_empty_slot_id_and_keeps_movement_role_independent() {
+        let alphabet = Alphabet::new(vec!['A', 'B', 'C']).unwrap();
+        let rotor = identity_wiring(&alphabet, "rotor");
+        let reflector = identity_wiring(&alphabet, "reflector");
+
+        assert_eq!(
+            MachineTopology::new(
+                alphabet.clone(),
+                vec![rotor.clone()],
+                vec![Slot::new(
+                    "right",
+                    "rotor",
+                    SlotRole::Rotor,
+                    Movement::Movable,
+                    'A',
+                    'Z'
+                )],
+            ),
+            Err(ModelError::UnknownSlotSymbol('Z'))
+        );
+        assert_eq!(
+            MachineTopology::new(
+                alphabet.clone(),
+                vec![rotor.clone()],
+                vec![Slot::new(
+                    "",
+                    "rotor",
+                    SlotRole::Rotor,
+                    Movement::Movable,
+                    'A',
+                    'A'
+                )],
+            ),
+            Err(ModelError::EmptySlotId)
+        );
+
+        // Movement is independent of role: a movable reflector is a valid machine.
+        let movable_reflector = MachineTopology::new(
+            alphabet.clone(),
+            vec![reflector, rotor.clone()],
+            vec![
+                Slot::new(
+                    "ukw",
+                    "reflector",
+                    SlotRole::Reflector,
+                    Movement::Movable,
+                    'A',
+                    'A',
+                ),
+                Slot::new(
+                    "right",
+                    "rotor",
+                    SlotRole::Rotor,
+                    Movement::Movable,
+                    'A',
+                    'A',
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(movable_reflector.slots()[0].movement(), Movement::Movable);
+
+        // A fixed rotor without a reflector models a stationary entry wheel.
+        let entry_wheel = MachineTopology::new(
+            alphabet,
+            vec![rotor],
+            vec![
+                Slot::new("entry", "rotor", SlotRole::Rotor, Movement::Fixed, 'A', 'A'),
+                Slot::new(
+                    "right",
+                    "rotor",
+                    SlotRole::Rotor,
+                    Movement::Movable,
+                    'A',
+                    'A',
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(entry_wheel.slots()[0].movement(), Movement::Fixed);
+    }
+
+    #[test]
     fn topology_accepts_leftmost_involutive_reflector_and_exposes_bound_alphabet() {
         let alphabet = Alphabet::new(vec!['A', 'B', 'C']).unwrap();
         let rotor = identity_wiring(&alphabet, "rotor");
@@ -1220,6 +1328,31 @@ mod tests {
     }
 
     #[test]
+    fn plugboard_reports_the_left_endpoint_before_the_right() {
+        let alphabet = Alphabet::new(vec!['A', 'B', 'C']).unwrap();
+        // Both endpoints unknown: the left endpoint is reported first.
+        assert_eq!(
+            Plugboard::new(&alphabet, &[('Z', 'Y')]),
+            Err(ModelError::UnknownSymbol('Z'))
+        );
+        // A known left endpoint does not mask an unknown right endpoint.
+        assert_eq!(
+            Plugboard::new(&alphabet, &[('A', 'Z')]),
+            Err(ModelError::UnknownSymbol('Z'))
+        );
+        // A repeated symbol is reported from the endpoint that repeats.
+        assert_eq!(
+            Plugboard::new(&alphabet, &[('A', 'B'), ('C', 'B')]),
+            Err(ModelError::DuplicatePlugboardSymbol('B'))
+        );
+        // An unknown endpoint is reported before the self-pair rule.
+        assert_eq!(
+            Plugboard::new(&alphabet, &[('Z', 'Z')]),
+            Err(ModelError::UnknownSymbol('Z'))
+        );
+    }
+
+    #[test]
     fn plugboard_preserves_unicode_symbols_without_normalizing() {
         let alphabet = Alphabet::new(vec!['λ', '中', 'é']).unwrap();
         let plugboard = Plugboard::new(&alphabet, &[('λ', '中')]).unwrap();
@@ -1287,6 +1420,111 @@ mod tests {
         assert!(stepping.plan(&topology, &positions).unwrap().is_empty());
         stepping.advance(&topology, &mut positions).unwrap();
         assert_eq!(positions, ['A', 'A']);
+    }
+
+    #[test]
+    fn stepping_rejects_reuse_with_a_different_topology() {
+        let topology = stepping_topology();
+        let stepping = Stepping::new(
+            &topology,
+            vec![StepRule::new(StepCondition::Always, vec!["fast".into()])],
+        )
+        .unwrap();
+
+        // Same identifiers, but the target slot is no longer movable: the rule set must
+        // reject the topology instead of advancing a now-fixed slot.
+        let alphabet = Alphabet::new(vec!['A', 'B', 'C', 'D']).unwrap();
+        let fast = Wiring::new("fast", &alphabet, &['B', 'C', 'D', 'A'], &['B']).unwrap();
+        let slow = Wiring::new("slow", &alphabet, &['A', 'B', 'C', 'D'], &['A']).unwrap();
+        let fixed_target = MachineTopology::new(
+            alphabet.clone(),
+            vec![fast.clone(), slow.clone()],
+            vec![
+                Slot::new("slow", "slow", SlotRole::Rotor, Movement::Movable, 'A', 'A'),
+                Slot::new("fast", "fast", SlotRole::Rotor, Movement::Fixed, 'A', 'A'),
+            ],
+        )
+        .unwrap();
+        let mut positions = ['A', 'A'];
+        assert_eq!(
+            stepping.plan(&fixed_target, &positions),
+            Err(ModelError::SteppingTopologyMismatch)
+        );
+        assert_eq!(
+            stepping.advance(&fixed_target, &mut positions),
+            Err(ModelError::SteppingTopologyMismatch)
+        );
+
+        // A renamed slot previously caused the unknown target to be skipped silently.
+        let renamed = MachineTopology::new(
+            alphabet,
+            vec![fast, slow],
+            vec![
+                Slot::new(
+                    "slow-2",
+                    "slow",
+                    SlotRole::Rotor,
+                    Movement::Movable,
+                    'A',
+                    'A',
+                ),
+                Slot::new(
+                    "fast-2",
+                    "fast",
+                    SlotRole::Rotor,
+                    Movement::Movable,
+                    'A',
+                    'A',
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            stepping.plan(&renamed, &positions),
+            Err(ModelError::SteppingTopologyMismatch)
+        );
+    }
+
+    #[test]
+    fn stepping_result_is_independent_of_rule_order() {
+        let topology = stepping_topology();
+        let forward = Stepping::new(
+            &topology,
+            vec![
+                StepRule::new(StepCondition::Always, vec!["fast".into()]),
+                StepRule::new(
+                    StepCondition::AtPosition {
+                        slot: "fast".into(),
+                        symbol: 'A',
+                    },
+                    vec!["fast".into(), "slow".into()],
+                ),
+                StepRule::new(StepCondition::Always, vec!["slow".into()]),
+            ],
+        )
+        .unwrap();
+        let reversed = Stepping::new(
+            &topology,
+            vec![
+                StepRule::new(StepCondition::Always, vec!["slow".into()]),
+                StepRule::new(
+                    StepCondition::AtPosition {
+                        slot: "fast".into(),
+                        symbol: 'A',
+                    },
+                    vec!["slow".into(), "fast".into()],
+                ),
+                StepRule::new(StepCondition::Always, vec!["fast".into()]),
+            ],
+        )
+        .unwrap();
+
+        let positions = ['A', 'A'];
+        assert_eq!(
+            forward.plan(&topology, &positions),
+            reversed.plan(&topology, &positions)
+        );
+        assert_eq!(forward.plan(&topology, &positions).unwrap(), vec![0, 1]);
     }
 
     #[test]
