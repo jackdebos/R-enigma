@@ -48,12 +48,15 @@ pub const PROTOCOL_VERSION: u32 = 1;
 mod configuration;
 mod definition;
 mod engine;
+mod request;
+mod strict_json;
 
 pub use configuration::{
     ConfigurationDiagnostic, ResolvedConfiguration, SlotConfiguration, TransformConfiguration,
 };
 pub use definition::{Definition, DefinitionDiagnostic, DefinitionSlot, DefinitionSource};
 pub use engine::{Direction, Engine};
+pub use request::{RequestDiagnostic, TransformRequest, MAX_REQUEST_BYTES};
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
