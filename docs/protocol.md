@@ -175,15 +175,27 @@ Self-pairs, duplicate endpoints, and symbols outside the alphabet are invalid. N
 required value is omitted or defaulted; even structurally fixed wheels are explicitly
 repeated here and checked against their definition. A transform has no `space`.
 
-For `kind: "search"`, `configuration` expresses only the **known fixed choices**, and
-`space` expressly covers every remaining required choice (§3.3). Omission from the
-fixed portion alone means neither default nor automatic enumeration: if the same
-choice has no explicit variable domain in `space`, the request is invalid. For a
-partially known plugboard, the future search grammar must distinguish a fully fixed
-pair set (including the empty set) from known pairs plus an explicitly searched
-remainder; it must not reuse `[]` ambiguously for both. Exact partial-configuration
-syntax is finalized with `space` in task 9, before search parsing. No search object
-is claimed executable until this grammar is specified.
+For `kind: "search"`, `configuration` has exactly `slots` and `plugboard` and expresses
+only the **known fixed choices**. Fixed and variable assignments are reconciled by the
+§3.3 coverage rules; omission from the fixed portion is neither a default nor automatic
+enumeration.
+
+`configuration.slots` is an array of partial slot facts. Each entry is an object with
+exactly `id` plus any subset of `wheel`, `position`, and `ring`; `id` is required, must
+name a definition slot, and every entry must name a distinct slot (array order is
+insignificant). A present member is a fixed key fact and is checked for admissibility
+exactly as in a transform. Position and ring are key dimensions for every slot. A wheel
+is a key dimension only for a slot whose definition declares `allowed_wheels`; a
+structurally fixed wheel may be repeated here for checking or omitted, and is never a
+variable dimension. Any dimension that is neither structurally fixed nor fixed here
+must be covered by `space`.
+
+`configuration.plugboard` is an array of fixed disjoint pairs, validated exactly as in
+a transform and including the empty array. When `space.plugboard` is present these
+pairs are the known facts and the remainder is searched; when it is absent the fixed
+pair set is complete. A present-but-empty `configuration.plugboard` therefore means "no
+fixed pairs", and the ambiguity this section forbids is resolved by the presence or
+absence of `space.plugboard`, never by `[]` alone.
 
 The definition contains no position, ring, active wheel selection, or plugboard key.
 Configuration resolution combines definition structure and explicit configuration into
@@ -200,28 +212,60 @@ traversal and produce the same transform. Without reflector, encrypt traverses f
 right-to-left and decrypt reverse left-to-right, with plugboard at both ends. No
 universal involution or no-self-encryption claim is made.
 
-### 3.3 Search job boundary (schema deferred)
+### 3.3 Search job boundary (Task 9 grammar)
 
-A search job has `kind: "search"`, required `configuration`, `text`, `space`,
-`passes`, `measures`, and optional `resources`. `configuration` contains fixed known
-choices, while `space` contains explicit variable domains over definition slots and
-bounds such as `offset` and `limit`; `passes`, `measures`, and `resources` select and
-parameterize search behavior. This inventory is normative about the job boundary,
-not an executable schema. Do not treat a schematic search object as valid v1 JSON.
+A search job has `kind: "search"` and exactly `configuration`, `text`, `space`,
+`passes`, `measures`, and optional `resources`. `configuration` carries the fixed
+known choices (§3.2), `space` carries the explicit variable domains and bounds,
+`passes` and `measures` select behavior, and `resources` parameterizes it. This
+section is normative for the §3.2/§3.3 structure; it does not claim that any search
+pass executes (Tasks 11–13 implement the passes).
 
-For every required key dimension (including wheel choice where configurable,
-position, ring, and plugboard state), validation must prove exactly one coverage path:
-fully fixed by `configuration`, or variable in `space`, possibly constrained by
-explicit fixed partial facts such as known plugboard pairs. The variable remainder
-must be explicitly identified; fixed and variable assignments cannot conflict or
-leave an unbounded omission. The candidate resolver enforces definition restrictions,
-disjoint plugboard pairs, and unique complete candidates. Task 9 must define the exact
-partial-slot/plugboard syntax, search domains, bounds, variants, coverage checks, and
-unknown-versus-omitted errors before any search parser is implemented; task 10 defines
-resource and measure syntax. Concrete candidates are bound anew to their final
-topology and stepping rules; incompatible slot/wheel combinations or unsupported
-topology/pass/measure/resource combinations fail preflight before enumeration. Search
-never silently skips unsupported work.
+`space` is an object allowing exactly `slots`, `plugboard`, `offset`, and `limit`; all
+four are optional, so an empty object means the fixed choices are already complete.
+`slots` and `plugboard` are present only when that dimension is variable:
+
+- `slots`: array of slot domains. Each entry is an object with exactly `id` plus any
+  subset of `wheels`, `positions`, and `rings`; `id` is required, names a definition
+  slot, and is unique. `wheels` is allowed only for a slot with `allowed_wheels` and is
+  a non-empty unique subset of that slot's admissible wheels; `positions` and `rings`
+  are non-empty unique arrays of alphabet symbols. At least one of the three members
+  must be present.
+- `plugboard`: object with exactly `candidates` and `size`. `candidates` is a non-empty
+  unique array of disjoint two-symbol pairs drawn from the alphabet; `size` is a
+  positive integer no greater than `candidates.len()`, the number of additional pairs
+  to draw from that pool. Known pairs in `configuration.plugboard` must be disjoint
+  from every candidate pair.
+- `offset`: optional non-negative integer, default `0`, addressing the deterministic
+  enumeration order of §7.
+- `limit`: optional positive integer bounding the number of enumerated candidates;
+  omission means no explicit request bound (documented resource limits still apply).
+
+Coverage and conflict are checked before enumeration:
+
+- Every required key dimension has exactly one path: structurally fixed by the
+  definition, fixed in `configuration`, or declared in `space`.
+- Position and ring are required dimensions for every slot. A slot whose definition
+  fixes `wheel` has no wheel dimension; a slot with `allowed_wheels` requires the wheel
+  dimension to be fixed or declared.
+- A dimension covered twice (fixed and declared, or declared twice, or declared for a
+  structurally fixed wheel) is `invalid_search_space`; a required dimension covered by
+  no path is `invalid_search_space` with an actionable message. Unknown members remain
+  `unknown_field`. No value is defaulted or inferred.
+- The candidate resolver enforces definition restrictions, disjoint plugboard pairs,
+  and unique complete candidates; concrete candidates bind anew to their final
+  topology and stepping rules. Incompatible slot/wheel combinations and unsupported
+  topology/pass/measure/resource combinations fail preflight with
+  `unsupported_topology`, `unsupported_pass`, `unsupported_measure`, or
+  `unsupported_resource` before enumeration. Search never silently skips unsupported
+  work.
+
+`passes` is a non-empty unique array of pass identifiers. `measures` is a non-empty
+unique array of measure identifiers. Task 9's preflight framework decides supported
+passes and topology now; Task 10 owns the detailed `resources` and `measures` grammar
+and extends the same framework with their concrete compatibility rules, so Task 9
+validates only their boundary (a present array-of-strings `measures`, and an optional
+JSON-object `resources`).
 
 Stage 1 plans `hill_climb`, `partial_exhaustion` with backtracking, `reswapping`, `trie`,
 and `measure`; measures include index of coincidence, Sinkov n-gram statistics,
@@ -253,7 +297,8 @@ are distinct: unknown is an error; omission of a required value is an error, nev
 default. Example location: `/job/configuration/slots/1/position`. Error codes include
 `invalid_json`, `invalid_request`, `unsupported_version`, `unknown_field`,
 `invalid_definition`, `invalid_symbol`, `invalid_wiring`, `invalid_reflector`,
-`invalid_plugboard`, `invalid_slot`, `invalid_rule`, `unsupported_job`,
+`invalid_plugboard`, `invalid_slot`, `invalid_rule`, `invalid_search_space`,
+`unsupported_job`,
 `unsupported_pass`, `unsupported_measure`, `unsupported_resource`, `invalid_text`,
 `unsupported_topology`, and `internal_error`. `internal_error` is reserved for an
 internal invariant failure after `started`; it is never a request-validation failure.
@@ -288,7 +333,17 @@ resume restores the same next candidate. Detailed record fields are deferred to 
 ## 7. Determinism
 
 Enumeration order is completely defined by the resolved search space; offset/limit
-address that order. Scoring uses integer/fixed-point arithmetic where floating point
+address that order. The Task 9 base order is a flat lexicographic order over the
+assignment tuple: dimensions are visited in definition slot order (left to right), and
+within a slot in the order `wheel`, `position`, `ring`; the plugboard remainder is the
+last dimension. Later dimensions vary fastest (odometer), so the rightmost slot and
+then the plugboard remainder change fastest. A dimension that is structurally fixed or
+has a single-value domain contributes one value and does not vary. The plugboard
+remainder enumerates the `size`-element combinations of `candidates` in increasing
+candidate-index order, lexicographically. `offset` skips that many candidates and
+`limit` caps how many are produced, both counted in this one flat order. Task 14 may
+nest deterministic variant selection outside this base order; it does not change the
+order within a variant. Scoring uses integer/fixed-point arithmetic where floating point
 could vary, otherwise results are bit-identical. Unordered reductions do not affect
 scores; each candidate is scored independently. Stochastic passes record seed and RNG
 state. Holds order by `(score desc, enumeration index asc)`. These obligations apply
