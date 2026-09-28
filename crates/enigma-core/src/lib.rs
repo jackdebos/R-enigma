@@ -46,6 +46,7 @@
 pub const PROTOCOL_VERSION: u32 = 1;
 
 mod candidate;
+mod capability;
 mod configuration;
 mod definition;
 mod engine;
@@ -55,6 +56,7 @@ mod space;
 mod strict_json;
 
 pub use candidate::CandidateIterator;
+pub use capability::{Capabilities, CapabilityPolicy, PassSupport};
 pub use configuration::{
     ConfigurationDiagnostic, ResolvedConfiguration, SlotConfiguration, TransformConfiguration,
 };

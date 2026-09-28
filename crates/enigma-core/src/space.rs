@@ -6,6 +6,7 @@
 //! boundary fields (`passes`, `measures`, optional `resources`), and validates that every
 //! required key dimension is covered exactly once.
 
+use crate::capability::Capabilities;
 use crate::definition::Definition;
 use crate::request::{parse_root, RequestDiagnostic};
 use crate::Alphabet;
@@ -221,9 +222,9 @@ impl SearchSpace {
 /// A fully validated `search` request, ready for the candidate resolver (slice 9.3).
 ///
 /// Every structure, symbol, symbol domain, plugboard pair, and coverage rule was checked
-/// here before the transport may emit `started`. Candidate enumeration and capability
-/// preflight are deliberately not performed: this type only owns the validated explicit
-/// inputs.
+/// here before the transport may emit `started`. Candidate enumeration is lazy in
+/// `candidate.rs`, and capability preflight runs in `parse_search_job` before this value
+/// is returned; this type owns only the validated explicit inputs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SearchRequest {
     definition: Definition,
@@ -362,6 +363,11 @@ fn parse_search_job(
         measures,
         resources,
     };
+    // The preflight error type is exactly this function's `Vec<SearchDiagnostic>` error
+    // type, so propagate it explicitly without relying on a `?` conversion.
+    if let Err(diagnostics) = Capabilities::stage1().preflight(&request) {
+        return Err(diagnostics);
+    }
     Ok(request)
 }
 
