@@ -10,10 +10,11 @@
 //! `/job/configuration` from [`crate::TransformConfiguration::resolve`].
 
 use crate::definition::MAX_DEFINITION_BYTES;
+use crate::space::SearchDiagnostic;
 use crate::strict_json::StrictValue;
 use crate::{
-    ConfigurationDiagnostic, DefinitionDiagnostic, DefinitionSource, Direction, Engine, ModelError,
-    SlotConfiguration, TransformConfiguration, PROTOCOL_VERSION,
+    ConfigurationDiagnostic, Definition, DefinitionDiagnostic, DefinitionSource, Direction, Engine,
+    ModelError, SlotConfiguration, TransformConfiguration, PROTOCOL_VERSION,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -78,6 +79,16 @@ impl From<ConfigurationDiagnostic> for RequestDiagnostic {
     }
 }
 
+impl From<SearchDiagnostic> for RequestDiagnostic {
+    fn from(diagnostic: SearchDiagnostic) -> Self {
+        Self {
+            code: diagnostic.code(),
+            message: diagnostic.message().to_owned(),
+            location: diagnostic.location().to_owned(),
+        }
+    }
+}
+
 /// A fully validated, ready-to-run `transform` request.
 ///
 /// Every field was checked during [`TransformRequest::parse_json`], so the engine can
@@ -96,85 +107,10 @@ impl TransformRequest {
     /// (slots, coverage, symbols, plugboard), then direction, then whole-text alphabet
     /// membership. Nothing is defaulted; omission of a required value is an error.
     pub fn parse_json(json: &str) -> Result<Self, Vec<RequestDiagnostic>> {
-        if json.len() > MAX_REQUEST_BYTES {
-            return Err(vec![RequestDiagnostic::new(
-                "resource_limit",
-                "request JSON exceeds the 4 MiB resource limit",
-                "",
-            )]);
-        }
-        let mut deserializer = serde_json::Deserializer::from_str(json);
-        let parsed = StrictValue::deserialize(&mut deserializer).map_err(|error| {
-            vec![RequestDiagnostic::new(
-                "invalid_json",
-                format!("invalid JSON: {error}"),
-                "",
-            )]
-        })?;
-        deserializer.end().map_err(|error| {
-            vec![RequestDiagnostic::new(
-                "invalid_json",
-                format!("invalid JSON: {error}"),
-                "",
-            )]
-        })?;
-        let value = parsed.into_value();
-
-        let root = object(&value, "")?;
-        exact_keys(root, &["protocol_version", "machine", "job"], "")?;
-
-        // The version must be exactly the unsigned version this build implements.
-        let version = required(root, "protocol_version", "")?;
-        match version.as_u64() {
-            Some(value) if value == u64::from(PROTOCOL_VERSION) => {}
-            Some(value) => {
-                return Err(vec![RequestDiagnostic::new(
-                    "unsupported_version",
-                    format!(
-                        "protocol_version {value} is not supported; expected {PROTOCOL_VERSION}"
-                    ),
-                    "/protocol_version",
-                )]);
-            }
-            None => {
-                return Err(vec![RequestDiagnostic::new(
-                    "invalid_request",
-                    "protocol_version must be a non-negative integer",
-                    "/protocol_version",
-                )]);
-            }
-        }
-
-        // Resolve the definition before any job work, so definition errors win.
-        let machine = object(required(root, "machine", "")?, "/machine")?;
-        exact_keys(machine, &["definition"], "/machine")?;
-        let definition_value = required(machine, "definition", "/machine")?.clone();
-        // `parse_value` skips `parse_json`'s raw-byte check, so enforce the same encoded
-        // definition limit here; otherwise an embedded definition could exceed it.
-        let definition_bytes = serde_json::to_string(&definition_value)
-            .map_err(|error| {
-                vec![RequestDiagnostic::new(
-                    "invalid_json",
-                    format!("machine.definition is not serializable JSON: {error}"),
-                    "/machine/definition",
-                )]
-            })?
-            .len();
-        if definition_bytes > MAX_DEFINITION_BYTES {
-            return Err(vec![RequestDiagnostic::new(
-                "resource_limit",
-                format!(
-                    "machine.definition exceeds the {MAX_DEFINITION_BYTES}-byte definition limit"
-                ),
-                "/machine/definition",
-            )]);
-        }
-        let definition = DefinitionSource::parse_value(definition_value)
-            .and_then(DefinitionSource::resolve)
-            .map_err(definition_diagnostics)?;
+        let ParsedRoot { definition, job } = parse_root(json)?;
+        let job = object(&job, "/job")?;
 
         // Job kind selects the schema; the search schema is deferred to task 9.
-        let job = object(required(root, "job", "")?, "/job")?;
         let kind = required_string(job, "kind", "/job")?;
         if kind != "transform" {
             return Err(vec![RequestDiagnostic::new(
@@ -253,6 +189,101 @@ impl TransformRequest {
     pub fn transform(mut self) -> Result<String, ModelError> {
         self.engine.transform(&self.text, self.direction)
     }
+}
+
+/// The shared, already-validated root of a protocol request.
+///
+/// `protocol_version` and `machine.definition` are validated once here for both job
+/// kinds; the owned `job` value is returned so the kind-specific parser can interpret it
+/// with its own exact-field rules. Sharing this helper keeps both parsers byte-identical
+/// on root, version, machine, and definition diagnostics.
+pub(crate) struct ParsedRoot {
+    pub(crate) definition: Definition,
+    pub(crate) job: Value,
+}
+
+/// Parses and validates the shared request root: size limit, strict JSON, exact root
+/// fields, `protocol_version`, and `machine.definition`.
+///
+/// The definition is resolved before any job interpretation, so definition diagnostics
+/// always win over job diagnostics, exactly as the transform path already required.
+pub(crate) fn parse_root(json: &str) -> Result<ParsedRoot, Vec<RequestDiagnostic>> {
+    if json.len() > MAX_REQUEST_BYTES {
+        return Err(vec![RequestDiagnostic::new(
+            "resource_limit",
+            "request JSON exceeds the 4 MiB resource limit",
+            "",
+        )]);
+    }
+    let mut deserializer = serde_json::Deserializer::from_str(json);
+    let parsed = StrictValue::deserialize(&mut deserializer).map_err(|error| {
+        vec![RequestDiagnostic::new(
+            "invalid_json",
+            format!("invalid JSON: {error}"),
+            "",
+        )]
+    })?;
+    deserializer.end().map_err(|error| {
+        vec![RequestDiagnostic::new(
+            "invalid_json",
+            format!("invalid JSON: {error}"),
+            "",
+        )]
+    })?;
+    let value = parsed.into_value();
+
+    let root = object(&value, "")?;
+    exact_keys(root, &["protocol_version", "machine", "job"], "")?;
+
+    // The version must be exactly the unsigned version this build implements.
+    let version = required(root, "protocol_version", "")?;
+    match version.as_u64() {
+        Some(value) if value == u64::from(PROTOCOL_VERSION) => {}
+        Some(value) => {
+            return Err(vec![RequestDiagnostic::new(
+                "unsupported_version",
+                format!("protocol_version {value} is not supported; expected {PROTOCOL_VERSION}"),
+                "/protocol_version",
+            )]);
+        }
+        None => {
+            return Err(vec![RequestDiagnostic::new(
+                "invalid_request",
+                "protocol_version must be a non-negative integer",
+                "/protocol_version",
+            )]);
+        }
+    }
+
+    // Resolve the definition before any job work, so definition errors win.
+    let machine = object(required(root, "machine", "")?, "/machine")?;
+    exact_keys(machine, &["definition"], "/machine")?;
+    let definition_value = required(machine, "definition", "/machine")?.clone();
+    // `parse_value` skips `parse_json`'s raw-byte check, so enforce the same encoded
+    // definition limit here; otherwise an embedded definition could exceed it.
+    let definition_bytes = serde_json::to_string(&definition_value)
+        .map_err(|error| {
+            vec![RequestDiagnostic::new(
+                "invalid_json",
+                format!("machine.definition is not serializable JSON: {error}"),
+                "/machine/definition",
+            )]
+        })?
+        .len();
+    if definition_bytes > MAX_DEFINITION_BYTES {
+        return Err(vec![RequestDiagnostic::new(
+            "resource_limit",
+            format!("machine.definition exceeds the {MAX_DEFINITION_BYTES}-byte definition limit"),
+            "/machine/definition",
+        )]);
+    }
+    let definition = DefinitionSource::parse_value(definition_value)
+        .and_then(DefinitionSource::resolve)
+        .map_err(definition_diagnostics)?;
+
+    let job = required(root, "job", "")?.clone();
+
+    Ok(ParsedRoot { definition, job })
 }
 
 /// Parses the `job.configuration` object into a typed, unvalidated configuration.
@@ -676,6 +707,27 @@ mod tests {
         let diagnostic = errors(&value).remove(0);
         assert_eq!(diagnostic.code(), "resource_limit");
         assert_eq!(diagnostic.location(), "/machine/definition");
+    }
+
+    #[test]
+    fn shared_root_refactor_preserves_transform_behavior() {
+        // A valid transform still parses and transforms exactly as before.
+        let request = parse(&custom_request()).unwrap();
+        assert_eq!(request.transform().unwrap(), "BADC");
+
+        // Root/version/machine diagnostics are unchanged by the shared root helper.
+        let mut unknown = custom_request();
+        unknown["surprise"] = json!(1);
+        let diagnostic = errors(&unknown).remove(0);
+        assert_eq!(diagnostic.code(), "unknown_field");
+        assert_eq!(diagnostic.location(), "/surprise");
+
+        // A non-object job is still rejected at /job after definition resolution.
+        let mut bad_job = custom_request();
+        bad_job["job"] = json!(42);
+        let diagnostic = errors(&bad_job).remove(0);
+        assert_eq!(diagnostic.code(), "invalid_request");
+        assert_eq!(diagnostic.location(), "/job");
     }
 
     #[test]

@@ -50,6 +50,7 @@ mod definition;
 mod engine;
 mod event;
 mod request;
+mod space;
 mod strict_json;
 
 pub use configuration::{
@@ -59,6 +60,10 @@ pub use definition::{Definition, DefinitionDiagnostic, DefinitionSlot, Definitio
 pub use engine::{Direction, Engine};
 pub use event::{encode, rfc3339_utc, DoneReason, Event};
 pub use request::{RequestDiagnostic, TransformRequest, MAX_REQUEST_BYTES};
+pub use space::{
+    PlugboardDomain, SearchConfiguration, SearchDiagnostic, SearchFixedSlot, SearchRequest,
+    SearchSlotDomain, SearchSpace,
+};
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
