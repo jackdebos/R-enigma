@@ -45,6 +45,7 @@
 /// Must match `docs/protocol.md` §10. A breaking change to the protocol bumps this.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+mod candidate;
 mod configuration;
 mod definition;
 mod engine;
@@ -53,6 +54,7 @@ mod request;
 mod space;
 mod strict_json;
 
+pub use candidate::CandidateIterator;
 pub use configuration::{
     ConfigurationDiagnostic, ResolvedConfiguration, SlotConfiguration, TransformConfiguration,
 };

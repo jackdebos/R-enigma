@@ -52,6 +52,15 @@ impl SearchDiagnostic {
     pub fn location(&self) -> &str {
         &self.location
     }
+
+    /// Builds an `invalid_search_space` diagnostic for an internal invariant violation.
+    ///
+    /// The candidate resolver (slice 9.3) uses this when a space that already passed
+    /// validation unexpectedly fails to resolve, so it can fail closed instead of
+    /// skipping the candidate.
+    pub(crate) fn internal(message: impl Into<String>, location: impl Into<String>) -> Self {
+        Self::new("invalid_search_space", message, location)
+    }
 }
 
 impl fmt::Display for SearchDiagnostic {
