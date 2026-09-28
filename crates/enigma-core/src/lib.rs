@@ -45,9 +45,13 @@
 /// Must match `docs/protocol.md` §10. A breaking change to the protocol bumps this.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+mod configuration;
 mod definition;
 mod engine;
 
+pub use configuration::{
+    ConfigurationDiagnostic, ResolvedConfiguration, SlotConfiguration, TransformConfiguration,
+};
 pub use definition::{Definition, DefinitionDiagnostic, DefinitionSlot, DefinitionSource};
 pub use engine::{Direction, Engine};
 
