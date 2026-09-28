@@ -48,6 +48,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 mod configuration;
 mod definition;
 mod engine;
+mod event;
 mod request;
 mod strict_json;
 
@@ -56,6 +57,7 @@ pub use configuration::{
 };
 pub use definition::{Definition, DefinitionDiagnostic, DefinitionSlot, DefinitionSource};
 pub use engine::{Direction, Engine};
+pub use event::{encode, rfc3339_utc, DoneReason, Event};
 pub use request::{RequestDiagnostic, TransformRequest, MAX_REQUEST_BYTES};
 
 use std::collections::{BTreeSet, HashMap, HashSet};

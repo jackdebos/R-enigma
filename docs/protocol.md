@@ -30,8 +30,9 @@ search support.
 | local listener | web client | `--listen 127.0.0.1:<port>` | 2 (planned) |
 
 `stdout` contains one JSON object per line (JSONL), without embedded newlines.
-Diagnostics go to `stderr`. Stage 1 accepts a request file path or `--request -` for
-stdin. A future Stage 2 listener carries the same messages. No UI is part of Stage 1.
+Diagnostics go to `stderr`. Stage 1 accepts a positional request file path,
+`--request <path>` for a file, or `--request -` for stdin. A future Stage 2 listener
+carries the same messages. No UI is part of Stage 1.
 
 ## 3. Request
 
@@ -235,8 +236,12 @@ starting at 1, and RFC 3339 UTC `ts`. Unknown event names/fields may be ignored 
 clients. A successful validated job emits one `started` first, then applicable events,
 then exactly one terminal `done`; runtime failure emits terminal `error`. Search may
 emit `progress`, `candidate`, `checkpoint`, and `hold` according to job lifecycle.
-Transform emits no candidate, hold, or checkpoint event. Pre-validation failure emits
-one `error` at `seq: 1`, with no `started` or work events. Errors contain stable `code`,
+Transform emits no candidate, hold, or checkpoint event. A validated `transform` job
+emits `started`, then exactly one `output` whose `output` member is the transformed
+text, then exactly one terminal `done` with `reason: "completed"`. `done` remains
+solely a lifecycle/reason event shared by transform and future search; it never carries
+the transformed text. Pre-validation failure emits one `error` at `seq: 1`, with no
+`started` or work events. Errors contain stable `code`,
 actionable `message`, and JSON Pointer `location`; `expected` and `hint` may be added.
 Exit nonzero and write diagnostics to stderr on invalid input.
 
@@ -249,8 +254,10 @@ default. Example location: `/job/configuration/slots/1/position`. Error codes in
 `invalid_json`, `invalid_request`, `unsupported_version`, `unknown_field`,
 `invalid_definition`, `invalid_symbol`, `invalid_wiring`, `invalid_reflector`,
 `invalid_plugboard`, `invalid_slot`, `invalid_rule`, `unsupported_job`,
-`unsupported_pass`, `unsupported_measure`, `unsupported_resource`, `invalid_text`, and
-`unsupported_topology`. Syntax errors point to the closest available containing path.
+`unsupported_pass`, `unsupported_measure`, `unsupported_resource`, `invalid_text`,
+`unsupported_topology`, and `internal_error`. `internal_error` is reserved for an
+internal invariant failure after `started`; it is never a request-validation failure.
+Syntax errors point to the closest available containing path.
 
 ## 5. Control
 
