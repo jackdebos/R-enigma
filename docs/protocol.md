@@ -16,10 +16,11 @@ structurally non-configurable in the definition. Omission is not a default. Bund
 historical definitions and custom embedded definitions use the same schema and
 validation.
 
-This document marks protocol requirements as normative. Exact search-space grammar,
-pass fields, scoring/resource schemas, and checkpoint record layout are deferred to
-tasks 9, 10, and 16, respectively. Illustrative search concepts below are not
-executable request examples. Representability does not imply catalog availability or
+This document marks protocol requirements as normative. Search-space grammar is
+specified in §3.3 and §7; [Scoring and external resources](scoring-resources.md)
+specifies the normative Task 10 measure/resource contract. Pass execution fields and
+checkpoint record layout remain deferred to their implementation tasks. Illustrative
+search concepts below are not executable request examples. Representability does not imply catalog availability or
 search support.
 
 ## 2. Transport
@@ -261,11 +262,37 @@ Coverage and conflict are checked before enumeration:
   work.
 
 `passes` is a non-empty unique array of pass identifiers. `measures` is a non-empty
-unique array of measure identifiers. Task 9's preflight framework decides supported
-passes and topology now; Task 10 owns the detailed `resources` and `measures` grammar
-and extends the same framework with their concrete compatibility rules, so Task 9
-validates only their boundary (a present array-of-strings `measures`, and an optional
-JSON-object `resources`).
+unique array of measure identifiers: initially `ic`, `entropy`, `sinkov_monogram`,
+`sinkov_bigram`, `sinkov_trigram`, `sinkov_quadgram`, `sinkov_pentagram`,
+`sinkov_hexagram`, and `trie`. Unsupported names fail; there are no aliases or
+implicit combinations. IC and entropy are initially resource-free monogram measures.
+Each selected Sinkov/trie measure requires exactly one `resources` entry keyed by
+that measure ID, whose value is exactly `{"path":"..."}` with a nonempty path.
+Missing or unused references, duplicate keys, inline contents, and unknown fields
+fail. All request JSON remains duplicate-key-strict at every depth.
+
+The standalone [scoring/resource contract](scoring-resources.md) is normative for
+external JSON schemas, compatibility, bounds, Unicode semantics, formulas,
+orientation, and checked deterministic Q32 arithmetic. Resources must match the
+resolved ordered alphabet and selected kind/order. Measures are independently
+ordered; no combined ranking is promised. There is no global reflector requirement.
+
+Structural parsing does not authorize enumeration with unbound resources. The
+caller supplies bounded UTF-8 contents keyed by measure ID to a binding stage;
+only fully validated requests may enumerate. Core parsers never read files.
+Resource-free `SearchRequest::parse_json` remains a convenience; it fails when
+binding is required. File-request resource paths are relative to the request
+filename's directory; stdin paths are relative to the working directory captured
+once. Absolute paths are allowed; no expansion, URL loading, automatic symlink
+canonicalization, or sandbox restriction is introduced.
+
+**Implementation status:** Task 9 implements the structural boundary and capability
+framework, not this detailed scoring/resource contract. Slice 10.1 is documentation
+first; scorers and loading follow in later Task 10 slices. Valid search is still not
+executable in the current CLI. The planned shared strict dispatch validates and binds
+search resources before returning one `unsupported_job` error, with no `started`,
+`output`, `done`, or enumeration; resource errors precede that result. Transform
+never loads resources. This requirement does not change transform grammar or events.
 
 Stage 1 plans `hill_climb`, `partial_exhaustion` with backtracking, `reswapping`, `trie`,
 and `measure`; measures include index of coincidence, Sinkov n-gram statistics,
@@ -369,9 +396,11 @@ Task 17 is the differential-oracle validation task.
 `protocol_version: 1` denotes this unpublished, pre-implementation design. Unknown
 versions and fields fail before work. Incompatible changes to field meaning,
 validation, traversal, or event ordering after v1 ships require a version bump. Detailed
-search-space, pass, measure/resource, and checkpoint schemas remain deferred; they must
-be specified before their implementation, not presumed executable or imported from
-`bomm`. There is no Stage 1 UI; clients belong to Stage 2.
+pass execution fields and checkpoint schemas remain deferred; they must be specified
+before their implementation, not presumed executable or imported from `bomm`.
+Search-space and [measure/resource schemas](scoring-resources.md) are specified as
+normative design; that does not assert implemented scoring or search execution.
+There is no Stage 1 UI; clients belong to Stage 2.
 
 ## 11. GPU constraints (Stage 4)
 
