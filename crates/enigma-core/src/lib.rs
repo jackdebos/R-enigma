@@ -52,8 +52,13 @@ mod definition;
 mod engine;
 mod event;
 mod request;
+mod score;
 mod space;
 mod strict_json;
+
+pub use score::{
+    floor_div, integer_log2_q48, ln_ratio_q32, FixedScore, ScoreError, LN_2_Q48, SCALE,
+};
 
 pub use candidate::CandidateIterator;
 pub use capability::{Capabilities, CapabilityPolicy, PassSupport};
