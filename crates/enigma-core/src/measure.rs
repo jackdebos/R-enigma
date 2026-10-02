@@ -70,6 +70,13 @@ pub struct MeasuredScore {
 }
 
 impl MeasuredScore {
+    pub(crate) const fn higher_is_better(measured: FixedScore) -> Self {
+        Self {
+            measured,
+            ranking: measured,
+        }
+    }
+
     /// Read the measured value (entropy is nonnegative bits, not negative bits).
     pub const fn measured(self) -> FixedScore {
         self.measured

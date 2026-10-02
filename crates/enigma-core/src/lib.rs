@@ -52,6 +52,7 @@ mod definition;
 mod engine;
 mod event;
 mod measure;
+mod ngram;
 mod request;
 mod score;
 mod space;
@@ -62,6 +63,7 @@ pub use score::{
 };
 
 pub use measure::{index_of_coincidence, shannon_entropy, MeasureError, MeasuredScore};
+pub use ngram::{NgramError, NgramModel};
 
 pub use candidate::CandidateIterator;
 pub use capability::{Capabilities, CapabilityPolicy, PassSupport};

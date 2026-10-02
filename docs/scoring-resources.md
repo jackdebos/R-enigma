@@ -2,8 +2,9 @@
 
 Status: **Normative unpublished protocol v1 contract; implementation is partial.**
 The core implements checked fixed-point arithmetic, monogram IC, and positive
-Shannon entropy with explicit ranking orientation. External models, resource
-binding, and CLI resource loading remain unimplemented. Slice 10.1 froze this
+Shannon entropy with explicit ranking orientation. Typed sparse n-gram models and
+Sinkov scoring are also implemented in the core. External JSON resource parsing,
+resource binding, and CLI resource loading remain unimplemented. Slice 10.1 froze this
 contract before those implementation slices; the formulas below remain normative.
 The current CLI cannot execute search, including structurally valid search requests.
 See [Engine Protocol](protocol.md) for the surrounding request and event contract.
