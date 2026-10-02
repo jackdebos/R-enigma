@@ -1,7 +1,10 @@
 # Scoring and external resources
 
-Status: **Normative unpublished protocol v1 design, not implemented behavior.**
-Task 10 slice 10.1 freezes this contract before scorer, parser, and loader work.
+Status: **Normative unpublished protocol v1 contract; implementation is partial.**
+The core implements checked fixed-point arithmetic, monogram IC, and positive
+Shannon entropy with explicit ranking orientation. External models, resource
+binding, and CLI resource loading remain unimplemented. Slice 10.1 froze this
+contract before those implementation slices; the formulas below remain normative.
 The current CLI cannot execute search, including structurally valid search requests.
 See [Engine Protocol](protocol.md) for the surrounding request and event contract.
 
