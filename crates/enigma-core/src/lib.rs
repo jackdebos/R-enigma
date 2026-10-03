@@ -56,7 +56,7 @@ mod ngram;
 mod request;
 mod resource;
 
-pub use resource::{parse_ngram_json, ResourceDiagnostic};
+pub use resource::{parse_dictionary_json, parse_ngram_json, ResourceDiagnostic};
 mod score;
 mod space;
 mod strict_json;
