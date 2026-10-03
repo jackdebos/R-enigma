@@ -3,8 +3,9 @@
 Status: **Normative unpublished protocol v1 contract; implementation is partial.**
 The core implements checked fixed-point arithmetic, monogram IC, and positive
 Shannon entropy with explicit ranking orientation. Typed sparse n-gram models and
-Sinkov scoring are also implemented in the core. External JSON resource parsing,
-resource binding, and CLI resource loading remain unimplemented. Slice 10.1 froze this
+Sinkov scoring and strict standalone n-gram JSON parsing (`parse_ngram_json`) are
+also implemented in the core. Dictionary parsing, resource binding, and CLI
+resource loading remain unimplemented. Slice 10.1 froze this
 contract before those implementation slices; the formulas below remain normative.
 The current CLI cannot execute search, including structurally valid search requests.
 See [Engine Protocol](protocol.md) for the surrounding request and event contract.
@@ -307,7 +308,21 @@ and the weighted prefix `A` independently of the longer word `AB`.
 Validation errors use the protocol's actionable pre-start error envelope and JSON
 Pointer location. Reference/read failures point to `/job/resources/<measure>/path`;
 resource errors identify the measure, selected file, and resource-relative pointer
-(such as `/entries/0/count`) in their diagnostic context. Duplicate keys and syntax
+(such as `/entries/0/count`) in their diagnostic context. The standalone n-gram
+parser exposes `ResourceDiagnostic` code, message, and resource-relative location;
+file and measure context must be attached by a future caller. It rejects text over
+16 MiB before decoding and entries beyond 250,000 before decoding the excess
+entry. Other local collections are capped at 256 elements or members, with the
+standard JSON decoder recursion guard retained. The standalone n-gram parser
+allows at most 64 nested containers (objects or arrays): a root container is level
+1, each child container adds one level, and scalar values add no level. The visitor
+rejects entry into level 65 before decoding its contents, well below the decoder's
+recursion guard, with `resource_limit` at that container's resource-relative pointer
+and a message requesting flatter nesting. Depth is numeric and independent of
+member spelling, pointer escaping, or UTF-8 length. Containers through level 64
+are decoded normally and then checked against the schema; malformed syntax still
+uses `invalid_json`. Limit errors use `resource_limit`.
+Duplicate keys and syntax
 errors identify the closest available containing location. Limits and score overflow
 are diagnostics, not `internal_error` substitutes or silently dropped candidates.
 

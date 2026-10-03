@@ -54,6 +54,9 @@ mod event;
 mod measure;
 mod ngram;
 mod request;
+mod resource;
+
+pub use resource::{parse_ngram_json, ResourceDiagnostic};
 mod score;
 mod space;
 mod strict_json;
