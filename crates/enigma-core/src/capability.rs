@@ -9,7 +9,7 @@
 //! resource semantic is implemented.
 
 use crate::definition::Definition;
-use crate::space::{SearchDiagnostic, SearchRequest};
+use crate::space::{ParsedSearchRequest, SearchDiagnostic, SearchRequest};
 use crate::SlotRole;
 use serde_json::Value;
 
@@ -133,7 +133,40 @@ impl Capabilities {
     /// is rejected for a no-reflector topology only when its [`PassSupport`] opts in with
     /// `requires_reflector == true`.
     pub fn preflight(&self, request: &SearchRequest) -> Result<(), Vec<SearchDiagnostic>> {
-        for (index, pass) in request.passes().iter().enumerate() {
+        self.preflight_parsed(request.parsed())
+    }
+
+    /// Shared compatibility preflight for structurally parsed, unbound inputs.
+    pub fn preflight_parsed(
+        &self,
+        request: &ParsedSearchRequest,
+    ) -> Result<(), Vec<SearchDiagnostic>> {
+        self.check_passes(request.definition(), request.passes())?;
+        let ids: Vec<String> = request
+            .measures()
+            .iter()
+            .map(|measure| measure.id().to_owned())
+            .collect();
+        self.check_measures(&ids)
+            .map_err(|diagnostic| vec![diagnostic])?;
+        for reference in request.resources() {
+            if !self.resources.permits(reference.measure().id()) {
+                return Err(vec![SearchDiagnostic::new(
+                    "unsupported_resource",
+                    "resource is not supported by the configured capability policy",
+                    "/job/resources",
+                )]);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_passes(
+        &self,
+        definition: &Definition,
+        passes: &[String],
+    ) -> Result<(), Vec<SearchDiagnostic>> {
+        for (index, pass) in passes.iter().enumerate() {
             if !self.supports_pass(pass) {
                 return Err(vec![SearchDiagnostic::new(
                     "unsupported_pass",
@@ -142,11 +175,11 @@ impl Capabilities {
                 )]);
             }
         }
-        for pass in request.passes() {
+        for pass in passes {
             let support = self
                 .pass(pass)
                 .expect("the recognition loop accepted every requested pass");
-            if support.requires_reflector() && !has_reflector(request.definition()) {
+            if support.requires_reflector() && !has_reflector(definition) {
                 return Err(vec![SearchDiagnostic::new(
                     "unsupported_topology",
                     format!(
@@ -156,10 +189,6 @@ impl Capabilities {
                 )]);
             }
         }
-        self.check_measures(request.measures())
-            .map_err(|diagnostic| vec![diagnostic])?;
-        self.check_resources(request.resources())
-            .map_err(|diagnostic| vec![diagnostic])?;
         Ok(())
     }
 
@@ -270,7 +299,7 @@ mod tests {
                 "text": "AB",
                 "space": {"slots": []},
                 "passes": passes,
-                "measures": ["index_of_coincidence"]
+                "measures": ["ic"]
             }
         })
     }
@@ -292,7 +321,7 @@ mod tests {
                 "text": "AB",
                 "space": {"slots": []},
                 "passes": ["hill_climb"],
-                "measures": ["index_of_coincidence"]
+                "measures": ["ic"]
             }
         })
     }
@@ -411,16 +440,15 @@ mod tests {
     #[test]
     fn measure_allowlist_rejects_unlisted_measure_at_its_index() {
         let mut value = reflector_request();
-        value["job"]["measures"] = json!(["index_of_coincidence", "entropy"]);
+        value["job"]["measures"] = json!(["ic", "entropy"]);
         let request = parse(&value);
         let permitted = Capabilities::stage1().with_measures(CapabilityPolicy::Allowlist(vec![
-            "index_of_coincidence".to_owned(),
+            "ic".to_owned(),
             "entropy".to_owned(),
         ]));
         assert!(permitted.preflight(&request).is_ok());
-        let restricted = Capabilities::stage1().with_measures(CapabilityPolicy::Allowlist(vec![
-            "index_of_coincidence".to_owned(),
-        ]));
+        let restricted = Capabilities::stage1()
+            .with_measures(CapabilityPolicy::Allowlist(vec!["ic".to_owned()]));
         let diagnostic = restricted.preflight(&request).unwrap_err().remove(0);
         assert_eq!(diagnostic.code(), "unsupported_measure");
         assert_eq!(diagnostic.location(), "/job/measures/1");
@@ -443,17 +471,18 @@ mod tests {
     #[test]
     fn resource_allowlist_rejects_unlisted_resources_object() {
         let mut value = reflector_request();
-        value["job"]["resources"] = json!({"threads": 4});
-        let request = parse(&value);
+        value["job"]["measures"] = json!(["trie"]);
+        value["job"]["resources"] = json!({"trie": {"path": "words.json"}});
+        let request = ParsedSearchRequest::parse_json(&value.to_string()).unwrap();
         let allowlisted = Capabilities::stage1()
-            .with_resources(CapabilityPolicy::Allowlist(vec!["threads".to_owned()]));
-        assert!(allowlisted.preflight(&request).is_ok());
+            .with_resources(CapabilityPolicy::Allowlist(vec!["trie".to_owned()]));
+        assert!(allowlisted.preflight_parsed(&request).is_ok());
         let rejected = Capabilities::stage1()
             .with_resources(CapabilityPolicy::Allowlist(vec!["memory".to_owned()]));
-        let diagnostic = rejected.preflight(&request).unwrap_err().remove(0);
+        let diagnostic = rejected.preflight_parsed(&request).unwrap_err().remove(0);
         assert_eq!(diagnostic.code(), "unsupported_resource");
         assert_eq!(diagnostic.location(), "/job/resources");
-        assert!(Capabilities::stage1().preflight(&request).is_ok());
+        assert!(Capabilities::stage1().preflight_parsed(&request).is_ok());
     }
 
     #[test]

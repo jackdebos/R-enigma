@@ -7,7 +7,9 @@ Sinkov scoring and strict standalone n-gram JSON parsing (`parse_ngram_json`) ar
 also implemented in the core. Typed immutable weighted dictionaries (`TrieModel`)
 and exact overlapping trie scoring are implemented. Strict standalone dictionary
 JSON parsing (`parse_dictionary_json`) returns a validated `TrieModel`.
-Resource binding and CLI resource loading remain unimplemented. Slice 10.1 froze this
+Typed measure/path selection and the structural `ParsedSearchRequest` gate are
+implemented: only resource-free conversion currently produces an enumerable
+`SearchRequest`. Supplied-content binding and CLI resource loading remain pending. Slice 10.1 froze this
 contract before those implementation slices; the formulas below remain normative.
 The current CLI cannot execute search, including structurally valid search requests.
 See [Engine Protocol](protocol.md) for the surrounding request and event contract.

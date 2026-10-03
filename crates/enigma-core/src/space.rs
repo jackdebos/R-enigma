@@ -1,14 +1,13 @@
-//! Typed search-space model, strict parser, and coverage validation (Task 9, slice 9.2).
+//! Strict structural search parsing and the validated enumeration gate.
 //!
-//! The frozen grammar lives in `docs/protocol.md` §3.2/§3.3. Candidate enumeration
-//! (slice 9.3) and the capability/preflight framework (slice 9.4) are out of scope here;
-//! this module only models the explicit variable domains, its known fixed facts, the
-//! boundary fields (`passes`, `measures`, optional `resources`), and validates that every
-//! required key dimension is covered exactly once.
+//! The frozen grammar lives in `docs/protocol.md` §3.2/§3.3 and
+//! `docs/scoring-resources.md`. External paths are metadata only; supplied-content
+//! binding is a separate stage, and only `SearchRequest` permits enumeration.
 
 use crate::capability::Capabilities;
 use crate::definition::Definition;
 use crate::request::{parse_root, RequestDiagnostic};
+use crate::selection::{parse_measures, parse_references, MeasureId, ResourceReference};
 use crate::Alphabet;
 use serde_json::{Map, Value};
 use std::collections::HashSet;
@@ -221,22 +220,83 @@ impl SearchSpace {
 
 /// A fully validated `search` request, ready for the candidate resolver (slice 9.3).
 ///
-/// Every structure, symbol, symbol domain, plugboard pair, and coverage rule was checked
-/// here before the transport may emit `started`. Candidate enumeration is lazy in
-/// `candidate.rs`, and capability preflight runs in `parse_search_job` before this value
-/// is returned; this type owns only the validated explicit inputs.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Structural validation and capability preflight have passed, and no unbound
+/// resources remain. Candidate enumeration is lazy in `candidate.rs`. Construction
+/// is private: callers cannot promote path references to validated contents.
+#[derive(Debug)]
 pub struct SearchRequest {
+    parsed: ParsedSearchRequest,
+}
+
+impl SearchRequest {
+    /// Resource-free convenience; external references require supplied content binding.
+    pub fn parse_json(json: &str) -> Result<Self, Vec<RequestDiagnostic>> {
+        ParsedSearchRequest::parse_json(json)?.into_resource_free()
+    }
+    /// Validated machine definition.
+    pub fn definition(&self) -> &Definition {
+        self.parsed.definition()
+    }
+    /// Validated input text.
+    pub fn text(&self) -> &str {
+        self.parsed.text()
+    }
+    /// Fixed key choices.
+    pub fn configuration(&self) -> &SearchConfiguration {
+        self.parsed.configuration()
+    }
+    /// Explicit variable domains.
+    pub fn space(&self) -> &SearchSpace {
+        self.parsed.space()
+    }
+    /// Selected passes in source order.
+    pub fn passes(&self) -> &[String] {
+        self.parsed.passes()
+    }
+    /// Typed measures in source order.
+    pub fn measures(&self) -> &[MeasureId] {
+        self.parsed.measures()
+    }
+    /// Validated external path metadata.
+    pub fn resources(&self) -> &[ResourceReference] {
+        self.parsed.resources()
+    }
+    pub(crate) fn parsed(&self) -> &ParsedSearchRequest {
+        &self.parsed
+    }
+}
+
+/// Structurally validated inputs, not yet eligible for enumeration.
+///
+/// ```compile_fail
+/// fn enumerate(request: enigma_core::ParsedSearchRequest) {
+///     request.candidates();
+/// }
+/// ```
+#[derive(Debug)]
+pub struct ParsedSearchRequest {
     definition: Definition,
     text: String,
     configuration: SearchConfiguration,
     space: SearchSpace,
     passes: Vec<String>,
-    measures: Vec<String>,
-    resources: Option<Value>,
+    measures: Vec<MeasureId>,
+    resources: Vec<ResourceReference>,
 }
 
-impl SearchRequest {
+impl ParsedSearchRequest {
+    /// Converts only resource-free selections; paths alone never authorize enumeration.
+    pub fn into_resource_free(self) -> Result<SearchRequest, Vec<RequestDiagnostic>> {
+        if let Some(reference) = self.resources.first() {
+            return Err(vec![SearchDiagnostic::new(
+                "unsupported_resource",
+                "external resources require supplied content binding before enumeration",
+                format!("/job/resources/{}/path", reference.measure().id()),
+            )
+            .into()]);
+        }
+        Ok(SearchRequest { parsed: self })
+    }
     /// Parses and fully validates a `kind: "search"` JSON request.
     ///
     /// Validation order mirrors the protocol: shared root and definition, then the
@@ -278,21 +338,21 @@ impl SearchRequest {
         &self.passes
     }
 
-    /// Requested measure identifiers, in source order.
-    pub fn measures(&self) -> &[String] {
+    /// Typed measure selection, in source order.
+    pub fn measures(&self) -> &[MeasureId] {
         &self.measures
     }
 
-    /// The opaque, optional `resources` object; its grammar is Task 10.
-    pub fn resources(&self) -> Option<&Value> {
-        self.resources.as_ref()
+    /// Validated external path references, in deterministic ID order.
+    pub fn resources(&self) -> &[ResourceReference] {
+        &self.resources
     }
 }
 
 fn parse_search_job(
     definition: &Definition,
     job: &Value,
-) -> Result<SearchRequest, Vec<SearchDiagnostic>> {
+) -> Result<ParsedSearchRequest, Vec<SearchDiagnostic>> {
     let job = object(job, "/job")?;
     let kind = required_string(job, "kind", "/job")?;
     if kind != "search" {
@@ -321,18 +381,6 @@ fn parse_search_job(
     let text = required_string(job, "text", "/job")?;
     let passes = parse_identifier_array(job, "passes", "/job")?;
     let measures = parse_identifier_array(job, "measures", "/job")?;
-    let resources = match job.get("resources") {
-        Some(value) => {
-            if !value.is_object() {
-                return Err(vec![invalid(
-                    "resources must be a JSON object when present",
-                    "/job/resources",
-                )]);
-            }
-            Some(value.clone())
-        }
-        None => None,
-    };
 
     if let Some(symbol) = text
         .chars()
@@ -354,7 +402,26 @@ fn parse_search_job(
         )?;
     }
 
-    let request = SearchRequest {
+    // Keep pass/topology precedence ahead of concrete measure/reference validation.
+    Capabilities::stage1().check_passes(definition, &passes)?;
+    let measures = parse_measures(&measures)?;
+    let resources = parse_references(&measures, job.get("resources"))?;
+    let samples = text.chars().count();
+    if let Some(measure) = measures
+        .iter()
+        .find(|measure| samples < measure.minimum_samples())
+    {
+        return Err(vec![SearchDiagnostic::new(
+            "invalid_text",
+            format!(
+                "{} requires at least {} Unicode scalars",
+                measure.id(),
+                measure.minimum_samples()
+            ),
+            "/job/text",
+        )]);
+    }
+    let request = ParsedSearchRequest {
         definition: definition.clone(),
         text: text.to_owned(),
         configuration,
@@ -365,7 +432,7 @@ fn parse_search_job(
     };
     // The preflight error type is exactly this function's `Vec<SearchDiagnostic>` error
     // type, so propagate it explicitly without relying on a `?` conversion.
-    if let Err(diagnostics) = Capabilities::stage1().preflight(&request) {
+    if let Err(diagnostics) = Capabilities::stage1().preflight_parsed(&request) {
         return Err(diagnostics);
     }
     Ok(request)
@@ -1114,6 +1181,161 @@ mod tests {
 
     /// A valid, fully fixed search request: every dimension is fixed in configuration,
     /// `space.slots` is empty, and no plugboard remainder is searched.
+    #[test]
+    fn typed_selection_gate() {
+        let mut value = base_request();
+        value["job"]["measures"] = json!(["ic"]);
+        assert!(SearchRequest::parse_json(&value.to_string()).is_ok());
+        for id in [
+            "sinkov_monogram",
+            "sinkov_bigram",
+            "sinkov_trigram",
+            "sinkov_quadgram",
+            "sinkov_pentagram",
+            "sinkov_hexagram",
+            "trie",
+        ] {
+            value["job"]["text"] = json!("ABABAB");
+            value["job"]["measures"] = json!([id]);
+            value["job"]["resources"] = json!({id: {"path": "model.json"}});
+            let parsed = ParsedSearchRequest::parse_json(&value.to_string()).unwrap();
+            assert_eq!(parsed.measures()[0].id(), id);
+            assert_eq!(parsed.resources()[0].path(), "model.json");
+            let error = SearchRequest::parse_json(&value.to_string()).unwrap_err();
+            assert_eq!(error[0].code(), "unsupported_resource");
+            assert!(error[0].message().contains("supplied"));
+        }
+        value["job"]["measures"] = json!(["entropy"]);
+        value["job"].as_object_mut().unwrap().remove("resources");
+        assert!(ParsedSearchRequest::parse_json(&value.to_string())
+            .unwrap()
+            .into_resource_free()
+            .is_ok());
+    }
+
+    #[test]
+    fn selection_errors_are_localized() {
+        for (measures, resources, code, location) in [
+            (
+                json!(["index_of_coincidence"]),
+                json!({}),
+                "unsupported_measure",
+                "/job/measures/0",
+            ),
+            (
+                json!(["sinkov_bigram"]),
+                json!({}),
+                "unsupported_resource",
+                "/job/resources/sinkov_bigram/path",
+            ),
+            (
+                json!(["ic"]),
+                json!({"ic": {"path": "x"}}),
+                "unsupported_resource",
+                "/job/resources/ic/path",
+            ),
+            (
+                json!(["entropy"]),
+                json!({"trie": {"path": "x"}}),
+                "unsupported_resource",
+                "/job/resources/trie/path",
+            ),
+            (
+                json!(["trie"]),
+                json!({"trie": {"path": ""}}),
+                "unsupported_resource",
+                "/job/resources/trie/path",
+            ),
+            (
+                json!(["trie"]),
+                json!({"trie": {"path": 1}}),
+                "unsupported_resource",
+                "/job/resources/trie/path",
+            ),
+            (
+                json!(["trie"]),
+                json!({"trie": {}}),
+                "unsupported_resource",
+                "/job/resources/trie/path",
+            ),
+            (
+                json!(["trie"]),
+                json!({"trie": {"path": "x", "entries": []}}),
+                "unknown_field",
+                "/job/resources/trie/entries",
+            ),
+            (
+                json!(["trie"]),
+                json!({"trie": []}),
+                "unsupported_resource",
+                "/job/resources/trie/path",
+            ),
+        ] {
+            let mut value = base_request();
+            value["job"]["measures"] = measures;
+            value["job"]["resources"] = resources;
+            let error = ParsedSearchRequest::parse_json(&value.to_string())
+                .unwrap_err()
+                .remove(0);
+            assert_eq!((error.code(), error.location()), (code, location));
+        }
+    }
+
+    #[test]
+    fn scalar_sample_boundaries() {
+        for (id, minimum) in [
+            ("ic", 2),
+            ("entropy", 1),
+            ("sinkov_monogram", 1),
+            ("sinkov_bigram", 2),
+            ("sinkov_trigram", 3),
+            ("sinkov_quadgram", 4),
+            ("sinkov_pentagram", 5),
+            ("sinkov_hexagram", 6),
+            ("trie", 1),
+        ] {
+            let mut value = base_request();
+            value["job"]["measures"] = json!([id]);
+            if id != "ic" && id != "entropy" {
+                value["job"]["resources"] = json!({id: {"path": "x"}});
+            }
+            for length in [minimum - 1, minimum] {
+                value["job"]["text"] = json!("é".repeat(length));
+                let json = value.to_string().replace("\"A\"", "\"é\"");
+                let result = ParsedSearchRequest::parse_json(&json);
+                if length == minimum {
+                    assert!(result.is_ok(), "{id}: {result:?}");
+                } else {
+                    let error = result.unwrap_err().remove(0);
+                    assert_eq!(
+                        (error.code(), error.location()),
+                        ("invalid_text", "/job/text")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resource_duplicate_keys_remain_strict() {
+        let mut value = base_request();
+        value["job"]["measures"] = json!(["trie"]);
+        value["job"]["resources"] = json!({"trie": {"path": "x"}});
+        let json = value.to_string();
+        for malformed in [
+            json.replace("\"path\":\"x\"", "\"path\":\"x\",\"path\":\"x\""),
+            json.replace(
+                "\"trie\":{\"path\":\"x\"}",
+                "\"trie\":{\"path\":\"x\"},\"trie\":{\"path\":\"x\"}",
+            ),
+        ] {
+            assert_eq!(
+                ParsedSearchRequest::parse_json(&malformed).unwrap_err()[0].code(),
+                "invalid_json"
+            );
+        }
+    }
+
     fn base_request() -> Value {
         json!({
             "protocol_version": 1,
@@ -1130,7 +1352,7 @@ mod tests {
                 "text": "AB",
                 "space": {"slots": []},
                 "passes": ["hill_climb"],
-                "measures": ["index_of_coincidence"]
+                "measures": ["ic"]
             }
         })
     }
@@ -1424,13 +1646,13 @@ mod tests {
         let mut bad = base_request();
         bad["job"]["resources"] = json!(5);
         let diagnostic = errors(&bad).remove(0);
-        assert_eq!(diagnostic.code(), "invalid_request");
+        assert_eq!(diagnostic.code(), "unsupported_resource");
         assert_eq!(diagnostic.location(), "/job/resources");
 
         let mut ok = base_request();
-        ok["job"]["resources"] = json!({"threads": 4});
+        ok["job"]["resources"] = json!({});
         let request = parse(&ok).unwrap();
-        assert!(request.resources().is_some());
+        assert!(request.resources().is_empty());
     }
 
     #[test]

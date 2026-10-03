@@ -385,7 +385,7 @@ mod tests {
                 "text": "ABCD",
                 "space": space,
                 "passes": ["hill_climb"],
-                "measures": ["index_of_coincidence"]
+                "measures": ["ic"]
             }
         })
     }
@@ -690,7 +690,7 @@ mod tests {
             Value::Array(configuration_slots),
             json!({"slots": space_slots}),
         );
-        value["job"]["text"] = json!(symbols[0].to_string());
+        value["job"]["text"] = json!(symbols[0].to_string().repeat(2));
 
         let request = parse(&value);
         assert_eq!(request.candidate_count(), None);

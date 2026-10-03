@@ -58,7 +58,9 @@ mod resource;
 
 pub use resource::{parse_dictionary_json, parse_ngram_json, ResourceDiagnostic};
 mod score;
+mod selection;
 mod space;
+pub use selection::{MeasureId, ResourceReference};
 mod strict_json;
 mod trie;
 
@@ -80,8 +82,8 @@ pub use engine::{Direction, Engine};
 pub use event::{encode, rfc3339_utc, DoneReason, Event};
 pub use request::{RequestDiagnostic, TransformRequest, MAX_REQUEST_BYTES};
 pub use space::{
-    PlugboardDomain, SearchConfiguration, SearchDiagnostic, SearchFixedSlot, SearchRequest,
-    SearchSlotDomain, SearchSpace,
+    ParsedSearchRequest, PlugboardDomain, SearchConfiguration, SearchDiagnostic, SearchFixedSlot,
+    SearchRequest, SearchSlotDomain, SearchSpace,
 };
 
 use std::collections::{BTreeSet, HashMap, HashSet};
