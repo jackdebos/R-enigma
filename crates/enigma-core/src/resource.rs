@@ -5,7 +5,9 @@ use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 
-const MAX_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum encoded UTF-8 text per scoring resource, shared with bounded callers.
+pub const MAX_RESOURCE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_BYTES: usize = MAX_RESOURCE_BYTES;
 const MAX_ENTRIES: usize = 250_000;
 const MAX_CONTAINER_DEPTH: usize = 64;
 

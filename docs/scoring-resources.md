@@ -8,9 +8,12 @@ also implemented in the core. Typed immutable weighted dictionaries (`TrieModel`
 and exact overlapping trie scoring are implemented. Strict standalone dictionary
 JSON parsing (`parse_dictionary_json`) returns a validated `TrieModel`.
 Typed measure/path selection and the structural `ParsedSearchRequest` gate are
-implemented: only resource-free conversion currently produces an enumerable
-`SearchRequest`. Supplied-content binding and CLI resource loading remain pending. Slice 10.1 froze this
-contract before those implementation slices; the formulas below remain normative.
+implemented. Pure supplied-content binding (`ParsedSearchRequest::bind_resources`)
+validates reference keys, budgets, and compatibility before producing an enumerable
+`SearchRequest` with retained typed scoring models (`bound_resource`). Resource-free
+conversion remains available; CLI resource loading is pending in slice 10.5c.
+Slice 10.1 froze this contract before those implementation slices; the formulas below
+remain normative.
 The current CLI cannot execute search, including structurally valid search requests.
 See [Engine Protocol](protocol.md) for the surrounding request and event contract.
 

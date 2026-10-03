@@ -226,6 +226,7 @@ impl SearchSpace {
 #[derive(Debug)]
 pub struct SearchRequest {
     parsed: ParsedSearchRequest,
+    bound_resources: Vec<(MeasureId, crate::BoundResource)>,
 }
 
 impl SearchRequest {
@@ -261,6 +262,14 @@ impl SearchRequest {
     pub fn resources(&self) -> &[ResourceReference] {
         self.parsed.resources()
     }
+    /// Retained scoring model for a resource-dependent measure, or `None` if unselected.
+    /// Resource-free measures never have a bound model.
+    pub fn bound_resource(&self, measure: MeasureId) -> Option<&crate::BoundResource> {
+        self.bound_resources
+            .iter()
+            .find(|(id, _)| *id == measure)
+            .map(|(_, model)| model)
+    }
     pub(crate) fn parsed(&self) -> &ParsedSearchRequest {
         &self.parsed
     }
@@ -285,6 +294,22 @@ pub struct ParsedSearchRequest {
 }
 
 impl ParsedSearchRequest {
+    /// Consumes this structural request and binds supplied UTF-8 text by exact measure ID.
+    ///
+    /// Contents are borrowed only during binding. Successful requests own the parsed
+    /// immutable scoring models, not the raw JSON; callers can drop the supplied text.
+    /// Paths are never opened. Missing/extra keys and all budgets fail before model parsing.
+    pub fn bind_resources(
+        self,
+        supplied: &std::collections::BTreeMap<String, &str>,
+    ) -> Result<SearchRequest, Vec<RequestDiagnostic>> {
+        let bound_resources = crate::binding::bind(&self, supplied)?;
+        Ok(SearchRequest {
+            parsed: self,
+            bound_resources,
+        })
+    }
+
     /// Converts only resource-free selections; paths alone never authorize enumeration.
     pub fn into_resource_free(self) -> Result<SearchRequest, Vec<RequestDiagnostic>> {
         if let Some(reference) = self.resources.first() {
@@ -295,7 +320,10 @@ impl ParsedSearchRequest {
             )
             .into()]);
         }
-        Ok(SearchRequest { parsed: self })
+        Ok(SearchRequest {
+            parsed: self,
+            bound_resources: Vec::new(),
+        })
     }
     /// Parses and fully validates a `kind: "search"` JSON request.
     ///

@@ -45,6 +45,7 @@
 /// Must match `docs/protocol.md` §10. A breaking change to the protocol bumps this.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+mod binding;
 mod candidate;
 mod capability;
 mod configuration;
@@ -56,7 +57,10 @@ mod ngram;
 mod request;
 mod resource;
 
-pub use resource::{parse_dictionary_json, parse_ngram_json, ResourceDiagnostic};
+pub use binding::{BoundResource, MAX_RESOURCE_REFERENCES, MAX_RESOURCE_TOTAL_BYTES};
+pub use resource::{
+    parse_dictionary_json, parse_ngram_json, ResourceDiagnostic, MAX_RESOURCE_BYTES,
+};
 mod score;
 mod selection;
 mod space;
