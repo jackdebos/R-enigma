@@ -4,8 +4,9 @@ Status: **Normative unpublished protocol v1 contract; implementation is partial.
 The core implements checked fixed-point arithmetic, monogram IC, and positive
 Shannon entropy with explicit ranking orientation. Typed sparse n-gram models and
 Sinkov scoring and strict standalone n-gram JSON parsing (`parse_ngram_json`) are
-also implemented in the core. Dictionary parsing, resource binding, and CLI
-resource loading remain unimplemented. Slice 10.1 froze this
+also implemented in the core. Typed immutable weighted dictionaries (`TrieModel`)
+and exact overlapping trie scoring are implemented. Dictionary JSON parsing,
+resource binding, and CLI resource loading remain unimplemented. Slice 10.1 froze this
 contract before those implementation slices; the formulas below remain normative.
 The current CLI cannot execute search, including structurally valid search requests.
 See [Engine Protocol](protocol.md) for the surrounding request and event contract.
