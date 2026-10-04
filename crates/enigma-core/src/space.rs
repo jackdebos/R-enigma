@@ -869,11 +869,84 @@ fn parse_search_job(
     parse_search_carrier(definition, job, PlugboardConstruction::LegacyPool)
 }
 
+// Temporarily unused outside tests until the private bound wrapper is integrated.
+// No carrier accessor or promotion API may escape this owner.
+#[allow(dead_code)]
+#[derive(Debug)]
+struct ParsedAttackRequest {
+    carrier: ParsedSearchRequest,
+    domain: AttackPlugboardDomain,
+    settings: AttackSettings,
+}
+
+#[allow(dead_code)]
+impl ParsedAttackRequest {
+    fn parse_json(json: &str) -> Result<Self, Vec<RequestDiagnostic>> {
+        let root = parse_root(json)?;
+        let parse = || {
+            let job = object(&root.job, "/job")?;
+            if required_string(job, "kind", "/job")? != "search" {
+                return Err(vec![SearchDiagnostic::new(
+                    "unsupported_job",
+                    "attack jobs must use kind `search`",
+                    "/job/kind",
+                )]);
+            }
+            exact_keys_with_optional(
+                job,
+                &[
+                    "kind",
+                    "configuration",
+                    "text",
+                    "space",
+                    "passes",
+                    "measures",
+                    "attack",
+                ],
+                &["resources"],
+                "/job",
+            )?;
+            let (carrier, (domain, settings)) = parse_carrier_with(
+                &root.definition,
+                job,
+                PlugboardConstruction::SlotOnly,
+                |configuration, passes, ids| {
+                    let space = object(required(job, "space", "/job")?, "/job/space")?;
+                    let domain = AttackPlugboardDomain::parse_value(
+                        root.definition.alphabet(),
+                        configuration.plugboard(),
+                        required(space, "plugboard", "/job/space")?,
+                    )?;
+                    let measures = parse_measures(ids)?;
+                    let settings = AttackSettings::parse_value(
+                        root.definition.alphabet(),
+                        &domain,
+                        passes,
+                        &measures,
+                        required(job, "attack", "/job")?,
+                    )?;
+                    Capabilities::stage1().check_passes(&root.definition, passes)?;
+                    Ok((measures, (domain, settings)))
+                },
+            )?;
+            Ok(Self {
+                carrier,
+                domain,
+                settings,
+            })
+        };
+        parse().map_err(|diagnostics: Vec<SearchDiagnostic>| {
+            diagnostics
+                .into_iter()
+                .map(RequestDiagnostic::from)
+                .collect()
+        })
+    }
+}
+
 #[derive(Clone, Copy)]
 enum PlugboardConstruction {
     LegacyPool,
-    // Reserved for private attack construction; there is no production caller yet.
-    #[allow(dead_code)]
     SlotOnly,
 }
 
@@ -885,6 +958,24 @@ fn parse_search_carrier(
     job: &Map<String, Value>,
     plugboard: PlugboardConstruction,
 ) -> Result<ParsedSearchRequest, Vec<SearchDiagnostic>> {
+    parse_carrier_with(definition, job, plugboard, |_, passes, ids| {
+        // Preserve legacy pass/topology precedence before concrete measures.
+        Capabilities::stage1().check_passes(definition, passes)?;
+        Ok((parse_measures(ids)?, ()))
+    })
+    .map(|(carrier, ())| carrier)
+}
+
+fn parse_carrier_with<T>(
+    definition: &Definition,
+    job: &Map<String, Value>,
+    plugboard: PlugboardConstruction,
+    validate: impl FnOnce(
+        &SearchConfiguration,
+        &[String],
+        &[String],
+    ) -> Result<(Vec<MeasureId>, T), Vec<SearchDiagnostic>>,
+) -> Result<(ParsedSearchRequest, T), Vec<SearchDiagnostic>> {
     let configuration = parse_configuration(definition, required(job, "configuration", "/job")?)?;
     let space = parse_space(definition, required(job, "space", "/job")?, plugboard)?;
     let text = required_string(job, "text", "/job")?;
@@ -911,9 +1002,7 @@ fn parse_search_carrier(
         )?;
     }
 
-    // Keep pass/topology precedence ahead of concrete measure/reference validation.
-    Capabilities::stage1().check_passes(definition, &passes)?;
-    let measures = parse_measures(&measures)?;
+    let (measures, extra) = validate(&configuration, &passes, &measures)?;
     let resources = parse_references(&measures, job.get("resources"))?;
     let samples = text.chars().count();
     if let Some(measure) = measures
@@ -944,7 +1033,7 @@ fn parse_search_carrier(
     if let Err(diagnostics) = Capabilities::stage1().preflight_parsed(&request) {
         return Err(diagnostics);
     }
-    Ok(request)
+    Ok((request, extra))
 }
 
 fn parse_configuration(
@@ -2822,6 +2911,502 @@ mod tests {
                 "measures": ["ic"]
             }
         })
+    }
+
+    fn attack_request() -> Value {
+        let mut value = base_request();
+        value["job"]["space"]["plugboard"] =
+            json!({"kind": "attack", "symbols": ["D", "C", "B", "A"], "max_pairs": 2});
+        value["job"]["attack"] = json!({
+            "kind": "hill_climb", "initial_measure": "ic", "final_measure": "ic",
+            "switch_pairs": 1, "backtrack_pairs": 0, "evaluation_budget": 9,
+            "start": [["D", "C"]]
+        });
+        value
+    }
+
+    #[test]
+    fn private_attack_owns_complete_hill_climb() {
+        let value = attack_request();
+        let raw = value.to_string();
+        let request = ParsedAttackRequest::parse_json(&raw).unwrap();
+        assert_eq!(request.domain.symbols(), ['D', 'C', 'B', 'A']);
+        assert_eq!(request.settings.start(), Some(&[('D', 'C')][..]));
+        assert_eq!(
+            request.carrier.text(),
+            value["job"]["text"].as_str().unwrap()
+        );
+        assert!(request.carrier.space().plugboard().is_none());
+        assert_eq!(raw, value.to_string());
+    }
+
+    fn attack_error(value: &Value) -> (String, String) {
+        let error = ParsedAttackRequest::parse_json(&value.to_string())
+            .unwrap_err()
+            .remove(0);
+        (error.code().to_owned(), error.location().to_owned())
+    }
+
+    #[test]
+    fn private_attack_seed_ownership_and_all_selected_measures() {
+        for policy in [
+            json!({"kind": "empty_single", "selection": "all"}),
+            json!({"kind": "empty_single", "selection": "touching", "symbols": ["C", "D"]}),
+        ] {
+            let mut value = attack_request();
+            value["job"]["passes"] = json!(["partial_exhaustion"]);
+            value["job"]["attack"]
+                .as_object_mut()
+                .unwrap()
+                .remove("start");
+            value["job"]["attack"]["kind"] = json!("partial_exhaustion");
+            value["job"]["attack"]["seeds"] = policy.clone();
+            value["job"]["configuration"]["plugboard"] = json!([["B", "A"]]);
+            value["job"]["configuration"]["slots"] = json!([
+                {"id": "fast", "wheel": "rotor2"},
+                {"id": "ukw", "position": "B", "ring": "C"}
+            ]);
+            value["job"]["space"] = json!({
+                "slots": [{"id": "fast", "positions": ["D", "B"], "rings": ["C", "A"]}],
+                "plugboard": {"kind": "attack", "symbols": ["D", "C"], "max_pairs": 2},
+                "offset": 7, "limit": 3
+            });
+            value["job"]["measures"] = json!(["ic", "trie"]);
+            value["job"]["resources"] = json!({"trie": {"path": "not-opened.json"}});
+            let original = value.clone();
+            let request = ParsedAttackRequest::parse_json(&value.to_string()).unwrap();
+            assert_eq!(value, original);
+            assert_eq!(request.domain.fixed_pairs(), [('B', 'A')]);
+            assert_eq!(request.domain.symbols(), ['D', 'C']);
+            assert_eq!(request.domain.max_pairs(), 2);
+            assert_eq!(request.carrier.configuration.slots()[0].id(), "fast");
+            assert_eq!(
+                request.carrier.space.slots()[0].positions().unwrap(),
+                ['D', 'B']
+            );
+            assert_eq!(
+                request.carrier.space.slots()[0].rings().unwrap(),
+                ['C', 'A']
+            );
+            assert_eq!(request.carrier.space.offset(), 7);
+            assert_eq!(request.carrier.space.limit(), Some(3));
+            assert_eq!(request.carrier.measures().len(), 2);
+            assert_eq!(request.carrier.resources()[0].path(), "not-opened.json");
+            let expected = if policy["selection"] == "all" {
+                AttackSeedPolicy::All
+            } else {
+                AttackSeedPolicy::Touching(vec!['C', 'D'])
+            };
+            assert_eq!(request.settings.seed_policy(), Some(&expected));
+            let raw = value.to_string();
+            assert!(ParsedSearchRequest::parse_json(&raw).is_err());
+            assert!(SearchRequest::parse_json(&raw).is_err());
+            assert!(crate::ParsedRequest::parse_json(&raw).is_err());
+            value["job"].as_object_mut().unwrap().remove("resources");
+            assert_eq!(
+                attack_error(&value),
+                (
+                    "unsupported_resource".into(),
+                    "/job/resources/trie/path".into()
+                )
+            );
+            value["job"]["measures"] = json!(["ic", "sinkov_hexagram"]);
+            value["job"]["resources"] = json!({"sinkov_hexagram": {"path": "six.json"}});
+            value["job"]["text"] = json!("AB");
+            assert_eq!(
+                attack_error(&value),
+                ("invalid_text".into(), "/job/text".into())
+            );
+        }
+    }
+
+    #[test]
+    fn private_attack_required_and_unknown_members() {
+        for (parent, keys, code) in [
+            (
+                "/job",
+                &[
+                    "kind",
+                    "configuration",
+                    "text",
+                    "space",
+                    "passes",
+                    "measures",
+                    "attack",
+                ][..],
+                "invalid_request",
+            ),
+            (
+                "/job/space/plugboard",
+                &["kind", "symbols", "max_pairs"][..],
+                "invalid_search_space",
+            ),
+            (
+                "/job/attack",
+                &[
+                    "kind",
+                    "initial_measure",
+                    "final_measure",
+                    "switch_pairs",
+                    "backtrack_pairs",
+                    "evaluation_budget",
+                    "start",
+                ][..],
+                "invalid_request",
+            ),
+        ] {
+            for key in keys {
+                let mut value = attack_request();
+                value
+                    .pointer_mut(parent)
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(*key);
+                assert_eq!(
+                    attack_error(&value),
+                    (code.into(), format!("{parent}/{key}"))
+                );
+            }
+        }
+        for parent in ["/job", "/job/space/plugboard", "/job/attack"] {
+            let mut value = attack_request();
+            value.pointer_mut(parent).unwrap()["bad~/key"] = json!(true);
+            assert_eq!(
+                attack_error(&value),
+                ("unknown_field".into(), format!("{parent}/bad~0~1key"))
+            );
+        }
+        let mut value = attack_request();
+        value["job"]["space"]
+            .as_object_mut()
+            .unwrap()
+            .remove("plugboard");
+        assert_eq!(
+            attack_error(&value),
+            ("invalid_request".into(), "/job/space/plugboard".into())
+        );
+    }
+
+    #[test]
+    fn private_attack_conflicts_and_structural_precedence() {
+        for (pointer, replacement, code, location) in [
+            (
+                "/job/attack/seeds",
+                json!({}),
+                "invalid_request",
+                "/job/attack/seeds",
+            ),
+            (
+                "/job/space/plugboard/candidates",
+                json!([]),
+                "unknown_field",
+                "/job/space/plugboard/candidates",
+            ),
+            (
+                "/job/space/plugboard/size",
+                json!(1),
+                "unknown_field",
+                "/job/space/plugboard/size",
+            ),
+            (
+                "/job/space/plugboard/symbols",
+                json!(["A", "A"]),
+                "invalid_search_space",
+                "/job/space/plugboard/symbols",
+            ),
+            (
+                "/job/attack/start",
+                json!([["A", "A"]]),
+                "invalid_search_space",
+                "/job/attack/start/0",
+            ),
+            (
+                "/job/passes",
+                json!(["hill_climb", "hill_climb"]),
+                "invalid_request",
+                "/job/passes/1",
+            ),
+            (
+                "/job/measures",
+                json!(["ic", "ic"]),
+                "invalid_request",
+                "/job/measures/1",
+            ),
+            (
+                "/job/passes",
+                json!(["partial_exhaustion"]),
+                "invalid_request",
+                "/job/attack/kind",
+            ),
+            (
+                "/job/passes",
+                json!(["hill_climb", "partial_exhaustion"]),
+                "invalid_request",
+                "/job/attack/kind",
+            ),
+            (
+                "/job/passes",
+                json!(["reswapping"]),
+                "invalid_request",
+                "/job/attack/kind",
+            ),
+            (
+                "/job/passes",
+                json!(["unknown"]),
+                "invalid_request",
+                "/job/attack/kind",
+            ),
+        ] {
+            let mut value = attack_request();
+            let (parent, key) = pointer.rsplit_once('/').unwrap();
+            value.pointer_mut(parent).unwrap()[key] = replacement;
+            assert_eq!(attack_error(&value), (code.into(), location.into()));
+        }
+        let mut value = attack_request();
+        value["job"]["passes"] = json!(["unknown"]);
+        value["job"]["resources"] = json!({"ic": {"path": "unused"}});
+        value["job"]["configuration"]["slots"] = json!([]);
+        assert_eq!(
+            attack_error(&value),
+            ("invalid_search_space".into(), "/job/space/slots".into())
+        );
+        value["job"]["configuration"] = attack_request()["job"]["configuration"].clone();
+        value["job"]["space"]["plugboard"]["max_pairs"] = json!(3);
+        assert_eq!(
+            attack_error(&value),
+            (
+                "invalid_search_space".into(),
+                "/job/space/plugboard/max_pairs".into()
+            )
+        );
+        value["job"]["space"] = attack_request()["job"]["space"].clone();
+        assert_eq!(
+            attack_error(&value),
+            ("invalid_request".into(), "/job/attack/kind".into())
+        );
+        value["job"]["measures"] = json!(["unknown"]);
+        assert_eq!(
+            attack_error(&value),
+            ("unsupported_measure".into(), "/job/measures/0".into())
+        );
+        value = attack_request();
+        value["job"]["resources"] = json!({"ic": {"path": "unused"}});
+        value["job"]["attack"]["evaluation_budget"] = json!(0);
+        assert_eq!(
+            attack_error(&value),
+            (
+                "invalid_request".into(),
+                "/job/attack/evaluation_budget".into()
+            )
+        );
+    }
+
+    #[test]
+    fn private_attack_strict_root_and_public_isolation() {
+        let raw = attack_request().to_string();
+        for needle in [
+            "\"protocol_version\":1",
+            "\"max_pairs\":2",
+            "\"evaluation_budget\":9",
+        ] {
+            let duplicate = raw.replace(needle, &format!("{needle},{needle}"));
+            let error = ParsedAttackRequest::parse_json(&duplicate)
+                .unwrap_err()
+                .remove(0);
+            assert_eq!((error.code(), error.location()), ("invalid_json", ""));
+        }
+        for malformed in [format!("{raw} true"), "[]".into(), "{".into()] {
+            let error = ParsedAttackRequest::parse_json(&malformed)
+                .unwrap_err()
+                .remove(0);
+            let expected = if malformed == "[]" {
+                "invalid_request"
+            } else {
+                "invalid_json"
+            };
+            assert_eq!((error.code(), error.location()), (expected, ""));
+        }
+        let oversized = format!("{raw}{}", " ".repeat(crate::MAX_REQUEST_BYTES));
+        let error = ParsedAttackRequest::parse_json(&oversized)
+            .unwrap_err()
+            .remove(0);
+        assert_eq!((error.code(), error.location()), ("resource_limit", ""));
+        for (pointer, replacement, code, location) in [
+            ("/machine", json!([]), "invalid_request", "/machine"),
+            (
+                "/protocol_version",
+                json!(2),
+                "unsupported_version",
+                "/protocol_version",
+            ),
+        ] {
+            let mut value = attack_request();
+            *value.pointer_mut(pointer).unwrap() = replacement;
+            value["job"] = json!(null);
+            assert_eq!(attack_error(&value), (code.into(), location.into()));
+        }
+        assert!(ParsedSearchRequest::parse_json(&raw).is_err());
+        assert!(SearchRequest::parse_json(&raw).is_err());
+        assert!(crate::ParsedRequest::parse_json(&raw).is_err());
+    }
+
+    #[test]
+    fn private_attack_complete_seed_diagnostics() {
+        let mut base = attack_request();
+        base["job"]["passes"] = json!(["partial_exhaustion"]);
+        base["job"]["attack"]
+            .as_object_mut()
+            .unwrap()
+            .remove("start");
+        base["job"]["attack"]["kind"] = json!("partial_exhaustion");
+        base["job"]["attack"]["seeds"] =
+            json!({"kind": "empty_single", "selection": "touching", "symbols": ["C", "D"]});
+        for key in ["seeds", "kind", "selection", "symbols"] {
+            let mut value = base.clone();
+            let parent = if key == "seeds" {
+                "/job/attack"
+            } else {
+                "/job/attack/seeds"
+            };
+            value
+                .pointer_mut(parent)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+            assert_eq!(
+                attack_error(&value),
+                ("invalid_request".into(), format!("{parent}/{key}"))
+            );
+        }
+        for (key, replacement, code, location) in [
+            (
+                "kind",
+                json!("other"),
+                "invalid_request",
+                "/job/attack/seeds/kind",
+            ),
+            (
+                "selection",
+                json!("other"),
+                "invalid_request",
+                "/job/attack/seeds/selection",
+            ),
+            (
+                "symbols",
+                json!(["C", "C"]),
+                "invalid_search_space",
+                "/job/attack/seeds/symbols/1",
+            ),
+            (
+                "bad~/key",
+                json!(true),
+                "unknown_field",
+                "/job/attack/seeds/bad~0~1key",
+            ),
+        ] {
+            let mut value = base.clone();
+            value["job"]["attack"]["seeds"][key] = replacement;
+            assert_eq!(attack_error(&value), (code.into(), location.into()));
+        }
+        let mut value = base.clone();
+        value["job"]["attack"]["start"] = json!([]);
+        assert_eq!(
+            attack_error(&value),
+            ("invalid_request".into(), "/job/attack/start".into())
+        );
+        value = base.clone();
+        value["job"]["attack"]["seeds"]["selection"] = json!("all");
+        assert_eq!(
+            attack_error(&value),
+            ("invalid_request".into(), "/job/attack/seeds/symbols".into())
+        );
+        let raw = base.to_string();
+        let needle = "\"selection\":\"touching\"";
+        let duplicate = raw.replace(needle, &format!("{needle},{needle}"));
+        let error = ParsedAttackRequest::parse_json(&duplicate)
+            .unwrap_err()
+            .remove(0);
+        assert_eq!((error.code(), error.location()), ("invalid_json", ""));
+    }
+
+    #[test]
+    fn private_attack_root_definition_and_exact_raw_ceiling() {
+        let raw = attack_request().to_string();
+        let at_limit = format!("{raw}{}", " ".repeat(crate::MAX_REQUEST_BYTES - raw.len()));
+        assert_eq!(at_limit.len(), crate::MAX_REQUEST_BYTES);
+        assert!(ParsedAttackRequest::parse_json(&at_limit).is_ok());
+        let error = ParsedAttackRequest::parse_json(&format!("{at_limit} "))
+            .unwrap_err()
+            .remove(0);
+        assert_eq!((error.code(), error.location()), ("resource_limit", ""));
+        for (parent, key) in [
+            ("", "protocol_version"),
+            ("", "machine"),
+            ("", "job"),
+            ("/machine", "definition"),
+        ] {
+            let mut value = attack_request();
+            value
+                .pointer_mut(parent)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+            assert_eq!(
+                attack_error(&value),
+                ("invalid_request".into(), format!("{parent}/{key}"))
+            );
+        }
+        for parent in ["", "/machine"] {
+            let mut value = attack_request();
+            value.pointer_mut(parent).unwrap()["bad~/key"] = json!(true);
+            assert_eq!(
+                attack_error(&value),
+                ("unknown_field".into(), format!("{parent}/bad~0~1key"))
+            );
+        }
+        for replacement in [json!(null), json!([]), json!({})] {
+            let mut value = attack_request();
+            value["job"] = replacement;
+            assert_eq!(
+                attack_error(&value),
+                (
+                    "invalid_request".into(),
+                    if value["job"].is_object() {
+                        "/job/kind"
+                    } else {
+                        "/job"
+                    }
+                    .into()
+                )
+            );
+        }
+        let mut value = attack_request();
+        value["machine"]["definition"] = json!({"kind": "bundled", "id": "not-bundled"});
+        value["job"] = json!(null);
+        let legacy = ParsedSearchRequest::parse_json(&value.to_string()).unwrap_err();
+        let attack = ParsedAttackRequest::parse_json(&value.to_string()).unwrap_err();
+        assert_eq!(attack, legacy);
+        assert!(!attack[0].location().starts_with("/job"));
+        value["machine"]["definition"] = json!({"kind": "custom", "value": {}});
+        assert_eq!(
+            ParsedAttackRequest::parse_json(&value.to_string()).unwrap_err(),
+            ParsedSearchRequest::parse_json(&value.to_string()).unwrap_err()
+        );
+        value = attack_request();
+        value["protocol_version"] = json!("1");
+        assert_eq!(
+            attack_error(&value),
+            ("invalid_request".into(), "/protocol_version".into())
+        );
+        value = attack_request();
+        value["job"]["kind"] = json!("attack");
+        assert_eq!(
+            attack_error(&value),
+            ("unsupported_job".into(), "/job/kind".into())
+        );
     }
 
     fn carrier(

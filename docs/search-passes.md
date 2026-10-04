@@ -1,6 +1,6 @@
 # Plugboard attack contract — Task 11
 
-Status: **Normative planned contract; complete attack requests remain unsupported.**
+Status: **Normative contract; public complete attack requests remain unsupported.**
 Task 11.2a provides only `AttackPlugboardDomain::parse_json`: strict typed fragment
 validation with immutable known fixed pairs. It is separate from legacy search
 spaces and grants neither complete request acceptance nor candidate enumeration.
@@ -11,7 +11,9 @@ seed policies. Task 11.2c adds `AttackGate::check` over a borrowed resource-boun
 `SearchRequest` and explicit typed domain/settings. It rechecks compatibility and
 returns privately constructed full/sliced outer and per-outer start counts, not an
 executable request or evaluation reservation. Counts do not truncate to the budget.
-Seed generation, complete attack requests and runtime attacks remain unsupported.
+Task 11.2d.4 adds complete internal private parsing that owns the slot carrier,
+domain and settings. Public acceptance, attack binding, seed generation and runtime
+attacks remain unsupported; the private owner exposes no carrier promotion API.
 
 For this settings fragment, malformed raw JSON (including duplicate keys, trailing
 input and nonobjects), missing fields and invalid kind/objectives/budget use
@@ -272,7 +274,8 @@ Runtime scoring/invariant errors fail explicitly, not as a termination or sentin
 
 These are **valid planned search-job fragments**, completed by protocol root
 `protocol_version: 1` and bundled `machine.definition` for `enigma-i`. They are
-not accepted attack requests by today's parser and are not known-answer vectors.
+not publicly accepted attack requests and are not known-answer vectors. Internal
+private parsing validates them without granting binding or execution.
 
 ```json
 {
