@@ -389,14 +389,31 @@ impl AttackSettings {
         deserializer
             .end()
             .map_err(|error| vec![invalid(format!("invalid JSON: {error}"), PATH)])?;
+        Self::parse_value(
+            alphabet,
+            domain,
+            declared_passes,
+            declared_measures,
+            &parsed.into_value(),
+        )
+    }
+
+    // Shared validation for an already strictly parsed settings value.
+    fn parse_value(
+        alphabet: &Alphabet,
+        domain: &AttackPlugboardDomain,
+        declared_passes: &[String],
+        declared_measures: &[MeasureId],
+        value: &Value,
+    ) -> Result<Self, Vec<SearchDiagnostic>> {
+        const PATH: &str = "/job/attack";
         if domain.alphabet != alphabet.symbols {
             return Err(vec![invalid(
                 "domain belongs to a different ordered alphabet",
                 PATH,
             )]);
         }
-        let value = parsed.into_value();
-        let settings = object(&value, PATH)?;
+        let settings = object(value, PATH)?;
         // Check unknown members before required/type checks, including deferred kinds.
         allow_keys(
             settings,
@@ -1715,6 +1732,139 @@ mod tests {
             "final_measure":"entropy", "switch_pairs":3, "backtrack_pairs":0,
             "evaluation_budget":1, "start":[["🦀","é"]]});
         (alphabet, domain, value)
+    }
+
+    #[test]
+    fn settings_value_entry_valid_initializations() {
+        let (alphabet, domain, value) = settings_fixture();
+        let settings = AttackSettings::parse_value(
+            &alphabet,
+            &domain,
+            &["hill_climb".to_owned()],
+            &[MeasureId::Ic, MeasureId::Entropy],
+            &value,
+        )
+        .unwrap();
+        assert_eq!(settings.kind(), AttackKind::HillClimb);
+        assert_eq!(settings.start(), Some(&[('🦀', 'é')][..]));
+        assert_eq!(settings.seed_policy(), None);
+        assert_eq!(settings.initial_measure(), MeasureId::Ic);
+        assert_eq!(settings.final_measure(), MeasureId::Entropy);
+        assert_eq!(settings.switch_pairs(), 3);
+        assert_eq!(settings.backtrack_pairs(), 0);
+        assert_eq!(settings.evaluation_budget(), 1);
+
+        let (alphabet, domain, mut value) = seed_fixture();
+        for (policy, expected) in [
+            (
+                json!({"kind":"empty_single","selection":"all"}),
+                AttackSeedPolicy::All,
+            ),
+            (
+                json!({"kind":"empty_single","selection":"touching","symbols":["🦀","é"]}),
+                AttackSeedPolicy::Touching(vec!['🦀', 'é']),
+            ),
+        ] {
+            value["seeds"] = policy;
+            let settings = AttackSettings::parse_value(
+                &alphabet,
+                &domain,
+                &["partial_exhaustion".to_owned()],
+                &[MeasureId::Ic, MeasureId::Entropy],
+                &value,
+            )
+            .unwrap();
+            assert_eq!(settings.kind(), AttackKind::PartialExhaustion);
+            assert_eq!(settings.start(), None);
+            assert_eq!(settings.seed_policy(), Some(&expected));
+        }
+    }
+
+    #[test]
+    fn settings_value_diagnostics_match_fragment() {
+        let (alphabet, domain, hill) = settings_fixture();
+        let (_, _, seed) = seed_fixture();
+        let mut cases = Vec::new();
+        for (base, key, replacement, code, suffix) in [
+            (&hill, "seeds", json!({}), "invalid_request", "/seeds"),
+            (&seed, "start", json!([]), "invalid_request", "/start"),
+            (
+                &hill,
+                "initial_measure",
+                json!("trie"),
+                "invalid_request",
+                "/initial_measure",
+            ),
+            (
+                &seed,
+                "final_measure",
+                json!("trie"),
+                "invalid_request",
+                "/final_measure",
+            ),
+            (&hill, "a~/b", json!(0), "unknown_field", "/a~0~1b"),
+            (
+                &hill,
+                "start",
+                json!([["🦀", "Z"]]),
+                "invalid_search_space",
+                "/start/0",
+            ),
+            (
+                &seed,
+                "seeds",
+                json!({"kind":"empty_single","selection":"touching","symbols":["🦀","Z"]}),
+                "invalid_search_space",
+                "/seeds/symbols/1",
+            ),
+        ] {
+            let mut value = base.clone();
+            value[key] = replacement;
+            let pass = base["kind"].as_str().unwrap().to_owned();
+            cases.push((value, pass, code, suffix));
+        }
+        cases.push((
+            hill.clone(),
+            "partial_exhaustion".to_owned(),
+            "invalid_request",
+            "/kind",
+        ));
+        cases.push((seed, "hill_climb".to_owned(), "invalid_request", "/kind"));
+        for (value, pass, code, suffix) in cases {
+            let passes = [pass];
+            let measures = [MeasureId::Ic, MeasureId::Entropy];
+            let errors =
+                AttackSettings::parse_value(&alphabet, &domain, &passes, &measures, &value)
+                    .unwrap_err();
+            assert_eq!(errors[0].code(), code, "{value}");
+            assert_eq!(
+                errors[0].location(),
+                format!("/job/attack{suffix}"),
+                "{value}"
+            );
+            assert_eq!(
+                errors,
+                AttackSettings::parse_json(
+                    &alphabet,
+                    &domain,
+                    &passes,
+                    &measures,
+                    &value.to_string(),
+                )
+                .unwrap_err(),
+                "{value}"
+            );
+        }
+        // Ordered-alphabet identity precedes even settings object validation.
+        let other = Alphabet::new(vec!['B', 'A', 'é', '🦀', 'C', 'D']).unwrap();
+        let errors =
+            AttackSettings::parse_value(&other, &domain, &[], &[], &Value::Null).unwrap_err();
+        assert_eq!(errors[0].code(), "invalid_request");
+        assert_eq!(errors[0].location(), "/job/attack");
+        assert_eq!(
+            errors,
+            AttackSettings::parse_json(&other, &domain, &[], &[], "null").unwrap_err()
+        );
     }
 
     fn settings_error(value: &Value, code: &str, suffix: &str) {
