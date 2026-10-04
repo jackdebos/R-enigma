@@ -866,8 +866,27 @@ fn parse_search_job(
         "/job",
     )?;
 
+    parse_search_carrier(definition, job, PlugboardConstruction::LegacyPool)
+}
+
+#[derive(Clone, Copy)]
+enum PlugboardConstruction {
+    LegacyPool,
+    // Reserved for private attack construction; there is no production caller yet.
+    #[allow(dead_code)]
+    SlotOnly,
+}
+
+/// Constructs only shared carrier facts, not a complete attack request. The caller
+/// owns the job boundary and any attack-domain/settings validation. SlotOnly must
+/// remain private and unreachable from public legacy candidate enumeration.
+fn parse_search_carrier(
+    definition: &Definition,
+    job: &Map<String, Value>,
+    plugboard: PlugboardConstruction,
+) -> Result<ParsedSearchRequest, Vec<SearchDiagnostic>> {
     let configuration = parse_configuration(definition, required(job, "configuration", "/job")?)?;
-    let space = parse_space(definition, required(job, "space", "/job")?)?;
+    let space = parse_space(definition, required(job, "space", "/job")?, plugboard)?;
     let text = required_string(job, "text", "/job")?;
     let passes = parse_identifier_array(job, "passes", "/job")?;
     let measures = parse_identifier_array(job, "measures", "/job")?;
@@ -1017,6 +1036,7 @@ fn parse_configuration(
 fn parse_space(
     definition: &Definition,
     value: &Value,
+    plugboard: PlugboardConstruction,
 ) -> Result<SearchSpace, Vec<SearchDiagnostic>> {
     let path = "/job/space";
     let space = object(value, path)?;
@@ -1038,13 +1058,16 @@ fn parse_space(
         }
     }
 
-    let plugboard = match space.get("plugboard") {
-        Some(value) => Some(parse_plugboard_domain(
-            definition.alphabet(),
-            value,
-            &child(path, "plugboard"),
-        )?),
-        None => None,
+    let plugboard = match plugboard {
+        PlugboardConstruction::LegacyPool => match space.get("plugboard") {
+            Some(value) => Some(parse_plugboard_domain(
+                definition.alphabet(),
+                value,
+                &child(path, "plugboard"),
+            )?),
+            None => None,
+        },
+        PlugboardConstruction::SlotOnly => None,
     };
 
     let offset = match space.get("offset") {
@@ -2799,6 +2822,203 @@ mod tests {
                 "measures": ["ic"]
             }
         })
+    }
+
+    fn carrier(
+        value: &Value,
+        branch: PlugboardConstruction,
+    ) -> Result<ParsedSearchRequest, Vec<SearchDiagnostic>> {
+        let definition = parse(&base_request()).unwrap().definition().clone();
+        parse_search_carrier(&definition, value["job"].as_object().unwrap(), branch)
+    }
+
+    #[test]
+    fn slot_only_retains_ordered_facts_without_consuming_attack_data() {
+        let mut value = base_request();
+        value["job"]["configuration"]["slots"] = json!([
+            {"id": "fast", "wheel": "rotor2"},
+            {"id": "ukw", "position": "B", "ring": "C"}
+        ]);
+        value["job"]["configuration"]["plugboard"] = json!([["D", "C"], ["B", "A"]]);
+        value["job"]["space"] = json!({
+            "slots": [{"id": "fast", "positions": ["D", "B"], "rings": ["C", "A"]}],
+            "plugboard": {"kind": "attack", "deliberately_unvalidated": true},
+            "offset": 7,
+            "limit": 3
+        });
+        value["job"]["attack"] = json!({"also_unvalidated": true});
+        value["job"]["measures"] = json!(["trie"]);
+        value["job"]["resources"] = json!({"trie": {"path": "model.json"}});
+        let original = value.clone();
+        let request = carrier(&value, PlugboardConstruction::SlotOnly).unwrap();
+        assert_eq!(value, original);
+        assert_eq!(request.configuration.slots()[0].id(), "fast");
+        assert_eq!(request.configuration.slots()[0].wheel(), Some("rotor2"));
+        assert_eq!(request.configuration.slots()[1].position(), Some('B'));
+        assert_eq!(request.configuration.plugboard(), [('D', 'C'), ('B', 'A')]);
+        assert_eq!(request.space.slots()[0].positions().unwrap(), ['D', 'B']);
+        assert_eq!(request.space.slots()[0].rings().unwrap(), ['C', 'A']);
+        assert_eq!(request.space.offset(), 7);
+        assert_eq!(request.space.limit(), Some(3));
+        assert!(request.space.plugboard().is_none());
+        assert_eq!(request.resources()[0].path(), "model.json");
+        assert_eq!(errors(&value)[0].code(), "unknown_field");
+    }
+
+    #[test]
+    fn slot_only_coverage_and_structural_errors_are_pinned() {
+        for (configuration, domains, message, location) in [
+            (
+                json!([{"id": "ukw", "ring": "A"}]),
+                json!([]),
+                "slot \"ukw\" position is neither fixed in configuration nor declared in space.slots; add exactly one path",
+                "/job/space/slots",
+            ),
+            (
+                json!([{"id": "ukw", "position": "A"}]),
+                json!([]),
+                "slot \"ukw\" ring is neither fixed in configuration nor declared in space.slots; add exactly one path",
+                "/job/space/slots",
+            ),
+            (
+                json!([{"id": "ukw", "position": "A", "ring": "A"}, {"id": "fast", "position": "A", "ring": "A"}]),
+                json!([]),
+                "slot \"fast\" wheels is neither fixed in configuration nor declared in space.slots; add exactly one path",
+                "/job/space/slots",
+            ),
+            (
+                base_request()["job"]["configuration"]["slots"].clone(),
+                json!([{"id": "ukw", "positions": ["B"]}]),
+                "slot \"ukw\" position is covered twice: fixed in configuration and declared in space.slots; keep exactly one path",
+                "/job/space/slots/0/positions",
+            ),
+        ] {
+            let mut value = base_request();
+            value["job"]["configuration"]["slots"] = configuration;
+            value["job"]["space"]["slots"] = domains;
+            let error = carrier(&value, PlugboardConstruction::SlotOnly).unwrap_err().remove(0);
+            assert_eq!((error.code(), error.message(), error.location()), ("invalid_search_space", message, location));
+        }
+        let mut value = base_request();
+        value["job"]["space"]["slots"] = json!([{"id": "ukw", "wheels": ["reflector"]}]);
+        let error = carrier(&value, PlugboardConstruction::SlotOnly)
+            .unwrap_err()
+            .remove(0);
+        assert_eq!(error.code(), "invalid_search_space");
+        assert_eq!(error.location(), "/job/space/slots/0/wheels");
+        assert_eq!(error.message(), "slot \"ukw\" has a structurally fixed wheel; space.slots must not declare `wheels` for it");
+    }
+
+    #[test]
+    fn carrier_branches_preserve_shared_diagnostic_precedence() {
+        for (member, replacement, code, location) in [
+            ("text", json!("AZ"), "invalid_text", "/job/text"),
+            ("passes", json!([]), "invalid_request", "/job/passes"),
+            (
+                "passes",
+                json!(["not_a_pass"]),
+                "unsupported_pass",
+                "/job/passes/0",
+            ),
+            (
+                "measures",
+                json!(["not_a_measure"]),
+                "unsupported_measure",
+                "/job/measures/0",
+            ),
+            (
+                "measures",
+                json!(["trie"]),
+                "unsupported_resource",
+                "/job/resources/trie/path",
+            ),
+            ("text", json!("A"), "invalid_text", "/job/text"),
+        ] {
+            let mut value = base_request();
+            value["job"][member] = replacement;
+            let legacy = carrier(&value, PlugboardConstruction::LegacyPool).unwrap_err();
+            let slot_only = carrier(&value, PlugboardConstruction::SlotOnly).unwrap_err();
+            assert_eq!(legacy, slot_only);
+            assert_eq!(
+                (slot_only[0].code(), slot_only[0].location()),
+                (code, location)
+            );
+        }
+        let mut value = base_request();
+        value["job"]["text"] = json!("Z");
+        value["job"]["passes"] = json!([]);
+        let error = carrier(&value, PlugboardConstruction::SlotOnly)
+            .unwrap_err()
+            .remove(0);
+        assert_eq!(
+            (error.code(), error.location()),
+            ("invalid_request", "/job/passes")
+        );
+    }
+
+    #[test]
+    fn slot_only_preserves_wheel_order_and_unicode_scalar_minima() {
+        let mut value = base_request();
+        value["job"]["configuration"]["slots"] = json!([
+            {"id": "ukw", "position": "A", "ring": "A"},
+            {"id": "fast", "position": "B", "ring": "A"}
+        ]);
+        value["job"]["space"]["slots"] = json!([{"id": "fast", "wheels": ["rotor2", "rotor1"]}]);
+        let request = carrier(&value, PlugboardConstruction::SlotOnly).unwrap();
+        assert_eq!(
+            request.space.slots()[0].wheels().unwrap(),
+            ["rotor2", "rotor1"]
+        );
+
+        let mut unicode: Value =
+            serde_json::from_str(&base_request().to_string().replace("\"A\"", "\"é\"")).unwrap();
+        unicode["job"]["text"] = json!("éB");
+        let definition = parse(&unicode).unwrap().definition().clone();
+        let mut job = unicode["job"].as_object().unwrap().clone();
+        for branch in [
+            PlugboardConstruction::LegacyPool,
+            PlugboardConstruction::SlotOnly,
+        ] {
+            job.insert("text".to_owned(), json!("é"));
+            let error = parse_search_carrier(&definition, &job, branch)
+                .unwrap_err()
+                .remove(0);
+            assert_eq!(
+                (error.code(), error.location()),
+                ("invalid_text", "/job/text")
+            );
+            assert_eq!(error.message(), "ic requires at least 2 Unicode scalars");
+            job.insert("text".to_owned(), json!("éé"));
+            assert!(parse_search_carrier(&definition, &job, branch).is_ok());
+        }
+    }
+
+    #[test]
+    fn legacy_carrier_keeps_pool_order_size_and_overlap_diagnostics() {
+        let mut value = base_request();
+        value["job"]["space"]["plugboard"] =
+            json!({"candidates": [["D", "C"], ["B", "A"]], "size": 2});
+        let request = carrier(&value, PlugboardConstruction::LegacyPool).unwrap();
+        let pool = request.space.plugboard().unwrap();
+        assert_eq!(pool.candidates(), [('D', 'C'), ('B', 'A')]);
+        assert_eq!(pool.size(), 2);
+        value["job"]["configuration"]["plugboard"] = json!([["A", "B"]]);
+        let error = carrier(&value, PlugboardConstruction::LegacyPool)
+            .unwrap_err()
+            .remove(0);
+        assert_eq!(error.code(), "invalid_search_space");
+        assert_eq!(error.location(), "/job/space/plugboard/candidates/1");
+        assert_eq!(error.message(), "space.plugboard candidate pair shares a symbol with a known fixed configuration pair; fixed and searched pairs must be disjoint");
+        assert!(carrier(&value, PlugboardConstruction::SlotOnly).is_ok());
+        value["job"]["space"]["plugboard"]["size"] = json!(0);
+        let error = carrier(&value, PlugboardConstruction::LegacyPool)
+            .unwrap_err()
+            .remove(0);
+        assert_eq!(error.code(), "invalid_request");
+        assert_eq!(error.location(), "/job/space/plugboard/size");
+        assert_eq!(error.message(), "size must be a positive integer");
+        value["job"]["configuration"]["plugboard"] = json!([["A", "A"]]);
+        assert!(carrier(&value, PlugboardConstruction::SlotOnly).is_err());
     }
 
     fn parse(value: &Value) -> Result<SearchRequest, Vec<RequestDiagnostic>> {
