@@ -11,7 +11,9 @@ Typed measure/path selection and the structural `ParsedSearchRequest` gate are
 implemented. Pure supplied-content binding (`ParsedSearchRequest::bind_resources`)
 validates reference keys, budgets, and compatibility before producing an enumerable
 `SearchRequest` with retained typed scoring models (`bound_resource`). Resource-free
-conversion remains available; CLI resource loading is pending in slice 10.5c.
+conversion remains available. The CLI uses shared strict `ParsedRequest` dispatch,
+loads bounded external resources, and binds search contents before rejecting search
+execution with `unsupported_job`.
 Slice 10.1 froze this contract before those implementation slices; the formulas below
 remain normative.
 The current CLI cannot execute search, including structurally valid search requests.
@@ -171,7 +173,19 @@ filesystem symlink behavior is not a sandbox. User-selected files may be anywher
 the caller can read; no repository confinement is imposed.
 
 The caller/CLI performs bounded reads and UTF-8 validation before `started`.
-Unreadable files and invalid UTF-8 are pre-start errors. Retain loaded contents once
+External resources must be regular files. Open/read/non-file and invalid UTF-8
+failures use `unsupported_resource`; byte/reference bounds use `resource_limit`.
+References are loaded in deterministic reference-ID order, not measure-array or
+filename order; the first observed loading failure wins. Identical paths are not
+deduplicated: their bytes count independently per reference.
+
+Each resource read permits at most the lesser of the 16 MiB per-reference bound
+and the remaining 64 MiB aggregate allowance, plus one detection byte. The loader
+stops immediately when that byte proves excess, without another read. A read failure
+observed before that proof remains an I/O failure. The 16-reference guard runs before
+opening an excess reference. The pure core independently rechecks keys, all byte
+budgets, resource kind, n-gram order and ordered alphabet before model binding.
+Retain loaded contents once
 for binding and scoring, rather than rereading files for each candidate. A path is
 not itself validated resource content.
 
@@ -192,11 +206,11 @@ supplied text and never perform filesystem I/O.
 
 Shared strict job dispatch must distinguish transform and search without weakening
 duplicate-key detection or interpreting invalid search JSON as a transform. Transform
-never loads scoring resources. After the loader integration slice, the CLI validates
-and binds search resources, then emits exactly one `unsupported_job` error: no
-`started`, `output`, `done`, or candidate enumeration. Resource validation errors
-precede that unsupported-search result. This is a future integration requirement,
-not a claim that the current CLI already loads resources or runs search.
+never loads scoring resources. The CLI now validates and binds search resources,
+then emits exactly one `unsupported_job` error at `/job/kind`, sequence 1, with a
+failure exit: no `started`, `output`, `progress`, `done`, candidate enumeration or
+other work events. Resource validation errors precede that unsupported-search result.
+This validation path does not implement search execution.
 
 ## 4. Score representation and reproducible logarithms
 
@@ -317,7 +331,7 @@ Pointer location. Reference/read failures point to `/job/resources/<measure>/pat
 resource errors identify the measure, selected file, and resource-relative pointer
 (such as `/entries/0/count`) in their diagnostic context. The standalone n-gram and dictionary
 parsers expose `ResourceDiagnostic` code, message, and resource-relative location;
-file and measure context must be attached by a future caller. It rejects text over
+file and measure context is attached by the binder and CLI loader. Each parser rejects text over
 16 MiB before decoding and entries beyond 250,000 before decoding the excess
 entry. Other local collections are capped at 256 elements or members, with the
 standard JSON decoder recursion guard retained. Both standalone parsers

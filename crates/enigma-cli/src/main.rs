@@ -6,17 +6,31 @@
 //! test harness without divergence. Parsing, validation and computation live in
 //! `enigma-core`; this module only moves bytes and emits protocol events.
 
+mod resource_loader;
+
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use enigma_core::{encode, rfc3339_utc, DoneReason, Event, TransformRequest, MAX_REQUEST_BYTES};
+use enigma_core::{
+    encode, rfc3339_utc, DoneReason, Event, ParsedRequest, ParsedSearchRequest, TransformRequest,
+    MAX_REQUEST_BYTES,
+};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match resolve_input(&args) {
-        Ok(bytes) => run(bytes),
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            eprintln!("error: failed to capture current directory: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    match resolve_input(&args, &cwd) {
+        Ok((bytes, origin)) => run(bytes, &origin),
         Err(InputError::Usage) => {
             print_usage();
             ExitCode::from(2)
@@ -52,19 +66,21 @@ enum InputError {
 /// Accepted: no argument is a usage error; one positional non-flag argument is a file
 /// path; `--request -` reads stdin; `--request <path>` reads that file. Anything else
 /// is a usage error.
-fn resolve_input(args: &[String]) -> Result<Vec<u8>, InputError> {
-    match args {
-        [] => Err(InputError::Usage),
-        [path] if !path.starts_with("--") => read_file(path),
+fn resolve_input(args: &[String], cwd: &Path) -> Result<(Vec<u8>, PathBuf), InputError> {
+    let path = match args {
+        [path] if !path.starts_with("--") => path,
         [flag, value] if flag == "--request" => {
             if value == "-" {
-                read_stdin()
-            } else {
-                read_file(value)
+                return read_stdin().map(|bytes| (bytes, cwd.to_owned()));
             }
+            value
         }
-        _ => Err(InputError::Usage),
-    }
+        _ => return Err(InputError::Usage),
+    };
+    // Lexical filename origin, deliberately not the canonical symlink target.
+    let filename = cwd.join(path);
+    let origin = filename.parent().unwrap_or(cwd).to_owned();
+    read_file(&filename, path).map(|bytes| (bytes, origin))
 }
 
 fn read_stdin() -> Result<Vec<u8>, InputError> {
@@ -73,8 +89,8 @@ fn read_stdin() -> Result<Vec<u8>, InputError> {
     read_bounded(&mut lock, "stdin")
 }
 
-fn read_file(path: &str) -> Result<Vec<u8>, InputError> {
-    let file = fs::File::open(path)
+fn read_file(filename: &Path, path: &str) -> Result<Vec<u8>, InputError> {
+    let file = fs::File::open(filename)
         .map_err(|error| InputError::Io(format!("failed to open {path:?}: {error}")))?;
     read_bounded(file, path)
 }
@@ -109,7 +125,7 @@ fn print_usage() {
 }
 
 /// Decodes input as UTF-8, parses and validates the request, and runs the transport.
-fn run(bytes: Vec<u8>) -> ExitCode {
+fn run(bytes: Vec<u8>, origin: &Path) -> ExitCode {
     let json = match String::from_utf8(bytes) {
         Ok(json) => json,
         Err(error) => {
@@ -122,8 +138,9 @@ fn run(bytes: Vec<u8>) -> ExitCode {
         }
     };
 
-    match TransformRequest::parse_json(&json) {
-        Ok(request) => run_transform(request),
+    match ParsedRequest::parse_json(&json) {
+        Ok(ParsedRequest::Transform(request)) => run_transform(request),
+        Ok(ParsedRequest::Search(request)) => run_search(request, origin),
         Err(diagnostics) => {
             // Pre-validation failure: exactly one `error` at seq 1, no `started`.
             let first = &diagnostics[0];
@@ -138,6 +155,41 @@ fn run(bytes: Vec<u8>) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Load owned UTF-8 once, then borrow it into the pure core binding boundary.
+/// Successful binding is not execution: never enumerate candidates or emit work.
+fn run_search(request: ParsedSearchRequest, origin: &Path) -> ExitCode {
+    let contents = match resource_loader::load(&request, origin) {
+        Ok(contents) => contents,
+        Err(error) => return search_error(error.code, &error.message, &error.location),
+    };
+    let supplied: BTreeMap<String, &str> = contents
+        .iter()
+        .map(|(id, text)| (id.clone(), text.as_str()))
+        .collect();
+    match request.bind_resources(&supplied) {
+        Ok(_validated) => search_error(
+            "unsupported_job",
+            "search execution is not implemented",
+            "/job/kind",
+        ),
+        Err(diagnostics) => {
+            let first = &diagnostics[0];
+            for diagnostic in &diagnostics {
+                eprintln!("{diagnostic}");
+            }
+            search_error(first.code(), first.message(), first.location())
+        }
+    }
+}
+
+fn search_error(code: &str, message: &str, location: &str) -> ExitCode {
+    if let Err(error) = emit_error_line(code, message, location, 1) {
+        eprintln!("error: failed to write protocol event: {error}");
+    }
+    eprintln!("{code}: {message}");
+    ExitCode::FAILURE
 }
 
 /// Emits the successful lifecycle: `started`, one `output`, then terminal `done`.
