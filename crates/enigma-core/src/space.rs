@@ -297,6 +297,10 @@ impl AttackPlugboardDomain {
         })
     }
 
+    pub(crate) fn matches_alphabet(&self, alphabet: &Alphabet) -> bool {
+        self.alphabet == alphabet.symbols
+    }
+
     /// Mutable endpoints in source order; never includes a known fixed endpoint.
     pub fn symbols(&self) -> &[char] {
         &self.symbols

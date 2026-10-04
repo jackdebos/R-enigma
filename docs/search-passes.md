@@ -7,8 +7,11 @@ spaces and grants neither complete request acceptance nor candidate enumeration.
 Task 11.2b adds isolated `AttackSettings::parse_json` validation for common
 settings, exact declared objectives and direct hill-climb starts, bound to the
 domain's ordered alphabet, plus typed partial-exhaustion `empty_single` all/touching
-seed policies. Seed generation and ordering are not implemented. Complete requests,
-executable eligibility/counts and runtime attacks remain unsupported.
+seed policies. Task 11.2c adds `AttackGate::check` over a borrowed resource-bound
+`SearchRequest` and explicit typed domain/settings. It rechecks compatibility and
+returns privately constructed full/sliced outer and per-outer start counts, not an
+executable request or evaluation reservation. Counts do not truncate to the budget.
+Seed generation, complete attack requests and runtime attacks remain unsupported.
 
 For this settings fragment, malformed raw JSON (including duplicate keys, trailing
 input and nonobjects), missing fields and invalid kind/objectives/budget use

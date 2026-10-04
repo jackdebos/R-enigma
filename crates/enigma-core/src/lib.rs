@@ -45,6 +45,8 @@
 /// Must match `docs/protocol.md` §10. A breaking change to the protocol bumps this.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+mod attack_gate;
+pub use attack_gate::AttackGate;
 mod binding;
 mod candidate;
 mod capability;
