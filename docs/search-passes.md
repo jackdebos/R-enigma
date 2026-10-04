@@ -4,15 +4,20 @@ Status: **Normative planned contract; complete attack requests remain unsupporte
 Task 11.2a provides only `AttackPlugboardDomain::parse_json`: strict typed fragment
 validation with immutable known fixed pairs. It is separate from legacy search
 spaces and grants neither complete request acceptance nor candidate enumeration.
-Task 11.2b.1 adds isolated `AttackSettings::parse_json` validation for common
+Task 11.2b adds isolated `AttackSettings::parse_json` validation for common
 settings, exact declared objectives and direct hill-climb starts, bound to the
-domain's ordered alphabet. Partial-exhaustion settings fragments explicitly return
-`unsupported_pass` at `/job/attack/kind` until 11.2b.2. Complete requests, executable
-eligibility/counts and runtime attacks remain unsupported.
+domain's ordered alphabet, plus typed partial-exhaustion `empty_single` all/touching
+seed policies. Seed generation and ordering are not implemented. Complete requests,
+executable eligibility/counts and runtime attacks remain unsupported.
 
 For this settings fragment, malformed raw JSON (including duplicate keys, trailing
 input and nonobjects), missing fields and invalid kind/objectives/budget use
 `invalid_request`; unknown fields use `unknown_field` with escaped JSON Pointers.
+Known branch-forbidden members and malformed policy shape/kind/selection use
+`invalid_request`; malformed touching masks use `invalid_search_space` at the
+field or offending index, including duplicates. Missing touching masks use
+`invalid_request`. Unknown members are checked against both branch keys before
+kind/conditional checks.
 Malformed thresholds/starts use `invalid_search_space` at the offending field or
 index. The 4 MiB raw-byte ceiling and incompatible ordered alphabets use
 `invalid_request` at `/job/attack`. Raw validation precedes alphabet compatibility,

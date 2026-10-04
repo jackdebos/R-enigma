@@ -318,6 +318,24 @@ impl AttackPlugboardDomain {
 pub enum AttackKind {
     /// Direct hill climb from an explicit mutable start.
     HillClimb,
+    /// Empty/single seed policy; no seed generation is provided here.
+    PartialExhaustion,
+}
+
+/// Explicit empty/single seed selection, preserving the supplied mask order.
+/// Constructing a policy alone does not validate attack settings.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AttackSeedPolicy {
+    /// All mutable endpoints; no mask is supplied.
+    All,
+    /// Pairs touching this nonempty ordered mask of mutable endpoints.
+    Touching(Vec<char>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AttackInitialization {
+    Start(Vec<(char, char)>),
+    Seeds(AttackSeedPolicy),
 }
 
 /// Validated isolated attack settings; grants no request acceptance or execution.
@@ -329,14 +347,14 @@ pub struct AttackSettings {
     switch_pairs: usize,
     backtrack_pairs: usize,
     evaluation_budget: u64,
-    start: Vec<(char, char)>,
+    initialization: AttackInitialization,
 }
 
 impl AttackSettings {
     /// Validates a strict `job.attack` fragment against its domain and declarations.
     ///
-    /// Only direct hill-climb settings are supported here. Partial-exhaustion settings
-    /// remain deferred. This boundary checks neither resources nor text lengths,
+    /// Supports direct hill-climb starts and partial-exhaustion seed policies only.
+    /// This boundary checks neither resources nor text lengths,
     /// execution eligibility, counts or whether the budget permits a complete run.
     pub fn parse_json(
         alphabet: &Alphabet,
@@ -377,6 +395,7 @@ impl AttackSettings {
                 "backtrack_pairs",
                 "evaluation_budget",
                 "start",
+                "seeds",
             ],
             PATH,
         )?;
@@ -390,26 +409,17 @@ impl AttackSettings {
                 child(PATH, "kind"),
             )]);
         }
-        if kind == "partial_exhaustion" {
-            return Err(vec![SearchDiagnostic::new(
-                "unsupported_pass",
-                "partial-exhaustion settings are not implemented yet",
-                child(PATH, "kind"),
+        let (kind, forbidden) = if kind == "hill_climb" {
+            (AttackKind::HillClimb, "seeds")
+        } else {
+            (AttackKind::PartialExhaustion, "start")
+        };
+        if settings.contains_key(forbidden) {
+            return Err(vec![invalid(
+                "member is forbidden for the selected attack kind",
+                child(PATH, forbidden),
             )]);
         }
-        exact_keys(
-            settings,
-            &[
-                "kind",
-                "initial_measure",
-                "final_measure",
-                "switch_pairs",
-                "backtrack_pairs",
-                "evaluation_budget",
-                "start",
-            ],
-            PATH,
-        )?;
         let objective = |key: &str| {
             let id = required_string(settings, key, PATH)?;
             declared_measures
@@ -450,44 +460,51 @@ impl AttackSettings {
                     child(PATH, "evaluation_budget"),
                 )]
             })?;
-        let start_path = child(PATH, "start");
-        // Translate only start-helper failures; shared legacy helper codes stay intact.
-        let start = (|| {
-            let start = parse_pair_array(
-                array(required(settings, "start", PATH)?, &start_path)?,
-                &start_path,
-            )?;
-            validate_disjoint_pairs(&start, &start_path, alphabet)?;
-            for (index, &(left, right)) in start.iter().enumerate() {
-                if !domain.symbols.contains(&left) || !domain.symbols.contains(&right) {
+        let initialization = if kind == AttackKind::PartialExhaustion {
+            AttackInitialization::Seeds(parse_seed_policy(
+                required(settings, "seeds", PATH)?,
+                domain,
+                alphabet,
+            )?)
+        } else {
+            let start_path = child(PATH, "start");
+            let start_value = required(settings, "start", PATH)?;
+            // Translate only start-helper failures; shared legacy helper codes stay intact.
+            let start = (|| {
+                let start = parse_pair_array(array(start_value, &start_path)?, &start_path)?;
+                validate_disjoint_pairs(&start, &start_path, alphabet)?;
+                for (index, &(left, right)) in start.iter().enumerate() {
+                    if !domain.symbols.contains(&left) || !domain.symbols.contains(&right) {
+                        return Err(vec![invalid_search_space(
+                            "start endpoints must belong to the mutable domain, not fixed facts",
+                            child(&start_path, &index.to_string()),
+                        )]);
+                    }
+                }
+                if start.len() > domain.max_pairs - domain.fixed_pairs.len() {
                     return Err(vec![invalid_search_space(
-                        "start endpoints must belong to the mutable domain, not fixed facts",
-                        child(&start_path, &index.to_string()),
+                        "fixed pairs plus start exceed max_pairs",
+                        &start_path,
                     )]);
                 }
-            }
-            if start.len() > domain.max_pairs - domain.fixed_pairs.len() {
-                return Err(vec![invalid_search_space(
-                    "fixed pairs plus start exceed max_pairs",
-                    &start_path,
-                )]);
-            }
-            Ok(start)
-        })()
-        .map_err(|mut diagnostics: Vec<SearchDiagnostic>| {
-            for diagnostic in &mut diagnostics {
-                diagnostic.code = "invalid_search_space";
-            }
-            diagnostics
-        })?;
+                Ok(start)
+            })()
+            .map_err(|mut diagnostics: Vec<SearchDiagnostic>| {
+                for diagnostic in &mut diagnostics {
+                    diagnostic.code = "invalid_search_space";
+                }
+                diagnostics
+            })?;
+            AttackInitialization::Start(start)
+        };
         Ok(Self {
-            kind: AttackKind::HillClimb,
+            kind,
             initial_measure,
             final_measure,
             switch_pairs,
             backtrack_pairs,
             evaluation_budget,
-            start,
+            initialization,
         })
     }
 
@@ -516,8 +533,83 @@ impl AttackSettings {
         self.evaluation_budget
     }
     /// Mutable starting pairs in source order and orientation, excluding fixed facts.
-    pub fn start(&self) -> &[(char, char)] {
-        &self.start
+    pub fn start(&self) -> Option<&[(char, char)]> {
+        match &self.initialization {
+            AttackInitialization::Start(start) => Some(start),
+            AttackInitialization::Seeds(_) => None,
+        }
+    }
+    /// Seed policy only for partial exhaustion; does not enumerate seeds.
+    pub fn seed_policy(&self) -> Option<&AttackSeedPolicy> {
+        match &self.initialization {
+            AttackInitialization::Seeds(policy) => Some(policy),
+            AttackInitialization::Start(_) => None,
+        }
+    }
+}
+
+fn parse_seed_policy(
+    value: &Value,
+    domain: &AttackPlugboardDomain,
+    alphabet: &Alphabet,
+) -> Result<AttackSeedPolicy, Vec<SearchDiagnostic>> {
+    const PATH: &str = "/job/attack/seeds";
+    let policy = object(value, PATH)?;
+    allow_keys(policy, &["kind", "selection", "symbols"], PATH)?;
+    if required_string(policy, "kind", PATH)? != "empty_single" {
+        return Err(vec![invalid(
+            "kind must be empty_single",
+            child(PATH, "kind"),
+        )]);
+    }
+    match required_string(policy, "selection", PATH)? {
+        "all" => {
+            if policy.contains_key("symbols") {
+                return Err(vec![invalid("all forbids symbols", child(PATH, "symbols"))]);
+            }
+            Ok(AttackSeedPolicy::All)
+        }
+        "touching" => {
+            let path = child(PATH, "symbols");
+            let value = required(policy, "symbols", PATH)?;
+            let symbols = (|| {
+                let values = array(value, &path)?;
+                if values.is_empty() {
+                    return Err(vec![invalid_search_space("mask must not be empty", &path)]);
+                }
+                let mut seen = HashSet::new();
+                let mut symbols = Vec::with_capacity(values.len());
+                for (index, value) in values.iter().enumerate() {
+                    let symbol_path = child(&path, &index.to_string());
+                    let symbol = scalar(value, &symbol_path)?;
+                    if alphabet.index_of(symbol).is_none() || !domain.symbols.contains(&symbol) {
+                        return Err(vec![invalid_search_space(
+                            "mask symbol must belong to the mutable domain",
+                            symbol_path,
+                        )]);
+                    }
+                    if !seen.insert(symbol) {
+                        return Err(vec![invalid_search_space(
+                            "duplicate mask symbol",
+                            symbol_path,
+                        )]);
+                    }
+                    symbols.push(symbol);
+                }
+                Ok(symbols)
+            })()
+            .map_err(|mut errors: Vec<SearchDiagnostic>| {
+                for error in &mut errors {
+                    error.code = "invalid_search_space";
+                }
+                errors
+            })?;
+            Ok(AttackSeedPolicy::Touching(symbols))
+        }
+        _ => Err(vec![invalid(
+            "selection must be all or touching",
+            child(PATH, "selection"),
+        )]),
     }
 }
 
@@ -1582,7 +1674,8 @@ mod tests {
                 assert_eq!(settings.switch_pairs(), 3);
                 assert_eq!(settings.backtrack_pairs(), 0);
                 assert_eq!(settings.evaluation_budget(), budget);
-                assert_eq!(settings.start(), &[('🦀', 'é')]);
+                assert_eq!(settings.start(), Some(&[('🦀', 'é')][..]));
+                assert_eq!(settings.seed_policy(), None);
             }
         }
         value["start"] = json!([]);
@@ -1614,15 +1707,12 @@ mod tests {
             value.as_object_mut().unwrap().remove(key);
             settings_error(&value, "invalid_request", &format!("/{key}"));
         }
-        for key in ["seeds", "a~/b"] {
-            let mut value = base.clone();
-            value[key] = json!([]);
-            settings_error(
-                &value,
-                "unknown_field",
-                &format!("/{}", key.replace('~', "~0").replace('/', "~1")),
-            );
-        }
+        let mut value = base.clone();
+        value["a~/b"] = json!([]);
+        settings_error(&value, "unknown_field", "/a~0~1b");
+        let mut value = base.clone();
+        value["seeds"] = json!([]);
+        settings_error(&value, "invalid_request", "/seeds");
         for key in ["initial_measure", "final_measure"] {
             for bad in [json!("IC"), json!("sinkov_bigram"), json!(null), json!(1)] {
                 let mut value = base.clone();
@@ -1746,8 +1836,8 @@ mod tests {
             &deferred.to_string(),
         )
         .unwrap_err();
-        assert_eq!(errors[0].code(), "unsupported_pass");
-        assert_eq!(errors[0].location(), "/job/attack/kind");
+        assert_eq!(errors[0].code(), "invalid_request");
+        assert_eq!(errors[0].location(), "/job/attack/start");
         let reordered = Alphabet::new(vec!['B', 'A', 'é', '🦀', 'C', 'D']).unwrap();
         let errors = AttackSettings::parse_json(
             &reordered,
@@ -1793,6 +1883,245 @@ mod tests {
         let errors = parse(&padded).unwrap_err();
         assert_eq!(errors[0].code(), "invalid_request");
         assert_eq!(errors[0].location(), "/job/attack");
+    }
+
+    fn seed_fixture() -> (Alphabet, AttackPlugboardDomain, Value) {
+        let (alphabet, domain, mut value) = settings_fixture();
+        value.as_object_mut().unwrap().remove("start");
+        value["kind"] = json!("partial_exhaustion");
+        value["seeds"] = json!({"kind":"empty_single", "selection":"all"});
+        (alphabet, domain, value)
+    }
+
+    fn parse_seed_settings(
+        alphabet: &Alphabet,
+        domain: &AttackPlugboardDomain,
+        value: &Value,
+    ) -> Result<AttackSettings, Vec<SearchDiagnostic>> {
+        AttackSettings::parse_json(
+            alphabet,
+            domain,
+            &["partial_exhaustion".to_owned()],
+            &[MeasureId::Ic, MeasureId::Entropy, MeasureId::Trie],
+            &value.to_string(),
+        )
+    }
+
+    #[test]
+    fn seed_policy_typed_order_and_syntax_not_feasibility() {
+        let (alphabet, domain, mut value) = seed_fixture();
+        for (policy, expected) in [
+            (
+                json!({"kind":"empty_single","selection":"all"}),
+                AttackSeedPolicy::All,
+            ),
+            (
+                json!({"kind":"empty_single","selection":"touching","symbols":["🦀","é"]}),
+                AttackSeedPolicy::Touching(vec!['🦀', 'é']),
+            ),
+        ] {
+            value["seeds"] = policy;
+            value["final_measure"] = json!("ic");
+            let settings = parse_seed_settings(&alphabet, &domain, &value).unwrap();
+            assert_eq!(settings.kind(), AttackKind::PartialExhaustion);
+            assert_eq!(settings.start(), None);
+            assert_eq!(settings.seed_policy(), Some(&expected));
+            assert_eq!(settings.final_measure(), MeasureId::Ic);
+        }
+        let domain = AttackPlugboardDomain::parse_json(
+            &alphabet,
+            &[],
+            r#"{"kind":"attack","symbols":["é"],"max_pairs":0}"#,
+        )
+        .unwrap();
+        value["seeds"] = json!({"kind":"empty_single","selection":"all"});
+        assert!(parse_seed_settings(&alphabet, &domain, &value).is_ok());
+        value["seeds"] = json!({"kind":"empty_single","selection":"touching","symbols":["é"]});
+        assert!(parse_seed_settings(&alphabet, &domain, &value).is_ok());
+        let errors = AttackPlugboardDomain::parse_json(
+            &alphabet,
+            &[],
+            r#"{"kind":"attack","symbols":[],"max_pairs":0}"#,
+        )
+        .unwrap_err();
+        assert_eq!(errors[0].code(), "invalid_search_space");
+        assert_eq!(errors[0].location(), "/job/space/plugboard/symbols");
+    }
+
+    #[test]
+    fn seed_policy_diagnostics_and_conditional_members() {
+        let (alphabet, domain, base) = seed_fixture();
+        for (policy, code, suffix) in [
+            (json!(null), "invalid_request", ""),
+            (json!([]), "invalid_request", ""),
+            (json!({}), "invalid_request", "/kind"),
+            (
+                json!({"kind":"other","selection":"all"}),
+                "invalid_request",
+                "/kind",
+            ),
+            (
+                json!({"kind":1,"selection":"all"}),
+                "invalid_request",
+                "/kind",
+            ),
+            (
+                json!({"kind":"empty_single"}),
+                "invalid_request",
+                "/selection",
+            ),
+            (
+                json!({"kind":"empty_single","selection":false}),
+                "invalid_request",
+                "/selection",
+            ),
+            (
+                json!({"kind":"empty_single","selection":"other"}),
+                "invalid_request",
+                "/selection",
+            ),
+            (
+                json!({"kind":"empty_single","selection":"all","symbols":[]}),
+                "invalid_request",
+                "/symbols",
+            ),
+            (
+                json!({"kind":"empty_single","selection":"all","symbols":["é"]}),
+                "invalid_request",
+                "/symbols",
+            ),
+            (
+                json!({"kind":"empty_single","selection":"touching"}),
+                "invalid_request",
+                "/symbols",
+            ),
+            (
+                json!({"kind":"empty_single","selection":"touching","symbols":[]}),
+                "invalid_search_space",
+                "/symbols",
+            ),
+            (
+                json!({"kind":"empty_single","selection":"touching","symbols":null}),
+                "invalid_search_space",
+                "/symbols",
+            ),
+            (
+                json!({"kind":"empty_single","selection":"touching","symbols":["é","é"]}),
+                "invalid_search_space",
+                "/symbols/1",
+            ),
+            (
+                json!({"kind":"empty_single","selection":"touching","symbols":["é"]}),
+                "invalid_search_space",
+                "/symbols/0",
+            ),
+            (
+                json!({"kind":"empty_single","selection":"touching","symbols":[1]}),
+                "invalid_search_space",
+                "/symbols/0",
+            ),
+            (
+                json!({"kind":"empty_single","selection":"touching","symbols":["Z"]}),
+                "invalid_search_space",
+                "/symbols/0",
+            ),
+            (
+                json!({"kind":"empty_single","selection":"touching","symbols":["A"]}),
+                "invalid_search_space",
+                "/symbols/0",
+            ),
+            (json!({"a~/b":0}), "unknown_field", "/a~0~1b"),
+        ] {
+            let mut value = base.clone();
+            value["seeds"] = policy;
+            let errors = parse_seed_settings(&alphabet, &domain, &value).unwrap_err();
+            assert_eq!(errors[0].code(), code, "{value}");
+            assert_eq!(
+                errors[0].location(),
+                format!("/job/attack/seeds{suffix}"),
+                "{value}"
+            );
+        }
+        for mask in [json!(["é", "🦀", "é"]), json!(["🦀", "é", "é"])] {
+            let mut value = base.clone();
+            value["seeds"] = json!({"kind":"empty_single","selection":"touching","symbols":mask});
+            let errors = parse_seed_settings(&alphabet, &domain, &value).unwrap_err();
+            assert_eq!(errors[0].code(), "invalid_search_space");
+            assert_eq!(errors[0].location(), "/job/attack/seeds/symbols/2");
+        }
+        let restricted = AttackPlugboardDomain::parse_json(
+            &alphabet,
+            &[],
+            r#"{"kind":"attack","symbols":["é"],"max_pairs":0}"#,
+        )
+        .unwrap();
+        let mut value = base.clone();
+        value["seeds"] = json!({"kind":"empty_single","selection":"touching","symbols":["C"]});
+        let errors = parse_seed_settings(&alphabet, &restricted, &value).unwrap_err();
+        assert_eq!(errors[0].code(), "invalid_search_space");
+        assert_eq!(errors[0].location(), "/job/attack/seeds/symbols/0");
+        for start in [json!([]), json!([["é", "🦀"]])] {
+            let mut value = base.clone();
+            value["start"] = start;
+            let errors = parse_seed_settings(&alphabet, &domain, &value).unwrap_err();
+            assert_eq!(errors[0].code(), "invalid_request");
+            assert_eq!(errors[0].location(), "/job/attack/start");
+        }
+        let mut value = base.clone();
+        value.as_object_mut().unwrap().remove("seeds");
+        let errors = parse_seed_settings(&alphabet, &domain, &value).unwrap_err();
+        assert_eq!(errors[0].location(), "/job/attack/seeds");
+        value["kind"] = json!("unknown");
+        value["a~/b"] = json!(0);
+        let errors = parse_seed_settings(&alphabet, &domain, &value).unwrap_err();
+        assert_eq!(errors[0].code(), "unknown_field");
+        assert_eq!(errors[0].location(), "/job/attack/a~0~1b");
+    }
+
+    #[test]
+    fn seed_settings_raw_boundaries_passes_and_alphabet() {
+        let (alphabet, domain, value) = seed_fixture();
+        let parse = |alphabet: &Alphabet, passes: &[String], raw: &str| {
+            AttackSettings::parse_json(
+                alphabet,
+                &domain,
+                passes,
+                &[MeasureId::Ic, MeasureId::Entropy],
+                raw,
+            )
+        };
+        let passes = ["partial_exhaustion".to_owned()];
+        let reordered = Alphabet::new(vec!['B', 'A', 'é', '🦀', 'C', 'D']).unwrap();
+        for raw in [
+            r#"{"seeds":{"kind":"empty_single","kind":"empty_single"}}"#,
+            &format!("{} trailing", value),
+        ] {
+            let errors = parse(&reordered, &passes, raw).unwrap_err();
+            assert_eq!(errors[0].code(), "invalid_request");
+            assert_eq!(errors[0].location(), "/job/attack");
+        }
+        assert_eq!(
+            parse(&reordered, &passes, &value.to_string()).unwrap_err()[0].location(),
+            "/job/attack"
+        );
+        for passes in [
+            vec![],
+            vec!["hill_climb".to_owned()],
+            vec!["partial_exhaustion".to_owned(); 2],
+            vec!["partial_exhaustion".to_owned(), "hill_climb".to_owned()],
+        ] {
+            let errors = parse(&alphabet, &passes, &value.to_string()).unwrap_err();
+            assert_eq!(errors[0].code(), "invalid_request");
+            assert_eq!(errors[0].location(), "/job/attack/kind");
+        }
+        let mut raw = value.to_string();
+        raw.push_str(&" ".repeat(crate::MAX_REQUEST_BYTES - raw.len()));
+        assert!(parse(&alphabet, &passes, &raw).is_ok());
+        raw.push(' ');
+        assert_eq!(
+            parse(&alphabet, &passes, &raw).unwrap_err()[0].location(),
+            "/job/attack"
+        );
     }
 
     #[test]
