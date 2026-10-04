@@ -84,7 +84,7 @@ pub use configuration::{
 pub use definition::{Definition, DefinitionDiagnostic, DefinitionSlot, DefinitionSource};
 pub use engine::{Direction, Engine};
 pub use event::{encode, rfc3339_utc, DoneReason, Event};
-pub use request::{RequestDiagnostic, TransformRequest, MAX_REQUEST_BYTES};
+pub use request::{ParsedRequest, RequestDiagnostic, TransformRequest, MAX_REQUEST_BYTES};
 pub use space::{
     ParsedSearchRequest, PlugboardDomain, SearchConfiguration, SearchDiagnostic, SearchFixedSlot,
     SearchRequest, SearchSlotDomain, SearchSpace,

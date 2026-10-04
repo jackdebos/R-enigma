@@ -6,7 +6,7 @@
 
 use crate::capability::Capabilities;
 use crate::definition::Definition;
-use crate::request::{parse_root, RequestDiagnostic};
+use crate::request::{parse_root, ParsedRoot, RequestDiagnostic};
 use crate::selection::{parse_measures, parse_references, MeasureId, ResourceReference};
 use crate::Alphabet;
 use serde_json::{Map, Value};
@@ -332,7 +332,10 @@ impl ParsedSearchRequest {
     /// coverage/conflict rules. A non-search job kind is `unsupported_job` at
     /// `/job/kind`. Nothing is defaulted; an uncovered required dimension is an error.
     pub fn parse_json(json: &str) -> Result<Self, Vec<RequestDiagnostic>> {
-        let root = parse_root(json)?;
+        Self::from_parsed_root(parse_root(json)?)
+    }
+
+    pub(crate) fn from_parsed_root(root: ParsedRoot) -> Result<Self, Vec<RequestDiagnostic>> {
         parse_search_job(&root.definition, &root.job).map_err(|diagnostics| {
             diagnostics
                 .into_iter()

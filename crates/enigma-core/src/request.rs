@@ -1,4 +1,4 @@
-//! Strict, key-free JSON request parsing for the protocol `transform` job.
+//! Strict, pure JSON request parsing and dispatch for protocol jobs.
 //!
 //! A request is exactly `protocol_version`, `machine`, and `job`. This module validates
 //! every field before returning a [`TransformRequest`], because the transport emits the
@@ -100,6 +100,34 @@ pub struct TransformRequest {
     direction: Direction,
 }
 
+/// A strictly parsed job, without I/O or search-resource promotion.
+///
+/// Transform requests are ready to run; search requests still require resource binding.
+#[derive(Debug)]
+pub enum ParsedRequest {
+    /// Fully validated known-key transform.
+    Transform(TransformRequest),
+    /// Structurally validated search pending resource binding.
+    Search(crate::ParsedSearchRequest),
+}
+
+impl ParsedRequest {
+    /// Validates the shared root once, then parses only the selected job schema.
+    pub fn parse_json(json: &str) -> Result<Self, Vec<RequestDiagnostic>> {
+        let root = parse_root(json)?;
+        let job = object(&root.job, "/job")?;
+        match required_string(job, "kind", "/job")? {
+            "transform" => TransformRequest::from_parsed_root(root).map(Self::Transform),
+            "search" => crate::ParsedSearchRequest::from_parsed_root(root).map(Self::Search),
+            kind => Err(vec![RequestDiagnostic::new(
+                "unsupported_job",
+                format!("job kind {kind:?} is not supported; expected `transform` or `search`"),
+                "/job/kind",
+            )]),
+        }
+    }
+}
+
 impl TransformRequest {
     /// Parses and fully validates a JSON request.
     ///
@@ -107,10 +135,14 @@ impl TransformRequest {
     /// (slots, coverage, symbols, plugboard), then direction, then whole-text alphabet
     /// membership. Nothing is defaulted; omission of a required value is an error.
     pub fn parse_json(json: &str) -> Result<Self, Vec<RequestDiagnostic>> {
-        let ParsedRoot { definition, job } = parse_root(json)?;
+        Self::from_parsed_root(parse_root(json)?)
+    }
+
+    fn from_parsed_root(root: ParsedRoot) -> Result<Self, Vec<RequestDiagnostic>> {
+        let ParsedRoot { definition, job } = root;
         let job = object(&job, "/job")?;
 
-        // Job kind selects the schema; the search schema is deferred to task 9.
+        // Preserve the typed convenience parser's wrong-kind diagnostic.
         let kind = required_string(job, "kind", "/job")?;
         if kind != "transform" {
             return Err(vec![RequestDiagnostic::new(
@@ -451,10 +483,166 @@ fn definition_location(location: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{RequestDiagnostic, TransformRequest, MAX_REQUEST_BYTES};
+    use super::{ParsedRequest, RequestDiagnostic, TransformRequest, MAX_REQUEST_BYTES};
+
+    #[test]
+    fn dispatches_valid_transform() {
+        let mut value = bundled_request();
+        value["job"]["text"] = serde_json::json!("AAAAA");
+        let ParsedRequest::Transform(request) =
+            ParsedRequest::parse_json(&value.to_string()).unwrap()
+        else {
+            panic!("expected transform");
+        };
+        assert_eq!(request.transform().unwrap(), "BDZGO");
+    }
     use crate::definition::MAX_DEFINITION_BYTES;
     use crate::Direction;
     use serde_json::{json, Value};
+
+    fn search_request() -> Value {
+        let mut value = custom_request();
+        value["job"].as_object_mut().unwrap().remove("direction");
+        value["job"]["kind"] = json!("search");
+        value["job"]["space"] = json!({});
+        value["job"]["passes"] = json!(["measure"]);
+        value["job"]["measures"] = json!(["ic"]);
+        value
+    }
+
+    #[test]
+    fn dispatches_structural_search_without_promoting_resources() {
+        for resources in [false, true] {
+            let mut value = search_request();
+            if resources {
+                value["job"]["measures"] = json!(["sinkov_bigram"]);
+                value["job"]["resources"] = json!({"sinkov_bigram": {"path": "model.json"}});
+            }
+            let ParsedRequest::Search(parsed) =
+                ParsedRequest::parse_json(&value.to_string()).unwrap()
+            else {
+                panic!("expected search");
+            };
+            assert_eq!(parsed.resources().len(), usize::from(resources));
+            assert_eq!(parsed.text(), "ABCD");
+            assert_eq!(
+                crate::SearchRequest::parse_json(&value.to_string()).is_ok(),
+                !resources
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_preserves_search_errors_without_transform_retry() {
+        let base = search_request();
+        let cases = [
+            ("/job/space", json!(null)),
+            ("/job/passes", json!(["unknown"])),
+            ("/job/measures", json!(["unknown"])),
+            ("/job/text", json!("Z")),
+            ("/job/configuration/slots/0/position", json!("Z")),
+            ("/job/extra", json!(true)),
+            ("/job/space/extra", json!(true)),
+            ("/job/configuration/slots/0/extra", json!(true)),
+        ];
+        for (pointer, replacement) in cases {
+            let mut value = base.clone();
+            if pointer.ends_with("/extra") {
+                let (parent, _) = pointer.rsplit_once('/').unwrap();
+                value
+                    .pointer_mut(parent)
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("extra".into(), replacement);
+            } else {
+                *value.pointer_mut(pointer).unwrap() = replacement;
+            }
+            let json = value.to_string();
+            let expected = crate::ParsedSearchRequest::parse_json(&json).unwrap_err();
+            let actual = ParsedRequest::parse_json(&json).unwrap_err();
+            assert_eq!(actual, expected, "{pointer}");
+            assert_ne!(actual[0].code(), "unsupported_job");
+        }
+    }
+
+    #[test]
+    fn dispatch_rejects_unknown_kinds_and_preserves_definition_precedence() {
+        for kind in [json!("unknown"), json!(null), json!(7)] {
+            let mut value = custom_request();
+            value["job"]["kind"] = kind.clone();
+            let error = ParsedRequest::parse_json(&value.to_string()).unwrap_err();
+            assert_eq!(error[0].location(), "/job/kind");
+            assert_eq!(
+                error[0].code(),
+                if kind.is_string() {
+                    "unsupported_job"
+                } else {
+                    "invalid_request"
+                }
+            );
+            value["machine"]["definition"] = json!({"kind": "bundled", "id": "unknown"});
+            assert_eq!(
+                ParsedRequest::parse_json(&value.to_string()).unwrap_err(),
+                TransformRequest::parse_json(&value.to_string()).unwrap_err()
+            );
+        }
+        let search = search_request().to_string();
+        assert_eq!(
+            TransformRequest::parse_json(&search).unwrap_err()[0].code(),
+            "unsupported_job"
+        );
+        assert_eq!(
+            crate::ParsedSearchRequest::parse_json(&custom_request().to_string()).unwrap_err()[0]
+                .code(),
+            "unsupported_job"
+        );
+    }
+
+    #[test]
+    fn dispatch_keeps_strict_root_reference_and_nested_json() {
+        let mut value = search_request();
+        value["job"]["measures"] = json!(["sinkov_bigram"]);
+        value["job"]["resources"] = json!({"sinkov_bigram": {"path": "model.json"}});
+        for pointer in ["", "/machine", "/job", "/job/resources/sinkov_bigram"] {
+            let mut invalid = value.clone();
+            invalid
+                .pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("extra".into(), json!(true));
+            let json = invalid.to_string();
+            assert_eq!(
+                ParsedRequest::parse_json(&json).unwrap_err(),
+                crate::ParsedSearchRequest::parse_json(&json).unwrap_err()
+            );
+        }
+        let json = value.to_string();
+        for (original, duplicate) in [
+            (
+                "\"protocol_version\":1",
+                "\"protocol_version\":1,\"protocol_version\":1",
+            ),
+            (
+                "\"kind\":\"search\"",
+                "\"kind\":\"search\",\"kind\":\"search\"",
+            ),
+            (
+                "\"path\":\"model.json\"",
+                "\"path\":\"model.json\",\"path\":\"other.json\"",
+            ),
+            (
+                "\"position\":\"A\"",
+                "\"position\":\"A\",\"position\":\"B\"",
+            ),
+        ] {
+            assert!(json.contains(original));
+            let error =
+                ParsedRequest::parse_json(&json.replacen(original, duplicate, 1)).unwrap_err();
+            assert_eq!(error[0].code(), "invalid_json");
+        }
+    }
 
     /// The protocol §3 custom example: a 4-symbol machine with a fixed plugboard-free key.
     fn custom_request() -> Value {
