@@ -229,12 +229,21 @@ impl AttackPlugboardDomain {
         deserializer
             .end()
             .map_err(|error| vec![invalid_search_space(format!("invalid JSON: {error}"), PATH)])?;
-        let value = parsed.into_value();
+        Self::parse_value(alphabet, fixed_pairs, &parsed.into_value())
+    }
+
+    // The caller owns raw JSON size, duplicate-key and trailing-input checks.
+    fn parse_value(
+        alphabet: &Alphabet,
+        fixed_pairs: &[(char, char)],
+        value: &Value,
+    ) -> Result<Self, Vec<SearchDiagnostic>> {
+        const PATH: &str = "/job/space/plugboard";
         // Existing utilities keep their legacy codes; only this fragment boundary
         // translates malformed-domain diagnostics to the Task 11 contract.
         let result = (|| {
             validate_disjoint_pairs(fixed_pairs, "/job/configuration/plugboard", alphabet)?;
-            let domain = object(&value, PATH)?;
+            let domain = object(value, PATH)?;
             exact_keys(domain, &["kind", "symbols", "max_pairs"], PATH)?;
             if required_string(domain, "kind", PATH)? != "attack" {
                 return Err(vec![invalid_search_space(
@@ -1624,6 +1633,75 @@ mod tests {
     use super::*;
     use crate::request::RequestDiagnostic;
     use serde_json::{json, Value};
+
+    #[test]
+    fn attack_value_preserves_ordered_alphabet_and_fixed_facts() {
+        let alphabet = Alphabet::new(vec!['B', 'A', 'é', '🦀', 'D', 'C']).unwrap();
+        let fixed = [('B', 'A'), ('D', 'C')];
+        let value = json!({"kind":"attack", "symbols":["🦀","é"], "max_pairs":3});
+        let domain = AttackPlugboardDomain::parse_value(&alphabet, &fixed, &value).unwrap();
+        assert!(domain.matches_alphabet(&alphabet));
+        assert!(
+            !domain.matches_alphabet(&Alphabet::new(vec!['A', 'B', 'é', '🦀', 'D', 'C']).unwrap())
+        );
+        assert_eq!(domain.fixed_pairs(), &fixed);
+        assert_eq!(domain.symbols(), &['🦀', 'é']);
+        assert_eq!(domain.max_pairs(), 3);
+    }
+
+    #[test]
+    fn attack_value_rejects_fixed_endpoint_overlap() {
+        let alphabet = Alphabet::new(vec!['A', 'B', 'C', 'D']).unwrap();
+        let value = json!({"kind":"attack", "symbols":["C","B"], "max_pairs":2});
+        let errors =
+            AttackPlugboardDomain::parse_value(&alphabet, &[('A', 'B')], &value).unwrap_err();
+        assert_eq!(errors[0].code(), "invalid_search_space");
+        assert_eq!(errors[0].location(), "/job/space/plugboard/symbols/1");
+        assert_eq!(
+            errors[0].message(),
+            "mutable symbol is an endpoint of a known fixed pair"
+        );
+    }
+
+    #[test]
+    fn attack_value_accepts_zero_mutable_capacity() {
+        let alphabet = Alphabet::new(vec!['A', 'B', 'C']).unwrap();
+        for fixed in [vec![], vec![('B', 'A')]] {
+            let value = json!({"kind":"attack", "symbols":["C"], "max_pairs":fixed.len()});
+            let domain = AttackPlugboardDomain::parse_value(&alphabet, &fixed, &value).unwrap();
+            assert_eq!(domain.fixed_pairs(), fixed);
+            assert_eq!(domain.symbols(), &['C']);
+            assert_eq!(domain.max_pairs(), fixed.len());
+        }
+    }
+
+    #[test]
+    fn attack_value_preserves_escaped_and_indexed_diagnostics() {
+        let alphabet = Alphabet::new(vec!['A', 'B', 'é', '🦀']).unwrap();
+        for (value, code, suffix) in [
+            (
+                json!({"kind":"attack", "symbols":["é","🦀"], "max_pairs":1, "a~/b":0}),
+                "unknown_field",
+                "/a~0~1b",
+            ),
+            (
+                json!({"kind":"attack", "symbols":["é","Z"], "max_pairs":1}),
+                "invalid_search_space",
+                "/symbols/1",
+            ),
+        ] {
+            let errors = AttackPlugboardDomain::parse_value(&alphabet, &[], &value).unwrap_err();
+            assert_eq!(errors[0].code(), code);
+            assert_eq!(
+                errors[0].location(),
+                format!("/job/space/plugboard{suffix}")
+            );
+            assert_eq!(
+                errors,
+                AttackPlugboardDomain::parse_json(&alphabet, &[], &value.to_string()).unwrap_err()
+            );
+        }
+    }
 
     fn settings_fixture() -> (Alphabet, AttackPlugboardDomain, Value) {
         let alphabet = Alphabet::new(vec!['A', 'B', 'é', '🦀', 'C', 'D']).unwrap();
