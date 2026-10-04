@@ -19,7 +19,9 @@ validation.
 This document marks protocol requirements as normative. Search-space grammar is
 specified in §3.3 and §7; [Scoring and external resources](scoring-resources.md)
 specifies the normative Task 10 measure/resource contract. Pass execution fields and
-checkpoint record layout remain deferred to their implementation tasks. Illustrative
+checkpoint record layout remain deferred to their implementation tasks.
+[Task 11 plugboard attacks](search-passes.md) freezes the planned additive attack
+branch and pass settings; it does not enable parsing or execution. Illustrative
 search concepts below are not executable request examples. Representability does not imply catalog availability or
 search support.
 
@@ -232,7 +234,7 @@ four are optional, so an empty object means the fixed choices are already comple
   a non-empty unique subset of that slot's admissible wheels; `positions` and `rings`
   are non-empty unique arrays of alphabet symbols. At least one of the three members
   must be present.
-- `plugboard`: object with exactly `candidates` and `size`. `candidates` is a non-empty
+- `plugboard`: the retained Task 9 subset branch is an object with exactly `candidates` and `size`. `candidates` is a non-empty
   unique array of disjoint two-symbol pairs drawn from the alphabet; `size` is a
   positive integer no greater than `candidates.len()`, the number of additional pairs
   to draw from that pool. Known pairs in `configuration.plugboard` must be disjoint
@@ -241,6 +243,12 @@ four are optional, so an empty object means the fixed choices are already comple
   enumeration order of §7.
 - `limit`: optional positive integer bounding the number of enumerated candidates;
   omission means no explicit request bound (documented resource limits still apply).
+
+The separately discriminated **planned**, not parser-enabled
+[`kind: "attack"` branch](search-passes.md#1-two-domain-branches-no-implicit-unknown-key)
+adds mutable endpoints without altering this subset grammar or fixed-pair meaning.
+Its strict `job.attack` field is an additive exception to the inventory above,
+only for that branch; see [settings](search-passes.md#2-one-executable-pass-and-explicit-settings).
 
 Coverage and conflict are checked before enumeration:
 
@@ -295,6 +303,10 @@ error, with no `started`, `output`, `done`, or enumeration; resource errors prec
 that result. Valid search is still not executable in the current CLI. Transform
 never loads resources. This status does not change transform grammar or events.
 
+[Task 11](search-passes.md) specifies one core-only executable attack pass per
+request as a planned contract, including resource gates and internal termination;
+no search wire payload or CLI execution is added.
+
 Stage 1 plans `hill_climb`, `partial_exhaustion` with backtracking, `reswapping`, `trie`,
 and `measure`; measures include index of coincidence, Sinkov n-gram statistics,
 Shannon entropy, and trie scoring. This plan does not assert parser or search support.
@@ -328,7 +340,8 @@ default. Example location: `/job/configuration/slots/1/position`. Error codes in
 `invalid_plugboard`, `invalid_slot`, `invalid_rule`, `invalid_search_space`,
 `unsupported_job`,
 `unsupported_pass`, `unsupported_measure`, `unsupported_resource`, `invalid_text`,
-`unsupported_topology`, and `internal_error`. `internal_error` is reserved for an
+`unsupported_topology`, `resource_limit` (including pre-execution count/budget bounds),
+and `internal_error`. `internal_error` is reserved for an
 internal invariant failure after `started`; it is never a request-validation failure.
 Syntax errors point to the closest available containing path.
 
@@ -375,7 +388,10 @@ order within a variant. Scoring uses integer/fixed-point arithmetic where floati
 could vary, otherwise results are bit-identical. Unordered reductions do not affect
 scores; each candidate is scored independently. Stochastic passes record seed and RNG
 state. Holds order by `(score desc, enumeration index asc)`. These obligations apply
-only to implemented search jobs.
+only to implemented search jobs. The planned Task 11 attack branch retains the
+per-slot order but slices outer scramblers only; seed/action indices and evaluation
+budgets are separate, as specified in [attack order](search-passes.md#3-pre-execution-gates-and-outer-order).
+This does not change legacy subset enumeration or define cross-pass holds.
 
 ## 8. Local listener (Stage 2)
 
@@ -397,7 +413,8 @@ Task 17 is the differential-oracle validation task.
 `protocol_version: 1` denotes this unpublished, pre-implementation design. Unknown
 versions and fields fail before work. Incompatible changes to field meaning,
 validation, traversal, or event ordering after v1 ships require a version bump. Detailed
-pass execution fields and checkpoint schemas remain deferred; they must be specified
+pass execution fields other than the [planned Task 11 contract](search-passes.md)
+and checkpoint schemas remain deferred; they must be specified
 before their implementation, not presumed executable or imported from `bomm`.
 Search-space and [measure/resource schemas](scoring-resources.md) are specified as
 normative design; that does not assert implemented scoring or search execution.
