@@ -1,6 +1,10 @@
 # Plugboard attack contract — Task 11
 
-Status: **Normative planned contract, not implemented or parser-enabled.**
+Status: **Normative planned contract; complete attack requests remain unsupported.**
+Task 11.2a provides only `AttackPlugboardDomain::parse_json`: strict typed fragment
+validation with immutable known fixed pairs. It is separate from legacy search
+spaces and grants neither complete request acceptance nor candidate enumeration.
+Attack settings, executable eligibility/counts and runtime attacks remain unimplemented.
 Task 11 first validates a known scrambler with unknown plugboard, then nests the
 same attack inside outer scrambler enumeration. Current CLI search only validates,
 loads and binds resources, then returns `unsupported_job`; core attacks do not run.

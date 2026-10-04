@@ -184,6 +184,133 @@ impl PlugboardDomain {
     }
 }
 
+/// A validated Task 11 attack-domain fragment, not an executable search request.
+///
+/// This model is deliberately separate from [`PlugboardDomain`] and [`SearchSpace`].
+/// It cannot grant candidate enumeration or full attack-request acceptance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttackPlugboardDomain {
+    symbols: Vec<char>,
+    fixed_pairs: Vec<(char, char)>,
+    max_pairs: usize,
+}
+
+impl AttackPlugboardDomain {
+    /// Validates only `{kind:"attack", symbols:[...], max_pairs:N}` JSON.
+    ///
+    /// `alphabet` is the ordered runtime alphabet; `fixed_pairs` supplies known facts,
+    /// not guesses. Membership, symmetry and disjointness of those facts are checked
+    /// before domain validation. Neither input is modified or normalized. The model
+    /// owns a source-ordered copy of the facts and exposes no mutation methods.
+    /// Diagnostics use `/job/space/plugboard` and `/job/configuration/plugboard`.
+    /// Duplicate keys and trailing JSON are rejected, rather than collapsed in a Value.
+    /// Successful fragment validation does not validate settings, coverage, resources,
+    /// executable eligibility or counts; complete attack requests remain unsupported.
+    pub fn parse_json(
+        alphabet: &Alphabet,
+        fixed_pairs: &[(char, char)],
+        json: &str,
+    ) -> Result<Self, Vec<SearchDiagnostic>> {
+        use crate::strict_json::StrictValue;
+        use serde::Deserialize;
+
+        const PATH: &str = "/job/space/plugboard";
+        // Match the request parser's input-size ceiling before allocating a JSON tree.
+        if json.len() > crate::MAX_REQUEST_BYTES {
+            return Err(vec![invalid_search_space(
+                "attack fragment exceeds 4 MiB",
+                PATH,
+            )]);
+        }
+        let mut deserializer = serde_json::Deserializer::from_str(json);
+        let parsed = StrictValue::deserialize(&mut deserializer)
+            .map_err(|error| vec![invalid_search_space(format!("invalid JSON: {error}"), PATH)])?;
+        deserializer
+            .end()
+            .map_err(|error| vec![invalid_search_space(format!("invalid JSON: {error}"), PATH)])?;
+        let value = parsed.into_value();
+        // Existing utilities keep their legacy codes; only this fragment boundary
+        // translates malformed-domain diagnostics to the Task 11 contract.
+        let result = (|| {
+            validate_disjoint_pairs(fixed_pairs, "/job/configuration/plugboard", alphabet)?;
+            let domain = object(&value, PATH)?;
+            exact_keys(domain, &["kind", "symbols", "max_pairs"], PATH)?;
+            if required_string(domain, "kind", PATH)? != "attack" {
+                return Err(vec![invalid_search_space(
+                    "kind must be the literal `attack`",
+                    child(PATH, "kind"),
+                )]);
+            }
+            let symbols_path = child(PATH, "symbols");
+            let symbols = parse_unique_symbol_array(
+                required(domain, "symbols", PATH)?,
+                &symbols_path,
+                alphabet,
+            )?;
+            let occupied: HashSet<char> = fixed_pairs
+                .iter()
+                .flat_map(|&(left, right)| [left, right])
+                .collect();
+            for (index, symbol) in symbols.iter().enumerate() {
+                if occupied.contains(symbol) {
+                    return Err(vec![invalid_search_space(
+                        "mutable symbol is an endpoint of a known fixed pair",
+                        child(&symbols_path, &index.to_string()),
+                    )]);
+                }
+            }
+            let cap_path = child(PATH, "max_pairs");
+            let cap = required(domain, "max_pairs", PATH)?
+                .as_u64()
+                .ok_or_else(|| {
+                    vec![invalid_search_space(
+                        "max_pairs must be a nonnegative integer",
+                        &cap_path,
+                    )]
+                })?;
+            let capacity = alphabet.len() / 2;
+            // Compare before converting to usize, including on 32-bit targets.
+            if cap > capacity as u64
+                || cap < fixed_pairs.len() as u64
+                || cap > (fixed_pairs.len() + symbols.len() / 2) as u64
+            {
+                return Err(vec![invalid_search_space(
+                    "max_pairs must cover fixed pairs and fit alphabet and mutable capacity",
+                    cap_path,
+                )]);
+            }
+            Ok(Self {
+                symbols,
+                fixed_pairs: fixed_pairs.to_vec(),
+                max_pairs: cap as usize,
+            })
+        })();
+        result.map_err(|mut diagnostics: Vec<SearchDiagnostic>| {
+            for diagnostic in &mut diagnostics {
+                if diagnostic.code != "unknown_field" {
+                    diagnostic.code = "invalid_search_space";
+                }
+            }
+            diagnostics
+        })
+    }
+
+    /// Mutable endpoints in source order; never includes a known fixed endpoint.
+    pub fn symbols(&self) -> &[char] {
+        &self.symbols
+    }
+
+    /// Immutable known pairs in supplied order and orientation.
+    pub fn fixed_pairs(&self) -> &[(char, char)] {
+        &self.fixed_pairs
+    }
+
+    /// Maximum total pair count, including known fixed pairs.
+    pub fn max_pairs(&self) -> usize {
+        self.max_pairs
+    }
+}
+
 /// The explicit variable domains and bounds of `job.space`.
 ///
 /// `slots` and `plugboard` are optional: a fully fixed search declares no variable
@@ -1191,6 +1318,255 @@ mod tests {
     use super::*;
     use crate::request::RequestDiagnostic;
     use serde_json::{json, Value};
+
+    #[test]
+    fn attack_fragment_preserves_unicode_order_and_fixed_facts() {
+        let alphabet = Alphabet::new(vec!['A', 'B', 'é', '🦀', 'C', 'D']).unwrap();
+        let fixed = [('B', 'A')];
+        let domain = AttackPlugboardDomain::parse_json(
+            &alphabet,
+            &fixed,
+            r#"{"kind":"attack","symbols":["🦀","é","D","C"],"max_pairs":3}"#,
+        )
+        .unwrap();
+        assert_eq!(domain.symbols(), &['🦀', 'é', 'D', 'C']);
+        assert_eq!(domain.fixed_pairs(), &fixed);
+        assert_eq!(domain.max_pairs(), 3);
+        assert_eq!(fixed, [('B', 'A')]);
+        for cap in [1, 2, 3] {
+            let fragment =
+                format!(r#"{{"kind":"attack","symbols":["é","🦀","C","D"],"max_pairs":{cap}}}"#);
+            assert!(AttackPlugboardDomain::parse_json(&alphabet, &fixed, &fragment).is_ok());
+        }
+        let zero = AttackPlugboardDomain::parse_json(
+            &alphabet,
+            &[],
+            r#"{"kind":"attack","symbols":["é"],"max_pairs":0}"#,
+        )
+        .unwrap();
+        assert_eq!(zero.max_pairs(), 0);
+        assert!(zero.fixed_pairs().is_empty());
+    }
+
+    #[test]
+    fn attack_fragment_odd_capacity_and_large_integer_boundaries() {
+        let alphabet = Alphabet::new(vec!['A', 'B', 'C', 'D', 'é']).unwrap();
+        let fixed = [('D', 'C'), ('B', 'A')];
+        let domain = AttackPlugboardDomain::parse_json(
+            &alphabet,
+            &fixed,
+            r#"{"kind":"attack","symbols":["é"],"max_pairs":2}"#,
+        )
+        .unwrap();
+        assert_eq!(domain.fixed_pairs(), &fixed);
+        for cap in [
+            "3",
+            "18446744073709551615",
+            "18446744073709551616",
+            "null",
+            "true",
+            "\"2\"",
+        ] {
+            let fragment = format!(r#"{{"kind":"attack","symbols":["é"],"max_pairs":{cap}}}"#);
+            let errors =
+                AttackPlugboardDomain::parse_json(&alphabet, &fixed, &fragment).unwrap_err();
+            assert_eq!(errors[0].code(), "invalid_search_space");
+            assert_eq!(errors[0].location(), "/job/space/plugboard/max_pairs");
+        }
+        let errors = AttackPlugboardDomain::parse_json(
+            &alphabet,
+            &fixed,
+            r#"{"kind":"attack","symbols":["é"],"max_pairs":2}"#,
+        )
+        .unwrap_err();
+        assert_eq!(errors[0].location(), "/job/space/plugboard/symbols/0");
+    }
+
+    #[test]
+    fn attack_fragment_diagnostics_are_exact() {
+        let alphabet = Alphabet::new(vec!['A', 'B', 'C', 'D', 'E', 'F']).unwrap();
+        for (fragment, fixed, code, location) in [
+            (
+                r#"null"#,
+                vec![],
+                "invalid_search_space",
+                "/job/space/plugboard",
+            ),
+            (
+                r#"{"kind":"legacy","symbols":["C","D"],"max_pairs":1}"#,
+                vec![],
+                "invalid_search_space",
+                "/job/space/plugboard/kind",
+            ),
+            (
+                r#"{"kind":"attack","symbols":[],"max_pairs":0}"#,
+                vec![],
+                "invalid_search_space",
+                "/job/space/plugboard/symbols",
+            ),
+            (
+                r#"{"kind":"attack","symbols":["C","C"],"max_pairs":1}"#,
+                vec![],
+                "invalid_search_space",
+                "/job/space/plugboard/symbols",
+            ),
+            (
+                r#"{"kind":"attack","symbols":["Z"],"max_pairs":0}"#,
+                vec![],
+                "invalid_search_space",
+                "/job/space/plugboard/symbols/0",
+            ),
+            (
+                r#"{"kind":"attack","symbols":["CD"],"max_pairs":0}"#,
+                vec![],
+                "invalid_search_space",
+                "/job/space/plugboard/symbols/0",
+            ),
+            (
+                r#"{"kind":"attack","symbols":[""],"max_pairs":0}"#,
+                vec![],
+                "invalid_search_space",
+                "/job/space/plugboard/symbols/0",
+            ),
+            (
+                r#"{"kind":"attack","symbols":[4],"max_pairs":0}"#,
+                vec![],
+                "invalid_search_space",
+                "/job/space/plugboard/symbols/0",
+            ),
+            (
+                r#"{"kind":"attack","symbols":["A","C"],"max_pairs":1}"#,
+                vec![('A', 'B')],
+                "invalid_search_space",
+                "/job/space/plugboard/symbols/0",
+            ),
+            (
+                r#"{"kind":"attack","symbols":["C","D"],"max_pairs":0}"#,
+                vec![('A', 'B')],
+                "invalid_search_space",
+                "/job/space/plugboard/max_pairs",
+            ),
+            (
+                r#"{"kind":"attack","symbols":["A","B","C","D","E","F"],"max_pairs":4}"#,
+                vec![],
+                "invalid_search_space",
+                "/job/space/plugboard/max_pairs",
+            ),
+            (
+                r#"{"kind":"attack","symbols":["C"],"max_pairs":2}"#,
+                vec![('A', 'B')],
+                "invalid_search_space",
+                "/job/space/plugboard/max_pairs",
+            ),
+            (
+                r#"{"kind":"attack","symbols":["C","D"],"max_pairs":-1}"#,
+                vec![],
+                "invalid_search_space",
+                "/job/space/plugboard/max_pairs",
+            ),
+            (
+                r#"{"kind":"attack","symbols":["C","D"],"max_pairs":1.0}"#,
+                vec![],
+                "invalid_search_space",
+                "/job/space/plugboard/max_pairs",
+            ),
+            (
+                r#"{"kind":"attack","symbols":["C","D"]}"#,
+                vec![],
+                "invalid_search_space",
+                "/job/space/plugboard/max_pairs",
+            ),
+            (
+                r#"{"kind":"attack","symbols":["C","D"],"max_pairs":1,"x/y~z":0}"#,
+                vec![],
+                "unknown_field",
+                "/job/space/plugboard/x~1y~0z",
+            ),
+            (
+                r#"{"kind":"attack","symbols":["C","D"],"max_pairs":1,"candidates":[]}"#,
+                vec![],
+                "unknown_field",
+                "/job/space/plugboard/candidates",
+            ),
+            (
+                r#"{"kind":"attack","symbols":["C","D"],"max_pairs":1,"size":1}"#,
+                vec![],
+                "unknown_field",
+                "/job/space/plugboard/size",
+            ),
+        ] {
+            let errors =
+                AttackPlugboardDomain::parse_json(&alphabet, &fixed, fragment).unwrap_err();
+            assert_eq!(errors.len(), 1, "{fragment}");
+            assert_eq!(
+                (errors[0].code(), errors[0].location()),
+                (code, location),
+                "{fragment}"
+            );
+        }
+    }
+
+    #[test]
+    fn attack_fragment_rejects_duplicates_trailing_json_and_invalid_fixed_facts() {
+        let alphabet = Alphabet::new(vec!['A', 'B', 'C', 'D']).unwrap();
+        for fragment in [
+            r#"{"kind":"attack","kind":"attack","symbols":["C","D"],"max_pairs":1}"#,
+            r#"{"kind":"attack","symbols":["C","D"],"max_pairs":1,"max_pairs":0}"#,
+            r#"{"kind":"attack","symbols":["C","D"],"max_pairs":1} null"#,
+        ] {
+            let errors = AttackPlugboardDomain::parse_json(&alphabet, &[], fragment).unwrap_err();
+            assert_eq!(errors[0].code(), "invalid_search_space");
+            assert_eq!(errors[0].location(), "/job/space/plugboard");
+        }
+        for fixed in [
+            vec![('A', 'A')],
+            vec![('A', 'Z')],
+            vec![('A', 'B'), ('A', 'C')],
+        ] {
+            let before = fixed.clone();
+            let errors = AttackPlugboardDomain::parse_json(
+                &alphabet,
+                &fixed,
+                r#"{"kind":"attack","symbols":["D"],"max_pairs":1}"#,
+            )
+            .unwrap_err();
+            assert_eq!(errors[0].code(), "invalid_search_space");
+            assert!(errors[0]
+                .location()
+                .starts_with("/job/configuration/plugboard/"));
+            assert_eq!(fixed, before);
+        }
+    }
+
+    #[test]
+    fn attack_fragments_never_enable_complete_requests_or_legacy_enumeration() {
+        let mut value = base_request();
+        value["job"]["space"]["plugboard"] =
+            json!({"kind":"attack","symbols":["A","B"],"max_pairs":1});
+        assert!(ParsedSearchRequest::parse_json(&value.to_string()).is_err());
+        assert!(SearchRequest::parse_json(&value.to_string()).is_err());
+        value["job"]["attack"] = json!({"kind":"hill_climb","initial_measure":"ic","final_measure":"ic","switch_pairs":1,"backtrack_pairs":0,"evaluation_budget":1,"start":[]});
+        assert!(ParsedSearchRequest::parse_json(&value.to_string()).is_err());
+        assert!(SearchRequest::parse_json(&value.to_string()).is_err());
+        let json =
+            value
+                .to_string()
+                .replacen("\"max_pairs\":1", "\"max_pairs\":1,\"max_pairs\":0", 1);
+        assert_eq!(
+            ParsedSearchRequest::parse_json(&json).unwrap_err()[0].code(),
+            "invalid_json"
+        );
+        let fixed = SearchRequest::parse_json(&base_request().to_string()).unwrap();
+        assert!(fixed.space().plugboard().is_none());
+        let legacy = parse_plugboard_domain(
+            fixed.definition().alphabet(),
+            &json!({"candidates":[["D","C"],["B","A"]],"size":1}),
+            "/job/space/plugboard",
+        )
+        .unwrap();
+        assert_eq!(legacy.candidates(), &[('D', 'C'), ('B', 'A')]);
+        assert_eq!(legacy.size(), 1);
+    }
 
     /// A small arbitrary custom definition with two slots: a structurally fixed reflector
     /// and a movable rotor with two admissible wheels. Not a historical machine.
