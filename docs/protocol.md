@@ -287,12 +287,13 @@ once. Absolute paths are allowed; no expansion, URL loading, automatic symlink
 canonicalization, or sandbox restriction is introduced.
 
 **Implementation status:** Task 9 implements the structural boundary and capability
-framework, not this detailed scoring/resource contract. Slice 10.1 is documentation
-first; scorers and loading follow in later Task 10 slices. Valid search is still not
-executable in the current CLI. The planned shared strict dispatch validates and binds
-search resources before returning one `unsupported_job` error, with no `started`,
-`output`, `done`, or enumeration; resource errors precede that result. Transform
-never loads resources. This requirement does not change transform grammar or events.
+framework. Task 10 implements deterministic IC, Shannon entropy, Sinkov n-gram and
+weighted trie scoring, strict external resource parsers, typed measure/resource
+selection, pure content binding, and bounded CLI loading. The CLI uses shared strict
+dispatch to validate and bind search resources before returning one `unsupported_job`
+error, with no `started`, `output`, `done`, or enumeration; resource errors precede
+that result. Valid search is still not executable in the current CLI. Transform
+never loads resources. This status does not change transform grammar or events.
 
 Stage 1 plans `hill_climb`, `partial_exhaustion` with backtracking, `reswapping`, `trie`,
 and `measure`; measures include index of coincidence, Sinkov n-gram statistics,
