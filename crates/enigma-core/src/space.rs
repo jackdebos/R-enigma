@@ -190,6 +190,7 @@ impl PlugboardDomain {
 /// It cannot grant candidate enumeration or full attack-request acceptance.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttackPlugboardDomain {
+    alphabet: Vec<char>,
     symbols: Vec<char>,
     fixed_pairs: Vec<(char, char)>,
     max_pairs: usize,
@@ -280,6 +281,7 @@ impl AttackPlugboardDomain {
                 )]);
             }
             Ok(Self {
+                alphabet: alphabet.symbols.clone(),
                 symbols,
                 fixed_pairs: fixed_pairs.to_vec(),
                 max_pairs: cap as usize,
@@ -308,6 +310,214 @@ impl AttackPlugboardDomain {
     /// Maximum total pair count, including known fixed pairs.
     pub fn max_pairs(&self) -> usize {
         self.max_pairs
+    }
+}
+
+/// Supported settings-fragment pass, not an execution capability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttackKind {
+    /// Direct hill climb from an explicit mutable start.
+    HillClimb,
+}
+
+/// Validated isolated attack settings; grants no request acceptance or execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttackSettings {
+    kind: AttackKind,
+    initial_measure: MeasureId,
+    final_measure: MeasureId,
+    switch_pairs: usize,
+    backtrack_pairs: usize,
+    evaluation_budget: u64,
+    start: Vec<(char, char)>,
+}
+
+impl AttackSettings {
+    /// Validates a strict `job.attack` fragment against its domain and declarations.
+    ///
+    /// Only direct hill-climb settings are supported here. Partial-exhaustion settings
+    /// remain deferred. This boundary checks neither resources nor text lengths,
+    /// execution eligibility, counts or whether the budget permits a complete run.
+    pub fn parse_json(
+        alphabet: &Alphabet,
+        domain: &AttackPlugboardDomain,
+        declared_passes: &[String],
+        declared_measures: &[MeasureId],
+        json: &str,
+    ) -> Result<Self, Vec<SearchDiagnostic>> {
+        use crate::strict_json::StrictValue;
+        use serde::Deserialize;
+
+        const PATH: &str = "/job/attack";
+        if json.len() > crate::MAX_REQUEST_BYTES {
+            return Err(vec![invalid("attack settings exceed 4 MiB", PATH)]);
+        }
+        let mut deserializer = serde_json::Deserializer::from_str(json);
+        let parsed = StrictValue::deserialize(&mut deserializer)
+            .map_err(|error| vec![invalid(format!("invalid JSON: {error}"), PATH)])?;
+        deserializer
+            .end()
+            .map_err(|error| vec![invalid(format!("invalid JSON: {error}"), PATH)])?;
+        if domain.alphabet != alphabet.symbols {
+            return Err(vec![invalid(
+                "domain belongs to a different ordered alphabet",
+                PATH,
+            )]);
+        }
+        let value = parsed.into_value();
+        let settings = object(&value, PATH)?;
+        // Check unknown members before required/type checks, including deferred kinds.
+        allow_keys(
+            settings,
+            &[
+                "kind",
+                "initial_measure",
+                "final_measure",
+                "switch_pairs",
+                "backtrack_pairs",
+                "evaluation_budget",
+                "start",
+            ],
+            PATH,
+        )?;
+        let kind = required_string(settings, "kind", PATH)?;
+        if declared_passes.len() != 1
+            || declared_passes[0] != kind
+            || !matches!(kind, "hill_climb" | "partial_exhaustion")
+        {
+            return Err(vec![invalid(
+                "kind must match the sole selected attack pass",
+                child(PATH, "kind"),
+            )]);
+        }
+        if kind == "partial_exhaustion" {
+            return Err(vec![SearchDiagnostic::new(
+                "unsupported_pass",
+                "partial-exhaustion settings are not implemented yet",
+                child(PATH, "kind"),
+            )]);
+        }
+        exact_keys(
+            settings,
+            &[
+                "kind",
+                "initial_measure",
+                "final_measure",
+                "switch_pairs",
+                "backtrack_pairs",
+                "evaluation_budget",
+                "start",
+            ],
+            PATH,
+        )?;
+        let objective = |key: &str| {
+            let id = required_string(settings, key, PATH)?;
+            declared_measures
+                .iter()
+                .copied()
+                .find(|measure| measure.id() == id)
+                .ok_or_else(|| {
+                    vec![invalid(
+                        "objective must be an exact declared measure identifier",
+                        child(PATH, key),
+                    )]
+                })
+        };
+        let initial_measure = objective("initial_measure")?;
+        let final_measure = objective("final_measure")?;
+        let threshold = |key: &str| {
+            let path = child(PATH, key);
+            let value = required(settings, key, PATH)?;
+            let count = value
+                .as_u64()
+                .filter(|&count| count <= (alphabet.len() / 2) as u64)
+                .ok_or_else(|| {
+                    vec![invalid_search_space(
+                        "threshold must be an integer within alphabet pair capacity",
+                        &path,
+                    )]
+                })?;
+            Ok::<usize, Vec<SearchDiagnostic>>(count as usize)
+        };
+        let switch_pairs = threshold("switch_pairs")?;
+        let backtrack_pairs = threshold("backtrack_pairs")?;
+        let evaluation_budget = required(settings, "evaluation_budget", PATH)?
+            .as_u64()
+            .filter(|&budget| budget > 0)
+            .ok_or_else(|| {
+                vec![invalid(
+                    "evaluation_budget must be a positive u64 integer",
+                    child(PATH, "evaluation_budget"),
+                )]
+            })?;
+        let start_path = child(PATH, "start");
+        // Translate only start-helper failures; shared legacy helper codes stay intact.
+        let start = (|| {
+            let start = parse_pair_array(
+                array(required(settings, "start", PATH)?, &start_path)?,
+                &start_path,
+            )?;
+            validate_disjoint_pairs(&start, &start_path, alphabet)?;
+            for (index, &(left, right)) in start.iter().enumerate() {
+                if !domain.symbols.contains(&left) || !domain.symbols.contains(&right) {
+                    return Err(vec![invalid_search_space(
+                        "start endpoints must belong to the mutable domain, not fixed facts",
+                        child(&start_path, &index.to_string()),
+                    )]);
+                }
+            }
+            if start.len() > domain.max_pairs - domain.fixed_pairs.len() {
+                return Err(vec![invalid_search_space(
+                    "fixed pairs plus start exceed max_pairs",
+                    &start_path,
+                )]);
+            }
+            Ok(start)
+        })()
+        .map_err(|mut diagnostics: Vec<SearchDiagnostic>| {
+            for diagnostic in &mut diagnostics {
+                diagnostic.code = "invalid_search_space";
+            }
+            diagnostics
+        })?;
+        Ok(Self {
+            kind: AttackKind::HillClimb,
+            initial_measure,
+            final_measure,
+            switch_pairs,
+            backtrack_pairs,
+            evaluation_budget,
+            start,
+        })
+    }
+
+    /// Validated settings-fragment kind.
+    pub fn kind(&self) -> AttackKind {
+        self.kind
+    }
+    /// Exact declared initial objective.
+    pub fn initial_measure(&self) -> MeasureId {
+        self.initial_measure
+    }
+    /// Exact declared final objective.
+    pub fn final_measure(&self) -> MeasureId {
+        self.final_measure
+    }
+    /// Total pair cardinality threshold for switching objectives.
+    pub fn switch_pairs(&self) -> usize {
+        self.switch_pairs
+    }
+    /// Total pair cardinality threshold for backtracking.
+    pub fn backtrack_pairs(&self) -> usize {
+        self.backtrack_pairs
+    }
+    /// Positive whole-run evaluation budget; syntax, not execution feasibility.
+    pub fn evaluation_budget(&self) -> u64 {
+        self.evaluation_budget
+    }
+    /// Mutable starting pairs in source order and orientation, excluding fixed facts.
+    pub fn start(&self) -> &[(char, char)] {
+        &self.start
     }
 }
 
@@ -1318,6 +1528,272 @@ mod tests {
     use super::*;
     use crate::request::RequestDiagnostic;
     use serde_json::{json, Value};
+
+    fn settings_fixture() -> (Alphabet, AttackPlugboardDomain, Value) {
+        let alphabet = Alphabet::new(vec!['A', 'B', 'é', '🦀', 'C', 'D']).unwrap();
+        let domain = AttackPlugboardDomain::parse_json(
+            &alphabet,
+            &[('B', 'A')],
+            r#"{"kind":"attack","symbols":["🦀","é","D","C"],"max_pairs":2}"#,
+        )
+        .unwrap();
+        let value = json!({"kind":"hill_climb", "initial_measure":"ic",
+            "final_measure":"entropy", "switch_pairs":3, "backtrack_pairs":0,
+            "evaluation_budget":1, "start":[["🦀","é"]]});
+        (alphabet, domain, value)
+    }
+
+    fn settings_error(value: &Value, code: &str, suffix: &str) {
+        let (alphabet, domain, _) = settings_fixture();
+        let errors = AttackSettings::parse_json(
+            &alphabet,
+            &domain,
+            &["hill_climb".to_owned()],
+            &[MeasureId::Ic, MeasureId::Entropy, MeasureId::Trie],
+            &value.to_string(),
+        )
+        .unwrap_err();
+        assert_eq!(errors[0].code(), code, "{value}");
+        assert_eq!(
+            errors[0].location(),
+            format!("/job/attack{suffix}"),
+            "{value}"
+        );
+    }
+
+    #[test]
+    fn settings_valid_objectives_thresholds_budget_and_order() {
+        let (alphabet, domain, mut value) = settings_fixture();
+        for final_measure in ["ic", "entropy"] {
+            for budget in [1, u64::MAX] {
+                value["final_measure"] = json!(final_measure);
+                value["evaluation_budget"] = json!(budget);
+                let settings = AttackSettings::parse_json(
+                    &alphabet,
+                    &domain,
+                    &["hill_climb".to_owned()],
+                    &[MeasureId::Ic, MeasureId::Entropy, MeasureId::Trie],
+                    &value.to_string(),
+                )
+                .unwrap();
+                assert_eq!(settings.kind(), AttackKind::HillClimb);
+                assert_eq!(settings.initial_measure(), MeasureId::Ic);
+                assert_eq!(settings.final_measure().id(), final_measure);
+                assert_eq!(settings.switch_pairs(), 3);
+                assert_eq!(settings.backtrack_pairs(), 0);
+                assert_eq!(settings.evaluation_budget(), budget);
+                assert_eq!(settings.start(), &[('🦀', 'é')]);
+            }
+        }
+        value["start"] = json!([]);
+        value["switch_pairs"] = json!(0);
+        value["backtrack_pairs"] = json!(3);
+        assert!(AttackSettings::parse_json(
+            &alphabet,
+            &domain,
+            &["hill_climb".to_owned()],
+            &[MeasureId::Ic, MeasureId::Entropy],
+            &value.to_string()
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn settings_required_unknown_and_objective_fields() {
+        let (_, _, base) = settings_fixture();
+        for key in [
+            "kind",
+            "initial_measure",
+            "final_measure",
+            "switch_pairs",
+            "backtrack_pairs",
+            "evaluation_budget",
+            "start",
+        ] {
+            let mut value = base.clone();
+            value.as_object_mut().unwrap().remove(key);
+            settings_error(&value, "invalid_request", &format!("/{key}"));
+        }
+        for key in ["seeds", "a~/b"] {
+            let mut value = base.clone();
+            value[key] = json!([]);
+            settings_error(
+                &value,
+                "unknown_field",
+                &format!("/{}", key.replace('~', "~0").replace('/', "~1")),
+            );
+        }
+        for key in ["initial_measure", "final_measure"] {
+            for bad in [json!("IC"), json!("sinkov_bigram"), json!(null), json!(1)] {
+                let mut value = base.clone();
+                value[key] = bad;
+                settings_error(&value, "invalid_request", &format!("/{key}"));
+            }
+        }
+        for bad in [json!(null), json!(false), json!("unknown")] {
+            let mut value = base.clone();
+            value["kind"] = bad;
+            settings_error(&value, "invalid_request", "/kind");
+        }
+    }
+
+    #[test]
+    fn settings_integer_lexemes_and_start_conflicts() {
+        let (alphabet, domain, base) = settings_fixture();
+        for key in ["evaluation_budget", "switch_pairs", "backtrack_pairs"] {
+            let bad = if key == "evaluation_budget" {
+                vec![
+                    "0",
+                    "-1",
+                    "-0",
+                    "1.0",
+                    "1e0",
+                    "true",
+                    "\"1\"",
+                    "18446744073709551616",
+                ]
+            } else {
+                vec!["4", "-1", "-0", "1.0", "1e0", "false", "\"1\""]
+            };
+            for literal in bad {
+                let mut value = base.clone();
+                value[key] = json!("REPLACE");
+                let raw = value.to_string().replace("\"REPLACE\"", literal);
+                let errors = AttackSettings::parse_json(
+                    &alphabet,
+                    &domain,
+                    &["hill_climb".to_owned()],
+                    &[MeasureId::Ic, MeasureId::Entropy],
+                    &raw,
+                )
+                .unwrap_err();
+                assert_eq!(
+                    errors[0].code(),
+                    if key == "evaluation_budget" {
+                        "invalid_request"
+                    } else {
+                        "invalid_search_space"
+                    },
+                    "{raw}"
+                );
+                assert_eq!(errors[0].location(), format!("/job/attack/{key}"));
+            }
+        }
+        for (start, suffix) in [
+            (json!(null), "/start"),
+            (json!([["A", "B"]]), "/start/0"),
+            (json!([["é", "A"]]), "/start/0"),
+            (json!([["é", "Z"]]), "/start/0"),
+            (json!([["é", "é"]]), "/start/0"),
+            (json!([["é"]]), "/start/0"),
+            (json!([["é", "🦀"], ["é", "C"]]), "/start/1"),
+            (json!([["é", "🦀"], ["C", "D"]]), "/start"),
+            (json!([["é", "🦀"]]), "/start/0/0"),
+        ] {
+            let mut value = base.clone();
+            value["start"] = start;
+            settings_error(&value, "invalid_search_space", suffix);
+        }
+        let restricted = AttackPlugboardDomain::parse_json(
+            &alphabet,
+            &[('A', 'B')],
+            r#"{"kind":"attack","symbols":["é","🦀"],"max_pairs":2}"#,
+        )
+        .unwrap();
+        let mut value = base.clone();
+        value["start"] = json!([["C", "D"]]);
+        let errors = AttackSettings::parse_json(
+            &alphabet,
+            &restricted,
+            &["hill_climb".to_owned()],
+            &[MeasureId::Ic, MeasureId::Entropy],
+            &value.to_string(),
+        )
+        .unwrap_err();
+        assert_eq!(errors[0].code(), "invalid_search_space");
+        assert_eq!(errors[0].location(), "/job/attack/start/0");
+    }
+
+    #[test]
+    fn settings_pass_membership_and_ordered_alphabet_identity() {
+        let (alphabet, domain, value) = settings_fixture();
+        for passes in [
+            vec![],
+            vec!["partial_exhaustion"],
+            vec!["reswapping"],
+            vec!["hill_climb", "partial_exhaustion"],
+            vec!["hill_climb", "hill_climb"],
+        ] {
+            let passes: Vec<String> = passes.into_iter().map(str::to_owned).collect();
+            let errors = AttackSettings::parse_json(
+                &alphabet,
+                &domain,
+                &passes,
+                &[MeasureId::Ic, MeasureId::Entropy],
+                &value.to_string(),
+            )
+            .unwrap_err();
+            assert_eq!(errors[0].code(), "invalid_request");
+            assert_eq!(errors[0].location(), "/job/attack/kind");
+        }
+        let mut deferred = value.clone();
+        deferred["kind"] = json!("partial_exhaustion");
+        let errors = AttackSettings::parse_json(
+            &alphabet,
+            &domain,
+            &["partial_exhaustion".to_owned()],
+            &[],
+            &deferred.to_string(),
+        )
+        .unwrap_err();
+        assert_eq!(errors[0].code(), "unsupported_pass");
+        assert_eq!(errors[0].location(), "/job/attack/kind");
+        let reordered = Alphabet::new(vec!['B', 'A', 'é', '🦀', 'C', 'D']).unwrap();
+        let errors = AttackSettings::parse_json(
+            &reordered,
+            &domain,
+            &["hill_climb".to_owned()],
+            &[],
+            &value.to_string(),
+        )
+        .unwrap_err();
+        assert_eq!(errors[0].code(), "invalid_request");
+        assert_eq!(errors[0].location(), "/job/attack");
+    }
+
+    #[test]
+    fn settings_strict_raw_json_and_exact_byte_ceiling() {
+        let (alphabet, domain, value) = settings_fixture();
+        let parse = |raw: &str| {
+            AttackSettings::parse_json(
+                &alphabet,
+                &domain,
+                &["hill_climb".to_owned()],
+                &[MeasureId::Ic, MeasureId::Entropy],
+                raw,
+            )
+        };
+        for raw in [
+            "{",
+            "[]",
+            "null",
+            "{} {}",
+            r#"{"nested":{"x":1,"x":2}}"#,
+            r#"{"kind":"hill_climb","kind":"hill_climb"}"#,
+        ] {
+            let errors = parse(raw).unwrap_err();
+            assert_eq!(errors[0].code(), "invalid_request", "{raw}");
+            assert_eq!(errors[0].location(), "/job/attack", "{raw}");
+        }
+        let mut padded = value.to_string();
+        padded.push_str(&" ".repeat(crate::MAX_REQUEST_BYTES - padded.len()));
+        assert_eq!(padded.len(), crate::MAX_REQUEST_BYTES);
+        assert!(parse(&padded).is_ok());
+        padded.push(' ');
+        let errors = parse(&padded).unwrap_err();
+        assert_eq!(errors[0].code(), "invalid_request");
+        assert_eq!(errors[0].location(), "/job/attack");
+    }
 
     #[test]
     fn attack_fragment_preserves_unicode_order_and_fixed_facts() {
