@@ -16,8 +16,8 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use enigma_core::{
-    encode, rfc3339_utc, DoneReason, Event, ParsedRequest, ParsedSearchRequest, TransformRequest,
-    MAX_REQUEST_BYTES,
+    encode, rfc3339_utc, DoneReason, Event, ParsedAttackRequest, ParsedRequest,
+    ParsedSearchRequest, TransformRequest, MAX_REQUEST_BYTES,
 };
 
 fn main() -> ExitCode {
@@ -160,7 +160,7 @@ fn run(bytes: Vec<u8>, origin: &Path) -> ExitCode {
 /// Load owned UTF-8 once, then borrow it into the pure core binding boundary.
 /// Successful binding is not execution: never enumerate candidates or emit work.
 fn run_search(request: ParsedSearchRequest, origin: &Path) -> ExitCode {
-    let contents = match resource_loader::load(&request, origin) {
+    let contents = match resource_loader::load(request.resources(), origin) {
         Ok(contents) => contents,
         Err(error) => return search_error(error.code, &error.message, &error.location),
     };
@@ -180,6 +180,42 @@ fn run_search(request: ParsedSearchRequest, origin: &Path) -> ExitCode {
                 eprintln!("{diagnostic}");
             }
             search_error(first.code(), first.message(), first.location())
+        }
+    }
+}
+
+/// Private preparation only; the root dispatcher intentionally remains unchanged.
+/// Binding finalizes eligibility, so no second gate check or resource read is needed.
+#[allow(dead_code)]
+fn run_attack(request: ParsedAttackRequest, origin: &Path, out: &mut impl Write) -> ExitCode {
+    let failure = |out: &mut _, code: &str, message: &str, location: &str| {
+        if let Err(error) = write_error_line(out, code, message, location, 1) {
+            eprintln!("error: failed to write protocol event: {error}");
+        }
+        eprintln!("{code}: {message}");
+        ExitCode::FAILURE
+    };
+    let contents = match resource_loader::load(request.resources(), origin) {
+        Ok(contents) => contents,
+        Err(error) => return failure(out, error.code, &error.message, &error.location),
+    };
+    let supplied: BTreeMap<String, &str> = contents
+        .iter()
+        .map(|(id, text)| (id.clone(), text.as_str()))
+        .collect();
+    match request.bind_resources(&supplied) {
+        Ok(_validated) => failure(
+            out,
+            "unsupported_job",
+            "attack execution is not implemented",
+            "/job/kind",
+        ),
+        Err(diagnostics) => {
+            for diagnostic in &diagnostics {
+                eprintln!("{diagnostic}");
+            }
+            let first = &diagnostics[0];
+            failure(out, first.code(), first.message(), first.location())
         }
     }
 }
@@ -243,6 +279,17 @@ fn run_transform(request: TransformRequest) -> ExitCode {
 
 /// Writes one terminal `error` event at the caller-supplied `seq` to stdout.
 fn emit_error_line(code: &str, message: &str, location: &str, seq: u64) -> io::Result<()> {
+    let stdout = io::stdout();
+    write_error_line(&mut stdout.lock(), code, message, location, seq)
+}
+
+fn write_error_line(
+    out: &mut impl Write,
+    code: &str,
+    message: &str,
+    location: &str,
+    seq: u64,
+) -> io::Result<()> {
     let event = Event::Error {
         code: code.to_owned(),
         message: message.to_owned(),
@@ -250,9 +297,7 @@ fn emit_error_line(code: &str, message: &str, location: &str, seq: u64) -> io::R
         expected: None,
         hint: None,
     };
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    emit(&mut out, &event, seq, &now_ts())?;
+    emit(out, &event, seq, &now_ts())?;
     out.flush()
 }
 
@@ -268,5 +313,271 @@ fn now_ts() -> String {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(elapsed) => rfc3339_utc(elapsed.as_secs() as i64),
         Err(_) => rfc3339_utc(0),
+    }
+}
+
+#[cfg(test)]
+mod attack_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn request() -> Value {
+        json!({"protocol_version":1,"machine":{"definition":{"kind":"custom","value":{
+            "alphabet":["A","B"],"wheels":[{"name":"r","wiring":["B","A"],"turnovers":[]}],
+            "slots":[{"id":"r","role":"rotor","movement":"fixed","wheel":"r"}],"stepping":{"rules":[]}}}},
+            "job":{"kind":"search","configuration":{"slots":[{"id":"r","ring":"A"}],"plugboard":[]},
+            "space":{"slots":[{"id":"r","positions":["A","B"]}],
+                "plugboard":{"kind":"attack","symbols":["A","B"],"max_pairs":1}},
+            "text":"AA","passes":["hill_climb"],"measures":["ic"],"resources":{},
+            "attack":{"kind":"hill_climb","initial_measure":"ic","final_measure":"ic",
+                "switch_pairs":1,"backtrack_pairs":0,"evaluation_budget":1,"start":[]}}})
+    }
+
+    fn check(value: &Value, origin: &Path, code: &str, location: &str) -> Value {
+        let parsed = ParsedAttackRequest::parse_json(&value.to_string()).unwrap();
+        let mut output = Vec::new();
+        assert_eq!(run_attack(parsed, origin, &mut output), ExitCode::FAILURE);
+        let text = String::from_utf8(output).unwrap();
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "no work events: {text}");
+        let event: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(event["event"], "error");
+        assert_eq!(event["seq"], 1);
+        assert_eq!(event["code"], code, "{event}");
+        assert_eq!(event["location"], location, "{event}");
+        event
+    }
+
+    fn partial(selection: &str) -> Value {
+        let mut value = request();
+        value["job"]["passes"] = json!(["partial_exhaustion"]);
+        let attack = value["job"]["attack"].as_object_mut().unwrap();
+        attack.remove("start");
+        attack.insert("kind".into(), json!("partial_exhaustion"));
+        attack.insert(
+            "seeds".into(),
+            json!({"kind":"empty_single","selection":selection}),
+        );
+        if selection == "touching" {
+            value["job"]["attack"]["seeds"]["symbols"] = json!(["A"]);
+        }
+        value
+    }
+
+    fn outer(slots: usize) -> Value {
+        let alphabet: Vec<String> = (0..256)
+            .map(|i| char::from_u32(0x100 + i).unwrap().to_string())
+            .collect();
+        let mut value = request();
+        value["machine"]["definition"]["value"] = json!({
+            "alphabet":alphabet,"wheels":[{"name":"r","wiring":alphabet,"turnovers":[]}],
+            "slots":(0..slots).map(|i| json!({"id":format!("r{i}"),"role":"rotor","movement":"fixed","wheel":"r"})).collect::<Vec<_>>(),
+            "stepping":{"rules":[]}});
+        value["job"]["configuration"]["slots"] = json!([]);
+        value["job"]["text"] = json!(alphabet[0].repeat(2));
+        value["job"]["space"] = json!({"limit":1,
+            "slots":(0..slots).map(|i| json!({"id":format!("r{i}"),"positions":alphabet,"rings":alphabet})).collect::<Vec<_>>(),
+            "plugboard":{"kind":"attack","symbols":&alphabet[..2],"max_pairs":1}});
+        value
+    }
+
+    #[test]
+    fn validated_attack_is_not_execution() {
+        for value in [request(), partial("all"), partial("touching"), outer(5)] {
+            let event = check(&value, Path::new("."), "unsupported_job", "/job/kind");
+            assert_eq!(event["message"], "attack execution is not implemented");
+        }
+        check(&outer(8), Path::new("."), "resource_limit", "/job/space");
+    }
+
+    #[test]
+    fn structural_diagnostics_are_parser_not_handler_failures() {
+        for passes in [
+            json!(["partial_exhaustion"]),
+            json!(["hill_climb", "partial_exhaustion"]),
+            json!(["reswapping"]),
+        ] {
+            let mut value = request();
+            value["job"]["passes"] = passes;
+            parse_error(&value, "invalid_request", "/job/attack/kind");
+        }
+        for (pointer, replacement, code, location) in [
+            (
+                "/job/attack/initial_measure",
+                json!("entropy"),
+                "invalid_request",
+                "/job/attack/initial_measure",
+            ),
+            (
+                "/job/attack/final_measure",
+                json!("entropy"),
+                "invalid_request",
+                "/job/attack/final_measure",
+            ),
+            (
+                "/job/attack/start",
+                json!([["A", "A"]]),
+                "invalid_search_space",
+                "/job/attack/start/0",
+            ),
+            (
+                "/job/attack/switch_pairs",
+                json!(2),
+                "invalid_search_space",
+                "/job/attack/switch_pairs",
+            ),
+            ("/job/text", json!("A"), "invalid_text", "/job/text"),
+        ] {
+            let mut value = request();
+            *value.pointer_mut(pointer).unwrap() = replacement;
+            parse_error(&value, code, location);
+        }
+        let mut value = request();
+        value["job"]["attack"]["seeds"] = json!({"kind":"empty_single","selection":"all"});
+        parse_error(&value, "invalid_request", "/job/attack/seeds");
+        let mut value = partial("all");
+        value["job"]["attack"]["start"] = json!([]);
+        parse_error(&value, "invalid_request", "/job/attack/start");
+        let mut value = partial("touching");
+        value["job"]["attack"]["seeds"]["symbols"] = json!([]);
+        parse_error(&value, "invalid_search_space", "/job/attack/seeds/symbols");
+        // Every declared measure imposes its minimum, even a non-objective.
+        for (measure, text) in [
+            ("ic", "A"),
+            ("entropy", ""),
+            ("trie", ""),
+            ("sinkov_bigram", "A"),
+        ] {
+            let mut value = request();
+            value["job"]["measures"] = json!(["entropy", measure]);
+            value["job"]["attack"]["initial_measure"] = json!("entropy");
+            value["job"]["attack"]["final_measure"] = json!("entropy");
+            if measure == "entropy" {
+                value["job"]["measures"] = json!(["entropy"]);
+            }
+            value["job"]["text"] = json!(text);
+            if !["ic", "entropy"].contains(&measure) {
+                value["job"]["resources"][measure] = json!({"path":"never-loaded.json"});
+            }
+            parse_error(&value, "invalid_text", "/job/text");
+        }
+    }
+
+    fn parse_error(value: &Value, code: &str, location: &str) {
+        let errors = ParsedAttackRequest::parse_json(&value.to_string()).unwrap_err();
+        assert_eq!((errors[0].code(), errors[0].location()), (code, location));
+    }
+
+    #[test]
+    fn resources_load_then_bind_then_finalize_eligibility() {
+        // A unique lexical origin also lets missing paths include escaped diagnostics.
+        let origin = std::env::temp_dir().join(format!("enigma-attack-{}", std::process::id()));
+        fs::create_dir_all(&origin).unwrap();
+        let filename = "model\"\\.json";
+        let mut model = json!({"resource_version":1,"kind":"ngram","alphabet":["A","B"],
+            "order":2,"entries":[{"gram":["A","A"],"count":1}]});
+        let backed = |mut value: Value| {
+            value["job"]["measures"] = json!(["ic", "sinkov_bigram"]);
+            value["job"]["resources"] = json!({"sinkov_bigram":{"path":filename}});
+            value
+        };
+        let overflow = backed(outer(8));
+        let event = check(
+            &overflow,
+            &origin,
+            "unsupported_resource",
+            "/job/resources/sinkov_bigram/path",
+        );
+        assert!(event["message"].as_str().unwrap().contains("model"));
+        // A directory is a deterministically unreadable resource, even as root.
+        let mut directory = backed(request());
+        directory["job"]["resources"]["sinkov_bigram"]["path"] = json!(".");
+        check(
+            &directory,
+            &origin,
+            "unsupported_resource",
+            "/job/resources/sinkov_bigram/path",
+        );
+        let path = origin.join(filename);
+        fs::write(&path, "{").unwrap();
+        check(&overflow, &origin, "invalid_json", "");
+        for (content, code, location) in [
+            ("{".to_owned(), "invalid_json", ""),
+            (
+                {
+                    let mut m = model.clone();
+                    m["order"] = json!(1);
+                    m["entries"][0]["gram"] = json!(["A"]);
+                    m.to_string()
+                },
+                "unsupported_resource",
+                "/order",
+            ),
+            (
+                {
+                    let mut m = model.clone();
+                    m["alphabet"] = json!(["B", "A"]);
+                    m.to_string()
+                },
+                "unsupported_resource",
+                "/alphabet",
+            ),
+        ] {
+            fs::write(&path, content).unwrap();
+            check(&backed(request()), &origin, code, location);
+        }
+        fs::write(&path, model.to_string()).unwrap();
+        check(&backed(request()), &origin, "unsupported_job", "/job/kind");
+        model["alphabet"] = outer(8)["machine"]["definition"]["value"]["alphabet"].clone();
+        model["entries"][0]["gram"] = json!(["Ā", "Ā"]);
+        fs::write(&path, model.to_string()).unwrap();
+        check(&overflow, &origin, "resource_limit", "/job/space");
+        fs::remove_dir_all(origin).unwrap();
+    }
+
+    #[test]
+    fn error_output_flushes_and_writer_failures_are_not_delivery_guarantees() {
+        struct Writer {
+            bytes: Vec<u8>,
+            flushes: usize,
+            fail_write: bool,
+            fail_flush: bool,
+        }
+        impl Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.fail_write {
+                    return Err(io::Error::other("injected write failure"));
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushes += 1;
+                if self.fail_flush {
+                    Err(io::Error::other("injected flush failure"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for (fail_write, fail_flush) in [(false, false), (true, false), (false, true)] {
+            let mut out = Writer {
+                bytes: vec![],
+                flushes: 0,
+                fail_write,
+                fail_flush,
+            };
+            let parsed = ParsedAttackRequest::parse_json(&request().to_string()).unwrap();
+            assert_eq!(
+                run_attack(parsed, Path::new("."), &mut out),
+                ExitCode::FAILURE
+            );
+            assert_eq!(out.flushes, usize::from(!fail_write));
+            if !fail_write {
+                let event: Value = serde_json::from_slice(&out.bytes).unwrap();
+                assert_eq!(event["event"], "error");
+                assert_eq!(event["seq"], 1);
+            }
+        }
     }
 }

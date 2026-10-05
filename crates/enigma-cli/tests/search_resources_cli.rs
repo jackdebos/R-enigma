@@ -267,6 +267,25 @@ fn aggregate_counts_repeated_paths_before_semantic_parsing() {
     );
 }
 #[test]
+fn complete_attack_remains_rejected_before_resource_loading() {
+    let f = Fixture::new();
+    let mut r = request(&["ic", "trie"]);
+    r["job"]["space"]["plugboard"] = json!({"kind":"attack","symbols":["A","B"],"max_pairs":1});
+    r["job"]["attack"] = json!({"kind":"hill_climb","initial_measure":"ic","final_measure":"ic",
+        "switch_pairs":1,"backtrack_pairs":0,"evaluation_budget":1,"start":[]});
+    // The complete owner is publicly valid; the binary still uses legacy parsing.
+    enigma_core::ParsedAttackRequest::parse_json(&r.to_string()).unwrap();
+    error(f.stdin(&r), "unknown_field", "/job/attack");
+    r["job"]["passes"] = json!(["partial_exhaustion"]);
+    r["job"]["attack"].as_object_mut().unwrap().remove("start");
+    r["job"]["attack"]["kind"] = json!("partial_exhaustion");
+    r["job"]["attack"]["seeds"] = json!({"kind":"empty_single","selection":"all"});
+    enigma_core::ParsedAttackRequest::parse_json(&r.to_string()).unwrap();
+    f.write("request.json", r.to_string());
+    error(f.file("request.json"), "unknown_field", "/job/attack");
+}
+
+#[test]
 fn missing_request_stays_stderr_only_exit_two() {
     let f = Fixture::new();
     let out = f.file("missing.json");

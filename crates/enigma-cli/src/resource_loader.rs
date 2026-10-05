@@ -1,6 +1,6 @@
 //! Caller-side lexical path loading. No sandbox or confinement is implied.
 use enigma_core::{
-    ParsedSearchRequest, MAX_RESOURCE_BYTES, MAX_RESOURCE_REFERENCES, MAX_RESOURCE_TOTAL_BYTES,
+    ResourceReference, MAX_RESOURCE_BYTES, MAX_RESOURCE_REFERENCES, MAX_RESOURCE_TOTAL_BYTES,
 };
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -60,7 +60,7 @@ impl Budget {
 }
 
 pub(crate) fn load(
-    request: &ParsedSearchRequest,
+    references: &[ResourceReference],
     origin: &Path,
 ) -> Result<BTreeMap<String, String>, LoadError> {
     let mut budget = Budget {
@@ -71,7 +71,7 @@ pub(crate) fn load(
     let mut contents = BTreeMap::new();
     // Parsed references are in deterministic ID order, not selected-measure order.
     // Each reference is read independently even when path spellings are identical.
-    for (index, reference) in request.resources().iter().enumerate() {
+    for (index, reference) in references.iter().enumerate() {
         let id = reference.measure().id();
         let fail = |code, message: String| LoadError {
             code,
