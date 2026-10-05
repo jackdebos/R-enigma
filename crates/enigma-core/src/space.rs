@@ -869,19 +869,47 @@ fn parse_search_job(
     parse_search_carrier(definition, job, PlugboardConstruction::LegacyPool)
 }
 
-// Temporarily unused outside tests until the private bound wrapper is integrated.
-// No carrier accessor or promotion API may escape this owner.
-#[allow(dead_code)]
+/// Structurally validated attack inputs awaiting resource binding and eligibility.
+///
+/// ```compile_fail
+/// fn carrier(request: enigma_core::ParsedAttackRequest) { let _ = request.carrier; }
+/// ```
 #[derive(Debug)]
-struct ParsedAttackRequest {
+pub struct ParsedAttackRequest {
     carrier: ParsedSearchRequest,
     domain: AttackPlugboardDomain,
     settings: AttackSettings,
 }
 
-#[allow(dead_code)]
 impl ParsedAttackRequest {
-    fn parse_json(json: &str) -> Result<Self, Vec<RequestDiagnostic>> {
+    /// Validated references callers can load without exposing the slot carrier.
+    pub fn resources(&self) -> &[ResourceReference] {
+        self.carrier.resources()
+    }
+
+    /// Binds exact supplied contents without I/O, then checks attack eligibility.
+    pub fn bind_resources(
+        self,
+        supplied: &std::collections::BTreeMap<String, &str>,
+    ) -> Result<AttackRequest, Vec<RequestDiagnostic>> {
+        AttackRequest::finish(
+            self.carrier.bind_resources(supplied)?,
+            self.domain,
+            self.settings,
+        )
+    }
+
+    /// Promotes resource-free selections only, then checks attack eligibility.
+    pub fn into_resource_free(self) -> Result<AttackRequest, Vec<RequestDiagnostic>> {
+        AttackRequest::finish(
+            self.carrier.into_resource_free()?,
+            self.domain,
+            self.settings,
+        )
+    }
+
+    /// Parses a strict complete attack request once, without binding or enumeration.
+    pub fn parse_json(json: &str) -> Result<Self, Vec<RequestDiagnostic>> {
         let root = parse_root(json)?;
         let parse = || {
             let job = object(&root.job, "/job")?;
@@ -941,6 +969,85 @@ impl ParsedAttackRequest {
                 .map(RequestDiagnostic::from)
                 .collect()
         })
+    }
+}
+
+/// Resource-bound, eligibility-checked attack inputs; not executable or enumerable.
+///
+/// ```compile_fail
+/// fn carrier(request: enigma_core::AttackRequest) { let _ = request.carrier; }
+/// ```
+///
+/// ```compile_fail
+/// fn enumerate(request: enigma_core::AttackRequest) { request.candidates(); }
+/// ```
+///
+/// ```compile_fail
+/// fn resolve(request: enigma_core::AttackRequest) { request.candidate_at(0); }
+/// ```
+#[derive(Debug)]
+pub struct AttackRequest {
+    carrier: SearchRequest,
+    domain: AttackPlugboardDomain,
+    settings: AttackSettings,
+    gate: crate::AttackGate,
+}
+
+impl AttackRequest {
+    fn finish(
+        carrier: SearchRequest,
+        domain: AttackPlugboardDomain,
+        settings: AttackSettings,
+    ) -> Result<Self, Vec<RequestDiagnostic>> {
+        let gate = crate::AttackGate::check(&carrier, &domain, &settings).map_err(|errors| {
+            errors
+                .into_iter()
+                .map(RequestDiagnostic::from)
+                .collect::<Vec<_>>()
+        })?;
+        Ok(Self {
+            carrier,
+            domain,
+            settings,
+            gate,
+        })
+    }
+
+    /// Parses and promotes only resource-free complete attack requests.
+    pub fn parse_json(json: &str) -> Result<Self, Vec<RequestDiagnostic>> {
+        ParsedAttackRequest::parse_json(json)?.into_resource_free()
+    }
+    /// Validated machine definition.
+    pub fn definition(&self) -> &Definition {
+        self.carrier.definition()
+    }
+    /// Validated input text.
+    pub fn text(&self) -> &str {
+        self.carrier.text()
+    }
+    /// Selected measures in source order.
+    pub fn measures(&self) -> &[MeasureId] {
+        self.carrier.measures()
+    }
+    /// Validated external reference metadata.
+    pub fn resources(&self) -> &[ResourceReference] {
+        self.carrier.resources()
+    }
+    /// Retained immutable scoring model, if the measure requires one.
+    pub fn bound_resource(&self, measure: MeasureId) -> Option<&crate::BoundResource> {
+        self.carrier.bound_resource(measure)
+    }
+    /// Mutable domain and immutable fixed facts.
+    pub fn domain(&self) -> &AttackPlugboardDomain {
+        &self.domain
+    }
+    /// Validated typed attack settings.
+    pub fn settings(&self) -> &AttackSettings {
+        &self.settings
+    }
+    /// Checked cardinalities, not evaluation reservations.
+    pub fn gate(&self) -> &crate::AttackGate {
+        &self.gate
     }
 }
 
@@ -2923,6 +3030,245 @@ mod tests {
             "start": [["D", "C"]]
         });
         value
+    }
+
+    #[test]
+    fn public_attack_promotion_and_counts() {
+        for (selection, starts) in [(None, 1), (Some("all"), 7), (Some("touching"), 4)] {
+            let mut value = attack_request();
+            value["job"]["attack"]["evaluation_budget"] = json!(1);
+            if let Some(selection) = selection {
+                value["job"]["passes"] = json!(["partial_exhaustion"]);
+                value["job"]["attack"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("start");
+                value["job"]["attack"]["kind"] = json!("partial_exhaustion");
+                let mut seeds = json!({"kind":"empty_single", "selection":selection});
+                if selection == "touching" {
+                    seeds["symbols"] = json!(["D"]);
+                }
+                value["job"]["attack"]["seeds"] = seeds;
+            }
+            value["job"]["configuration"]["slots"][1]
+                .as_object_mut()
+                .unwrap()
+                .remove("position");
+            value["job"]["space"]["slots"] = json!([{"id":"fast", "positions":["A","B","C","D"]}]);
+            for (offset, limit, selected) in [(0, 4, 4), (1, 2, 2), (4, 1, 0)] {
+                value["job"]["space"]["offset"] = json!(offset);
+                value["job"]["space"]["limit"] = json!(limit);
+                let parsed = crate::ParsedAttackRequest::parse_json(&value.to_string()).unwrap();
+                assert!(parsed.resources().is_empty());
+                let bound = parsed
+                    .bind_resources(&std::collections::BTreeMap::new())
+                    .unwrap();
+                let free = crate::AttackRequest::parse_json(&value.to_string()).unwrap();
+                for request in [&bound, &free] {
+                    assert_eq!(
+                        (
+                            request.gate().outer_total(),
+                            request.gate().outer_selected(),
+                            request.gate().starts_per_outer()
+                        ),
+                        (4, selected, starts)
+                    );
+                    assert_eq!(request.settings().evaluation_budget(), 1);
+                    assert!(request.bound_resource(MeasureId::Ic).is_none());
+                }
+            }
+        }
+        let mut value = attack_request();
+        value["job"]["configuration"]["plugboard"] = json!([["B", "A"]]);
+        value["job"]["space"]["plugboard"]["symbols"] = json!(["D", "C"]);
+        let request = crate::AttackRequest::parse_json(&value.to_string()).unwrap();
+        assert_eq!(request.domain().fixed_pairs(), [('B', 'A')]);
+        assert_eq!(request.domain().symbols(), ['D', 'C']);
+        assert_eq!(request.settings().start(), Some(&[('D', 'C')][..]));
+    }
+
+    fn resource_attack() -> Value {
+        let mut value = attack_request();
+        value["job"]["text"] = json!("AAAAAA");
+        value["job"]["measures"] = json!(["ic", "sinkov_bigram", "trie"]);
+        value["job"]["resources"] =
+            json!({"sinkov_bigram":{"path":"ng.json"}, "trie":{"path":"dict.json"}});
+        value
+    }
+
+    fn attack_models() -> (Value, Value) {
+        (
+            json!({"resource_version":1, "kind":"ngram", "alphabet":["A","B","C","D"], "order":2, "entries":[{"gram":["A","A"],"count":1}]}),
+            json!({"resource_version":1, "kind":"dictionary", "alphabet":["A","B","C","D"], "entries":[{"word":["A"],"weight":2}]}),
+        )
+    }
+
+    #[test]
+    fn public_attack_retains_nonobjective_models_after_inputs_drop() {
+        let request = {
+            let (ngram, trie) = attack_models();
+            let (ngram, trie) = (ngram.to_string(), trie.to_string());
+            let supplied = std::collections::BTreeMap::from([
+                ("sinkov_bigram".into(), ngram.as_str()),
+                ("trie".into(), trie.as_str()),
+            ]);
+            let parsed =
+                crate::ParsedAttackRequest::parse_json(&resource_attack().to_string()).unwrap();
+            assert_eq!(parsed.resources().len(), 2);
+            assert_eq!(parsed.resources()[0].measure(), MeasureId::SinkovBigram);
+            parsed.bind_resources(&supplied).unwrap()
+        };
+        assert_eq!(request.resources()[1].path(), "dict.json");
+        assert_eq!(
+            request.measures(),
+            [MeasureId::Ic, MeasureId::SinkovBigram, MeasureId::Trie]
+        );
+        assert_eq!(request.settings().initial_measure(), MeasureId::Ic);
+        for measure in [MeasureId::SinkovBigram, MeasureId::Trie] {
+            match request.bound_resource(measure).unwrap() {
+                crate::BoundResource::Ngram(model) => {
+                    assert_eq!(model.alphabet(), request.definition().alphabet());
+                    assert_eq!(model.order(), 2);
+                    assert_eq!(model.score(request.text()).unwrap().measured().units(), 0);
+                }
+                crate::BoundResource::Trie(model) => {
+                    assert_eq!(model.alphabet(), request.definition().alphabet());
+                    assert_eq!(
+                        model.score(request.text()).unwrap().measured().units(),
+                        12 * crate::SCALE
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn public_attack_binding_error_precedence_and_context() {
+        let value = resource_attack();
+        let parse = || crate::ParsedAttackRequest::parse_json(&value.to_string()).unwrap();
+        let check = |errors: Vec<RequestDiagnostic>, code, path| {
+            assert_eq!((errors[0].code(), errors[0].location()), (code, path));
+        };
+        check(
+            crate::AttackRequest::parse_json(&value.to_string()).unwrap_err(),
+            "unsupported_resource",
+            "/job/resources/sinkov_bigram/path",
+        );
+        check(
+            parse().into_resource_free().unwrap_err(),
+            "unsupported_resource",
+            "/job/resources/sinkov_bigram/path",
+        );
+        check(
+            parse()
+                .bind_resources(&std::collections::BTreeMap::new())
+                .unwrap_err(),
+            "unsupported_resource",
+            "/job/resources/sinkov_bigram/path",
+        );
+        let extra = std::collections::BTreeMap::from([("a~/extra".into(), "bad")]);
+        check(
+            parse().bind_resources(&extra).unwrap_err(),
+            "unsupported_resource",
+            "/job/resources/a~0~1extra/path",
+        );
+        let oversized = "x".repeat(crate::MAX_RESOURCE_BYTES + 1);
+        let supplied = std::collections::BTreeMap::from([
+            ("sinkov_bigram".into(), "bad"),
+            ("trie".into(), oversized.as_str()),
+        ]);
+        check(
+            parse().bind_resources(&supplied).unwrap_err(),
+            "resource_limit",
+            "/job/resources/trie/path",
+        );
+        let (ngram, trie) = attack_models();
+        let trie = trie.to_string();
+        let mut wrong_order = ngram.clone();
+        wrong_order["order"] = json!(1);
+        wrong_order["entries"][0]["gram"] = json!(["A"]);
+        let mut wrong_alphabet = ngram;
+        wrong_alphabet["alphabet"] = json!(["B", "A", "C", "D"]);
+        for (content, path) in [
+            ("{".to_owned(), ""),
+            (wrong_order.to_string(), "/order"),
+            (wrong_alphabet.to_string(), "/alphabet"),
+        ] {
+            let supplied = std::collections::BTreeMap::from([
+                ("sinkov_bigram".into(), content.as_str()),
+                ("trie".into(), trie.as_str()),
+            ]);
+            let errors = parse().bind_resources(&supplied).unwrap_err();
+            assert_eq!(errors[0].location(), path);
+            assert!(errors[0].message().contains("ng.json"));
+            assert!(errors[0].message().contains("sinkov_bigram"));
+        }
+    }
+
+    #[test]
+    fn public_attack_structure_precedes_eligibility() {
+        for passes in [
+            json!(["reswapping"]),
+            json!(["hill_climb", "partial_exhaustion"]),
+            json!(["partial_exhaustion"]),
+        ] {
+            let mut value = attack_request();
+            value["job"]["passes"] = passes;
+            let errors = crate::AttackRequest::parse_json(&value.to_string()).unwrap_err();
+            assert_eq!(
+                (errors[0].code(), errors[0].location()),
+                ("invalid_request", "/job/attack/kind")
+            );
+        }
+        for (field, code) in [
+            ("switch_pairs", "invalid_search_space"),
+            ("evaluation_budget", "invalid_request"),
+        ] {
+            let mut value = attack_request();
+            value["job"]["attack"][field] = json!(-1);
+            let errors = crate::AttackRequest::parse_json(&value.to_string()).unwrap_err();
+            assert_eq!(errors[0].code(), code);
+            assert_eq!(errors[0].location(), format!("/job/attack/{field}"));
+        }
+    }
+
+    #[test]
+    fn public_attack_full_outer_overflow_precedes_slicing() {
+        let alphabet: Vec<String> = (0..256)
+            .map(|i| char::from_u32(0x100 + i).unwrap().to_string())
+            .collect();
+        for slots in [5, 8] {
+            let mut value = attack_request();
+            value["machine"]["definition"]["value"] = json!({
+                "alphabet":alphabet, "wheels":[{"name":"r","wiring":alphabet,"turnovers":[]}],
+                "slots":(0..slots).map(|i| json!({"id":format!("r{i}"),"role":"rotor","movement":"fixed","wheel":"r"})).collect::<Vec<_>>(),
+                "stepping":{"rules":[]}
+            });
+            value["job"]["configuration"]["slots"] = json!([]);
+            value["job"]["text"] = json!(alphabet[0].repeat(2));
+            value["job"]["space"] = json!({"limit":1,
+                "slots":(0..slots).map(|i| json!({"id":format!("r{i}"),"positions":alphabet,"rings":alphabet})).collect::<Vec<_>>(),
+                "plugboard":{"kind":"attack","symbols":&alphabet[..2],"max_pairs":1}});
+            value["job"]["attack"]["start"] = json!([]);
+            let parsed = crate::ParsedAttackRequest::parse_json(&value.to_string()).unwrap();
+            let result = parsed.bind_resources(&std::collections::BTreeMap::new());
+            if slots == 8 {
+                let errors = result.unwrap_err();
+                assert_eq!(
+                    (errors[0].code(), errors[0].location()),
+                    ("resource_limit", "/job/space")
+                );
+            } else {
+                let request = result.unwrap();
+                assert_eq!(
+                    (
+                        request.gate().outer_total(),
+                        request.gate().outer_selected()
+                    ),
+                    (1u128 << 80, 1)
+                );
+            }
+        }
     }
 
     #[test]

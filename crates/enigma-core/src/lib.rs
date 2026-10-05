@@ -88,9 +88,9 @@ pub use engine::{Direction, Engine};
 pub use event::{encode, rfc3339_utc, DoneReason, Event};
 pub use request::{ParsedRequest, RequestDiagnostic, TransformRequest, MAX_REQUEST_BYTES};
 pub use space::{
-    AttackKind, AttackPlugboardDomain, AttackSeedPolicy, AttackSettings, ParsedSearchRequest,
-    PlugboardDomain, SearchConfiguration, SearchDiagnostic, SearchFixedSlot, SearchRequest,
-    SearchSlotDomain, SearchSpace,
+    AttackKind, AttackPlugboardDomain, AttackRequest, AttackSeedPolicy, AttackSettings,
+    ParsedAttackRequest, ParsedSearchRequest, PlugboardDomain, SearchConfiguration,
+    SearchDiagnostic, SearchFixedSlot, SearchRequest, SearchSlotDomain, SearchSpace,
 };
 
 use std::collections::{BTreeSet, HashMap, HashSet};
