@@ -1,6 +1,71 @@
-//! Private trial-board validation; transformation and scoring are not implemented here.
+//! Private fresh-state trial evaluation with retained, caller-borrowed scoring models.
 
-use crate::{AttackPlugboardDomain, ModelError, Plugboard, ResolvedConfiguration};
+use crate::{
+    index_of_coincidence, shannon_entropy, AttackPlugboardDomain, BoundResource, Direction, Engine,
+    MeasureError, MeasureId, MeasuredScore, ModelError, Plugboard, ResolvedConfiguration,
+};
+
+#[derive(Debug, PartialEq, Eq)]
+enum TrialEvaluationError {
+    Board(TrialBoardError),
+    Model(ModelError),
+    MissingResource(MeasureId),
+    IncompatibleResource(MeasureId),
+    Measure(MeasureError),
+}
+
+struct TrialEvaluator<'a> {
+    initial: &'a ResolvedConfiguration,
+    domain: &'a AttackPlugboardDomain,
+    input: &'a str,
+    direction: Direction,
+    objective: MeasureId,
+    resource: Option<&'a BoundResource>,
+}
+
+impl TrialEvaluator<'_> {
+    fn evaluate(
+        &self,
+        mutable: &[(char, char)],
+    ) -> Result<(String, MeasuredScore), TrialEvaluationError> {
+        let board = validated_trial_board(self.initial, self.domain, mutable)
+            .map_err(TrialEvaluationError::Board)?;
+        // Engine::clone preserves positions. Build and discard a local engine instead.
+        let mut engine = Engine::new(
+            self.initial.topology().clone(),
+            self.initial.stepping().clone(),
+            board,
+        )
+        .map_err(TrialEvaluationError::Model)?;
+        let plaintext = engine
+            .transform(self.input, self.direction)
+            .map_err(TrialEvaluationError::Model)?;
+        let score = self.measure(&plaintext)?;
+        Ok((plaintext, score))
+    }
+
+    fn measure(&self, plaintext: &str) -> Result<MeasuredScore, TrialEvaluationError> {
+        let alphabet = self.initial.topology().alphabet();
+        let incompatible = || TrialEvaluationError::IncompatibleResource(self.objective);
+        let score = match (self.objective, self.resource) {
+            (MeasureId::Ic, None) => index_of_coincidence(alphabet, plaintext),
+            (MeasureId::Entropy, None) => shannon_entropy(alphabet, plaintext),
+            (objective, None) if objective.requires_resource() => {
+                return Err(TrialEvaluationError::MissingResource(objective));
+            }
+            (objective, Some(BoundResource::Ngram(model)))
+                if objective.order() == Some(model.order()) && model.alphabet() == alphabet =>
+            {
+                model.score(plaintext)
+            }
+            (MeasureId::Trie, Some(BoundResource::Trie(model))) if model.alphabet() == alphabet => {
+                model.score(plaintext)
+            }
+            _ => return Err(incompatible()),
+        };
+        score.map_err(TrialEvaluationError::Measure)
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum TrialBoardError {
@@ -91,6 +156,277 @@ mod tests {
     fn assert_mapping(board: &Plugboard, expected: &str) {
         let actual: String = "ABCDEFGH".chars().map(|c| board.map(c).unwrap()).collect();
         assert_eq!(actual, expected);
+    }
+
+    fn machine(
+        symbols: &str,
+        wiring: &str,
+        positions: &str,
+        stepped: bool,
+    ) -> ResolvedConfiguration {
+        let slots: Vec<_> = positions.chars().enumerate().map(|(i, _)| {
+            serde_json::json!({"id": format!("r{i}"), "role": "rotor", "movement": "movable", "wheel": "r"})
+        }).collect();
+        let rules = if stepped {
+            serde_json::json!([{"when": {"always": true}, "advance": ["r0"]}])
+        } else {
+            serde_json::json!([])
+        };
+        let source = serde_json::json!({"kind": "custom", "value": {
+            "alphabet": symbols.chars().collect::<Vec<_>>(),
+            "wheels": [{"name": "r", "wiring": wiring.chars().collect::<Vec<_>>(), "turnovers": []}],
+            "slots": slots, "stepping": {"rules": rules}
+        }});
+        let definition = DefinitionSource::parse_json(&source.to_string())
+            .unwrap()
+            .resolve()
+            .unwrap();
+        TransformConfiguration::new(
+            positions
+                .chars()
+                .enumerate()
+                .map(|(i, p)| SlotConfiguration::new(format!("r{i}"), "r", p, 'A'))
+                .collect(),
+            vec![],
+        )
+        .resolve(&definition)
+        .unwrap()
+    }
+
+    fn evaluator<'a>(
+        initial: &'a ResolvedConfiguration,
+        domain: &'a AttackPlugboardDomain,
+        input: &'a str,
+    ) -> TrialEvaluator<'a> {
+        TrialEvaluator {
+            initial,
+            domain,
+            input,
+            direction: Direction::Decrypt,
+            objective: MeasureId::Ic,
+            resource: None,
+        }
+    }
+
+    const SINKOV: [MeasureId; 6] = [
+        MeasureId::SinkovMonogram,
+        MeasureId::SinkovBigram,
+        MeasureId::SinkovTrigram,
+        MeasureId::SinkovQuadgram,
+        MeasureId::SinkovPentagram,
+        MeasureId::SinkovHexagram,
+    ];
+
+    fn ngram(alphabet: &Alphabet, order: usize) -> BoundResource {
+        BoundResource::Ngram(
+            crate::NgramModel::new(
+                alphabet.clone(),
+                order,
+                vec![(vec!['A'; order], 3), (vec!['B'; order], 1)],
+            )
+            .unwrap(),
+        )
+    }
+
+    fn trie(alphabet: &Alphabet) -> BoundResource {
+        BoundResource::Trie(
+            crate::TrieModel::new(
+                alphabet.clone(),
+                vec![(vec!['A'], 2), (vec!['A', 'A'], -1), (vec!['B'], 1)],
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn independent_direction_and_stepping_oracles() {
+        let initial = machine("ABCD", "ABDC", "CB", false);
+        let alphabet = initial.topology().alphabet();
+        let domain = domain(alphabet, &[], "ABCD", 2);
+        let mut trial = evaluator(&initial, &domain, "ABCD");
+        assert_eq!(trial.evaluate(&[]).unwrap().0, "CABD");
+        trial.direction = Direction::Encrypt;
+        assert_eq!(trial.evaluate(&[]).unwrap().0, "BCAD");
+        for (stepped, expected) in [(true, "CA"), (false, "BB")] {
+            let initial = machine("ABC", "BAC", "A", stepped);
+            let domain = super::tests::domain(initial.topology().alphabet(), &[], "ABC", 1);
+            let trial = evaluator(&initial, &domain, "AA");
+            assert_eq!(trial.evaluate(&[]).unwrap().0, expected);
+        }
+    }
+
+    #[test]
+    fn stepped_trials_and_failures_are_isolated_and_inputs_stay_owned() {
+        let initial = machine("ABC", "BAC", "A", true);
+        let domain = domain(initial.topology().alphabet(), &[], "ABC", 1);
+        let input = String::from("AA");
+        let pairs = [('A', 'B')];
+        let before = (initial.clone(), domain.clone(), input.clone(), pairs);
+        let trial = evaluator(&initial, &domain, &input);
+        let a = trial.evaluate(&[]).unwrap();
+        let b = trial.evaluate(&pairs).unwrap();
+        assert_eq!(a.0, "CA");
+        assert_eq!(b.0, "AC");
+        assert_ne!(a, b);
+        assert_eq!(trial.evaluate(&[]).unwrap(), a);
+        assert_eq!(
+            trial.evaluate(&[('A', 'A')]),
+            Err(TrialEvaluationError::Board(TrialBoardError::Model(
+                ModelError::PlugboardSelfPair('A')
+            ))),
+        );
+        assert_eq!(trial.evaluate(&[]).unwrap(), a);
+        let foreign = TrialEvaluator {
+            input: "AZ",
+            ..trial
+        };
+        assert_eq!(
+            foreign.evaluate(&[]),
+            Err(TrialEvaluationError::Model(ModelError::UnknownSymbol('Z')))
+        );
+        assert_eq!(trial.evaluate(&[]).unwrap(), a);
+        assert_eq!((initial, domain, input, pairs), before);
+    }
+
+    #[test]
+    fn resource_free_scores_have_independent_nonzero_orientation() {
+        let alphabet = Alphabet::new("AB".chars().collect()).unwrap();
+        let initial = initial(&alphabet, &[]);
+        let domain = domain(&alphabet, &[], "AB", 1);
+        let mut trial = evaluator(&initial, &domain, "AABB");
+        let score = trial.evaluate(&[]).unwrap().1;
+        assert_eq!(score.measured().units(), 2 * crate::SCALE / 3);
+        assert_eq!(score.ranking(), score.measured());
+        trial.objective = MeasureId::Entropy;
+        let score = trial.evaluate(&[]).unwrap().1;
+        assert_eq!(score.measured().units(), crate::SCALE);
+        assert_eq!(score.ranking().units(), -crate::SCALE);
+        trial.input = "AAAA";
+        assert!(trial.evaluate(&[]).unwrap().1.ranking().units() > score.ranking().units());
+        trial.objective = MeasureId::Ic;
+        assert!(trial.evaluate(&[]).unwrap().1.ranking().units() > 2 * crate::SCALE / 3);
+    }
+
+    #[test]
+    fn retained_models_repeat_with_known_nonuniform_scores_for_every_order() {
+        let alphabet = Alphabet::new("AB".chars().collect()).unwrap();
+        let initial = initial(&alphabet, &[]);
+        let domain = domain(&alphabet, &[], "AB", 1);
+        for (i, objective) in SINKOV.into_iter().enumerate() {
+            let resource = ngram(&alphabet, i + 1);
+            let mut trial = evaluator(&initial, &domain, "AAAAAAA");
+            trial.objective = objective;
+            trial.resource = Some(&resource);
+            let a = trial.evaluate(&[]).unwrap();
+            // ln(3/4) and ln(1/4), independently quantized downward to Q32.
+            assert_eq!(a.1.measured().units(), -1_235_585_093);
+            assert_eq!(a.1.ranking(), a.1.measured());
+            trial.input = "BBBBBBB";
+            let b = trial.evaluate(&[]).unwrap();
+            assert_eq!(b.1.measured().units(), -5_954_088_944);
+            assert!(a.1.ranking().units() > b.1.ranking().units());
+            trial.input = "AAAAAAA";
+            assert_eq!(trial.evaluate(&[]).unwrap(), a);
+        }
+        let resource = trie(&alphabet);
+        let mut trial = evaluator(&initial, &domain, "AAB");
+        trial.objective = MeasureId::Trie;
+        trial.resource = Some(&resource);
+        let a = trial.evaluate(&[]).unwrap();
+        assert_eq!(a.1.measured().units(), 4 * crate::SCALE);
+        assert_eq!(a.1.ranking(), a.1.measured());
+        trial.input = "BBB";
+        assert_eq!(
+            trial.evaluate(&[]).unwrap().1.measured().units(),
+            3 * crate::SCALE
+        );
+        trial.input = "AAB";
+        assert_eq!(trial.evaluate(&[]).unwrap(), a);
+    }
+
+    #[test]
+    fn complete_resource_compatibility_matrix_is_typed() {
+        let alphabet = Alphabet::new("AB".chars().collect()).unwrap();
+        let reversed = Alphabet::new("BA".chars().collect()).unwrap();
+        let initial = initial(&alphabet, &[]);
+        let domain = domain(&alphabet, &[], "AB", 1);
+        let resources: Vec<_> = (1..=6).map(|order| ngram(&alphabet, order)).collect();
+        let trie = trie(&alphabet);
+        let wrong_trie = super::tests::trie(&reversed);
+        for objective in [MeasureId::Ic, MeasureId::Entropy]
+            .into_iter()
+            .chain(SINKOV)
+            .chain([MeasureId::Trie])
+        {
+            let mut trial = evaluator(&initial, &domain, "AAAAAAA");
+            trial.objective = objective;
+            let result = trial.evaluate(&[]);
+            if objective.requires_resource() {
+                assert_eq!(
+                    result,
+                    Err(TrialEvaluationError::MissingResource(objective))
+                );
+            } else {
+                assert!(result.is_ok());
+            }
+            for resource in resources.iter().chain([&trie]) {
+                trial.resource = Some(resource);
+                let compatible = match resource {
+                    BoundResource::Ngram(model) => objective.order() == Some(model.order()),
+                    BoundResource::Trie(_) => objective == MeasureId::Trie,
+                };
+                if compatible {
+                    assert!(trial.evaluate(&[]).is_ok());
+                } else {
+                    assert_eq!(
+                        trial.evaluate(&[]),
+                        Err(TrialEvaluationError::IncompatibleResource(objective))
+                    );
+                }
+            }
+            let wrong_ngram = ngram(&reversed, objective.order().unwrap_or(1));
+            for resource in [&wrong_ngram, &wrong_trie] {
+                trial.resource = Some(resource);
+                assert_eq!(
+                    trial.evaluate(&[]),
+                    Err(TrialEvaluationError::IncompatibleResource(objective))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exact_sample_errors_are_preserved_for_all_measures() {
+        let alphabet = Alphabet::new("AB".chars().collect()).unwrap();
+        let initial = initial(&alphabet, &[]);
+        let domain = domain(&alphabet, &[], "AB", 1);
+        for objective in [MeasureId::Ic, MeasureId::Entropy]
+            .into_iter()
+            .chain(SINKOV)
+            .chain([MeasureId::Trie])
+        {
+            let resource = if let Some(order) = objective.order() {
+                Some(ngram(&alphabet, order))
+            } else if objective == MeasureId::Trie {
+                Some(trie(&alphabet))
+            } else {
+                None
+            };
+            let required = objective.minimum_samples() as u128;
+            for actual in 0..required {
+                let input = "A".repeat(actual as usize);
+                let mut trial = evaluator(&initial, &domain, &input);
+                trial.objective = objective;
+                trial.resource = resource.as_ref();
+                assert_eq!(
+                    trial.evaluate(&[]),
+                    Err(TrialEvaluationError::Measure(
+                        crate::MeasureError::InsufficientSamples { required, actual }
+                    )),
+                    "{objective:?}, {actual}",
+                );
+            }
+        }
     }
 
     #[test]
