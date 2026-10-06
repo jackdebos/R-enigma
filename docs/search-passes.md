@@ -1,6 +1,6 @@
 # Plugboard attack contract — Task 11
 
-Status: **Normative contract; direct Core attack validation is supported, execution is not.**
+Status: **Normative contract; Core and CLI attack validation are supported, execution is not.**
 Task 11.2a provides only `AttackPlugboardDomain::parse_json`: strict typed fragment
 validation with immutable known fixed pairs. It is separate from legacy search
 spaces and grants neither complete request acceptance nor candidate enumeration.
@@ -14,8 +14,11 @@ executable request or evaluation reservation. Counts do not truncate to the budg
 Task 11.2d.5 exposes `ParsedAttackRequest::parse_json` and supplied-content binding,
 plus resource-free `AttackRequest::parse_json`. Both promotion routes check eligibility
 before returning privately owned inputs, retained models and counts. No carrier or
-candidate APIs are exposed. Public root dispatch, CLI execution, seed generation and
-runtime attacks remain unsupported.
+candidate APIs are exposed. Public root dispatch selects this owner only when
+`job.space.plugboard.kind` is `"attack"`, with wire kind still `"search"`.
+The CLI loads resources once, binds and checks eligibility, then emits one seq1
+`unsupported_job` error at `/job/kind` (`attack execution is not implemented`),
+without work events. CLI execution, seed generation and runtime attacks remain unsupported.
 
 For this settings fragment, malformed raw JSON (including duplicate keys, trailing
 input and nonobjects), missing fields and invalid kind/objectives/budget use

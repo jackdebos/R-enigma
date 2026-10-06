@@ -267,22 +267,201 @@ fn aggregate_counts_repeated_paths_before_semantic_parsing() {
     );
 }
 #[test]
-fn complete_attack_remains_rejected_before_resource_loading() {
+fn complete_attack_routes_before_resource_loading() {
     let f = Fixture::new();
     let mut r = request(&["ic", "trie"]);
     r["job"]["space"]["plugboard"] = json!({"kind":"attack","symbols":["A","B"],"max_pairs":1});
     r["job"]["attack"] = json!({"kind":"hill_climb","initial_measure":"ic","final_measure":"ic",
         "switch_pairs":1,"backtrack_pairs":0,"evaluation_budget":1,"start":[]});
-    // The complete owner is publicly valid; the binary still uses legacy parsing.
     enigma_core::ParsedAttackRequest::parse_json(&r.to_string()).unwrap();
-    error(f.stdin(&r), "unknown_field", "/job/attack");
+    error(
+        f.stdin(&r),
+        "unsupported_resource",
+        "/job/resources/trie/path",
+    );
     r["job"]["passes"] = json!(["partial_exhaustion"]);
     r["job"]["attack"].as_object_mut().unwrap().remove("start");
     r["job"]["attack"]["kind"] = json!("partial_exhaustion");
     r["job"]["attack"]["seeds"] = json!({"kind":"empty_single","selection":"all"});
     enigma_core::ParsedAttackRequest::parse_json(&r.to_string()).unwrap();
     f.write("request.json", r.to_string());
-    error(f.file("request.json"), "unknown_field", "/job/attack");
+    error(
+        f.file("request.json"),
+        "unsupported_resource",
+        "/job/resources/trie/path",
+    );
+}
+
+fn attack(pass: &str, selection: &str, ids: &[&str]) -> Value {
+    let mut r = request(ids);
+    r["job"]["passes"] = json!([pass]);
+    r["job"]["space"]["plugboard"] = json!({"kind":"attack","symbols":["A","B"],"max_pairs":1});
+    r["job"]["attack"] = json!({"kind":pass,"initial_measure":ids[0],"final_measure":ids[0],
+        "switch_pairs":1,"backtrack_pairs":0,"evaluation_budget":1});
+    if pass == "hill_climb" {
+        r["job"]["attack"]["start"] = json!([]);
+    } else {
+        r["job"]["attack"]["seeds"] = json!({"kind":"empty_single","selection":selection});
+        if selection == "touching" {
+            r["job"]["attack"]["seeds"]["symbols"] = json!(["A"]);
+        }
+    }
+    r
+}
+
+#[test]
+fn public_attack_free_and_bound_validation_is_not_execution() {
+    let f = Fixture::new();
+    f.write("sinkov_bigram.json", model(2).to_string());
+    for (pass, selection) in [
+        ("hill_climb", "all"),
+        ("partial_exhaustion", "all"),
+        ("partial_exhaustion", "touching"),
+    ] {
+        for ids in [&["ic"][..], &["sinkov_bigram"][..]] {
+            let event = error(
+                f.stdin(&attack(pass, selection, ids)),
+                "unsupported_job",
+                "/job/kind",
+            );
+            assert_eq!(event["message"], "attack execution is not implemented");
+        }
+    }
+}
+
+#[test]
+fn public_attack_structural_diagnostics_precede_loading() {
+    let f = Fixture::new();
+    for (pass, selection, pointer, replacement) in [
+        (
+            "hill_climb",
+            "all",
+            "/job/attack/start",
+            json!([["A", "A"]]),
+        ),
+        ("hill_climb", "all", "/job/attack/seeds", json!({})),
+        ("hill_climb", "all", "/job/attack/extra", json!(true)),
+        (
+            "hill_climb",
+            "all",
+            "/job/attack/evaluation_budget",
+            json!(0),
+        ),
+        ("hill_climb", "all", "/job/text", json!("Z")),
+        (
+            "hill_climb",
+            "all",
+            "/job/passes",
+            json!(["partial_exhaustion"]),
+        ),
+        (
+            "hill_climb",
+            "all",
+            "/job/space/plugboard/candidates",
+            json!([]),
+        ),
+        ("partial_exhaustion", "all", "/job/attack/start", json!([])),
+        (
+            "partial_exhaustion",
+            "all",
+            "/job/attack/seeds/selection",
+            json!("unknown"),
+        ),
+        (
+            "partial_exhaustion",
+            "touching",
+            "/job/attack/seeds/symbols",
+            json!(["A", "A"]),
+        ),
+    ] {
+        let mut r = attack(pass, selection, &["sinkov_bigram"]);
+        let (parent, key) = pointer.rsplit_once('/').unwrap();
+        r.pointer_mut(parent)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(key.into(), replacement);
+        let expected = enigma_core::ParsedAttackRequest::parse_json(&r.to_string()).unwrap_err();
+        let event = error(f.stdin(&r), expected[0].code(), expected[0].location());
+        assert_eq!(event["message"], expected[0].message(), "{pointer}");
+    }
+    let mut r = attack("hill_climb", "all", &["sinkov_bigram"]);
+    r["job"].as_object_mut().unwrap().remove("attack");
+    error(f.stdin(&r), "invalid_request", "/job/attack");
+}
+
+fn outer_attack(slots: usize, bound: bool) -> Value {
+    let alphabet: Vec<String> = (0..256)
+        .map(|i| char::from_u32(0x100 + i).unwrap().to_string())
+        .collect();
+    let mut r = attack(
+        "hill_climb",
+        "all",
+        if bound { &["sinkov_bigram"] } else { &["ic"] },
+    );
+    r["machine"]["definition"]["value"] = json!({
+        "alphabet":alphabet,"wheels":[{"name":"r","wiring":alphabet,"turnovers":[]}],
+        "slots":(0..slots).map(|i| json!({"id":format!("r{i}"),"role":"rotor","movement":"fixed","wheel":"r"})).collect::<Vec<_>>(),
+        "stepping":{"rules":[]}});
+    r["job"]["configuration"]["slots"] = json!([]);
+    r["job"]["text"] = json!(alphabet[0].repeat(2));
+    r["job"]["space"] = json!({"limit":1,
+        "slots":(0..slots).map(|i| json!({"id":format!("r{i}"),"positions":alphabet,"rings":alphabet})).collect::<Vec<_>>(),
+        "plugboard":{"kind":"attack","symbols":&alphabet[..2],"max_pairs":1}});
+    r
+}
+
+#[test]
+fn public_attack_load_bind_gate_precedence_and_full_cardinality() {
+    let f = Fixture::new();
+    error(
+        f.stdin(&outer_attack(5, false)),
+        "unsupported_job",
+        "/job/kind",
+    );
+    error(
+        f.stdin(&outer_attack(8, false)),
+        "resource_limit",
+        "/job/space",
+    );
+    let overflow = outer_attack(8, true);
+    error(
+        f.stdin(&overflow),
+        "unsupported_resource",
+        "/job/resources/sinkov_bigram/path",
+    );
+    let ordinary = attack("hill_climb", "all", &["sinkov_bigram"]);
+    for (contents, code, location) in [
+        ("{".to_owned(), "invalid_json", ""),
+        (model(1).to_string(), "unsupported_resource", "/order"),
+        (
+            {
+                let mut m = model(2);
+                m["alphabet"] = json!(["B", "A"]);
+                m.to_string()
+            },
+            "unsupported_resource",
+            "/alphabet",
+        ),
+    ] {
+        f.write("sinkov_bigram.json", contents);
+        error(f.stdin(&ordinary), code, location);
+    }
+    f.write("sinkov_bigram.json", "{");
+    error(f.stdin(&overflow), "invalid_json", "");
+    let alphabet = overflow["machine"]["definition"]["value"]["alphabet"].clone();
+    f.write(
+        "sinkov_bigram.json",
+        json!({"resource_version":1,"kind":"ngram",
+        "alphabet":alphabet,"order":2,"entries":[{"gram":[alphabet[0],alphabet[0]],"count":1}]})
+        .to_string(),
+    );
+    error(f.stdin(&overflow), "resource_limit", "/job/space");
+    error(
+        f.stdin(&outer_attack(5, true)),
+        "unsupported_job",
+        "/job/kind",
+    );
 }
 
 #[test]

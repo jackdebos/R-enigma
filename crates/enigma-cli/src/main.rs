@@ -141,6 +141,7 @@ fn run(bytes: Vec<u8>, origin: &Path) -> ExitCode {
     match ParsedRequest::parse_json(&json) {
         Ok(ParsedRequest::Transform(request)) => run_transform(request),
         Ok(ParsedRequest::Search(request)) => run_search(request, origin),
+        Ok(ParsedRequest::Attack(request)) => run_attack(request, origin, &mut io::stdout().lock()),
         Err(diagnostics) => {
             // Pre-validation failure: exactly one `error` at seq 1, no `started`.
             let first = &diagnostics[0];
@@ -184,9 +185,7 @@ fn run_search(request: ParsedSearchRequest, origin: &Path) -> ExitCode {
     }
 }
 
-/// Private preparation only; the root dispatcher intentionally remains unchanged.
 /// Binding finalizes eligibility, so no second gate check or resource read is needed.
-#[allow(dead_code)]
 fn run_attack(request: ParsedAttackRequest, origin: &Path, out: &mut impl Write) -> ExitCode {
     let failure = |out: &mut _, code: &str, message: &str, location: &str| {
         if let Err(error) = write_error_line(out, code, message, location, 1) {

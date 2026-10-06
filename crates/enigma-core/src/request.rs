@@ -109,6 +109,8 @@ pub enum ParsedRequest {
     Transform(TransformRequest),
     /// Structurally validated search pending resource binding.
     Search(crate::ParsedSearchRequest),
+    /// Structurally validated attack pending resource binding and eligibility.
+    Attack(crate::ParsedAttackRequest),
 }
 
 impl ParsedRequest {
@@ -118,7 +120,19 @@ impl ParsedRequest {
         let job = object(&root.job, "/job")?;
         match required_string(job, "kind", "/job")? {
             "transform" => TransformRequest::from_parsed_root(root).map(Self::Transform),
-            "search" => crate::ParsedSearchRequest::from_parsed_root(root).map(Self::Search),
+            "search" => {
+                if job
+                    .get("space")
+                    .and_then(|space| space.get("plugboard"))
+                    .and_then(|plugboard| plugboard.get("kind"))
+                    .and_then(Value::as_str)
+                    == Some("attack")
+                {
+                    crate::ParsedAttackRequest::from_parsed_root(root).map(Self::Attack)
+                } else {
+                    crate::ParsedSearchRequest::from_parsed_root(root).map(Self::Search)
+                }
+            }
             kind => Err(vec![RequestDiagnostic::new(
                 "unsupported_job",
                 format!("job kind {kind:?} is not supported; expected `transform` or `search`"),
@@ -530,6 +544,110 @@ mod tests {
                 !resources
             );
         }
+    }
+
+    fn attack_request(pass: &str, selection: &str) -> Value {
+        let mut value = search_request();
+        value["job"]["passes"] = json!([pass]);
+        value["job"]["space"]["plugboard"] =
+            json!({"kind":"attack","symbols":["A","B","C","D"],"max_pairs":2});
+        value["job"]["attack"] = json!({"kind":pass,"initial_measure":"ic","final_measure":"ic",
+            "switch_pairs":1,"backtrack_pairs":0,"evaluation_budget":1});
+        if pass == "hill_climb" {
+            value["job"]["attack"]["start"] = json!([]);
+        } else {
+            value["job"]["attack"]["seeds"] = json!({"kind":"empty_single","selection":selection});
+            if selection == "touching" {
+                value["job"]["attack"]["seeds"]["symbols"] = json!(["A"]);
+            }
+        }
+        value
+    }
+
+    #[test]
+    fn dispatches_attack_owner_without_binding() {
+        for (pass, selection) in [
+            ("hill_climb", "all"),
+            ("partial_exhaustion", "all"),
+            ("partial_exhaustion", "touching"),
+        ] {
+            for bound in [false, true] {
+                let mut value = attack_request(pass, selection);
+                if bound {
+                    value["job"]["measures"] = json!(["ic", "sinkov_bigram"]);
+                    value["job"]["resources"] = json!({"sinkov_bigram":{"path":"missing.json"}});
+                }
+                let ParsedRequest::Attack(owner) =
+                    ParsedRequest::parse_json(&value.to_string()).unwrap()
+                else {
+                    panic!("expected safe attack owner");
+                };
+                assert_eq!(owner.resources().len(), usize::from(bound));
+                if bound {
+                    assert_eq!(owner.resources()[0].measure().id(), "sinkov_bigram");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn attack_dispatch_preserves_direct_diagnostics_and_legacy_fallback() {
+        let base = attack_request("hill_climb", "all");
+        for (pointer, replacement) in [
+            ("/job/attack/start", json!([["A", "A"]])),
+            ("/job/attack/evaluation_budget", json!(0)),
+            ("/job/text", json!("Z")),
+            ("/job/passes", json!(["partial_exhaustion"])),
+            ("/job/space/plugboard/symbols", json!(["A", "A"])),
+            ("/job/configuration/slots/0/position", json!("Z")),
+        ] {
+            let mut value = base.clone();
+            *value.pointer_mut(pointer).unwrap() = replacement;
+            let text = value.to_string();
+            assert_eq!(
+                ParsedRequest::parse_json(&text).unwrap_err(),
+                crate::ParsedAttackRequest::parse_json(&text).unwrap_err(),
+                "{pointer}"
+            );
+        }
+        let mut missing = base.clone();
+        missing["job"].as_object_mut().unwrap().remove("attack");
+        let errors = ParsedRequest::parse_json(&missing.to_string()).unwrap_err();
+        assert_eq!(
+            (errors[0].code(), errors[0].location()),
+            ("invalid_request", "/job/attack")
+        );
+        for discriminator in [None, Some(json!("pool")), Some(json!(7))] {
+            let mut value = base.clone();
+            let plugboard = value["job"]["space"]["plugboard"].as_object_mut().unwrap();
+            plugboard.remove("kind");
+            if let Some(kind) = discriminator {
+                plugboard.insert("kind".into(), kind);
+            }
+            let text = value.to_string();
+            assert_eq!(
+                ParsedRequest::parse_json(&text).unwrap_err(),
+                crate::ParsedSearchRequest::parse_json(&text).unwrap_err()
+            );
+        }
+        let text = base.to_string();
+        for invalid in [
+            text.replace(
+                "\"kind\":\"attack\"",
+                "\"kind\":\"attack\",\"kind\":\"attack\"",
+            ),
+            format!("{text} null"),
+        ] {
+            assert_eq!(
+                ParsedRequest::parse_json(&invalid).unwrap_err(),
+                crate::ParsedAttackRequest::parse_json(&invalid).unwrap_err()
+            );
+        }
+        missing["machine"]["definition"] = json!({"kind":"bundled","id":"unknown"});
+        assert_eq!(
+            ParsedRequest::parse_json(&missing.to_string()).unwrap_err(),
+            crate::ParsedAttackRequest::parse_json(&missing.to_string()).unwrap_err()
+        );
     }
 
     #[test]

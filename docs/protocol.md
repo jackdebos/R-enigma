@@ -21,7 +21,8 @@ specified in §3.3 and §7; [Scoring and external resources](scoring-resources.m
 specifies the normative Task 10 measure/resource contract. Pass execution fields and
 checkpoint record layout remain deferred to their implementation tasks.
 [Task 11 plugboard attacks](search-passes.md) freezes the planned additive attack
-branch and pass settings; it does not enable parsing or execution. Illustrative
+branch and pass settings; strict attack parsing and CLI validation are supported,
+but execution is not. Illustrative
 search concepts below are not executable request examples. Representability does not imply catalog availability or
 search support.
 
@@ -303,9 +304,13 @@ error, with no `started`, `output`, `done`, or enumeration; resource errors prec
 that result. Valid search is still not executable in the current CLI. Transform
 never loads resources. This status does not change transform grammar or events.
 
-[Task 11](search-passes.md) specifies one core-only executable attack pass per
-request as a planned contract, including resource gates and internal termination;
-no search wire payload or CLI execution is added.
+[Task 11](search-passes.md) adds strict attack dispatch when
+`job.space.plugboard.kind` is `"attack"`, still with `job.kind = "search"`.
+The CLI loads and binds resources, checks eligibility, then emits one seq1
+`unsupported_job` at `/job/kind`: `attack execution is not implemented`.
+Structural, loading, model-binding and eligibility errors precede that result.
+Missing or other discriminators retain legacy search validation. No attack
+execution, seed generation or enumeration is implemented.
 
 Stage 1 plans `hill_climb`, `partial_exhaustion` with backtracking, `reswapping`, `trie`,
 and `measure`; measures include index of coincidence, Sinkov n-gram statistics,

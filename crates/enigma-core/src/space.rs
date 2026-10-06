@@ -910,7 +910,10 @@ impl ParsedAttackRequest {
 
     /// Parses a strict complete attack request once, without binding or enumeration.
     pub fn parse_json(json: &str) -> Result<Self, Vec<RequestDiagnostic>> {
-        let root = parse_root(json)?;
+        Self::from_parsed_root(parse_root(json)?)
+    }
+
+    pub(crate) fn from_parsed_root(root: ParsedRoot) -> Result<Self, Vec<RequestDiagnostic>> {
         let parse = || {
             let job = object(&root.job, "/job")?;
             if required_string(job, "kind", "/job")? != "search" {
@@ -3347,7 +3350,10 @@ mod tests {
             let raw = value.to_string();
             assert!(ParsedSearchRequest::parse_json(&raw).is_err());
             assert!(SearchRequest::parse_json(&raw).is_err());
-            assert!(crate::ParsedRequest::parse_json(&raw).is_err());
+            assert!(matches!(
+                crate::ParsedRequest::parse_json(&raw),
+                Ok(crate::ParsedRequest::Attack(_))
+            ));
             value["job"].as_object_mut().unwrap().remove("resources");
             assert_eq!(
                 attack_error(&value),
@@ -3594,7 +3600,10 @@ mod tests {
         }
         assert!(ParsedSearchRequest::parse_json(&raw).is_err());
         assert!(SearchRequest::parse_json(&raw).is_err());
-        assert!(crate::ParsedRequest::parse_json(&raw).is_err());
+        assert!(matches!(
+            crate::ParsedRequest::parse_json(&raw),
+            Ok(crate::ParsedRequest::Attack(_))
+        ));
     }
 
     #[test]
