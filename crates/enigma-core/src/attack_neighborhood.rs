@@ -1,9 +1,80 @@
-//! Bounded independent replacements for one selected alphabet-index pair.
+//! Bounded per-pair replacements and lazy alphabet-index neighborhood traversal.
 
 use crate::attack_evaluator::{validated_trial_board, TrialBoardError};
 use crate::{AttackPlugboardDomain, ResolvedConfiguration};
 
 type MutableBoard = Vec<(char, char)>;
+
+#[cfg(test)]
+thread_local! {
+    static PAIR_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Owns the current snapshot; only immutable configuration and domain are borrowed.
+struct NeighborhoodCursor<'a> {
+    initial: &'a ResolvedConfiguration,
+    domain: &'a AttackPlugboardDomain,
+    current: MutableBoard,
+    backtrack_pairs: usize,
+    next_pair: (usize, usize),
+    pending: std::vec::IntoIter<MutableBoard>,
+    exhausted: bool,
+}
+
+impl<'a> NeighborhoodCursor<'a> {
+    fn new(
+        initial: &'a ResolvedConfiguration,
+        domain: &'a AttackPlugboardDomain,
+        current: &[(char, char)],
+        backtrack_pairs: usize,
+    ) -> Result<Self, TrialBoardError> {
+        TrialContext::new(initial, domain, current, backtrack_pairs)?;
+        Ok(Self {
+            initial,
+            domain,
+            current: current.to_vec(),
+            backtrack_pairs,
+            next_pair: (0, 1),
+            pending: Vec::new().into_iter(),
+            exhausted: false,
+        })
+    }
+}
+
+impl Iterator for NeighborhoodCursor<'_> {
+    type Item = MutableBoard;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(board) = self.pending.next() {
+                return Some(board);
+            }
+            let n = self.initial.topology().alphabet().symbols.len();
+            let (a, b) = self.next_pair;
+            if self.exhausted || b >= n {
+                self.exhausted = true;
+                return None;
+            }
+            self.next_pair = if b + 1 < n {
+                (a, b + 1)
+            } else {
+                (a + 1, a + 2)
+            };
+            let context = TrialContext {
+                initial: self.initial,
+                domain: self.domain,
+                current: &self.current,
+                backtrack_pairs: self.backtrack_pairs,
+            };
+            // Constructor validation and legal alphabet indices make helper errors
+            // invariant failures; candidate admissibility filtering remains in trials_for.
+            self.pending = context
+                .trials_for(a, b)
+                .expect("validated snapshot and increasing in-range alphabet indices")
+                .into_iter();
+        }
+    }
+}
 
 struct TrialContext<'a> {
     initial: &'a ResolvedConfiguration,
@@ -31,6 +102,8 @@ impl<'a> TrialContext<'a> {
     /// Indices must be increasing and inside the runtime alphabet.
     /// Invalid selections report AlphabetBinding without producing any trials.
     fn trials_for(&self, a: usize, b: usize) -> Result<Vec<MutableBoard>, TrialBoardError> {
+        #[cfg(test)]
+        PAIR_VISITS.with(|visits| visits.set(visits.get() + 1));
         let alphabet = &self.initial.topology().alphabet().symbols;
         if a >= b || b >= alphabet.len() {
             return Err(TrialBoardError::AlphabetBinding);
@@ -231,6 +304,7 @@ mod tests {
         let maps = mappings(6);
         assert_eq!(maps.len(), 76);
         let mut comparisons = 0;
+        let mut neighborhoods = 0;
         for map in maps {
             let all = pairs(&map, &alphabet.symbols);
             for fixed_bits in 0..1usize << all.len() {
@@ -265,6 +339,7 @@ mod tests {
                         for threshold in [0, all.len(), all.len() + 1] {
                             let context =
                                 TrialContext::new(&initial, &domain, &current, threshold).unwrap();
+                            let mut flattened = Vec::new();
                             for a in 0..6 {
                                 for b in a + 1..6 {
                                     let expected: Vec<_> =
@@ -281,6 +356,7 @@ mod tests {
                                                     .collect::<MutableBoard>()
                                             })
                                             .collect();
+                                    flattened.extend(expected.clone());
                                     let actual = context.trials_for(a, b).unwrap();
                                     let canonical = pairs(&map, &alphabet.symbols);
                                     let canonical: Vec<_> = canonical
@@ -301,6 +377,19 @@ mod tests {
                                     comparisons += 1;
                                 }
                             }
+                            let canonical: MutableBoard = pairs(&map, &alphabet.symbols)
+                                .into_iter()
+                                .filter(|&(x, _)| !fixed.iter().any(|&(f, g)| x == f || x == g))
+                                .collect();
+                            for board in [&current, &canonical] {
+                                assert_eq!(
+                                    NeighborhoodCursor::new(&initial, &domain, board, threshold)
+                                        .unwrap()
+                                        .collect::<Vec<_>>(),
+                                    flattened,
+                                );
+                                neighborhoods += 1;
+                            }
                         }
                         assert_eq!((initial, domain, current.clone()), snapshot);
                     }
@@ -308,7 +397,8 @@ mod tests {
             }
         }
         assert_eq!(comparisons, 86_760);
-        println!("independent per-pair comparisons: {comparisons}");
+        assert_eq!(neighborhoods, 11_568);
+        println!("independent per-pair comparisons: {comparisons}; neighborhoods: {neighborhoods}");
     }
 
     #[test]
@@ -316,12 +406,17 @@ mod tests {
         let alphabet = Alphabet::new("ABCD".chars().collect()).unwrap();
         let initial = initial(&alphabet, &[]);
         let full = domain(&alphabet, &[], &alphabet.symbols, 2);
-        let assert_error = |d: &AttackPlugboardDomain, board: &[(char, char)], expected| {
-            assert_eq!(
-                TrialContext::new(&initial, d, board, 0).err(),
-                Some(expected)
-            );
-        };
+        let assert_error =
+            |d: &AttackPlugboardDomain, board: &[(char, char)], expected: TrialBoardError| {
+                assert_eq!(
+                    TrialContext::new(&initial, d, board, 0).err().as_ref(),
+                    Some(&expected)
+                );
+                assert_eq!(
+                    NeighborhoodCursor::new(&initial, d, board, 0).err(),
+                    Some(expected)
+                );
+            };
         let reversed = Alphabet::new("DCBA".chars().collect()).unwrap();
         assert_error(
             &domain(&reversed, &[], &reversed.symbols, 2),
@@ -358,6 +453,160 @@ mod tests {
                 Err(TrialBoardError::AlphabetBinding)
             );
         }
+    }
+
+    #[test]
+    fn lazy_prefix_pending_and_snapshot_isolation() {
+        let alphabet = Alphabet::new("ABCD".chars().collect()).unwrap();
+        let initial = initial(&alphabet, &[]);
+        let domain = domain(&alphabet, &[], &alphabet.symbols, 2);
+        let snapshot = (initial.clone(), domain.clone());
+        let mut caller = vec![('D', 'B'), ('C', 'A')];
+        let mut expected = Vec::new();
+        for a in 0..4 {
+            for b in a + 1..4 {
+                expected.extend(
+                    oracle(&[2, 3, 0, 1], &[false; 4], &[true; 4], 2, 0, a, b)
+                        .iter()
+                        .map(|m| pairs(m, &alphabet.symbols)),
+                );
+            }
+        }
+        PAIR_VISITS.with(|v| v.set(0));
+        let mut cursor = NeighborhoodCursor::new(&initial, &domain, &caller, 0).unwrap();
+        caller.clear();
+        drop(caller);
+        assert_eq!(PAIR_VISITS.with(|v| v.get()), 0);
+        let mut first = cursor.next().unwrap_or_default();
+        assert_eq!(PAIR_VISITS.with(|v| v.get()), 1);
+        assert_eq!(first, vec![('A', 'B')]);
+        first.clear();
+        assert_eq!(cursor.next(), Some(vec![('A', 'B'), ('C', 'D')]));
+        assert_eq!(PAIR_VISITS.with(|v| v.get()), 1);
+        assert_eq!(cursor.next(), Some(vec![('A', 'D')]));
+        assert_eq!(cursor.next(), Some(vec![('A', 'D'), ('B', 'C')]));
+        drop(cursor);
+        assert_eq!(PAIR_VISITS.with(|v| v.get()), 1);
+        let mut cursor =
+            NeighborhoodCursor::new(&initial, &domain, &[('D', 'B'), ('C', 'A')], 0).unwrap();
+        PAIR_VISITS.with(|v| v.set(0));
+        let mut yielded = cursor.next().unwrap();
+        yielded.clear();
+        assert_eq!(cursor.by_ref().collect::<Vec<_>>(), expected[1..]);
+        assert_eq!(PAIR_VISITS.with(|v| v.get()), 6);
+        assert_eq!(cursor.next(), None);
+        assert_eq!(cursor.next(), None);
+        assert_eq!(PAIR_VISITS.with(|v| v.get()), 6);
+        assert_eq!((initial, domain), snapshot);
+    }
+
+    #[test]
+    fn complete_cross_pair_duplicates_in_action_order() {
+        let alphabet = Alphabet::new("ABCD".chars().collect()).unwrap();
+        let initial = initial(&alphabet, &[]);
+        let domain = domain(&alphabet, &[], &alphabet.symbols, 2);
+        // AB removes; AC/AD/BC/BD reconnect independently; CD adds to AB.
+        let expected = vec![
+            vec![],
+            vec![('A', 'C')],
+            vec![('B', 'C')],
+            vec![('A', 'D')],
+            vec![('B', 'D')],
+            vec![('B', 'C')],
+            vec![('A', 'C')],
+            vec![('B', 'D')],
+            vec![('A', 'D')],
+            vec![('A', 'B'), ('C', 'D')],
+        ];
+        let actual: Vec<_> = NeighborhoodCursor::new(&initial, &domain, &[('A', 'B')], 0)
+            .unwrap()
+            .collect();
+        assert_eq!(actual, expected);
+        for board in [
+            vec![('A', 'C')],
+            vec![('A', 'D')],
+            vec![('B', 'C')],
+            vec![('B', 'D')],
+        ] {
+            assert_eq!(actual.iter().filter(|b| **b == board).count(), 2);
+        }
+    }
+
+    #[test]
+    fn unicode_reverse_mask_uses_declared_alphabet_order() {
+        let alphabet = Alphabet::new("Ωa🦀Zé中".chars().collect()).unwrap();
+        let initial = initial(&alphabet, &[]);
+        let mask: Vec<_> = alphabet.symbols.iter().rev().copied().collect();
+        let domain = domain(&alphabet, &[], &mask, 1);
+        let expected = vec![
+            vec![('Ω', 'a')],
+            vec![('Ω', '🦀')],
+            vec![('Ω', 'Z')],
+            vec![('Ω', 'é')],
+            vec![('Ω', '中')],
+            vec![('a', '🦀')],
+            vec![('a', 'Z')],
+            vec![('a', 'é')],
+            vec![('a', '中')],
+            vec![('🦀', 'Z')],
+            vec![('🦀', 'é')],
+            vec![('🦀', '中')],
+            vec![('Z', 'é')],
+            vec![('Z', '中')],
+            vec![('é', '中')],
+        ];
+        PAIR_VISITS.with(|v| v.set(0));
+        let mut cursor = NeighborhoodCursor::new(&initial, &domain, &[], 0).unwrap();
+        assert_eq!(PAIR_VISITS.with(|v| v.get()), 0);
+        assert_eq!(cursor.by_ref().collect::<Vec<_>>(), expected);
+        assert_eq!(PAIR_VISITS.with(|v| v.get()), 15);
+        assert_eq!(cursor.next(), None);
+        assert_eq!(cursor.next(), None);
+        assert_eq!(PAIR_VISITS.with(|v| v.get()), 15);
+    }
+
+    #[test]
+    fn filtered_prefix_empty_capacity_and_smallest_alphabet() {
+        for (symbols, mask, cap, current, threshold, expected, prefix) in [
+            ("ABCD", "CD", 1, vec![], 0, vec![vec![('C', 'D')]], 6),
+            ("ABCD", "ABCD", 0, vec![], 0, vec![], 6),
+            ("AB", "AB", 1, vec![('A', 'B')], 2, vec![], 1),
+            ("AB", "AB", 1, vec![], 0, vec![vec![('A', 'B')]], 1),
+            ("A", "A", 0, vec![], 0, vec![], 0),
+        ] {
+            let alphabet = Alphabet::new(symbols.chars().collect()).unwrap();
+            let initial = initial(&alphabet, &[]);
+            let domain = domain(&alphabet, &[], &mask.chars().collect::<Vec<_>>(), cap);
+            PAIR_VISITS.with(|v| v.set(0));
+            let mut cursor =
+                NeighborhoodCursor::new(&initial, &domain, &current, threshold).unwrap();
+            assert_eq!(PAIR_VISITS.with(|v| v.get()), 0);
+            assert_eq!(cursor.next(), expected.first().cloned());
+            assert_eq!(PAIR_VISITS.with(|v| v.get()), prefix);
+            assert_eq!(cursor.next(), None);
+            assert_eq!(cursor.next(), None);
+            let n = alphabet.symbols.len();
+            assert_eq!(PAIR_VISITS.with(|v| v.get()), n * (n - 1) / 2);
+        }
+    }
+
+    #[test]
+    fn fixed_mutable_collision_rejected_by_both_constructors() {
+        let alphabet = Alphabet::new("ABCD".chars().collect()).unwrap();
+        let initial = initial(&alphabet, &[('A', 'B')]);
+        let domain = domain(&alphabet, &[('A', 'B')], &['C', 'D'], 2);
+        let board = [('A', 'C')];
+        let expected = TrialBoardError::Model(crate::ModelError::DuplicatePlugboardSymbol('A'));
+        assert_eq!(
+            TrialContext::new(&initial, &domain, &board, 0).err(),
+            Some(expected)
+        );
+        assert_eq!(
+            NeighborhoodCursor::new(&initial, &domain, &board, 0).err(),
+            Some(TrialBoardError::Model(
+                crate::ModelError::DuplicatePlugboardSymbol('A')
+            )),
+        );
     }
 
     #[test]
