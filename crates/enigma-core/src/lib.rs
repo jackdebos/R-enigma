@@ -47,6 +47,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 mod attack_evaluator;
 mod attack_gate;
+mod attack_neighborhood;
 pub use attack_gate::AttackGate;
 mod binding;
 mod candidate;
