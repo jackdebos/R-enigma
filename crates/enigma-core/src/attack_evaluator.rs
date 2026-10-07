@@ -6,7 +6,7 @@ use crate::{
 };
 
 #[derive(Debug, PartialEq, Eq)]
-enum TrialEvaluationError {
+pub(super) enum TrialEvaluationError {
     Board(TrialBoardError),
     Model(ModelError),
     MissingResource(MeasureId),
@@ -14,7 +14,7 @@ enum TrialEvaluationError {
     Measure(MeasureError),
 }
 
-struct TrialEvaluator<'a> {
+pub(super) struct TrialEvaluator<'a> {
     initial: &'a ResolvedConfiguration,
     domain: &'a AttackPlugboardDomain,
     input: &'a str,
@@ -23,8 +23,26 @@ struct TrialEvaluator<'a> {
     resource: Option<&'a BoundResource>,
 }
 
-impl TrialEvaluator<'_> {
-    fn evaluate(
+impl<'a> TrialEvaluator<'a> {
+    pub(super) fn new(
+        initial: &'a ResolvedConfiguration,
+        domain: &'a AttackPlugboardDomain,
+        input: &'a str,
+        direction: Direction,
+        objective: MeasureId,
+        resource: Option<&'a BoundResource>,
+    ) -> Self {
+        Self {
+            initial,
+            domain,
+            input,
+            direction,
+            objective,
+            resource,
+        }
+    }
+
+    pub(super) fn evaluate(
         &self,
         mutable: &[(char, char)],
     ) -> Result<(String, MeasuredScore), TrialEvaluationError> {

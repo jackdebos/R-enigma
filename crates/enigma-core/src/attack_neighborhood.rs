@@ -11,7 +11,7 @@ thread_local! {
 }
 
 /// Owns the current snapshot; only immutable configuration and domain are borrowed.
-struct NeighborhoodCursor<'a> {
+pub(super) struct NeighborhoodCursor<'a> {
     initial: &'a ResolvedConfiguration,
     domain: &'a AttackPlugboardDomain,
     current: MutableBoard,
@@ -22,7 +22,7 @@ struct NeighborhoodCursor<'a> {
 }
 
 impl<'a> NeighborhoodCursor<'a> {
-    fn new(
+    pub(super) fn new(
         initial: &'a ResolvedConfiguration,
         domain: &'a AttackPlugboardDomain,
         current: &[(char, char)],

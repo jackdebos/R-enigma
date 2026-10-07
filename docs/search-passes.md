@@ -19,6 +19,8 @@ candidate APIs are exposed. Public root dispatch selects this owner only when
 The CLI loads resources once, binds and checks eligibility, then emits one seq1
 `unsupported_job` error at `/job/kind` (`attack execution is not implemented`),
 without work events. CLI execution, seed generation and runtime attacks remain unsupported.
+Task 11.4a adds private budget-aware complete-neighborhood best-improvement selection only.
+Adaptive ascent, seed generation, outer execution and CLI execution remain unimplemented; no public runtime is enabled.
 
 For this settings fragment, malformed raw JSON (including duplicate keys, trailing
 input and nonobjects), missing fields and invalid kind/objectives/budget use
