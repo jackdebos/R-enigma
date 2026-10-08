@@ -18,14 +18,15 @@ candidate APIs are exposed. Public root dispatch selects this owner only when
 `job.space.plugboard.kind` is `"attack"`, with wire kind still `"search"`.
 The CLI loads resources once, binds and checks eligibility, then emits one seq1
 `unsupported_job` error at `/job/kind` (`attack execution is not implemented`),
-without work events. CLI execution, seed generation and runtime attacks remain unsupported.
+without work events. CLI execution and public runtime attacks remain unsupported.
 Task 11.4a adds private budget-aware complete-neighborhood best-improvement selection only.
 Task 11.4b.1 adds a private bound scoring lifecycle: start-phase selection, shared final-score
 reservation, committed-board objective switching and once-only finalization, without an ascent loop.
 Task 11.4b.2 adds a private single-climb driver repeating complete strict-improvement scans,
 with final-scored committed outcomes on completion or budget interruption. Interrupted scans
 never commit provisional winners; final rescoring alone does not count as final-objective ascent.
-Seed generation, outer execution and CLI execution remain unimplemented; no public runtime is enabled.
+Task 11.5a adds private lazy empty/single mutable seed generation with dense local indices.
+Seed climbs, outer execution and CLI execution remain unimplemented; no public runtime is enabled.
 
 For this settings fragment, malformed raw JSON (including duplicate keys, trailing
 input and nonobjects), missing fields and invalid kind/objectives/budget use

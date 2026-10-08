@@ -9,6 +9,95 @@ use crate::{
 
 type MutableBoard = Vec<(char, char)>;
 
+/// Lazy empty/single mutable remainders. Fixed knowledge stays in the bound domain.
+struct SeedCursor<'a> {
+    symbols: Vec<char>,
+    policy: &'a crate::AttackSeedPolicy,
+    next_pair: (usize, usize),
+    next_index: u128,
+    empty_pending: bool,
+    singles_allowed: bool,
+}
+
+impl<'a> SeedCursor<'a> {
+    /// Inputs come from validated domain/settings; snapshot validation checks binding.
+    fn new(
+        initial: &ResolvedConfiguration,
+        domain: &AttackPlugboardDomain,
+        policy: &'a crate::AttackSeedPolicy,
+    ) -> Result<Self, crate::attack_evaluator::TrialBoardError> {
+        validated_trial_board(initial, domain, &[])?;
+        // Linear storage only, in runtime alphabet order, never declaration order.
+        let symbols = initial
+            .topology()
+            .alphabet()
+            .symbols
+            .iter()
+            .copied()
+            .filter(|symbol| domain.symbols().contains(symbol))
+            .filter(|symbol| {
+                !domain
+                    .fixed_pairs()
+                    .iter()
+                    .any(|&(a, b)| a == *symbol || b == *symbol)
+            })
+            .collect();
+        Ok(Self {
+            symbols,
+            policy,
+            next_pair: (0, 1),
+            next_index: 0,
+            empty_pending: true,
+            singles_allowed: domain.fixed_pairs().len() < domain.max_pairs(),
+        })
+    }
+
+    fn indexed(&mut self, board: MutableBoard) -> (u128, MutableBoard) {
+        let index = self.next_index;
+        // Match the gate's u128 start counts. A scalar alphabet has at most
+        // 1,112,064 members, so 1 + choose(n, 2) fits even u64; checked u128
+        // increment documents the invariant without relying on usize width.
+        self.next_index = index.checked_add(1).expect("scalar seed count fits u128");
+        (index, board)
+    }
+}
+
+impl Iterator for SeedCursor<'_> {
+    type Item = (u128, MutableBoard);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.empty_pending {
+            self.empty_pending = false;
+            return Some(self.indexed(vec![]));
+        }
+        if !self.singles_allowed {
+            return None;
+        }
+        loop {
+            let (a, b) = self.next_pair;
+            if b >= self.symbols.len() {
+                return None;
+            }
+            self.next_pair = if b + 1 < self.symbols.len() {
+                (a, b + 1)
+            } else {
+                (a + 1, a + 2)
+            };
+            let pair = (self.symbols[a], self.symbols[b]);
+            let selected = match self.policy {
+                crate::AttackSeedPolicy::All => true,
+                crate::AttackSeedPolicy::Touching(mask) => {
+                    mask.contains(&pair.0) || mask.contains(&pair.1)
+                }
+            };
+            if selected {
+                // Filtering precedes numbering; both masked endpoints still emit once.
+                return Some(self.indexed(vec![pair]));
+            }
+        }
+    }
+}
+
 /// Shared accounting, never reset by a scan. Reserve is supplied per operation.
 #[derive(Debug)]
 pub(super) struct EvaluationAllowance {
@@ -316,6 +405,153 @@ mod tests {
         )
         .unwrap();
         (initial, domain)
+    }
+
+    #[test]
+    fn seeds_have_independent_literal_order_and_dense_indices() {
+        let (initial, _) = fixture();
+        for (symbols, cap, policy, expected) in [
+            (
+                vec!['C', 'A', 'B'],
+                1,
+                crate::AttackSeedPolicy::All,
+                vec![vec![], vec![('A', 'B')], vec![('A', 'C')], vec![('B', 'C')]],
+            ),
+            (
+                vec!['B', 'C', 'A'],
+                1,
+                crate::AttackSeedPolicy::Touching(vec!['C']),
+                vec![vec![], vec![('A', 'C')], vec![('B', 'C')]],
+            ),
+            (
+                vec!['C', 'B', 'A'],
+                1,
+                crate::AttackSeedPolicy::Touching(vec!['C', 'A']),
+                vec![vec![], vec![('A', 'B')], vec![('A', 'C')], vec![('B', 'C')]],
+            ),
+            (
+                vec!['B', 'A', 'C'],
+                0,
+                crate::AttackSeedPolicy::All,
+                vec![vec![]],
+            ),
+            (vec!['B'], 0, crate::AttackSeedPolicy::All, vec![vec![]]),
+        ] {
+            let domain = AttackPlugboardDomain::parse_json(
+                initial.topology().alphabet(), &[],
+                &serde_json::json!({"kind":"attack","symbols":symbols.iter().map(char::to_string).collect::<Vec<_>>(),"max_pairs":cap}).to_string(),
+            ).unwrap();
+            let mut cursor = SeedCursor::new(&initial, &domain, &policy).unwrap();
+            for (index, board) in expected.iter().enumerate() {
+                assert_eq!(cursor.next(), Some((index as u128, board.clone())));
+            }
+            assert_eq!(cursor.next(), None);
+            assert_eq!(cursor.next(), None);
+        }
+    }
+
+    #[test]
+    fn seeds_preserve_fixed_facts_unicode_order_and_gate_counts() {
+        // Runtime order deliberately differs from Unicode scalar order.
+        let alphabet = ["🦀", "é", "Ω", "中", "β", "あ"];
+        let value = serde_json::json!({"protocol_version":1,"machine":{"definition":{
+            "kind":"custom","value":{"alphabet":alphabet,
+            "wheels":[{"name":"r","wiring":alphabet,"turnovers":[]}],
+            "slots":[{"id":"r","role":"rotor","movement":"fixed","wheel":"r"}],
+            "stepping":{"rules":[]}}}},"job":{"kind":"search",
+            "configuration":{"slots":[{"id":"r","position":"🦀","ring":"🦀"}],
+                "plugboard":[["é","中"]]},
+            "space":{},"text":"🦀🦀","passes":["partial_exhaustion"],"measures":["ic"]}});
+        let request = crate::SearchRequest::parse_json(&value.to_string()).unwrap();
+        let initial = TransformConfiguration::new(
+            vec![SlotConfiguration::new("r", "r", '🦀', '🦀')],
+            vec![('é', '中')],
+        )
+        .resolve(request.definition())
+        .unwrap();
+        for (cap, seeds, expected) in [
+            (
+                2,
+                serde_json::json!({"kind":"empty_single","selection":"all"}),
+                vec![
+                    vec![],
+                    vec![('🦀', 'Ω')],
+                    vec![('🦀', 'β')],
+                    vec![('🦀', 'あ')],
+                    vec![('Ω', 'β')],
+                    vec![('Ω', 'あ')],
+                    vec![('β', 'あ')],
+                ],
+            ),
+            (
+                3,
+                serde_json::json!({"kind":"empty_single","selection":"touching","symbols":["あ","Ω"]}),
+                vec![
+                    vec![],
+                    vec![('🦀', 'Ω')],
+                    vec![('🦀', 'あ')],
+                    vec![('Ω', 'β')],
+                    vec![('Ω', 'あ')],
+                    vec![('β', 'あ')],
+                ],
+            ),
+            (
+                1,
+                serde_json::json!({"kind":"empty_single","selection":"all"}),
+                vec![vec![]],
+            ),
+            (
+                1,
+                serde_json::json!({"kind":"empty_single","selection":"touching","symbols":["β"]}),
+                vec![vec![]],
+            ),
+        ] {
+            let domain = AttackPlugboardDomain::parse_json(
+                request.definition().alphabet(),
+                request.configuration().plugboard(),
+                &serde_json::json!({"kind":"attack","symbols":["あ","β","Ω","🦀"],"max_pairs":cap})
+                    .to_string(),
+            )
+            .unwrap();
+            let settings = crate::AttackSettings::parse_json(
+                request.definition().alphabet(),
+                &domain,
+                request.passes(),
+                request.measures(),
+                &serde_json::json!({"kind":"partial_exhaustion","initial_measure":"ic",
+                    "final_measure":"ic","switch_pairs":0,"backtrack_pairs":0,
+                    "evaluation_budget":1,"seeds":seeds})
+                .to_string(),
+            )
+            .unwrap();
+            let policy = settings.seed_policy().unwrap();
+            let actual: Vec<_> = SeedCursor::new(&initial, &domain, policy)
+                .unwrap()
+                .collect();
+            let indexed: Vec<_> = expected
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, board)| (index as u128, board))
+                .collect();
+            assert_eq!(actual, indexed);
+            // Gate checks count only; the spelled sequence above is the order oracle.
+            assert_eq!(
+                crate::AttackGate::check(&request, &domain, &settings)
+                    .unwrap()
+                    .starts_per_outer(),
+                expected.len() as u128
+            );
+            for (_, board) in actual {
+                let full = validated_trial_board(&initial, &domain, &board).unwrap();
+                assert_eq!(full.map('é'), Some('中'));
+                assert_eq!(full.map('中'), Some('é'));
+                for (a, b) in board {
+                    assert_eq!(full.map(a), Some(b));
+                    assert_eq!(full.map(b), Some(a));
+                }
+            }
+        }
     }
 
     fn resource(initial: &ResolvedConfiguration) -> crate::BoundResource {
