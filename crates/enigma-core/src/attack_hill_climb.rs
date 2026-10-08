@@ -1,8 +1,11 @@
-//! Complete-neighborhood selection only; no ascent or objective-phase orchestration.
+//! Private complete-neighborhood selection and scoring lifecycle; no ascent loop.
 
-use crate::attack_evaluator::{TrialEvaluationError, TrialEvaluator};
+use crate::attack_evaluator::{validated_trial_board, TrialEvaluationError, TrialEvaluator};
 use crate::attack_neighborhood::NeighborhoodCursor;
-use crate::{AttackPlugboardDomain, FixedScore, MeasuredScore, ResolvedConfiguration};
+use crate::{
+    AttackPlugboardDomain, BoundResource, Direction, FixedScore, MeasureId, MeasuredScore,
+    ResolvedConfiguration,
+};
 
 type MutableBoard = Vec<(char, char)>;
 
@@ -21,6 +24,154 @@ impl EvaluationAllowance {
         }
         self.used += 1;
         true
+    }
+}
+
+/// Both evaluators share immutable machine, domain, input and decrypt direction.
+struct BoundClimbScoring<'a> {
+    initial: &'a ResolvedConfiguration,
+    domain: &'a AttackPlugboardDomain,
+    initial_evaluator: TrialEvaluator<'a>,
+    final_evaluator: TrialEvaluator<'a>,
+    identical: bool,
+    switch_pairs: usize,
+}
+
+#[derive(Debug)]
+struct ScoredBoard {
+    board: MutableBoard,
+    plaintext: String,
+    score: MeasuredScore,
+}
+
+struct ScoringState<'c, 'a> {
+    context: &'c BoundClimbScoring<'a>,
+    current: ScoredBoard,
+    final_phase: bool,
+    known_final: bool,
+}
+
+impl<'a> BoundClimbScoring<'a> {
+    fn new(
+        initial: &'a ResolvedConfiguration,
+        domain: &'a AttackPlugboardDomain,
+        input: &'a str,
+        first: (MeasureId, Option<&'a BoundResource>),
+        last: (MeasureId, Option<&'a BoundResource>),
+        switch_pairs: usize,
+    ) -> Self {
+        let same_resource = match (first.1, last.1) {
+            (None, None) => true,
+            (Some(a), Some(b)) => std::ptr::eq(a, b),
+            _ => false,
+        };
+        Self {
+            initial,
+            domain,
+            initial_evaluator: TrialEvaluator::new(
+                initial,
+                domain,
+                input,
+                Direction::Decrypt,
+                first.0,
+                first.1,
+            ),
+            final_evaluator: TrialEvaluator::new(
+                initial,
+                domain,
+                input,
+                Direction::Decrypt,
+                last.0,
+                last.1,
+            ),
+            identical: first.0 == last.0 && same_resource,
+            switch_pairs,
+        }
+    }
+
+    fn start(
+        &self,
+        board: MutableBoard,
+        allowance: &mut EvaluationAllowance,
+    ) -> Result<Option<ScoringState<'_, 'a>>, TrialEvaluationError> {
+        validated_trial_board(self.initial, self.domain, &board)
+            .map_err(TrialEvaluationError::Board)?;
+        let final_phase = self.domain.fixed_pairs().len() + board.len() >= self.switch_pairs;
+        let known_final = final_phase || self.identical;
+        if !allowance.admit(u64::from(!known_final)) {
+            return Ok(None);
+        }
+        let evaluator = if final_phase {
+            &self.final_evaluator
+        } else {
+            &self.initial_evaluator
+        };
+        let (plaintext, score) = evaluator.evaluate(&board)?;
+        Ok(Some(ScoringState {
+            context: self,
+            current: ScoredBoard {
+                board,
+                plaintext,
+                score,
+            },
+            final_phase,
+            known_final,
+        }))
+    }
+}
+
+impl ScoringState<'_, '_> {
+    fn reserve(&self) -> u64 {
+        u64::from(!self.known_final)
+    }
+
+    /// Caller must preserve reserve in the shared allowance. None reports denied admission.
+    /// Consuming the state makes finalization once-only; it never starts another ascent.
+    fn finalize(
+        mut self,
+        allowance: &mut EvaluationAllowance,
+    ) -> Result<Option<ScoredBoard>, TrialEvaluationError> {
+        if !self.known_final {
+            if !allowance.admit(0) {
+                return Ok(None);
+            }
+            let (plaintext, score) = self.context.final_evaluator.evaluate(&self.current.board)?;
+            self.current.plaintext = plaintext;
+            self.current.score = score;
+        }
+        Ok(Some(self.current))
+    }
+
+    /// Precondition for 11.4b.2: trial is a complete-scan-selected strict winner,
+    /// evaluated with THIS context's current objective; its call was already charged.
+    /// This lifecycle does not verify selection. Caller must have preserved reserve.
+    /// Consuming self prevents an unscored committed board escaping on any error.
+    fn commit_trial(
+        mut self,
+        trial: ScoredBoard,
+        allowance: &mut EvaluationAllowance,
+    ) -> Result<Option<Self>, TrialEvaluationError> {
+        validated_trial_board(self.context.initial, self.context.domain, &trial.board)
+            .map_err(TrialEvaluationError::Board)?;
+        self.current = trial;
+        self.known_final = self.final_phase || self.context.identical;
+        if !self.final_phase
+            && self.context.domain.fixed_pairs().len() + self.current.board.len()
+                >= self.context.switch_pairs
+        {
+            self.final_phase = true;
+            if !self.known_final {
+                if !allowance.admit(0) {
+                    return Ok(None);
+                }
+                let (plaintext, score) =
+                    self.context.final_evaluator.evaluate(&self.current.board)?;
+                self.current.plaintext = plaintext;
+                self.current.score = score;
+            }
+            self.known_final = true;
+        }
+        Ok(Some(self))
     }
 }
 
@@ -107,6 +258,327 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn lifecycle_reserves_then_finalizes_the_literal_current_board() {
+        let (initial, domain) = fixture();
+        let resource = resource(&initial);
+        let context = BoundClimbScoring::new(
+            &initial,
+            &domain,
+            "AA",
+            (MeasureId::Ic, None),
+            (MeasureId::Trie, Some(&resource)),
+            2,
+        );
+        let mut allowance = EvaluationAllowance { used: 4, limit: 5 };
+        assert!(context.start(vec![], &mut allowance).unwrap().is_none());
+        assert_eq!(allowance.used, 4);
+        allowance.limit = 6;
+        let state = context.start(vec![], &mut allowance).unwrap().unwrap();
+        assert!(!state.final_phase);
+        assert_eq!(state.reserve(), 1);
+        assert_eq!(state.current.plaintext, "CA");
+        assert_eq!(state.current.score.ranking().units(), 0);
+        let final_board = state.finalize(&mut allowance).unwrap().unwrap();
+        assert_eq!(final_board.board, vec![]);
+        assert_eq!(final_board.plaintext, "CA");
+        assert_eq!(final_board.score.ranking().units(), 0);
+        assert_eq!(allowance.used, 6);
+
+        let mut allowance = EvaluationAllowance { used: 0, limit: 3 };
+        let state = context.start(vec![], &mut allowance).unwrap().unwrap();
+        assert!(allowance.admit(state.reserve()));
+        let (plaintext, score) = context.initial_evaluator.evaluate(&[('A', 'C')]).unwrap();
+        let trial = ScoredBoard {
+            board: vec![('A', 'C')],
+            plaintext,
+            score,
+        };
+        // Transition mechanics only; this IC fixture does not claim strict selection.
+        let state = state.commit_trial(trial, &mut allowance).unwrap().unwrap();
+        assert!(!state.final_phase);
+        assert_eq!(state.reserve(), 1);
+        let result = state.finalize(&mut allowance).unwrap().unwrap();
+        assert_eq!(result.board, vec![('A', 'C')]);
+        assert_eq!(result.plaintext, "CB");
+        assert_eq!(result.score.ranking().units(), 2 << 32);
+        assert_eq!(allowance.used, 3);
+    }
+
+    #[test]
+    fn fixed_and_mutable_counts_choose_start_phase() {
+        let source = serde_json::json!({"kind":"custom", "value": {
+            "alphabet":["A","B","C","D","E","F"],
+            "wheels":[{"name":"r","wiring":["A","B","C","D","E","F"],"turnovers":[]}],
+            "slots":[{"id":"r","role":"rotor","movement":"fixed","wheel":"r"}],
+            "stepping":{"rules":[]}
+        }});
+        let definition = DefinitionSource::parse_json(&source.to_string())
+            .unwrap()
+            .resolve()
+            .unwrap();
+        let initial = TransformConfiguration::new(
+            vec![SlotConfiguration::new("r", "r", 'A', 'A')],
+            vec![('A', 'B')],
+        )
+        .resolve(&definition)
+        .unwrap();
+        let domain = AttackPlugboardDomain::parse_json(
+            initial.topology().alphabet(),
+            &[('A', 'B')],
+            r#"{"kind":"attack","symbols":["C","D","E","F"],"max_pairs":3}"#,
+        )
+        .unwrap();
+        // Identity wheel: substitutions cancel; AA has alphabet-scaled IC = 6.
+        for (board, threshold, final_phase) in [
+            (vec![], 2, false),
+            (vec![('C', 'D')], 2, true),
+            (vec![('C', 'D'), ('E', 'F')], 2, true),
+            (vec![], 0, true),
+            (vec![('C', 'D')], 4, false),
+        ] {
+            let context = BoundClimbScoring::new(
+                &initial,
+                &domain,
+                "AA",
+                (MeasureId::Ic, None),
+                (MeasureId::Entropy, None),
+                threshold,
+            );
+            let mut allowance = EvaluationAllowance { used: 0, limit: 2 };
+            let state = context
+                .start(board.clone(), &mut allowance)
+                .unwrap()
+                .unwrap();
+            assert_eq!(state.final_phase, final_phase);
+            assert_eq!(state.reserve(), u64::from(!final_phase));
+            assert_eq!(state.current.board, board);
+            assert_eq!(state.current.plaintext, "AA");
+            assert_eq!(
+                state.current.score.ranking().units(),
+                if final_phase { 0 } else { 6 << 32 }
+            );
+            state.finalize(&mut allowance).unwrap().unwrap();
+            assert_eq!(allowance.used, if final_phase { 1 } else { 2 });
+        }
+    }
+
+    #[test]
+    fn identity_uses_the_borrowed_resource_not_only_measure_id() {
+        let (initial, domain) = fixture();
+        let first = resource(&initial);
+        let independent = resource(&initial);
+        for (last, expected) in [(&first, 1), (&independent, 2)] {
+            let context = BoundClimbScoring::new(
+                &initial,
+                &domain,
+                "AA",
+                (MeasureId::Trie, Some(&first)),
+                (MeasureId::Trie, Some(last)),
+                2,
+            );
+            let mut allowance = EvaluationAllowance { used: 0, limit: 2 };
+            let state = context
+                .start(vec![('A', 'C')], &mut allowance)
+                .unwrap()
+                .unwrap();
+            assert_eq!(state.reserve(), expected - 1);
+            let result = state.finalize(&mut allowance).unwrap().unwrap();
+            assert_eq!(result.plaintext, "CB");
+            assert_eq!(result.score.ranking().units(), 2 << 32);
+            assert_eq!(allowance.used, expected);
+        }
+        let context = BoundClimbScoring::new(
+            &initial,
+            &domain,
+            "AA",
+            (MeasureId::Ic, None),
+            (MeasureId::Ic, None),
+            1,
+        );
+        let mut allowance = EvaluationAllowance { used: 0, limit: 2 };
+        let state = context.start(vec![], &mut allowance).unwrap().unwrap();
+        assert_eq!(state.reserve(), 0);
+        assert!(allowance.admit(state.reserve()));
+        let (plaintext, score) = context.initial_evaluator.evaluate(&[('A', 'C')]).unwrap();
+        let trial = ScoredBoard {
+            board: vec![('A', 'C')],
+            plaintext,
+            score,
+        };
+        // Exercise transition mechanics only: strict winner selection is the caller's duty.
+        let state = state.commit_trial(trial, &mut allowance).unwrap().unwrap();
+        assert!(state.final_phase);
+        assert_eq!(state.reserve(), 0);
+        state.finalize(&mut allowance).unwrap().unwrap();
+        assert_eq!(allowance.used, 2);
+    }
+
+    #[test]
+    fn crossing_remeasures_current_then_removal_stays_final() {
+        let (initial, domain) = fixture();
+        let first = resource(&initial);
+        let last = crate::BoundResource::Trie(
+            crate::TrieModel::new(
+                initial.topology().alphabet().clone(),
+                vec![(vec!['C', 'A'], 4), (vec!['C', 'B'], 3)],
+            )
+            .unwrap(),
+        );
+        let context = BoundClimbScoring::new(
+            &initial,
+            &domain,
+            "AA",
+            (MeasureId::Trie, Some(&first)),
+            (MeasureId::Trie, Some(&last)),
+            1,
+        );
+        let mut allowance = EvaluationAllowance { used: 3, limit: 7 };
+        let state = context.start(vec![], &mut allowance).unwrap().unwrap();
+        assert_eq!(state.reserve(), 1);
+        // AC is the initial objective's complete-neighborhood winner (existing fixture).
+        assert!(allowance.admit(state.reserve()));
+        let (plaintext, score) = context.initial_evaluator.evaluate(&[('A', 'C')]).unwrap();
+        assert_eq!(plaintext, "CB");
+        assert_eq!(score.ranking().units(), 2 << 32);
+        let trial = ScoredBoard {
+            board: vec![('A', 'C')],
+            plaintext,
+            score,
+        };
+        let state = state.commit_trial(trial, &mut allowance).unwrap().unwrap();
+        assert!(state.final_phase);
+        assert_eq!(state.current.board, vec![('A', 'C')]);
+        assert_eq!(state.current.plaintext, "CB");
+        assert_eq!(state.current.score.ranking().units(), 3 << 32);
+        assert_eq!(state.reserve(), 0);
+        assert_eq!(allowance.used, 6);
+        assert!(allowance.admit(state.reserve()));
+        let (plaintext, score) = context.final_evaluator.evaluate(&[]).unwrap();
+        // Empty board is the final objective's strict complete-neighborhood winner.
+        let trial = ScoredBoard {
+            board: vec![],
+            plaintext,
+            score,
+        };
+        let state = state.commit_trial(trial, &mut allowance).unwrap().unwrap();
+        assert!(state.final_phase);
+        assert_eq!(state.reserve(), 0);
+        let result = state.finalize(&mut allowance).unwrap().unwrap();
+        assert!(result.board.is_empty());
+        assert_eq!(result.plaintext, "CA");
+        assert_eq!(result.score.ranking().units(), 4 << 32);
+        assert_eq!(allowance.used, 7);
+    }
+
+    #[test]
+    fn validation_precedes_admission_and_charged_failures_propagate() {
+        let (initial, domain) = fixture();
+        let resource = resource(&initial);
+        let mismatched = AttackPlugboardDomain::parse_json(
+            initial.topology().alphabet(),
+            &[('A', 'B')],
+            r#"{"kind":"attack","symbols":["C"],"max_pairs":1}"#,
+        )
+        .unwrap();
+        let mut allowance = EvaluationAllowance { used: 0, limit: 0 };
+        for (binding, board) in [(&domain, vec![('A', 'A')]), (&mismatched, vec![])] {
+            let context = BoundClimbScoring::new(
+                &initial,
+                binding,
+                "AA",
+                (MeasureId::Ic, None),
+                (MeasureId::Ic, None),
+                0,
+            );
+            assert!(matches!(
+                context.start(board, &mut allowance),
+                Err(TrialEvaluationError::Board(_))
+            ));
+            assert_eq!(allowance.used, 0);
+        }
+        for (input, objective, model, expected) in [
+            (
+                "AZ",
+                MeasureId::Ic,
+                None,
+                TrialEvaluationError::Model(crate::ModelError::UnknownSymbol('Z')),
+            ),
+            (
+                "AA",
+                MeasureId::Trie,
+                None,
+                TrialEvaluationError::MissingResource(MeasureId::Trie),
+            ),
+            (
+                "AA",
+                MeasureId::Ic,
+                Some(&resource),
+                TrialEvaluationError::IncompatibleResource(MeasureId::Ic),
+            ),
+            (
+                "A",
+                MeasureId::Ic,
+                None,
+                TrialEvaluationError::Measure(crate::MeasureError::InsufficientSamples {
+                    required: 2,
+                    actual: 1,
+                }),
+            ),
+        ] {
+            let context = BoundClimbScoring::new(
+                &initial,
+                &domain,
+                input,
+                (objective, model),
+                (objective, model),
+                0,
+            );
+            allowance.limit = allowance.used + 1;
+            let before = allowance.used;
+            assert_eq!(context.start(vec![], &mut allowance).err(), Some(expected));
+            assert_eq!(allowance.used, before + 1);
+        }
+    }
+
+    #[test]
+    fn final_scoring_errors_consume_reserve_without_returning_state() {
+        let (initial, domain) = fixture();
+        for threshold in [1, 2] {
+            let context = BoundClimbScoring::new(
+                &initial,
+                &domain,
+                "AA",
+                (MeasureId::Ic, None),
+                (MeasureId::Trie, None),
+                threshold,
+            );
+            let mut allowance = EvaluationAllowance { used: 0, limit: 3 };
+            let state = context.start(vec![], &mut allowance).unwrap().unwrap();
+            let error = if threshold == 1 {
+                assert!(allowance.admit(state.reserve()));
+                let (plaintext, score) = context.initial_evaluator.evaluate(&[('A', 'C')]).unwrap();
+                state
+                    .commit_trial(
+                        ScoredBoard {
+                            board: vec![('A', 'C')],
+                            plaintext,
+                            score,
+                        },
+                        &mut allowance,
+                    )
+                    .err()
+            } else {
+                state.finalize(&mut allowance).err()
+            };
+            assert_eq!(
+                error,
+                Some(TrialEvaluationError::MissingResource(MeasureId::Trie))
+            );
+            assert_eq!(allowance.used, if threshold == 1 { 3 } else { 2 });
+        }
     }
 
     #[test]
