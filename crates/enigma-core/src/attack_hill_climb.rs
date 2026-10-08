@@ -1,4 +1,4 @@
-//! Private complete-neighborhood selection and scoring lifecycle; no ascent loop.
+//! Private complete-neighborhood strict ascent with bound scoring and shared accounting.
 
 use crate::attack_evaluator::{validated_trial_board, TrialEvaluationError, TrialEvaluator};
 use crate::attack_neighborhood::NeighborhoodCursor;
@@ -37,7 +37,7 @@ struct BoundClimbScoring<'a> {
     switch_pairs: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct ScoredBoard {
     board: MutableBoard,
     plaintext: String,
@@ -51,7 +51,75 @@ struct ScoringState<'c, 'a> {
     known_final: bool,
 }
 
+#[derive(Debug)]
+struct ClimbOutcome {
+    current: Option<ScoredBoard>,
+    budget_stopped: bool,
+    final_objective_ascent: bool,
+    neighborhood_exhausted: bool,
+}
+
 impl<'a> BoundClimbScoring<'a> {
+    fn climb(
+        &self,
+        board: MutableBoard,
+        backtrack_pairs: usize,
+        allowance: &mut EvaluationAllowance,
+    ) -> Result<ClimbOutcome, TrialEvaluationError> {
+        let Some(mut state) = self.start(board, allowance)? else {
+            return Ok(ClimbOutcome {
+                current: None,
+                budget_stopped: true,
+                final_objective_ascent: false,
+                neighborhood_exhausted: false,
+            });
+        };
+        let mut final_objective_ascent = false;
+        let neighborhood_exhausted = loop {
+            // Build from this state's context, never an independently bound evaluator.
+            let selection = NeighborhoodSelection {
+                initial: self.initial,
+                domain: self.domain,
+                evaluator: if state.final_phase {
+                    &self.final_evaluator
+                } else {
+                    &self.initial_evaluator
+                },
+                backtrack_pairs,
+            };
+            // Even with no allowance, the cursor may complete without evaluations.
+            let outcome = selection.scan(
+                &state.current.board,
+                state.current.score.ranking(),
+                allowance,
+                state.reserve(),
+            )?;
+            match outcome {
+                ScanOutcome::Interrupted => break false,
+                ScanOutcome::Complete(winner) => {
+                    final_objective_ascent |= state.final_phase || self.identical;
+                    let Some(winner) = winner else { break true };
+                    // Each admitted scan call leaves reserve intact. Crossing spends at
+                    // most that reserve; identical/already-final commits spend nothing.
+                    state = state
+                        .commit_trial(winner, allowance)?
+                        .expect("complete scan preserved the objective-crossing reservation");
+                }
+            }
+        };
+        // The same invariant leaves one call for an unknown final score, even
+        // after an interrupted scan. Consuming finalization cannot run twice.
+        let current = state
+            .finalize(allowance)?
+            .expect("driver preserved the final-score reservation");
+        Ok(ClimbOutcome {
+            current: Some(current),
+            budget_stopped: !neighborhood_exhausted,
+            final_objective_ascent,
+            neighborhood_exhausted,
+        })
+    }
+
     fn new(
         initial: &'a ResolvedConfiguration,
         domain: &'a AttackPlugboardDomain,
@@ -176,8 +244,8 @@ impl ScoringState<'_, '_> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum ScanOutcome {
-    Complete(Option<(MutableBoard, MeasuredScore)>),
+enum ScanOutcome {
+    Complete(Option<ScoredBoard>),
     Interrupted,
 }
 
@@ -189,7 +257,7 @@ pub(super) struct NeighborhoodSelection<'a> {
 }
 
 impl NeighborhoodSelection<'_> {
-    pub(super) fn scan(
+    fn scan(
         &self,
         current: &[(char, char)],
         ranking: FixedScore,
@@ -205,10 +273,14 @@ impl NeighborhoodSelection<'_> {
             if !allowance.admit(reserve) {
                 return Ok(ScanOutcome::Interrupted);
             }
-            let (_, score) = self.evaluator.evaluate(&board)?;
+            let (plaintext, score) = self.evaluator.evaluate(&board)?;
             if score.ranking().units() > best_ranking.units() {
                 best_ranking = score.ranking();
-                best = Some((board, score));
+                best = Some(ScoredBoard {
+                    board,
+                    plaintext,
+                    score,
+                });
             }
         }
         Ok(ScanOutcome::Complete(best))
@@ -258,6 +330,251 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn driver_repeats_complete_scans_and_retains_only_committed_boards() {
+        let (initial, domain) = fixture();
+        let first = resource(&initial);
+        let last = crate::BoundResource::Trie(
+            crate::TrieModel::new(
+                initial.topology().alphabet().clone(),
+                vec![(vec!['C', 'A'], 4), (vec!['C', 'B'], 3)],
+            )
+            .unwrap(),
+        );
+        // AB touches A -> AB, BC; AC removes -> empty; BC touches C -> BC, AB.
+        // Thus AC neighbors cost five calls, including repeated boards.
+        let neighbors: Vec<_> = NeighborhoodCursor::new(&initial, &domain, &[('A', 'C')], 0)
+            .unwrap()
+            .collect();
+        assert_eq!(
+            neighbors,
+            vec![
+                vec![('A', 'B')],
+                vec![('B', 'C')],
+                vec![],
+                vec![('B', 'C')],
+                vec![('A', 'B')]
+            ]
+        );
+        // start + first scan + crossing = 5; final winning scan = 5;
+        // last empty-board scan = 3. Initial optimum instead costs 1+3+5+1.
+        for (threshold, limit, board, text, weight, used, ascent, exhausted) in [
+            (1, 100, vec![], "CA", 4, 13, true, true),
+            (1, 5, vec![('A', 'C')], "CB", 3, 5, false, false),
+            (1, 10, vec![], "CA", 4, 10, true, false),
+            (1, 4, vec![], "CA", 4, 4, false, false),
+            (2, 100, vec![('A', 'C')], "CB", 3, 10, false, true),
+        ] {
+            let context = BoundClimbScoring::new(
+                &initial,
+                &domain,
+                "AA",
+                (MeasureId::Trie, Some(&first)),
+                (MeasureId::Trie, Some(&last)),
+                threshold,
+            );
+            let mut allowance = EvaluationAllowance { used: 0, limit };
+            let result = context.climb(vec![], 0, &mut allowance).unwrap();
+            let current = result.current.unwrap();
+            assert_eq!(current.board, board);
+            assert_eq!(current.plaintext, text);
+            assert_eq!(current.score.ranking().units(), weight << 32);
+            assert_eq!(allowance.used, used);
+            assert_eq!(result.final_objective_ascent, ascent);
+            assert_eq!(result.neighborhood_exhausted, exhausted);
+            assert_eq!(result.budget_stopped, !exhausted);
+        }
+    }
+
+    #[test]
+    fn driver_identical_objective_requires_a_complete_scan_not_just_a_score() {
+        let (initial, domain) = fixture();
+        let resource = resource(&initial);
+        let context = BoundClimbScoring::new(
+            &initial,
+            &domain,
+            "AA",
+            (MeasureId::Trie, Some(&resource)),
+            (MeasureId::Trie, Some(&resource)),
+            2,
+        );
+        // No switch is reached. First tied maximum is AC, not BC.
+        // 1 start + 3 empty neighbors + 5 AC plateau neighbors = 9.
+        for (limit, used, board, weight, ascent, exhausted) in [
+            (9, 9, vec![('A', 'C')], 2, true, true),
+            (4, 4, vec![('A', 'C')], 2, true, false),
+            (3, 3, vec![], 0, false, false),
+        ] {
+            let mut allowance = EvaluationAllowance { used: 0, limit };
+            let result = context.climb(vec![], 0, &mut allowance).unwrap();
+            let current = result.current.unwrap();
+            assert_eq!(current.board, board);
+            assert_eq!(
+                current.plaintext,
+                if board.is_empty() { "CA" } else { "CB" }
+            );
+            assert_eq!(current.score.ranking().units(), weight << 32);
+            assert_eq!(allowance.used, used);
+            assert_eq!(result.final_objective_ascent, ascent);
+            assert_eq!(result.neighborhood_exhausted, exhausted);
+            assert_eq!(result.budget_stopped, !exhausted);
+        }
+    }
+
+    #[test]
+    fn driver_starting_final_is_not_itself_final_objective_ascent() {
+        let (initial, domain) = fixture();
+        let resource = resource(&initial);
+        let context = BoundClimbScoring::new(
+            &initial,
+            &domain,
+            "AA",
+            (MeasureId::Ic, None),
+            (MeasureId::Trie, Some(&resource)),
+            0,
+        );
+        for (limit, board, ascent, exhausted) in
+            [(1, vec![], false, false), (9, vec![('A', 'C')], true, true)]
+        {
+            let mut allowance = EvaluationAllowance { used: 0, limit };
+            let result = context.climb(vec![], 0, &mut allowance).unwrap();
+            assert_eq!(result.current.unwrap().board, board);
+            assert_eq!(result.final_objective_ascent, ascent);
+            assert_eq!(result.neighborhood_exhausted, exhausted);
+            assert_eq!(result.budget_stopped, !exhausted);
+            assert_eq!(allowance.used, limit);
+        }
+    }
+
+    #[test]
+    fn driver_reservation_denial_and_zero_cost_completion() {
+        let (initial, domain) = fixture();
+        let resource = resource(&initial);
+        let context = BoundClimbScoring::new(
+            &initial,
+            &domain,
+            "AA",
+            (MeasureId::Ic, None),
+            (MeasureId::Trie, Some(&resource)),
+            2,
+        );
+        for limit in [0, 1] {
+            let mut allowance = EvaluationAllowance { used: 0, limit };
+            let result = context.climb(vec![], 0, &mut allowance).unwrap();
+            assert!(result.current.is_none());
+            assert!(result.budget_stopped);
+            assert!(!result.final_objective_ascent);
+            assert!(!result.neighborhood_exhausted);
+            assert_eq!(allowance.used, 0);
+        }
+        let empty_domain = AttackPlugboardDomain::parse_json(
+            initial.topology().alphabet(),
+            &[],
+            r#"{"kind":"attack","symbols":["A","B","C"],"max_pairs":0}"#,
+        )
+        .unwrap();
+        for identical in [false, true] {
+            let context = BoundClimbScoring::new(
+                &initial,
+                &empty_domain,
+                "AA",
+                (MeasureId::Ic, None),
+                if identical {
+                    (MeasureId::Ic, None)
+                } else {
+                    (MeasureId::Trie, Some(&resource))
+                },
+                2,
+            );
+            let limit = if identical { 1 } else { 2 };
+            let mut allowance = EvaluationAllowance { used: 0, limit };
+            let result = context.climb(vec![], 0, &mut allowance).unwrap();
+            let current = result.current.unwrap();
+            assert!(current.board.is_empty());
+            assert_eq!(current.plaintext, "CA");
+            assert_eq!(current.score.ranking().units(), 0);
+            assert_eq!(allowance.used, limit);
+            assert!(!result.budget_stopped);
+            assert!(result.neighborhood_exhausted);
+            assert_eq!(result.final_objective_ascent, identical);
+        }
+    }
+
+    #[test]
+    fn driver_errors_remain_errors_and_charge_only_admitted_calls() {
+        let (initial, domain) = fixture();
+        let resource = resource(&initial);
+        let context = BoundClimbScoring::new(
+            &initial,
+            &domain,
+            "AA",
+            (MeasureId::Ic, None),
+            (MeasureId::Ic, None),
+            0,
+        );
+        let mut allowance = EvaluationAllowance { used: 0, limit: 0 };
+        assert!(matches!(
+            context.climb(vec![('A', 'A')], 0, &mut allowance),
+            Err(TrialEvaluationError::Board(_))
+        ));
+        assert_eq!(allowance.used, 0);
+        for (input, objective, expected) in [
+            (
+                "AZ",
+                MeasureId::Ic,
+                TrialEvaluationError::Model(crate::ModelError::UnknownSymbol('Z')),
+            ),
+            (
+                "AA",
+                MeasureId::Trie,
+                TrialEvaluationError::MissingResource(MeasureId::Trie),
+            ),
+            (
+                "A",
+                MeasureId::Ic,
+                TrialEvaluationError::Measure(crate::MeasureError::InsufficientSamples {
+                    required: 2,
+                    actual: 1,
+                }),
+            ),
+        ] {
+            let context = BoundClimbScoring::new(
+                &initial,
+                &domain,
+                input,
+                (objective, None),
+                (objective, None),
+                0,
+            );
+            let mut allowance = EvaluationAllowance { used: 0, limit: 1 };
+            assert_eq!(
+                context.climb(vec![], 0, &mut allowance).err(),
+                Some(expected)
+            );
+            assert_eq!(allowance.used, 1);
+        }
+        // Missing final resource fails at either actual crossing or terminal rescore.
+        for (threshold, used) in [(1, 5), (2, 10)] {
+            let context = BoundClimbScoring::new(
+                &initial,
+                &domain,
+                "AA",
+                (MeasureId::Trie, Some(&resource)),
+                (MeasureId::Trie, None),
+                threshold,
+            );
+            let mut allowance = EvaluationAllowance {
+                used: 0,
+                limit: 100,
+            };
+            assert_eq!(
+                context.climb(vec![], 0, &mut allowance).err(),
+                Some(TrialEvaluationError::MissingResource(MeasureId::Trie))
+            );
+            assert_eq!(allowance.used, used);
+        }
     }
 
     #[test]
@@ -604,10 +921,11 @@ mod tests {
         let result = selection.scan(&[], ranking, &mut allowance, 0).unwrap();
         assert_eq!(
             result,
-            ScanOutcome::Complete(Some((
-                vec![('A', 'C')],
-                MeasuredScore::higher_is_better(FixedScore::from_units(2 << 32)),
-            )))
+            ScanOutcome::Complete(Some(ScoredBoard {
+                board: vec![('A', 'C')],
+                plaintext: String::from("CB"),
+                score: MeasuredScore::higher_is_better(FixedScore::from_units(2 << 32)),
+            }))
         );
         assert_eq!(allowance.used, 3);
     }
@@ -723,10 +1041,11 @@ mod tests {
         let score = evaluator.evaluate(&current).unwrap().1;
         assert_eq!(
             selection.scan(&current, score.ranking(), &mut allowance, 0),
-            Ok(ScanOutcome::Complete(Some((
-                boards[1].clone(),
-                MeasuredScore::higher_is_better(FixedScore::from_units(2 << 32))
-            ))))
+            Ok(ScanOutcome::Complete(Some(ScoredBoard {
+                board: boards[1].clone(),
+                plaintext: String::from("CB"),
+                score: MeasuredScore::higher_is_better(FixedScore::from_units(2 << 32)),
+            })))
         );
         assert_eq!(allowance.used, 5);
         assert_eq!(current, vec![('A', 'B')]);

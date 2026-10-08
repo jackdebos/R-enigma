@@ -22,7 +22,10 @@ without work events. CLI execution, seed generation and runtime attacks remain u
 Task 11.4a adds private budget-aware complete-neighborhood best-improvement selection only.
 Task 11.4b.1 adds a private bound scoring lifecycle: start-phase selection, shared final-score
 reservation, committed-board objective switching and once-only finalization, without an ascent loop.
-Adaptive ascent, seed generation, outer execution and CLI execution remain unimplemented; no public runtime is enabled.
+Task 11.4b.2 adds a private single-climb driver repeating complete strict-improvement scans,
+with final-scored committed outcomes on completion or budget interruption. Interrupted scans
+never commit provisional winners; final rescoring alone does not count as final-objective ascent.
+Seed generation, outer execution and CLI execution remain unimplemented; no public runtime is enabled.
 
 For this settings fragment, malformed raw JSON (including duplicate keys, trailing
 input and nonobjects), missing fields and invalid kind/objectives/budget use
