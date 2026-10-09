@@ -63,8 +63,9 @@ same attack inside outer scrambler enumeration. Current CLI search only validate
 loads and binds resources, then returns `unsupported_job`. Private HC/PE drivers
 and outer schedulers are implemented; public runtime and CLI execution remain unsupported.
 [Protocol](protocol.md) and [scoring/resources](scoring-resources.md) remain normative.
-This document specifies only `hill_climb` and `partial_exhaustion`, not lifecycle,
-wire results, progress, cancellation, checkpoints, other passes or variants.
+This document specifies `hill_climb` and `partial_exhaustion`, plus the future private
+control contract in §6.1; it does not define public lifecycle, wire results, progress,
+cancellation, checkpoints, other passes or variants.
 
 ## 1. Two domain branches, no implicit unknown key
 
@@ -288,6 +289,76 @@ cannot fit, retain that committed board and terminate with its final score.
 A zero-cost completion takes precedence over budget termination when there is
 no remaining work (including an empty legal neighborhood). No evaluation beyond
 the budget, timeout heuristic, cancellation or new wire event is specified.
+
+### 6.1 Future private progress and cancellation — Task 12.1a
+
+**Normative private groundwork, not implemented.** Existing private HC/PE runtimes
+still lack this control/accounting hookup. Task 12 remains partial; this contract
+adds no public runtime, exports, events, CLI/platform controls or checkpoint/resume.
+The Task 11 budget-only behavior above remains the present-day implementation.
+
+#### Accounting and completion
+
+Private immutable snapshots carry checked counters for the shared whole run:
+
+| Counter | Type | Increment condition |
+| --- | --- | --- |
+| `evaluations_admitted` | `u64` | Admission consumes allowance before evaluation |
+| `evaluations_completed` | `u64` | Full decryption and objective scoring both succeed |
+| `climbs_started` | `u128` | Initial evaluation succeeds |
+| `climbs_completed` | `u128` | Normal neighborhood exhaustion and required final score succeed |
+| `outers_completed` | `u128` | All climbs for that outer complete |
+
+Existing `evaluations_used` remains admission accounting, not completed work.
+Initial, trial, objective-switch and final evaluations all follow these rules.
+Failed evaluations remain admitted but not completed; there are no refunds.
+Reservations protect required final scoring; only an actually admitted call is charged.
+Cancelled or budget-interrupted climbs and their unfinished outers are not completed.
+Before initial success there is no current climb result; retain any earlier aggregate.
+
+#### Sticky safe-stop and committed results
+
+Cancellation observation is sticky. Poll before the next climb or outer, before
+trial admission, and after evaluation before the next trial or scan-winner commit.
+Once observed, abandon any unfinished scan and its provisional winner; preserve
+only the previously committed board. No optimization follows observation: no new
+trial, winner commit, objective-switch ascent or next climb/outer may begin.
+
+The sole evaluation exception is one already-required, reserved, charged final-
+objective rescore of that committed board, only if its final score is absent.
+If a final score already exists, reuse it without evaluation. This exception retains
+an eligible valid result, never promotes a provisional winner or resumes ascent.
+Failure of this final rescore remains an error, not a cancelled result.
+
+Each admitted full-message decryption plus score is cooperative and nonpreemptible;
+it may finish before cancellation is observed. There is no immediate-interruption,
+wall-clock bound or compliance claim for the public progress interval.
+
+#### Stop precedence and determinism
+
+An encountered evaluation, resolution or invariant error remains an error;
+cancellation must not mask it or erase charged usage. Already-established zero-cost
+or natural exhaustion remains complete (an empty outer slice is `outer_slice_end`).
+When work remains, cancellation precedes budget termination. Do not perform an extra
+evaluation to probe exhaustion, and do not cancel retroactively after completion.
+
+Preserve deterministic pair/action and outer/seed tie order, immutable fixed pairs,
+and final-score eligibility. Winning-result flags (final-objective ascent and fully
+exhausted neighborhood) remain distinct from the whole-run stop reason; neither
+final rescoring nor an earlier completed winner makes a cancelled run complete.
+
+#### Counter-only observation boundary
+
+A future private observer is synchronous and infallible and receives immutable
+counters only: at entry, after successful evaluations, at accounting transitions,
+and at terminal success, cancellation or error. Duplicate snapshots are allowed.
+No callback runs mid-evaluation; cancellation polling is independent of observer
+cadence. Error snapshots retain admitted usage and only successful completions.
+
+This boundary decides no clock, rate, I/O, hold capacity or candidate payload.
+Future public-adapter coalescing is separate work, not an observer cadence promise.
+[Protocol control](protocol.md#5-control) retains its public obligations; Task 16
+still owns checkpoint/resume design and implementation.
 
 ## 7. Minimal core result, examples and limits
 

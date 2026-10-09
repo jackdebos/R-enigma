@@ -363,6 +363,13 @@ Syntax errors point to the closest available containing path.
 
 Transform has no search progress, cancellation, hold, or checkpoint contract in v1.
 
+[Task 12.1a private groundwork](search-passes.md#61-future-private-progress-and-cancellation--task-121a)
+freezes future counter-only observation and cooperative safe-stop semantics, not an
+implemented control/accounting hookup or public execution surface. It does not
+weaken the public `started`/progress, hold, configured final-checkpoint or cancellation
+obligations above and in §4. No public schema or cadence is added; adapter integration
+remains deferred, and checkpoint/resume remains Task 16 work under §6.
+
 ## 6. Checkpoint and resume (record schema deferred)
 
 Only a resumable search may write checkpoints. A transform has no Stage 1 checkpoint.
