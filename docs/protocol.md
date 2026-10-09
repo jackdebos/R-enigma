@@ -245,9 +245,10 @@ four are optional, so an empty object means the fixed choices are already comple
 - `limit`: optional positive integer bounding the number of enumerated candidates;
   omission means no explicit request bound (documented resource limits still apply).
 
-The separately discriminated **planned**, not parser-enabled
+The separately discriminated
 [`kind: "attack"` branch](search-passes.md#1-two-domain-branches-no-implicit-unknown-key)
-adds mutable endpoints without altering this subset grammar or fixed-pair meaning.
+supports strict parsing and public validation, adding mutable endpoints without
+altering this subset grammar or fixed-pair meaning.
 Its strict `job.attack` field is an additive exception to the inventory above,
 only for that branch; see [settings](search-passes.md#2-one-executable-pass-and-explicit-settings).
 
@@ -309,8 +310,9 @@ never loads resources. This status does not change transform grammar or events.
 The CLI loads and binds resources, checks eligibility, then emits one seq1
 `unsupported_job` at `/job/kind`: `attack execution is not implemented`.
 Structural, loading, model-binding and eligibility errors precede that result.
-Missing or other discriminators retain legacy search validation. No attack
-execution, seed generation or enumeration is implemented.
+Missing or other discriminators retain legacy search validation. Private HC/PE
+evaluation, seed exhaustion and ordered outer scheduling are implemented;
+public runtime and CLI execution remain unsupported.
 
 Stage 1 plans `hill_climb`, `partial_exhaustion` with backtracking, `reswapping`, `trie`,
 and `measure`; measures include index of coincidence, Sinkov n-gram statistics,

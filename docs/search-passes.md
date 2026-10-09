@@ -1,6 +1,6 @@
 # Plugboard attack contract — Task 11
 
-Status: **Normative contract; Core and CLI attack validation are supported, execution is not.**
+Status: **Normative contract; Core and CLI attack validation are supported, public runtime and CLI execution are not.**
 Task 11.2a provides only `AttackPlugboardDomain::parse_json`: strict typed fragment
 validation with immutable known fixed pairs. It is separate from legacy search
 spaces and grants neither complete request acceptance nor candidate enumeration.
@@ -42,7 +42,8 @@ usage or the indexed original evaluator error. Task 11.6c.2 privately schedules 
 same-owner PE outers with one allowance, checked aggregate counts and stable committed
 final-score best ownership. Whole seed-run completion stays independent of winner flags;
 original indexed resolution/evaluation errors retain cumulative usage.
-Full attack results, public runtime APIs and CLI execution remain unimplemented.
+Minimal private HC/PE aggregate results are implemented; public runtime APIs,
+full wire results and CLI execution remain deferred.
 
 For this settings fragment, malformed raw JSON (including duplicate keys, trailing
 input and nonobjects), missing fields and invalid kind/objectives/budget use
@@ -59,7 +60,8 @@ then exact-field and required/type checks. These fragment-local choices do not
 change existing root/domain diagnostic policies.
 Task 11 first validates a known scrambler with unknown plugboard, then nests the
 same attack inside outer scrambler enumeration. Current CLI search only validates,
-loads and binds resources, then returns `unsupported_job`; core attacks do not run.
+loads and binds resources, then returns `unsupported_job`. Private HC/PE drivers
+and outer schedulers are implemented; public runtime and CLI execution remain unsupported.
 [Protocol](protocol.md) and [scoring/resources](scoring-resources.md) remain normative.
 This document specifies only `hill_climb` and `partial_exhaustion`, not lifecycle,
 wire results, progress, cancellation, checkpoints, other passes or variants.
@@ -304,7 +306,8 @@ Runtime scoring/invariant errors fail explicitly, not as a termination or sentin
 These are **valid planned search-job fragments**, completed by protocol root
 `protocol_version: 1` and bundled `machine.definition` for `enigma-i`. They are
 not known-answer vectors. Direct Core attack parsing, binding and eligibility checks
-validate them; public root dispatch and CLI/runtime execution remain unsupported.
+validate them. Safe public root Core/CLI validation and private execution are
+implemented; public runtime and CLI execution remain unsupported.
 
 ```json
 {
