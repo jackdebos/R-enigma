@@ -38,8 +38,10 @@ checked counters, stable final-score best ownership and independent aggregate te
 Original indexed resolution/evaluation errors retain cumulative usage; PE remains rejected.
 Task 11.6c.1 binds one internally supplied resolved outer/index to retained PE settings and
 resources, preserving independent seed outcomes, winner flags, run counts and cumulative
-usage or the indexed original evaluator error. PE outer scheduling, global aggregation,
-public runtime execution and CLI execution remain unimplemented.
+usage or the indexed original evaluator error. Task 11.6c.2 privately schedules ordered
+same-owner PE outers with one allowance, checked aggregate counts and stable committed
+final-score best ownership. Whole seed-run completion stays independent of winner flags;
+original indexed resolution/evaluation errors retain cumulative usage.
 Full attack results, public runtime APIs and CLI execution remain unimplemented.
 
 For this settings fragment, malformed raw JSON (including duplicate keys, trailing

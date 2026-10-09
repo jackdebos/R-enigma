@@ -3130,6 +3130,59 @@ mod tests {
     }
 
     #[test]
+    fn partial_outer_scheduler_private_invariant_faults_keep_original_errors() {
+        use crate::attack_hill_climb::{PartialClimbError, PartialRunError};
+        let mut value = attack_request();
+        value["job"]["passes"] = json!(["partial_exhaustion"]);
+        value["job"]["attack"]["kind"] = json!("partial_exhaustion");
+        value["job"]["attack"]
+            .as_object_mut()
+            .unwrap()
+            .remove("start");
+        value["job"]["attack"]["seeds"] = json!({"kind":"empty_single","selection":"all"});
+        value["job"]["space"]["plugboard"]["max_pairs"] = json!(0);
+        value["job"]["configuration"]["slots"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("position");
+        value["job"]["space"]["slots"] = json!([{"id":"fast","positions":["A","B"]}]);
+        value["job"]["space"]["offset"] = json!(1);
+        let mut request = AttackRequest::parse_json(&value.to_string()).unwrap();
+        // PRIVATE evaluator invariant injection: first selected outer, NOT a
+        // later evaluator failure after successful earlier scheduler work.
+        request.carrier.parsed.text = "AZ".to_owned();
+        let error = request.schedule_partial_outers().unwrap_err();
+        assert_eq!((error.outer_index, error.evaluations_used), (Some(1), 1));
+        let PartialRunError::Climb(source) = error.source else {
+            panic!("evaluation diagnostic was replaced");
+        };
+        assert_eq!(
+            source,
+            PartialClimbError::Evaluation(crate::attack_evaluator::TrialEvaluationError::Model(
+                crate::ModelError::UnknownSymbol('Z')
+            ))
+        );
+
+        value["job"]["space"]["offset"] = json!(0);
+        let mut request = AttackRequest::parse_json(&value.to_string()).unwrap();
+        // PRIVATE resolver invariant injection: the sole empty seed of outer 0
+        // really completes at cost 1 before the later invalid position resolves.
+        request.carrier.parsed.space.slots[0]
+            .positions
+            .as_mut()
+            .unwrap()[1] = 'Z';
+        let original = request.outer_candidates().nth(1).unwrap().1.unwrap_err();
+        let error = request.schedule_partial_outers().unwrap_err();
+        assert_eq!((error.outer_index, error.evaluations_used), (Some(1), 1));
+        let PartialRunError::Resolution(diagnostics) = error.source else {
+            panic!("resolution diagnostics were replaced");
+        };
+        assert_eq!(diagnostics, original);
+        // Later evaluation-error mapping is structural only: all outers share
+        // evaluator inputs/resources; no production hook manufactures that trace.
+    }
+
+    #[test]
     fn direct_outer_scheduler_private_faults_keep_original_indexed_errors() {
         use crate::attack_hill_climb::{DirectClimbError, DirectRunError};
         let mut value = attack_request();

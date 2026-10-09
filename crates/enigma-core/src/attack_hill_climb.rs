@@ -87,7 +87,121 @@ pub(crate) struct IndexedPartialClimbError {
     pub(crate) source: PartialClimbError,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PartialRunTermination {
+    OuterSliceEnd,
+    Completed,
+    EvaluationBudget,
+}
+
+#[derive(Debug)]
+pub(crate) struct PartialRunOutcome {
+    pub(crate) termination: PartialRunTermination,
+    pub(crate) outer_completed: u128,
+    pub(crate) climbs_started: u128,
+    pub(crate) climbs_completed: u128,
+    pub(crate) evaluations_used: u64,
+    /// Owns initial fixed facts and the independently final-scored seed winner.
+    pub(crate) best: Option<PartialOuterOutcome>,
+}
+
+#[derive(Debug)]
+pub(crate) enum PartialRunError {
+    Resolution(Vec<crate::SearchDiagnostic>),
+    Climb(PartialClimbError),
+}
+
+#[derive(Debug)]
+pub(crate) struct IndexedPartialRunError {
+    /// None only for pass rejection before enumeration or evaluation.
+    pub(crate) outer_index: Option<u128>,
+    pub(crate) evaluations_used: u64,
+    pub(crate) source: PartialRunError,
+}
+
 impl crate::AttackRequest {
+    /// Same-owner projection supplies absolute indices and fresh independent seeds.
+    pub(crate) fn schedule_partial_outers(
+        &self,
+    ) -> Result<PartialRunOutcome, IndexedPartialRunError> {
+        if self.settings().kind() != crate::AttackKind::PartialExhaustion {
+            return Err(IndexedPartialRunError {
+                outer_index: None,
+                evaluations_used: 0,
+                source: PartialRunError::Climb(PartialClimbError::UnsupportedPass),
+            });
+        }
+        let mut allowance = EvaluationAllowance {
+            used: 0,
+            limit: self.settings().evaluation_budget(),
+        };
+        let mut result = PartialRunOutcome {
+            termination: PartialRunTermination::OuterSliceEnd,
+            outer_completed: 0,
+            climbs_started: 0,
+            climbs_completed: 0,
+            evaluations_used: 0,
+            best: None,
+        };
+        for (index, initial) in self.outer_candidates() {
+            let initial = initial.map_err(|source| IndexedPartialRunError {
+                outer_index: Some(index),
+                evaluations_used: allowance.used,
+                source: PartialRunError::Resolution(source),
+            })?;
+            let outcome = self
+                .climb_partial_outer(initial, index, &mut allowance)
+                .map_err(|error| IndexedPartialRunError {
+                    outer_index: Some(error.outer_index),
+                    evaluations_used: error.evaluations_used,
+                    source: PartialRunError::Climb(error.source),
+                })?;
+            result.evaluations_used = allowance.used;
+            // Defensive checked arithmetic: admitted starts each charge at least
+            // one evaluation, so realistic request totals are bounded by u64 usage.
+            result.climbs_started = result
+                .climbs_started
+                .checked_add(outcome.seeds.climbs_started)
+                .expect("charged starts fit u128");
+            result.climbs_completed = result
+                .climbs_completed
+                .checked_add(outcome.seeds.climbs_completed)
+                .expect("completed climbs cannot exceed charged starts");
+            let interrupted = outcome.seeds.budget_stopped;
+            if !interrupted {
+                result.outer_completed = result
+                    .outer_completed
+                    .checked_add(1)
+                    .expect("completed outers cannot exceed charged starts");
+            }
+            if let Some(seed) = &outcome.seeds.best {
+                if result.best.as_ref().is_none_or(|best| {
+                    seed.current.score.ranking().units()
+                        > best
+                            .seeds
+                            .best
+                            .as_ref()
+                            .expect("best has committed seed")
+                            .current
+                            .score
+                            .ranking()
+                            .units()
+                }) {
+                    result.best = Some(outcome);
+                }
+            }
+            // Select committed interrupted winners before returning; winning seed
+            // flags never stand in for completion of the entire seed run.
+            if interrupted {
+                result.termination = PartialRunTermination::EvaluationBudget;
+                return Ok(result);
+            }
+            // Iterator exhaustion and zero-cost completion precede budget denial.
+            result.termination = PartialRunTermination::Completed;
+        }
+        Ok(result)
+    }
+
     /// Caller supplies a resolved initial/index from this owner's outer projection.
     /// This private adapter retains that index but does not validate provenance.
     pub(crate) fn climb_partial_outer(
@@ -947,6 +1061,297 @@ mod tests {
             job["space"]["slots"] = serde_json::json!([{"id":"r","positions":["A","B","C"]}]);
             job["space"]["offset"] = serde_json::json!(offset);
         })
+    }
+
+    fn partial_scheduler_request(
+        budget: u64,
+        distinct: bool,
+        customize: impl FnOnce(&mut serde_json::Value),
+    ) -> crate::AttackRequest {
+        direct_request_with(serde_json::json!([]), distinct, true, |job| {
+            job["attack"]["evaluation_budget"] = serde_json::json!(budget);
+            job["configuration"]["slots"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("position");
+            job["space"]["slots"] = serde_json::json!([{"id":"r","positions":["A","B","C"]}]);
+            customize(job);
+        })
+    }
+
+    fn partial_counts(run: &PartialRunOutcome) -> (u128, u128, u128, u64) {
+        (
+            run.outer_completed,
+            run.climbs_started,
+            run.climbs_completed,
+            run.evaluations_used,
+        )
+    }
+
+    #[test]
+    fn partial_outer_scheduler_empty_and_wrong_pass() {
+        let run = scheduler_request(1, false, true, 3)
+            .schedule_partial_outers()
+            .unwrap();
+        assert_eq!(run.termination, PartialRunTermination::OuterSliceEnd);
+        assert_eq!(partial_counts(&run), (0, 0, 0, 0));
+        assert!(run.best.is_none());
+        for offset in [0, 3] {
+            let error = scheduler_request(1, false, false, offset)
+                .schedule_partial_outers()
+                .unwrap_err();
+            assert_eq!((error.outer_index, error.evaluations_used), (None, 0));
+            assert!(matches!(
+                error.source,
+                PartialRunError::Climb(PartialClimbError::UnsupportedPass)
+            ));
+        }
+    }
+
+    #[test]
+    fn partial_outer_scheduler_order_exact_boundary_and_seed_boundaries() {
+        for (selection, cost, seeds) in [("all", 32, 4), ("touching", 26, 3)] {
+            let request = partial_scheduler_request(cost, false, |job| {
+                job["space"]["limit"] = serde_json::json!(1);
+                job["attack"]["seeds"]["selection"] = serde_json::json!(selection);
+                if selection == "touching" {
+                    job["attack"]["seeds"]["symbols"] = serde_json::json!(["B"]);
+                }
+            });
+            let initial = request.outer_candidates().next().unwrap().1.unwrap();
+            let run = request.schedule_partial_outers().unwrap();
+            assert_eq!(run.termination, PartialRunTermination::Completed);
+            assert_eq!(partial_counts(&run), (1, seeds, seeds, cost));
+            let outer = run.best.unwrap();
+            assert_eq!(outer.initial, initial);
+            assert_eq!(outer.outer_index, 0);
+            assert!(!outer.seeds.budget_stopped);
+            let best = outer.seeds.best.unwrap();
+            assert_eq!(best.seed_index, 0);
+            assert_eq!(best.current.board, vec![('A', 'C')]);
+            assert_eq!(best.current.plaintext, "CB");
+            assert_eq!(best.current.score.ranking().units(), 2i128 << 32);
+            assert!(!best.incomplete);
+            assert!(best.neighborhood_exhausted && best.final_objective_ascent);
+        }
+        // Exact exhaustion wins only if no outer remains. Fresh second-outer
+        // admission costs one evaluation; it never reuses the previous board.
+        for (budget, started) in [(32, 4), (33, 5)] {
+            let run = scheduler_request(budget, false, true, 0)
+                .schedule_partial_outers()
+                .unwrap();
+            assert_eq!(run.termination, PartialRunTermination::EvaluationBudget);
+            assert_eq!(partial_counts(&run), (1, started, 4, budget));
+            let outer = run.best.unwrap();
+            assert_eq!(outer.outer_index, 0);
+            let best = outer.seeds.best.unwrap();
+            assert_eq!(best.current.plaintext, "CB");
+            assert!(!best.incomplete && best.neighborhood_exhausted);
+        }
+        for (budget, started, completed, incomplete) in
+            [(8, 1, 0, true), (9, 1, 1, false), (10, 2, 1, false)]
+        {
+            let run = scheduler_request(budget, false, true, 0)
+                .schedule_partial_outers()
+                .unwrap();
+            assert_eq!(run.termination, PartialRunTermination::EvaluationBudget);
+            assert_eq!(partial_counts(&run), (0, started, completed, budget));
+            let best = run.best.unwrap().seeds.best.unwrap();
+            assert_eq!(best.seed_index, 0);
+            assert_eq!(best.current.plaintext, "CB");
+            assert_eq!(best.current.score.ranking().units(), 2i128 << 32);
+            assert_eq!(best.incomplete, incomplete);
+            assert_eq!(best.neighborhood_exhausted, !incomplete);
+        }
+    }
+
+    #[test]
+    fn partial_outer_scheduler_matches_ordered_adapter_composition() {
+        // Supplemental composition oracle; the boundary tests above retain the
+        // literal A-outer costs, plaintext, scores and independent seed counts.
+        let request = scheduler_request(100, false, true, 0);
+        let mut allowance = EvaluationAllowance {
+            used: 0,
+            limit: 100,
+        };
+        let mut expected: Option<PartialOuterOutcome> = None;
+        for (index, initial) in request.outer_candidates() {
+            let outer = request
+                .climb_partial_outer(initial.unwrap(), index, &mut allowance)
+                .unwrap();
+            assert!(!outer.seeds.budget_stopped);
+            assert_eq!(
+                (outer.seeds.climbs_started, outer.seeds.climbs_completed),
+                (4, 4)
+            );
+            if expected.as_ref().is_none_or(|best| {
+                outer
+                    .seeds
+                    .best
+                    .as_ref()
+                    .unwrap()
+                    .current
+                    .score
+                    .ranking()
+                    .units()
+                    > best
+                        .seeds
+                        .best
+                        .as_ref()
+                        .unwrap()
+                        .current
+                        .score
+                        .ranking()
+                        .units()
+            }) {
+                expected = Some(outer);
+            }
+        }
+        let run = request.schedule_partial_outers().unwrap();
+        assert_eq!(run.termination, PartialRunTermination::Completed);
+        assert_eq!(partial_counts(&run), (3, 12, 12, allowance.used));
+        let outer = run.best.unwrap();
+        let expected = expected.unwrap();
+        assert_eq!(outer.outer_index, 0);
+        assert_eq!(outer.outer_index, expected.outer_index);
+        assert_eq!(outer.initial, expected.initial);
+        let best = outer.seeds.best.unwrap();
+        let expected = expected.seeds.best.unwrap();
+        assert_eq!(best.seed_index, 0);
+        assert_eq!(best.current, expected.current);
+        assert_eq!(best.current.plaintext, "CB");
+        assert_eq!(best.current.score.ranking().units(), 2i128 << 32);
+        assert!(!best.incomplete);
+        assert!(best.neighborhood_exhausted && best.final_objective_ascent);
+    }
+
+    #[test]
+    fn partial_outer_scheduler_distinct_admission_and_zero_cost_completion() {
+        let denied = scheduler_request(1, true, true, 0)
+            .schedule_partial_outers()
+            .unwrap();
+        assert_eq!(denied.termination, PartialRunTermination::EvaluationBudget);
+        assert_eq!(partial_counts(&denied), (0, 0, 0, 0));
+        assert!(denied.best.is_none());
+        for (budget, single) in [(2, true), (3, false)] {
+            let run = partial_scheduler_request(budget, true, |job| {
+                job["space"]["plugboard"]["max_pairs"] = serde_json::json!(0);
+                if single {
+                    job["space"]["limit"] = serde_json::json!(1);
+                }
+            })
+            .schedule_partial_outers()
+            .unwrap();
+            assert_eq!(partial_counts(&run), (1, 1, 1, 2));
+            assert_eq!(
+                run.termination,
+                if single {
+                    PartialRunTermination::Completed
+                } else {
+                    PartialRunTermination::EvaluationBudget
+                }
+            );
+            let best = run.best.unwrap().seeds.best.unwrap();
+            assert_eq!(best.current.plaintext, "CA");
+            assert_eq!(best.current.score.ranking().units(), 0);
+            assert!(!best.incomplete && best.neighborhood_exhausted);
+            assert!(!best.final_objective_ascent);
+        }
+    }
+
+    #[test]
+    fn partial_outer_scheduler_literal_later_winner_tie_and_dense_seed() {
+        let run = partial_scheduler_request(6, true, |job| {
+            job["text"] = serde_json::json!("CB");
+            job["space"]["plugboard"]["max_pairs"] = serde_json::json!(0);
+        })
+        .schedule_partial_outers()
+        .unwrap();
+        assert_eq!(run.termination, PartialRunTermination::Completed);
+        assert_eq!(partial_counts(&run), (3, 3, 3, 6));
+        let outer = run.best.unwrap();
+        assert_eq!(outer.outer_index, 1);
+        let best = outer.seeds.best.unwrap();
+        assert_eq!(best.seed_index, 0);
+        assert_eq!(best.current.plaintext, "BA");
+        assert_eq!(best.current.score.ranking().units(), 2i128 << 32);
+        let ties = partial_scheduler_request(2, false, |job| {
+            job["text"] = serde_json::json!("A");
+            job["space"]["offset"] = serde_json::json!(1);
+            job["space"]["plugboard"]["max_pairs"] = serde_json::json!(0);
+        })
+        .schedule_partial_outers()
+        .unwrap();
+        assert_eq!(ties.termination, PartialRunTermination::Completed);
+        assert_eq!(partial_counts(&ties), (2, 2, 2, 2));
+        let outer = ties.best.unwrap();
+        assert_eq!(outer.outer_index, 1); // Earliest SELECTED absolute outer.
+        assert_eq!(outer.seeds.best.unwrap().current.score.ranking().units(), 0);
+        for (selection, plaintext, rank) in [("all", "AC", 1), ("touching", "CB", 2)] {
+            let run = partial_scheduler_request(7, true, |job| {
+                job["attack"]["seeds"]["selection"] = serde_json::json!(selection);
+                if selection == "touching" {
+                    job["attack"]["seeds"]["symbols"] = serde_json::json!(["C"]);
+                }
+            })
+            .schedule_partial_outers()
+            .unwrap();
+            assert_eq!(run.termination, PartialRunTermination::EvaluationBudget);
+            assert_eq!(partial_counts(&run), (0, 2, 1, 7));
+            let outer = run.best.unwrap();
+            assert_eq!(outer.outer_index, 0);
+            assert!(outer.seeds.budget_stopped);
+            let best = outer.seeds.best.unwrap();
+            assert_eq!(best.seed_index, 1); // Dense local, including touching mask.
+            assert_eq!(best.current.plaintext, plaintext);
+            assert_eq!(best.current.score.ranking().units(), rank << 32);
+            assert!(best.incomplete);
+            assert!(!best.neighborhood_exhausted && !best.final_objective_ascent);
+        }
+    }
+
+    #[test]
+    fn partial_outer_scheduler_committed_not_provisional_and_owned_fixed_facts() {
+        for (budget, board, plaintext, rank) in
+            [(3, vec![], "CA", 0), (4, vec![('A', 'C')], "CB", 2)]
+        {
+            let run = scheduler_request(budget, false, true, 0)
+                .schedule_partial_outers()
+                .unwrap();
+            assert_eq!(run.termination, PartialRunTermination::EvaluationBudget);
+            assert_eq!(partial_counts(&run), (0, 1, 0, budget));
+            let outer = run.best.unwrap();
+            assert_eq!(outer.outer_index, 0);
+            let best = outer.seeds.best.unwrap();
+            assert_eq!(best.current.board, board);
+            assert_eq!(best.current.plaintext, plaintext);
+            assert_eq!(best.current.score.ranking().units(), rank << 32);
+            assert!(best.incomplete);
+            assert!(!best.neighborhood_exhausted);
+            assert_eq!(best.final_objective_ascent, budget == 4);
+        }
+        let request = partial_scheduler_request(1, false, |job| {
+            job["space"]["offset"] = serde_json::json!(1);
+            job["space"]["limit"] = serde_json::json!(1);
+            job["configuration"]["plugboard"] = serde_json::json!([["A", "B"]]);
+            job["space"]["plugboard"]["symbols"] = serde_json::json!(["C"]);
+        });
+        let initial = request.outer_candidates().next().unwrap().1.unwrap();
+        assert_eq!(initial.topology().slots()[0].position(), 'B');
+        assert_eq!(initial.plugboard().map('A'), Some('B'));
+        let run = request.schedule_partial_outers().unwrap();
+        assert_eq!(run.termination, PartialRunTermination::Completed);
+        assert_eq!(partial_counts(&run), (1, 1, 1, 1));
+        let outer = run.best.unwrap();
+        assert_eq!(outer.outer_index, 1);
+        assert_eq!(outer.initial, initial);
+        let best = outer.seeds.best.unwrap();
+        assert_eq!(best.seed_index, 0);
+        assert!(best.current.board.is_empty());
+        assert_eq!(best.current.plaintext, "CB");
+        assert_eq!(best.current.score.ranking().units(), 2i128 << 32);
+        assert!(!best.incomplete && best.neighborhood_exhausted);
+        assert!(best.final_objective_ascent);
     }
 
     #[test]
