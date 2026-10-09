@@ -3062,6 +3062,40 @@ mod tests {
     }
 
     #[test]
+    fn request_bound_direct_private_invariant_faults_preserve_index_and_usage() {
+        use crate::attack_hill_climb::{DirectClimbError, EvaluationAllowance};
+        // PRIVATE invariant faults: neither corruption is a valid promoted request.
+        let mut request = AttackRequest::parse_json(&attack_request().to_string()).unwrap();
+        request.carrier.parsed.text = "AZ".to_owned();
+        let initial = request.outer_candidates().next().unwrap().1.unwrap();
+        let mut allowance = EvaluationAllowance {
+            used: 3,
+            limit: 100,
+        };
+        let error = request
+            .climb_direct_outer(initial, 91, &mut allowance)
+            .unwrap_err();
+        assert_eq!(error.outer_index, 91);
+        assert_eq!(error.evaluations_used, 4);
+        assert_eq!(allowance.used, 4);
+        assert_eq!(
+            error.source,
+            DirectClimbError::Evaluation(crate::attack_evaluator::TrialEvaluationError::Model(
+                crate::ModelError::UnknownSymbol('Z')
+            ))
+        );
+        request.settings.initialization = AttackInitialization::Seeds(AttackSeedPolicy::All);
+        let initial = request.outer_candidates().next().unwrap().1.unwrap();
+        let error = request
+            .climb_direct_outer(initial, 92, &mut allowance)
+            .unwrap_err();
+        assert_eq!(error.outer_index, 92);
+        assert_eq!(error.evaluations_used, 4);
+        assert_eq!(error.source, DirectClimbError::MissingStart);
+        assert_eq!(allowance.used, 4);
+    }
+
+    #[test]
     fn attack_outer_candidates_preserve_slot_order_and_fixed_facts() {
         let mut value = attack_request();
         value["job"]["configuration"]["slots"] = json!([]);

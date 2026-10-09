@@ -9,6 +9,75 @@ use crate::{
 
 type MutableBoard = Vec<(char, char)>;
 
+/// Owned initial key facts remain separate from the committed mutable remainder.
+#[derive(Debug)]
+pub(crate) struct DirectOuterOutcome {
+    pub(crate) initial: ResolvedConfiguration,
+    pub(crate) outer_index: u128,
+    pub(crate) start_index: u128,
+    /// Cumulative caller allowance usage, including earlier work.
+    pub(crate) evaluations_used: u64,
+    pub(crate) climb: ClimbOutcome,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DirectClimbError {
+    UnsupportedPass,
+    MissingStart,
+    Evaluation(TrialEvaluationError),
+}
+
+#[derive(Debug)]
+pub(crate) struct IndexedDirectClimbError {
+    pub(crate) outer_index: u128,
+    pub(crate) evaluations_used: u64,
+    pub(crate) source: DirectClimbError,
+}
+
+impl crate::AttackRequest {
+    /// Internal caller must supply an initial key/index from THIS owner's private
+    /// outer projection. This adapter does not validate provenance or schedule outers.
+    pub(crate) fn climb_direct_outer(
+        &self,
+        initial: ResolvedConfiguration,
+        outer_index: u128,
+        allowance: &mut EvaluationAllowance,
+    ) -> Result<DirectOuterOutcome, IndexedDirectClimbError> {
+        let settings = self.settings();
+        let mut run = || -> Result<ClimbOutcome, DirectClimbError> {
+            if settings.kind() != crate::AttackKind::HillClimb {
+                return Err(DirectClimbError::UnsupportedPass);
+            }
+            let start = settings.start().ok_or(DirectClimbError::MissingStart)?;
+            let first = settings.initial_measure();
+            let last = settings.final_measure();
+            let scoring = BoundClimbScoring::new(
+                &initial,
+                self.domain(),
+                self.text(),
+                (first, self.bound_resource(first)),
+                (last, self.bound_resource(last)),
+                settings.switch_pairs(),
+            );
+            scoring
+                .climb(start.to_vec(), settings.backtrack_pairs(), allowance)
+                .map_err(DirectClimbError::Evaluation)
+        };
+        let climb = run().map_err(|source| IndexedDirectClimbError {
+            outer_index,
+            evaluations_used: allowance.used,
+            source,
+        })?;
+        Ok(DirectOuterOutcome {
+            initial,
+            outer_index,
+            start_index: 0,
+            evaluations_used: allowance.used,
+            climb,
+        })
+    }
+}
+
 /// Lazy empty/single mutable remainders. Fixed knowledge stays in the bound domain.
 struct SeedCursor<'a> {
     symbols: Vec<char>,
@@ -127,10 +196,10 @@ struct BoundClimbScoring<'a> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct ScoredBoard {
-    board: MutableBoard,
-    plaintext: String,
-    score: MeasuredScore,
+pub(crate) struct ScoredBoard {
+    pub(crate) board: MutableBoard,
+    pub(crate) plaintext: String,
+    pub(crate) score: MeasuredScore,
 }
 
 struct ScoringState<'c, 'a> {
@@ -141,11 +210,11 @@ struct ScoringState<'c, 'a> {
 }
 
 #[derive(Debug)]
-struct ClimbOutcome {
-    current: Option<ScoredBoard>,
-    budget_stopped: bool,
-    final_objective_ascent: bool,
-    neighborhood_exhausted: bool,
+pub(crate) struct ClimbOutcome {
+    pub(crate) current: Option<ScoredBoard>,
+    pub(crate) budget_stopped: bool,
+    pub(crate) final_objective_ascent: bool,
+    pub(crate) neighborhood_exhausted: bool,
 }
 
 #[derive(Debug)]
@@ -476,6 +545,128 @@ mod tests {
         )
         .unwrap();
         (initial, domain)
+    }
+
+    fn direct_request(start: serde_json::Value, distinct: bool, pe: bool) -> crate::AttackRequest {
+        let value = serde_json::json!({"protocol_version":1,"machine":{"definition":{
+            "kind":"custom","value":{"alphabet":["A","B","C"],
+            "wheels":[{"name":"r","wiring":["B","A","C"],"turnovers":[]}],
+            "slots":[{"id":"r","role":"rotor","movement":"movable","wheel":"r"}],
+            "stepping":{"rules":[{"when":{"always":true},"advance":["r"]}]}}}},
+            "job":{"kind":"search","configuration":{"slots":[{"id":"r","position":"A","ring":"A"}],
+            "plugboard":[]},"space":{"plugboard":{"kind":"attack","symbols":["A","B","C"],"max_pairs":1}},
+            "text":"AA","passes":[if pe {"partial_exhaustion"} else {"hill_climb"}],
+            "measures":if distinct {vec!["ic","trie"]} else {vec!["trie"]},
+            "resources":{"trie":{"path":"dictionary.json"}},
+            "attack":{"kind":"hill_climb","initial_measure":if distinct {"ic"} else {"trie"},
+            "final_measure":"trie","switch_pairs":1,"backtrack_pairs":0,"evaluation_budget":100,"start":start}}});
+        let mut value = value;
+        if pe {
+            value["job"]["attack"]["kind"] = serde_json::json!("partial_exhaustion");
+            value["job"]["attack"]
+                .as_object_mut()
+                .unwrap()
+                .remove("start");
+            value["job"]["attack"]["seeds"] =
+                serde_json::json!({"kind":"empty_single","selection":"all"});
+        }
+        let json = value.to_string();
+        let dictionary = serde_json::json!({"resource_version":1,"kind":"dictionary","alphabet":["A","B","C"],
+            "entries":[{"word":["A","C"],"weight":1},{"word":["C","B"],"weight":2},{"word":["B","A"],"weight":2}]}).to_string();
+        let supplied = std::collections::BTreeMap::from([("trie".to_owned(), dictionary.as_str())]);
+        crate::ParsedAttackRequest::parse_json(&json)
+            .unwrap()
+            .bind_resources(&supplied)
+            .unwrap()
+    }
+
+    #[test]
+    fn request_bound_direct_owned_start_and_shared_allowance() {
+        for (start, cost) in [
+            (serde_json::json!([]), 9),
+            (serde_json::json!([["A", "B"]]), 11),
+        ] {
+            // Caller JSON and supplied dictionary buffers have already been dropped.
+            let request = direct_request(start, false, false);
+            let initial = request.outer_candidates().next().unwrap().1.unwrap();
+            let expected_initial = initial.clone();
+            let index = u128::from(u64::MAX) + 7;
+            let mut allowance = EvaluationAllowance {
+                used: 0,
+                limit: cost,
+            };
+            let result = request
+                .climb_direct_outer(initial, index, &mut allowance)
+                .unwrap();
+            assert_eq!(result.outer_index, index);
+            assert_eq!(result.start_index, 0);
+            assert_eq!(result.initial, expected_initial);
+            assert_eq!(result.initial.plugboard().map('A'), Some('A'));
+            assert_eq!(result.evaluations_used, cost);
+            assert_eq!(allowance.used, cost);
+            let current = result.climb.current.unwrap();
+            assert_eq!(current.board, vec![('A', 'C')]);
+            assert_eq!(current.plaintext, "CB");
+            assert_eq!(current.score.ranking().units(), 2 * (1i128 << 32));
+            assert!(!result.climb.budget_stopped);
+            assert!(result.climb.neighborhood_exhausted);
+            assert!(result.climb.final_objective_ascent);
+            let initial = request.outer_candidates().next().unwrap().1.unwrap();
+            let denied = request
+                .climb_direct_outer(initial, index, &mut allowance)
+                .unwrap();
+            assert!(denied.climb.current.is_none());
+            assert!(denied.climb.budget_stopped);
+            assert!(!denied.climb.neighborhood_exhausted);
+            assert_eq!(denied.evaluations_used, cost);
+        }
+    }
+
+    #[test]
+    fn request_bound_direct_reservation_and_interrupted_winners() {
+        for (distinct, limit, board, plaintext, units, used) in [
+            (true, 1, None, "", 0, 0),
+            (true, 2, Some(vec![]), "CA", 0, 2),
+            (false, 3, Some(vec![]), "CA", 0, 3),
+            (false, 4, Some(vec![('A', 'C')]), "CB", 2 * (1i128 << 32), 4),
+        ] {
+            let request = direct_request(serde_json::json!([]), distinct, false);
+            let initial = request.outer_candidates().next().unwrap().1.unwrap();
+            let mut allowance = EvaluationAllowance { used: 0, limit };
+            let result = request
+                .climb_direct_outer(initial, 17, &mut allowance)
+                .unwrap();
+            assert_eq!(result.evaluations_used, used);
+            assert_eq!(allowance.used, used);
+            assert!(result.climb.budget_stopped);
+            assert!(!result.climb.neighborhood_exhausted);
+            match (board, result.climb.current) {
+                (Some(board), Some(current)) => {
+                    assert_eq!(current.board, board);
+                    assert_eq!(current.plaintext, plaintext);
+                    assert_eq!(current.score.ranking().units(), units);
+                }
+                (None, None) => assert!(!result.climb.final_objective_ascent),
+                other => panic!("unexpected committed outcome: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn request_bound_direct_rejects_promoted_partial_exhaustion() {
+        let request = direct_request(serde_json::json!([]), false, true);
+        let initial = request.outer_candidates().next().unwrap().1.unwrap();
+        let mut allowance = EvaluationAllowance {
+            used: 7,
+            limit: 100,
+        };
+        let error = request
+            .climb_direct_outer(initial, 29, &mut allowance)
+            .unwrap_err();
+        assert_eq!(error.outer_index, 29);
+        assert_eq!(error.evaluations_used, 7);
+        assert_eq!(error.source, DirectClimbError::UnsupportedPass);
+        assert_eq!(allowance.used, 7);
     }
 
     #[test]

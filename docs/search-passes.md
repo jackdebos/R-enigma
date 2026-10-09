@@ -30,6 +30,9 @@ Task 11.5b adds private ordered independent known-scrambler seed climbs with one
 allowance and stable final-score selection, including interrupted committed boards.
 Task 11.6a adds private lazy outer-candidate projection with absolute `u128` indices,
 resolved slot assignments and fixed plugboard facts, preserving indexed resolution errors.
+Task 11.6b.1 binds one internally supplied resolved outer/index to the owner's direct-HC
+settings and retained resources, returning owned initial facts, committed outcome and shared
+usage, or an indexed original evaluation error. Partial exhaustion is rejected before work.
 Outer scheduling, full attack results, public runtime APIs and CLI execution remain unimplemented.
 
 For this settings fragment, malformed raw JSON (including duplicate keys, trailing
