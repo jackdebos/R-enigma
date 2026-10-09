@@ -975,7 +975,7 @@ impl ParsedAttackRequest {
     }
 }
 
-/// Resource-bound, eligibility-checked attack inputs; not executable or enumerable.
+/// Resource-bound, eligibility-checked attack inputs; not executable or publicly enumerable.
 ///
 /// ```compile_fail
 /// fn carrier(request: enigma_core::AttackRequest) { let _ = request.carrier; }
@@ -988,6 +988,10 @@ impl ParsedAttackRequest {
 /// ```compile_fail
 /// fn resolve(request: enigma_core::AttackRequest) { request.candidate_at(0); }
 /// ```
+///
+/// ```compile_fail
+/// fn outer(request: enigma_core::AttackRequest) { request.outer_candidates(); }
+/// ```
 #[derive(Debug)]
 pub struct AttackRequest {
     carrier: SearchRequest,
@@ -997,6 +1001,28 @@ pub struct AttackRequest {
 }
 
 impl AttackRequest {
+    /// Lazily projects slot assignments and fixed plugboard facts, not mutable starts.
+    /// Indices address the full outer space, including items that fail resolution.
+    pub(crate) fn outer_candidates(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            u128,
+            Result<crate::ResolvedConfiguration, Vec<SearchDiagnostic>>,
+        ),
+    > + '_ {
+        // Eligibility rejects legacy pools and full-count overflow before slicing.
+        // The checked total bounds every yielded index strictly below u128::MAX.
+        let mut index = u128::from(self.carrier.space().offset()).min(self.gate.outer_total());
+        self.carrier.candidates().map(move |result| {
+            let current = index;
+            index = index
+                .checked_add(1)
+                .expect("eligible outer candidate index cannot overflow");
+            (current, result)
+        })
+    }
+
     fn finish(
         carrier: SearchRequest,
         domain: AttackPlugboardDomain,
@@ -3033,6 +3059,165 @@ mod tests {
             "start": [["D", "C"]]
         });
         value
+    }
+
+    #[test]
+    fn attack_outer_candidates_preserve_slot_order_and_fixed_facts() {
+        let mut value = attack_request();
+        value["job"]["configuration"]["slots"] = json!([]);
+        value["job"]["configuration"]["plugboard"] = json!([["B", "A"]]);
+        value["job"]["space"]["plugboard"]["symbols"] = json!(["D", "C"]);
+        // Source declarations deliberately reverse definition slot order.
+        value["job"]["space"]["slots"] = json!([
+            {"id":"fast", "wheels":["rotor2","rotor1"], "positions":["D","B"], "rings":["C","A"]},
+            {"id":"ukw", "positions":["C","A"], "rings":["B","D"]}
+        ]);
+        let request = AttackRequest::parse_json(&value.to_string()).unwrap();
+        assert!(request.carrier.space().plugboard().is_none());
+        assert_eq!(request.settings().start(), Some(&[('D', 'C')][..]));
+        let mut candidates = request.outer_candidates();
+        let mut expected_index = 0u128;
+        for ukw_position in ['C', 'A'] {
+            for ukw_ring in ['B', 'D'] {
+                for wheel in ["rotor2", "rotor1"] {
+                    for position in ['D', 'B'] {
+                        for ring in ['C', 'A'] {
+                            let (index, resolved) = candidates.next().unwrap();
+                            assert_eq!(index, expected_index);
+                            expected_index += 1;
+                            let resolved = resolved.unwrap();
+                            let slots = resolved.topology().slots();
+                            assert_eq!(slots[0].id(), "ukw");
+                            assert_eq!(slots[1].id(), "fast");
+                            assert_eq!(
+                                (slots[0].wheel(), slots[0].position(), slots[0].ring()),
+                                ("reflector", ukw_position, ukw_ring)
+                            );
+                            assert_eq!(
+                                (slots[1].wheel(), slots[1].position(), slots[1].ring()),
+                                (wheel, position, ring)
+                            );
+                            assert_eq!(resolved.plugboard().map('A'), Some('B'));
+                            assert_eq!(resolved.plugboard().map('B'), Some('A'));
+                            assert_eq!(resolved.plugboard().map('C'), Some('C'));
+                            assert_eq!(resolved.plugboard().map('D'), Some('D'));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(expected_index, 32);
+        assert!(candidates.next().is_none());
+        assert!(candidates.next().is_none());
+        assert_eq!(request.domain().fixed_pairs(), [('B', 'A')]);
+        assert_eq!(request.settings().start(), Some(&[('D', 'C')][..]));
+    }
+
+    #[test]
+    fn attack_outer_candidates_apply_absolute_slice_indices() {
+        let request = AttackRequest::parse_json(&attack_request().to_string()).unwrap();
+        let mut candidates = request.outer_candidates();
+        assert_eq!(candidates.next().unwrap().0, 0);
+        assert!(candidates.next().is_none());
+        assert!(candidates.next().is_none());
+
+        let mut value = attack_request();
+        value["job"]["configuration"]["slots"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("position");
+        value["job"]["space"]["slots"] = json!([{"id":"fast", "positions":["D","B","C","A"]}]);
+        for (offset, limit, expected) in [
+            (1, 2, vec![(1u128, 'B'), (2, 'C')]),
+            (3, 4, vec![(3, 'A')]),
+            (4, 1, vec![]),
+            (9, 2, vec![]),
+        ] {
+            value["job"]["space"]["offset"] = json!(offset);
+            value["job"]["space"]["limit"] = json!(limit);
+            let request = AttackRequest::parse_json(&value.to_string()).unwrap();
+            let mut candidates = request.outer_candidates();
+            for (expected_index, position) in expected {
+                let (index, resolved) = candidates.next().unwrap();
+                assert_eq!(index, expected_index);
+                assert_eq!(resolved.unwrap().topology().slots()[1].position(), position);
+            }
+            assert!(candidates.next().is_none());
+            assert!(candidates.next().is_none());
+        }
+    }
+
+    #[test]
+    fn attack_outer_candidates_cross_u64_boundary() {
+        let alphabet: Vec<String> = (0..256)
+            .map(|i| char::from_u32(0x100 + i).unwrap().to_string())
+            .collect();
+        let mut value = attack_request();
+        value["machine"]["definition"]["value"] = json!({
+            "alphabet":alphabet, "wheels":[{"name":"r","wiring":alphabet,"turnovers":[]}],
+            "slots":(0..5).map(|i| json!({"id":format!("r{i}"),"role":"rotor","movement":"fixed","wheel":"r"})).collect::<Vec<_>>(),
+            "stepping":{"rules":[]}
+        });
+        value["job"]["configuration"]["slots"] = json!([]);
+        value["job"]["text"] = json!(alphabet[0].repeat(2));
+        value["job"]["space"] = json!({"offset":u64::MAX, "limit":2,
+            "slots":(0..5).map(|i| json!({"id":format!("r{i}"),"positions":alphabet,"rings":alphabet})).collect::<Vec<_>>(),
+            "plugboard":{"kind":"attack","symbols":&alphabet[..2],"max_pairs":1}});
+        value["job"]["attack"]["start"] = json!([]);
+        let request = AttackRequest::parse_json(&value.to_string()).unwrap();
+        assert_eq!(request.gate().outer_total(), 1u128 << 80);
+        let mut candidates = request.outer_candidates();
+        // Ten base-256 digits: the first index is 00 00 FF FF FF FF FF FF FF FF;
+        // the next is 00 01 00 00 00 00 00 00 00 00.
+        for (index, digits) in [
+            (
+                u128::from(u64::MAX),
+                [0u32, 0, 255, 255, 255, 255, 255, 255, 255, 255],
+            ),
+            (u128::from(u64::MAX) + 1, [0, 1, 0, 0, 0, 0, 0, 0, 0, 0]),
+        ] {
+            let (actual_index, resolved) = candidates.next().unwrap();
+            assert_eq!(actual_index, index);
+            let resolved = resolved.unwrap();
+            for (slot, pair) in resolved
+                .topology()
+                .slots()
+                .iter()
+                .zip(digits.chunks_exact(2))
+            {
+                assert_eq!(slot.wheel(), "r");
+                assert_eq!(slot.position(), char::from_u32(0x100 + pair[0]).unwrap());
+                assert_eq!(slot.ring(), char::from_u32(0x100 + pair[1]).unwrap());
+            }
+        }
+        assert!(candidates.next().is_none());
+        assert!(candidates.next().is_none());
+    }
+
+    #[test]
+    fn attack_outer_candidates_preserve_resolution_errors() {
+        let mut value = attack_request();
+        value["job"]["configuration"]["slots"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("position");
+        value["job"]["space"]["slots"] = json!([{"id":"fast", "positions":["A","B","C"]}]);
+        value["job"]["space"]["offset"] = json!(1);
+        value["job"]["space"]["limit"] = json!(2);
+        let mut request = AttackRequest::parse_json(&value.to_string()).unwrap();
+        // PRIVATE invariant fault injection after valid ownership: ordinary validated
+        // owners cannot produce this invalid fixed self-pair.
+        request.carrier.parsed.configuration.plugboard = vec![('A', 'A')];
+        let mut candidates = request.outer_candidates();
+        for expected_index in [1u128, 2] {
+            let (index, result) = candidates.next().unwrap();
+            assert_eq!(index, expected_index);
+            let errors = result.unwrap_err();
+            assert!(!errors.is_empty());
+            assert_eq!(errors[0].code(), "invalid_search_space");
+        }
+        assert!(candidates.next().is_none());
+        assert!(candidates.next().is_none());
     }
 
     #[test]
