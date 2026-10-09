@@ -26,7 +26,9 @@ Task 11.4b.2 adds a private single-climb driver repeating complete strict-improv
 with final-scored committed outcomes on completion or budget interruption. Interrupted scans
 never commit provisional winners; final rescoring alone does not count as final-objective ascent.
 Task 11.5a adds private lazy empty/single mutable seed generation with dense local indices.
-Seed climbs, outer execution and CLI execution remain unimplemented; no public runtime is enabled.
+Task 11.5b adds private ordered independent known-scrambler seed climbs with one shared
+allowance and stable final-score selection, including interrupted committed boards.
+Outer scheduling, public runtime APIs and CLI execution remain unimplemented.
 
 For this settings fragment, malformed raw JSON (including duplicate keys, trailing
 input and nonobjects), missing fields and invalid kind/objectives/budget use

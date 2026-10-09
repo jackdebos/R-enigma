@@ -148,7 +148,78 @@ struct ClimbOutcome {
     neighborhood_exhausted: bool,
 }
 
+#[derive(Debug)]
+struct SeedBest {
+    seed_index: u128,
+    current: ScoredBoard,
+    incomplete: bool,
+    final_objective_ascent: bool,
+    neighborhood_exhausted: bool,
+}
+
+#[derive(Debug)]
+struct SeedRunOutcome {
+    budget_stopped: bool,
+    /// Cumulative usage of the borrowed allowance, including earlier work.
+    evaluations_used: u64,
+    climbs_started: u128,
+    climbs_completed: u128,
+    best: Option<SeedBest>,
+}
+
 impl<'a> BoundClimbScoring<'a> {
+    fn climb_seeds(
+        &self,
+        policy: &crate::AttackSeedPolicy,
+        backtrack_pairs: usize,
+        allowance: &mut EvaluationAllowance,
+    ) -> Result<SeedRunOutcome, TrialEvaluationError> {
+        let seeds = SeedCursor::new(self.initial, self.domain, policy)
+            .map_err(TrialEvaluationError::Board)?;
+        let mut result = SeedRunOutcome {
+            budget_stopped: false,
+            evaluations_used: allowance.used,
+            climbs_started: 0,
+            climbs_completed: 0,
+            best: None,
+        };
+        for (seed_index, board) in seeds {
+            let outcome = self.climb(board, backtrack_pairs, allowance)?;
+            result.budget_stopped = outcome.budget_stopped;
+            let Some(current) = outcome.current else {
+                break;
+            };
+            // Each counter is bounded by SeedCursor's scalar pair count, fits
+            // u128 like the gate, and never narrows to a platform-sized index.
+            result.climbs_started = result
+                .climbs_started
+                .checked_add(1)
+                .expect("scalar seed count fits u128");
+            if outcome.neighborhood_exhausted && !outcome.budget_stopped {
+                result.climbs_completed = result
+                    .climbs_completed
+                    .checked_add(1)
+                    .expect("completed climbs cannot exceed scalar seed count");
+            }
+            if result.best.as_ref().is_none_or(|best| {
+                current.score.ranking().units() > best.current.score.ranking().units()
+            }) {
+                result.best = Some(SeedBest {
+                    seed_index,
+                    current,
+                    incomplete: outcome.budget_stopped,
+                    final_objective_ascent: outcome.final_objective_ascent,
+                    neighborhood_exhausted: outcome.neighborhood_exhausted,
+                });
+            }
+            if outcome.budget_stopped {
+                break;
+            }
+        }
+        result.evaluations_used = allowance.used;
+        Ok(result)
+    }
+
     fn climb(
         &self,
         board: MutableBoard,
@@ -569,6 +640,315 @@ mod tests {
     }
 
     #[test]
+    fn ordered_climbs_share_budget_and_reset_every_seed() {
+        let (initial, domain) = fixture();
+        let first = resource(&initial);
+        let last = crate::BoundResource::Trie(
+            crate::TrieModel::new(
+                initial.topology().alphabet().clone(),
+                vec![(vec!['C', 'A'], 4), (vec!['C', 'B'], 3)],
+            )
+            .unwrap(),
+        );
+        // Stepping inverse maps AA to CA/AC/CB/BA for empty/AB/AC/BC.
+        // Identical: empty costs 1+3+5, AB 1+5+5, AC and BC 1+5.
+        // Different: empty costs 1+3+1+5+3; singles start final,
+        // then reach empty in five trials and exhaust its three neighbors.
+        for (
+            different,
+            limit,
+            used,
+            started,
+            completed,
+            stopped,
+            best_index,
+            board,
+            text,
+            weight,
+        ) in [
+            (false, 0, 0, 0, 0, true, None, vec![], "", 0),
+            (false, 8, 8, 1, 0, true, Some(0), vec![('A', 'C')], "CB", 2),
+            (false, 9, 9, 1, 1, true, Some(0), vec![('A', 'C')], "CB", 2),
+            (
+                false,
+                10,
+                10,
+                2,
+                1,
+                true,
+                Some(0),
+                vec![('A', 'C')],
+                "CB",
+                2,
+            ),
+            (
+                false,
+                20,
+                20,
+                2,
+                2,
+                true,
+                Some(0),
+                vec![('A', 'C')],
+                "CB",
+                2,
+            ),
+            (
+                false,
+                32,
+                32,
+                4,
+                4,
+                false,
+                Some(0),
+                vec![('A', 'C')],
+                "CB",
+                2,
+            ),
+            (
+                false,
+                100,
+                32,
+                4,
+                4,
+                false,
+                Some(0),
+                vec![('A', 'C')],
+                "CB",
+                2,
+            ),
+            (true, 12, 12, 1, 0, true, Some(0), vec![], "CA", 4),
+            (true, 13, 13, 1, 1, true, Some(0), vec![], "CA", 4),
+            (true, 14, 14, 2, 1, true, Some(0), vec![], "CA", 4),
+            (true, 40, 40, 4, 4, false, Some(0), vec![], "CA", 4),
+            (true, 100, 40, 4, 4, false, Some(0), vec![], "CA", 4),
+        ] {
+            let context = BoundClimbScoring::new(
+                &initial,
+                &domain,
+                "AA",
+                (MeasureId::Trie, Some(&first)),
+                (
+                    MeasureId::Trie,
+                    Some(if different { &last } else { &first }),
+                ),
+                1,
+            );
+            let mut allowance = EvaluationAllowance { used: 0, limit };
+            let result = context
+                .climb_seeds(&crate::AttackSeedPolicy::All, 0, &mut allowance)
+                .unwrap();
+            assert_eq!(result.evaluations_used, used);
+            assert_eq!(allowance.used, used);
+            assert_eq!(
+                (result.climbs_started, result.climbs_completed),
+                (started, completed)
+            );
+            assert_eq!(result.budget_stopped, stopped);
+            assert_eq!(result.best.as_ref().map(|best| best.seed_index), best_index);
+            if let Some(best) = result.best {
+                assert_eq!(best.current.board, board);
+                assert_eq!(best.current.plaintext, text);
+                assert_eq!(best.current.score.ranking().units(), weight << 32);
+                assert_eq!(best.incomplete, completed == 0);
+                assert_eq!(best.neighborhood_exhausted, completed != 0);
+                assert!(best.final_objective_ascent);
+            }
+        }
+    }
+
+    #[test]
+    fn ordered_interrupted_committed_winner_and_reservation_denial() {
+        let (initial, domain) = fixture();
+        let first = crate::BoundResource::Trie(
+            crate::TrieModel::new(
+                initial.topology().alphabet().clone(),
+                vec![
+                    (vec!['C', 'A'], 4),
+                    (vec!['A', 'C'], 1),
+                    (vec!['C', 'B'], 2),
+                    (vec!['B', 'A'], 2),
+                ],
+            )
+            .unwrap(),
+        );
+        // Initial empty CA=4 exhausts in three trials: 1+3+final=5.
+        // AB starts at AC=1, but its interrupted scan cannot commit a winner.
+        // Its reserved final AC score is independently either 3 or 0.
+        for weight in [0, 3] {
+            let last = crate::BoundResource::Trie(
+                crate::TrieModel::new(
+                    initial.topology().alphabet().clone(),
+                    vec![(vec!['C', 'A'], 1), (vec!['A', 'C'], weight)],
+                )
+                .unwrap(),
+            );
+            let context = BoundClimbScoring::new(
+                &initial,
+                &domain,
+                "AA",
+                (MeasureId::Trie, Some(&first)),
+                (MeasureId::Trie, Some(&last)),
+                2,
+            );
+            for limit in [5, 6, 7, 8] {
+                let mut allowance = EvaluationAllowance { used: 0, limit };
+                let result = context
+                    .climb_seeds(&crate::AttackSeedPolicy::All, 0, &mut allowance)
+                    .unwrap();
+                let admitted = limit >= 7;
+                assert_eq!(result.evaluations_used, if admitted { limit } else { 5 });
+                assert_eq!(
+                    (result.climbs_started, result.climbs_completed),
+                    (if admitted { 2 } else { 1 }, 1)
+                );
+                assert!(result.budget_stopped);
+                let best = result.best.unwrap();
+                let later_wins = admitted && weight == 3;
+                assert_eq!(best.seed_index, u128::from(later_wins));
+                assert_eq!(best.incomplete, later_wins);
+                assert_eq!(best.neighborhood_exhausted, !later_wins);
+                assert!(!best.final_objective_ascent);
+                assert_eq!(
+                    best.current.board,
+                    if later_wins { vec![('A', 'B')] } else { vec![] }
+                );
+                assert_eq!(best.current.plaintext, if later_wins { "AC" } else { "CA" });
+                assert_eq!(
+                    best.current.score.ranking().units(),
+                    if later_wins { 3 << 32 } else { 1 << 32 }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordered_sole_seed_finishes_at_exact_budget_and_reports_cumulative_usage() {
+        let (initial, _) = fixture();
+        let last = resource(&initial);
+        let domain = AttackPlugboardDomain::parse_json(
+            initial.topology().alphabet(),
+            &[],
+            r#"{"kind":"attack","symbols":["A","B","C"],"max_pairs":0}"#,
+        )
+        .unwrap();
+        for identical in [false, true] {
+            let context = BoundClimbScoring::new(
+                &initial,
+                &domain,
+                "AA",
+                (MeasureId::Ic, None),
+                if identical {
+                    (MeasureId::Ic, None)
+                } else {
+                    (MeasureId::Trie, Some(&last))
+                },
+                2,
+            );
+            let cost = if identical { 1 } else { 2 };
+            let mut allowance = EvaluationAllowance {
+                used: 7,
+                limit: 7 + cost,
+            };
+            let result = context
+                .climb_seeds(&crate::AttackSeedPolicy::All, 0, &mut allowance)
+                .unwrap();
+            assert_eq!(result.evaluations_used, 7 + cost);
+            assert_eq!((result.climbs_started, result.climbs_completed), (1, 1));
+            assert!(!result.budget_stopped);
+            let best = result.best.unwrap();
+            assert_eq!(best.seed_index, 0);
+            assert!(!best.incomplete);
+            assert!(best.neighborhood_exhausted);
+            assert_eq!(best.final_objective_ascent, identical);
+            assert_eq!(best.current.plaintext, "CA");
+            assert_eq!(best.current.score.ranking().units(), 0);
+        }
+    }
+
+    #[test]
+    fn ordered_local_accounting_keeps_gate_widths_at_allowance_extremes() {
+        // Unicode scalar count bounds the cursor and both climb counters.
+        let scalar_count = 1_112_064u128;
+        let maximum_seeds = 1 + scalar_count * (scalar_count - 1) / 2;
+        assert!(maximum_seeds < u128::from(u64::MAX));
+        let (initial, _) = fixture();
+        let domain = AttackPlugboardDomain::parse_json(
+            initial.topology().alphabet(),
+            &[],
+            r#"{"kind":"attack","symbols":["A"],"max_pairs":0}"#,
+        )
+        .unwrap();
+        let context = BoundClimbScoring::new(
+            &initial,
+            &domain,
+            "AA",
+            (MeasureId::Ic, None),
+            (MeasureId::Ic, None),
+            0,
+        );
+        for used in [u64::MAX - 1, u64::MAX] {
+            let mut allowance = EvaluationAllowance {
+                used,
+                limit: u64::MAX,
+            };
+            let result = context
+                .climb_seeds(&crate::AttackSeedPolicy::All, 0, &mut allowance)
+                .unwrap();
+            let count: u128 = u128::from(used != u64::MAX);
+            assert_eq!(
+                (result.climbs_started, result.climbs_completed),
+                (count, count)
+            );
+            assert_eq!(result.evaluations_used, u64::MAX);
+            assert_eq!(result.budget_stopped, count == 0);
+            assert_eq!(
+                result.best.map(|best| best.seed_index),
+                if count == 0 { None } else { Some(0u128) }
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_runtime_errors_are_not_budget_outcomes() {
+        let (initial, domain) = fixture();
+        for (input, measure, expected) in [
+            (
+                "AZ",
+                MeasureId::Ic,
+                TrialEvaluationError::Model(crate::ModelError::UnknownSymbol('Z')),
+            ),
+            (
+                "AA",
+                MeasureId::Trie,
+                TrialEvaluationError::MissingResource(MeasureId::Trie),
+            ),
+        ] {
+            let context = BoundClimbScoring::new(
+                &initial,
+                &domain,
+                input,
+                (measure, None),
+                (measure, None),
+                0,
+            );
+            let before = format!("{initial:?}{domain:?}");
+            let mut allowance = EvaluationAllowance {
+                used: 0,
+                limit: 100,
+            };
+            assert_eq!(
+                context
+                    .climb_seeds(&crate::AttackSeedPolicy::All, 0, &mut allowance)
+                    .unwrap_err(),
+                expected
+            );
+            assert_eq!(allowance.used, 1);
+            assert_eq!(format!("{initial:?}{domain:?}"), before);
+        }
+    }
+
+    #[test]
     fn driver_repeats_complete_scans_and_retains_only_committed_boards() {
         let (initial, domain) = fixture();
         let first = resource(&initial);
@@ -915,6 +1295,49 @@ mod tests {
             );
             state.finalize(&mut allowance).unwrap().unwrap();
             assert_eq!(allowance.used, if final_phase { 1 } else { 2 });
+        }
+        // Integrated fixed knowledge: identity decrypts AA under every seed.
+        // Cap two permits empty + six singles. Empty costs 1+6;
+        // each single costs 1+9 (remove + four one-free pairs twice).
+        for (cap, cost, count) in [(1, 1, 1), (2, 67, 7)] {
+            let domain = AttackPlugboardDomain::parse_json(
+                initial.topology().alphabet(),
+                &[('A', 'B')],
+                &serde_json::json!({"kind":"attack","symbols":["C","D","E","F"],"max_pairs":cap})
+                    .to_string(),
+            )
+            .unwrap();
+            let before = format!("{initial:?}{domain:?}");
+            let context = BoundClimbScoring::new(
+                &initial,
+                &domain,
+                "AA",
+                (MeasureId::Ic, None),
+                (MeasureId::Ic, None),
+                0,
+            );
+            let mut allowance = EvaluationAllowance {
+                used: 0,
+                limit: cost,
+            };
+            let result = context
+                .climb_seeds(&crate::AttackSeedPolicy::All, 0, &mut allowance)
+                .unwrap();
+            assert!(!result.budget_stopped);
+            assert_eq!(result.evaluations_used, cost);
+            assert_eq!(
+                (result.climbs_started, result.climbs_completed),
+                (count, count)
+            );
+            let best = result.best.unwrap();
+            assert_eq!(best.seed_index, 0);
+            assert!(best.current.board.is_empty());
+            assert_eq!(best.current.plaintext, "AA");
+            assert_eq!(best.current.score.ranking().units(), 6 << 32);
+            let board = validated_trial_board(&initial, &domain, &best.current.board).unwrap();
+            assert_eq!(board.map('A'), Some('B'));
+            assert_eq!(board.map('B'), Some('A'));
+            assert_eq!(format!("{initial:?}{domain:?}"), before);
         }
     }
 
