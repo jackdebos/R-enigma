@@ -3096,6 +3096,42 @@ mod tests {
     }
 
     #[test]
+    fn direct_outer_scheduler_private_faults_keep_original_indexed_errors() {
+        use crate::attack_hill_climb::{DirectClimbError, DirectRunError};
+        let mut value = attack_request();
+        value["job"]["configuration"]["slots"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("position");
+        value["job"]["space"]["slots"] = json!([{"id":"fast", "positions":["A","B","C"]}]);
+        value["job"]["space"]["offset"] = json!(1);
+        let mut request = AttackRequest::parse_json(&value.to_string()).unwrap();
+        // PRIVATE invariant injection, never a valid promoted request.
+        request.carrier.parsed.configuration.plugboard = vec![('A', 'A')];
+        let original = request.outer_candidates().next().unwrap().1.unwrap_err();
+        let error = request.schedule_direct_outers().unwrap_err();
+        assert_eq!(error.outer_index, Some(1));
+        assert_eq!(error.evaluations_used, 0);
+        let DirectRunError::Resolution(diagnostics) = error.source else {
+            panic!("resolution diagnostics were replaced");
+        };
+        assert_eq!(diagnostics, original);
+        request.carrier.parsed.configuration.plugboard.clear();
+        request.carrier.parsed.text = "AZ".to_owned();
+        let error = request.schedule_direct_outers().unwrap_err();
+        assert_eq!(error.outer_index, Some(1));
+        assert_eq!(error.evaluations_used, 1);
+        assert!(matches!(
+            error.source,
+            DirectRunError::Climb(DirectClimbError::Evaluation(
+                crate::attack_evaluator::TrialEvaluationError::Model(
+                    crate::ModelError::UnknownSymbol('Z')
+                )
+            ))
+        ));
+    }
+
+    #[test]
     fn attack_outer_candidates_preserve_slot_order_and_fixed_facts() {
         let mut value = attack_request();
         value["job"]["configuration"]["slots"] = json!([]);

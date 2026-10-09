@@ -33,7 +33,10 @@ resolved slot assignments and fixed plugboard facts, preserving indexed resoluti
 Task 11.6b.1 binds one internally supplied resolved outer/index to the owner's direct-HC
 settings and retained resources, returning owned initial facts, committed outcome and shared
 usage, or an indexed original evaluation error. Partial exhaustion is rejected before work.
-Outer scheduling, full attack results, public runtime APIs and CLI execution remain unimplemented.
+Task 11.6b.2 privately schedules same-owner ordered direct-HC outers with one allowance,
+checked counters, stable final-score best ownership and independent aggregate termination.
+Original indexed resolution/evaluation errors retain cumulative usage; PE remains rejected.
+Full attack results, public runtime APIs and CLI execution remain unimplemented.
 
 For this settings fragment, malformed raw JSON (including duplicate keys, trailing
 input and nonobjects), missing fields and invalid kind/objectives/budget use

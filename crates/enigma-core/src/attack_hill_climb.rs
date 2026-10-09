@@ -34,7 +34,114 @@ pub(crate) struct IndexedDirectClimbError {
     pub(crate) source: DirectClimbError,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DirectRunTermination {
+    OuterSliceEnd,
+    Completed,
+    EvaluationBudget,
+}
+
+#[derive(Debug)]
+pub(crate) struct DirectRunOutcome {
+    pub(crate) termination: DirectRunTermination,
+    pub(crate) outer_completed: u128,
+    pub(crate) climbs_started: u128,
+    pub(crate) climbs_completed: u128,
+    pub(crate) evaluations_used: u64,
+    /// Owns initial fixed facts and the final-scored committed board with its flags.
+    pub(crate) best: Option<DirectOuterOutcome>,
+}
+
+#[derive(Debug)]
+pub(crate) enum DirectRunError {
+    Resolution(Vec<crate::SearchDiagnostic>),
+    Climb(DirectClimbError),
+}
+
+#[derive(Debug)]
+pub(crate) struct IndexedDirectRunError {
+    /// None only for fail-closed pass rejection before enumeration.
+    pub(crate) outer_index: Option<u128>,
+    pub(crate) evaluations_used: u64,
+    pub(crate) source: DirectRunError,
+}
+
 impl crate::AttackRequest {
+    /// Same-owner lazy projection closes the adapter's key/index provenance precondition.
+    pub(crate) fn schedule_direct_outers(&self) -> Result<DirectRunOutcome, IndexedDirectRunError> {
+        if self.settings().kind() != crate::AttackKind::HillClimb {
+            return Err(IndexedDirectRunError {
+                outer_index: None,
+                evaluations_used: 0,
+                source: DirectRunError::Climb(DirectClimbError::UnsupportedPass),
+            });
+        }
+        let mut allowance = EvaluationAllowance {
+            used: 0,
+            limit: self.settings().evaluation_budget(),
+        };
+        let mut result = DirectRunOutcome {
+            termination: DirectRunTermination::OuterSliceEnd,
+            outer_completed: 0,
+            climbs_started: 0,
+            climbs_completed: 0,
+            evaluations_used: 0,
+            best: None,
+        };
+        for (index, initial) in self.outer_candidates() {
+            let initial = initial.map_err(|source| IndexedDirectRunError {
+                outer_index: Some(index),
+                evaluations_used: allowance.used,
+                source: DirectRunError::Resolution(source),
+            })?;
+            let outcome = self
+                .climb_direct_outer(initial, index, &mut allowance)
+                .map_err(|error| IndexedDirectRunError {
+                    outer_index: Some(error.outer_index),
+                    evaluations_used: error.evaluations_used,
+                    source: DirectRunError::Climb(error.source),
+                })?;
+            result.evaluations_used = allowance.used;
+            let interrupted = outcome.climb.budget_stopped;
+            if let Some(current) = &outcome.climb.current {
+                result.climbs_started = result
+                    .climbs_started
+                    .checked_add(1)
+                    .expect("started climbs are bounded by checked outer total");
+                if !interrupted {
+                    result.climbs_completed = result
+                        .climbs_completed
+                        .checked_add(1)
+                        .expect("completed climbs cannot exceed started climbs");
+                    result.outer_completed = result
+                        .outer_completed
+                        .checked_add(1)
+                        .expect("completed outers are bounded by checked outer total");
+                }
+                if result.best.as_ref().is_none_or(|best| {
+                    current.score.ranking().units()
+                        > best
+                            .climb
+                            .current
+                            .as_ref()
+                            .expect("best has committed board")
+                            .score
+                            .ranking()
+                            .units()
+                }) {
+                    result.best = Some(outcome);
+                }
+            }
+            if interrupted {
+                result.termination = DirectRunTermination::EvaluationBudget;
+                return Ok(result);
+            }
+            // Do not stop on usage == limit: exhaustion and zero-cost work take precedence.
+            result.termination = DirectRunTermination::Completed;
+        }
+        Ok(result)
+    }
+
     /// Internal caller must supply an initial key/index from THIS owner's private
     /// outer projection. This adapter does not validate provenance or schedule outers.
     pub(crate) fn climb_direct_outer(
@@ -548,6 +655,15 @@ mod tests {
     }
 
     fn direct_request(start: serde_json::Value, distinct: bool, pe: bool) -> crate::AttackRequest {
+        direct_request_with(start, distinct, pe, |_| {})
+    }
+
+    fn direct_request_with(
+        start: serde_json::Value,
+        distinct: bool,
+        pe: bool,
+        customize: impl FnOnce(&mut serde_json::Value),
+    ) -> crate::AttackRequest {
         let value = serde_json::json!({"protocol_version":1,"machine":{"definition":{
             "kind":"custom","value":{"alphabet":["A","B","C"],
             "wheels":[{"name":"r","wiring":["B","A","C"],"turnovers":[]}],
@@ -570,6 +686,7 @@ mod tests {
             value["job"]["attack"]["seeds"] =
                 serde_json::json!({"kind":"empty_single","selection":"all"});
         }
+        customize(&mut value["job"]);
         let json = value.to_string();
         let dictionary = serde_json::json!({"resource_version":1,"kind":"dictionary","alphabet":["A","B","C"],
             "entries":[{"word":["A","C"],"weight":1},{"word":["C","B"],"weight":2},{"word":["B","A"],"weight":2}]}).to_string();
@@ -578,6 +695,238 @@ mod tests {
             .unwrap()
             .bind_resources(&supplied)
             .unwrap()
+    }
+
+    fn scheduler_request(
+        limit: u64,
+        distinct: bool,
+        pe: bool,
+        offset: u64,
+    ) -> crate::AttackRequest {
+        direct_request_with(serde_json::json!([]), distinct, pe, |job| {
+            job["attack"]["evaluation_budget"] = serde_json::json!(limit);
+            job["configuration"]["slots"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("position");
+            job["space"]["slots"] = serde_json::json!([{"id":"r","positions":["A","B","C"]}]);
+            job["space"]["offset"] = serde_json::json!(offset);
+        })
+    }
+
+    #[test]
+    fn direct_outer_scheduler_empty_and_unsupported_pass() {
+        let empty = scheduler_request(1, false, false, 3)
+            .schedule_direct_outers()
+            .unwrap();
+        assert_eq!(empty.termination, DirectRunTermination::OuterSliceEnd);
+        assert_eq!(
+            (
+                empty.outer_completed,
+                empty.climbs_started,
+                empty.climbs_completed,
+                empty.evaluations_used
+            ),
+            (0, 0, 0, 0)
+        );
+        assert!(empty.best.is_none());
+        for offset in [0, 3] {
+            let error = scheduler_request(1, false, true, offset)
+                .schedule_direct_outers()
+                .unwrap_err();
+            assert!(matches!(
+                error.source,
+                DirectRunError::Climb(DirectClimbError::UnsupportedPass)
+            ));
+            assert_eq!(error.evaluations_used, 0);
+        }
+    }
+
+    #[test]
+    fn direct_outer_scheduler_order_fresh_state_and_final_ranking() {
+        let request = scheduler_request(100, false, false, 0);
+        let mut allowance = EvaluationAllowance {
+            used: 0,
+            limit: 100,
+        };
+        let mut expected_best = None;
+        let mut costs = Vec::new();
+        for (index, initial) in request.outer_candidates() {
+            let outcome = request
+                .climb_direct_outer(initial.unwrap(), index, &mut allowance)
+                .unwrap();
+            costs.push(outcome.evaluations_used);
+            if expected_best
+                .as_ref()
+                .is_none_or(|best: &DirectOuterOutcome| {
+                    outcome
+                        .climb
+                        .current
+                        .as_ref()
+                        .unwrap()
+                        .score
+                        .ranking()
+                        .units()
+                        > best.climb.current.as_ref().unwrap().score.ranking().units()
+                })
+            {
+                expected_best = Some(outcome);
+            }
+        }
+        let result = request.schedule_direct_outers().unwrap();
+        assert_eq!(result.termination, DirectRunTermination::Completed);
+        assert_eq!(
+            (
+                result.outer_completed,
+                result.climbs_started,
+                result.climbs_completed
+            ),
+            (3, 3, 3)
+        );
+        assert_eq!(result.evaluations_used, *costs.last().unwrap());
+        let best = result.best.unwrap();
+        let expected = expected_best.unwrap();
+        assert_eq!(best.outer_index, expected.outer_index);
+        assert_eq!(best.start_index, 0);
+        assert_eq!(best.initial, expected.initial);
+        assert_eq!(best.climb.current, expected.climb.current);
+        assert!(!best.climb.budget_stopped);
+    }
+
+    #[test]
+    fn direct_outer_scheduler_literal_later_winner_and_earliest_tie() {
+        let request = direct_request_with(serde_json::json!([]), true, false, |job| {
+            job["text"] = serde_json::json!("CB");
+            job["space"]["plugboard"]["max_pairs"] = serde_json::json!(0);
+            job["configuration"]["slots"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("position");
+            job["space"]["slots"] = serde_json::json!([{"id":"r","positions":["A","B","C"]}]);
+        });
+        let result = request.schedule_direct_outers().unwrap();
+        let best = result.best.unwrap();
+        assert_eq!(best.outer_index, 1);
+        assert_eq!(best.climb.current.as_ref().unwrap().plaintext, "BA");
+        assert_eq!(
+            best.climb.current.unwrap().score.ranking().units(),
+            2 * (1i128 << 32)
+        );
+        assert_eq!(result.evaluations_used, 6);
+        let ties = direct_request_with(serde_json::json!([]), false, false, |job| {
+            job["text"] = serde_json::json!("A");
+            job["space"]["plugboard"]["max_pairs"] = serde_json::json!(0);
+            job["configuration"]["slots"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("position");
+            job["space"]["slots"] = serde_json::json!([{"id":"r","positions":["A","B","C"]}]);
+            job["attack"]["evaluation_budget"] = serde_json::json!(3);
+        })
+        .schedule_direct_outers()
+        .unwrap();
+        assert_eq!(ties.termination, DirectRunTermination::Completed);
+        assert_eq!(ties.best.unwrap().outer_index, 0);
+        assert_eq!(ties.evaluations_used, 3);
+    }
+
+    #[test]
+    fn direct_outer_scheduler_exact_completion_and_denied_next_start() {
+        let single = direct_request_with(serde_json::json!([]), false, false, |job| {
+            job["attack"]["evaluation_budget"] = serde_json::json!(9);
+        })
+        .schedule_direct_outers()
+        .unwrap();
+        assert_eq!(single.termination, DirectRunTermination::Completed);
+        assert_eq!(
+            (
+                single.outer_completed,
+                single.climbs_started,
+                single.climbs_completed,
+                single.evaluations_used
+            ),
+            (1, 1, 1, 9)
+        );
+        let next = scheduler_request(9, false, false, 0)
+            .schedule_direct_outers()
+            .unwrap();
+        assert_eq!(next.termination, DirectRunTermination::EvaluationBudget);
+        assert_eq!(
+            (
+                next.outer_completed,
+                next.climbs_started,
+                next.climbs_completed,
+                next.evaluations_used
+            ),
+            (1, 1, 1, 9)
+        );
+        assert!(!next.best.unwrap().climb.budget_stopped);
+        let denied = scheduler_request(1, true, false, 0)
+            .schedule_direct_outers()
+            .unwrap();
+        assert_eq!((denied.climbs_started, denied.evaluations_used), (0, 0));
+        assert!(denied.best.is_none());
+        let reserved = direct_request_with(serde_json::json!([]), true, false, |job| {
+            job["space"]["plugboard"]["max_pairs"] = serde_json::json!(0);
+            job["configuration"]["slots"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("position");
+            job["space"]["slots"] = serde_json::json!([{"id":"r","positions":["A","B","C"]}]);
+            job["attack"]["evaluation_budget"] = serde_json::json!(3);
+        })
+        .schedule_direct_outers()
+        .unwrap();
+        assert_eq!(reserved.termination, DirectRunTermination::EvaluationBudget);
+        assert_eq!(
+            (
+                reserved.outer_completed,
+                reserved.climbs_started,
+                reserved.evaluations_used
+            ),
+            (1, 1, 2)
+        );
+        assert!(!reserved.best.unwrap().climb.budget_stopped);
+    }
+
+    #[test]
+    fn direct_outer_scheduler_committed_not_provisional_interruption() {
+        for (limit, board, used) in [(3, vec![], 3), (4, vec![('A', 'C')], 4)] {
+            let result = scheduler_request(limit, false, false, 0)
+                .schedule_direct_outers()
+                .unwrap();
+            assert_eq!(result.termination, DirectRunTermination::EvaluationBudget);
+            assert_eq!(
+                (
+                    result.outer_completed,
+                    result.climbs_started,
+                    result.climbs_completed
+                ),
+                (0, 1, 0)
+            );
+            assert_eq!(result.evaluations_used, used);
+            let best = result.best.unwrap();
+            assert_eq!(best.climb.current.unwrap().board, board);
+            assert!(best.climb.budget_stopped);
+            assert!(!best.climb.neighborhood_exhausted);
+        }
+        let losing = scheduler_request(10, false, false, 0)
+            .schedule_direct_outers()
+            .unwrap();
+        assert_eq!(
+            (
+                losing.outer_completed,
+                losing.climbs_started,
+                losing.climbs_completed
+            ),
+            (1, 2, 1)
+        );
+        assert_eq!(losing.termination, DirectRunTermination::EvaluationBudget);
+        assert_eq!(losing.best.as_ref().unwrap().outer_index, 0);
+        let best = losing.best.unwrap();
+        assert!(!best.climb.budget_stopped);
+        assert!(best.climb.neighborhood_exhausted);
+        assert!(best.climb.final_objective_ascent);
     }
 
     #[test]
