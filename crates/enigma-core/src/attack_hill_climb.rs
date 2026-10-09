@@ -66,7 +66,74 @@ pub(crate) struct IndexedDirectRunError {
     pub(crate) source: DirectRunError,
 }
 
+/// Single resolved outer only; seed completion is independent of winner flags.
+#[derive(Debug)]
+pub(crate) struct PartialOuterOutcome {
+    pub(crate) initial: ResolvedConfiguration,
+    pub(crate) outer_index: u128,
+    pub(crate) seeds: SeedRunOutcome,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PartialClimbError {
+    UnsupportedPass,
+    Evaluation(TrialEvaluationError),
+}
+
+#[derive(Debug)]
+pub(crate) struct IndexedPartialClimbError {
+    pub(crate) outer_index: u128,
+    pub(crate) evaluations_used: u64,
+    pub(crate) source: PartialClimbError,
+}
+
 impl crate::AttackRequest {
+    /// Caller supplies a resolved initial/index from this owner's outer projection.
+    /// This private adapter retains that index but does not validate provenance.
+    pub(crate) fn climb_partial_outer(
+        &self,
+        initial: ResolvedConfiguration,
+        outer_index: u128,
+        allowance: &mut EvaluationAllowance,
+    ) -> Result<PartialOuterOutcome, IndexedPartialClimbError> {
+        let settings = self.settings();
+        if settings.kind() != crate::AttackKind::PartialExhaustion {
+            return Err(IndexedPartialClimbError {
+                outer_index,
+                evaluations_used: allowance.used,
+                source: PartialClimbError::UnsupportedPass,
+            });
+        }
+        let first = settings.initial_measure();
+        let last = settings.final_measure();
+        let scoring = BoundClimbScoring::new(
+            &initial,
+            self.domain(),
+            self.text(),
+            (first, self.bound_resource(first)),
+            (last, self.bound_resource(last)),
+            settings.switch_pairs(),
+        );
+        let seeds = scoring
+            .climb_seeds(
+                settings
+                    .seed_policy()
+                    .expect("validated PE settings have seeds"),
+                settings.backtrack_pairs(),
+                allowance,
+            )
+            .map_err(|source| IndexedPartialClimbError {
+                outer_index,
+                evaluations_used: allowance.used,
+                source: PartialClimbError::Evaluation(source),
+            })?;
+        Ok(PartialOuterOutcome {
+            initial,
+            outer_index,
+            seeds,
+        })
+    }
+
     /// Same-owner lazy projection closes the adapter's key/index provenance precondition.
     pub(crate) fn schedule_direct_outers(&self) -> Result<DirectRunOutcome, IndexedDirectRunError> {
         if self.settings().kind() != crate::AttackKind::HillClimb {
@@ -325,22 +392,22 @@ pub(crate) struct ClimbOutcome {
 }
 
 #[derive(Debug)]
-struct SeedBest {
-    seed_index: u128,
-    current: ScoredBoard,
-    incomplete: bool,
-    final_objective_ascent: bool,
-    neighborhood_exhausted: bool,
+pub(crate) struct SeedBest {
+    pub(crate) seed_index: u128,
+    pub(crate) current: ScoredBoard,
+    pub(crate) incomplete: bool,
+    pub(crate) final_objective_ascent: bool,
+    pub(crate) neighborhood_exhausted: bool,
 }
 
 #[derive(Debug)]
-struct SeedRunOutcome {
-    budget_stopped: bool,
+pub(crate) struct SeedRunOutcome {
+    pub(crate) budget_stopped: bool,
     /// Cumulative usage of the borrowed allowance, including earlier work.
-    evaluations_used: u64,
-    climbs_started: u128,
-    climbs_completed: u128,
-    best: Option<SeedBest>,
+    pub(crate) evaluations_used: u64,
+    pub(crate) climbs_started: u128,
+    pub(crate) climbs_completed: u128,
+    pub(crate) best: Option<SeedBest>,
 }
 
 impl<'a> BoundClimbScoring<'a> {
@@ -695,6 +762,174 @@ mod tests {
             .unwrap()
             .bind_resources(&supplied)
             .unwrap()
+    }
+
+    #[test]
+    fn request_bound_partial_order_lifetime_and_shared_allowance() {
+        // direct_request_with drops the external JSON and dictionary buffers.
+        for (selection, mask, cost, count) in
+            [("all", vec![], 32, 4), ("touching", vec!["B"], 26, 3)]
+        {
+            let request = direct_request_with(serde_json::json!([]), false, true, |job| {
+                job["attack"]["seeds"]["selection"] = serde_json::json!(selection);
+                if selection == "touching" {
+                    job["attack"]["seeds"]["symbols"] = serde_json::json!(mask);
+                }
+            });
+            let initial = request.outer_candidates().next().unwrap().1.unwrap();
+            let retained = initial.clone();
+            let index = u128::from(u64::MAX) + 7;
+            let mut allowance = EvaluationAllowance {
+                used: 7,
+                limit: 100,
+            };
+            let outcome = request
+                .climb_partial_outer(initial, index, &mut allowance)
+                .unwrap();
+            assert_eq!(outcome.initial, retained);
+            assert_eq!(outcome.outer_index, index); // Retention, not provenance validation.
+            let run = outcome.seeds;
+            assert_eq!(run.evaluations_used, 7 + cost);
+            assert_eq!(allowance.used, 7 + cost);
+            assert_eq!((run.climbs_started, run.climbs_completed), (count, count));
+            assert!(!run.budget_stopped);
+            let best = run.best.unwrap();
+            assert_eq!(best.seed_index, 0);
+            assert_eq!(best.current.board, vec![('A', 'C')]);
+            assert_eq!(best.current.plaintext, "CB");
+            assert_eq!(best.current.score.ranking().units(), 2i128 << 32);
+            assert!(!best.incomplete);
+            assert!(best.neighborhood_exhausted && best.final_objective_ascent);
+        }
+    }
+
+    #[test]
+    fn request_bound_partial_admission_and_interruption() {
+        // Literal costs protect independent fresh seeds, not chained climbs.
+        for (limit, started, completed, incomplete) in [
+            (0, 0, 0, false),
+            (8, 1, 0, true),
+            (9, 1, 1, false),
+            (10, 2, 1, false),
+            (20, 2, 2, false),
+        ] {
+            let request = direct_request(serde_json::json!([]), false, true);
+            let initial = request.outer_candidates().next().unwrap().1.unwrap();
+            let mut allowance = EvaluationAllowance {
+                used: 3,
+                limit: 3 + limit,
+            };
+            let run = request
+                .climb_partial_outer(initial, 2, &mut allowance)
+                .unwrap()
+                .seeds;
+            assert_eq!(run.evaluations_used, 3 + limit);
+            assert_eq!(
+                (run.climbs_started, run.climbs_completed),
+                (started, completed)
+            );
+            assert!(run.budget_stopped);
+            if let Some(best) = run.best {
+                assert_eq!(best.seed_index, 0);
+                assert_eq!(best.current.plaintext, "CB");
+                assert_eq!(best.current.score.ranking().units(), 2i128 << 32);
+                assert_eq!(best.incomplete, incomplete);
+                assert_eq!(best.neighborhood_exhausted, !incomplete);
+            } else {
+                assert_eq!(started, 0);
+            }
+        }
+        let request = direct_request(serde_json::json!([]), true, true);
+        let initial = request.outer_candidates().next().unwrap().1.unwrap();
+        let mut allowance = EvaluationAllowance { used: 7, limit: 8 };
+        let run = request
+            .climb_partial_outer(initial, 0, &mut allowance)
+            .unwrap()
+            .seeds;
+        assert_eq!(run.evaluations_used, 7);
+        assert_eq!((run.climbs_started, run.climbs_completed), (0, 0));
+        assert!(run.best.is_none() && run.budget_stopped);
+    }
+
+    #[test]
+    fn request_bound_partial_fixed_facts_exact_completion_and_wrong_pass() {
+        for distinct in [false, true] {
+            let request = direct_request_with(serde_json::json!([]), distinct, true, |job| {
+                if distinct {
+                    job["space"]["plugboard"]["max_pairs"] = serde_json::json!(0);
+                } else {
+                    job["configuration"]["plugboard"] = serde_json::json!([["A", "B"]]);
+                    job["space"]["plugboard"]["symbols"] = serde_json::json!(["C"]);
+                }
+            });
+            let initial = request.outer_candidates().next().unwrap().1.unwrap();
+            let cost = if distinct { 2 } else { 1 };
+            let mut allowance = EvaluationAllowance {
+                used: 7,
+                limit: 7 + cost,
+            };
+            let outcome = request
+                .climb_partial_outer(initial.clone(), 0, &mut allowance)
+                .unwrap();
+            assert_eq!(outcome.initial, initial);
+            let run = outcome.seeds;
+            assert_eq!(run.evaluations_used, 7 + cost);
+            assert_eq!((run.climbs_started, run.climbs_completed), (1, 1));
+            assert!(!run.budget_stopped);
+            let best = run.best.unwrap();
+            assert!(best.current.board.is_empty());
+            assert_eq!(best.current.plaintext, if distinct { "CA" } else { "AC" });
+            assert_eq!(
+                best.current.score.ranking().units(),
+                if distinct { 0 } else { 1i128 << 32 }
+            );
+            assert!(!best.incomplete && best.neighborhood_exhausted);
+            assert_eq!(best.final_objective_ascent, !distinct);
+        }
+        let request = direct_request(serde_json::json!([]), false, false);
+        let initial = request.outer_candidates().next().unwrap().1.unwrap();
+        let mut allowance = EvaluationAllowance {
+            used: 7,
+            limit: 100,
+        };
+        let error = request
+            .climb_partial_outer(initial, 9, &mut allowance)
+            .unwrap_err();
+        assert_eq!(error.source, PartialClimbError::UnsupportedPass);
+        assert_eq!((error.outer_index, error.evaluations_used), (9, 7));
+        assert_eq!(allowance.used, 7);
+    }
+
+    #[test]
+    fn request_bound_partial_later_interrupted_winner_and_dense_mask_index() {
+        for (selection, symbols, index, plaintext, weight) in [
+            ("all", vec![], 1, "AC", 1),
+            ("touching", vec!["C"], 1, "CB", 2),
+        ] {
+            let request = direct_request_with(serde_json::json!([]), true, true, |job| {
+                // IC ties all two-distinct-letter outputs. Empty completes without
+                // ascent; the next seed's committed final score wins while interrupted.
+                job["attack"]["seeds"]["selection"] = serde_json::json!(selection);
+                if selection == "touching" {
+                    job["attack"]["seeds"]["symbols"] = serde_json::json!(symbols);
+                }
+            });
+            let initial = request.outer_candidates().next().unwrap().1.unwrap();
+            let mut allowance = EvaluationAllowance { used: 0, limit: 7 };
+            let run = request
+                .climb_partial_outer(initial, 0, &mut allowance)
+                .unwrap()
+                .seeds;
+            assert_eq!((run.climbs_started, run.climbs_completed), (2, 1));
+            assert_eq!(run.evaluations_used, 7);
+            assert!(run.budget_stopped);
+            let best = run.best.unwrap();
+            assert_eq!(best.seed_index, index);
+            assert_eq!(best.current.plaintext, plaintext);
+            assert_eq!(best.current.score.ranking().units(), weight << 32);
+            assert!(best.incomplete);
+            assert!(!best.neighborhood_exhausted && !best.final_objective_ascent);
+        }
     }
 
     fn scheduler_request(

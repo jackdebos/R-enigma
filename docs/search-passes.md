@@ -36,6 +36,10 @@ usage, or an indexed original evaluation error. Partial exhaustion is rejected b
 Task 11.6b.2 privately schedules same-owner ordered direct-HC outers with one allowance,
 checked counters, stable final-score best ownership and independent aggregate termination.
 Original indexed resolution/evaluation errors retain cumulative usage; PE remains rejected.
+Task 11.6c.1 binds one internally supplied resolved outer/index to retained PE settings and
+resources, preserving independent seed outcomes, winner flags, run counts and cumulative
+usage or the indexed original evaluator error. PE outer scheduling, global aggregation,
+public runtime execution and CLI execution remain unimplemented.
 Full attack results, public runtime APIs and CLI execution remain unimplemented.
 
 For this settings fragment, malformed raw JSON (including duplicate keys, trailing

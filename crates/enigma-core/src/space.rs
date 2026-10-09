@@ -3062,6 +3062,40 @@ mod tests {
     }
 
     #[test]
+    fn request_bound_partial_private_invariant_fault_preserves_diagnostic() {
+        use crate::attack_hill_climb::{EvaluationAllowance, PartialClimbError};
+        let mut value = attack_request();
+        value["job"]["passes"] = json!(["partial_exhaustion"]);
+        value["job"]["attack"]["kind"] = json!("partial_exhaustion");
+        value["job"]["attack"]
+            .as_object_mut()
+            .unwrap()
+            .remove("start");
+        value["job"]["attack"]["seeds"] = json!({"kind":"empty_single","selection":"all"});
+        let mut request = AttackRequest::parse_json(&value.to_string()).unwrap();
+        // PRIVATE evaluator invariant injection: not a valid promoted request.
+        request.carrier.parsed.text = "AZ".to_owned();
+        let initial = request.outer_candidates().next().unwrap().1.unwrap();
+        let mut allowance = EvaluationAllowance {
+            used: 3,
+            limit: 100,
+        };
+        let index = u128::from(u64::MAX) + 91;
+        let error = request
+            .climb_partial_outer(initial, index, &mut allowance)
+            .unwrap_err();
+        assert_eq!(error.outer_index, index);
+        assert_eq!(error.evaluations_used, 4);
+        assert_eq!(allowance.used, 4);
+        assert_eq!(
+            error.source,
+            PartialClimbError::Evaluation(crate::attack_evaluator::TrialEvaluationError::Model(
+                crate::ModelError::UnknownSymbol('Z')
+            ))
+        );
+    }
+
+    #[test]
     fn request_bound_direct_private_invariant_faults_preserve_index_and_usage() {
         use crate::attack_hill_climb::{DirectClimbError, EvaluationAllowance};
         // PRIVATE invariant faults: neither corruption is a valid promoted request.
