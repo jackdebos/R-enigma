@@ -801,7 +801,81 @@ pub(crate) struct SeedRunOutcome {
     pub(crate) best: Option<SeedBest>,
 }
 
+#[derive(Debug)]
+struct ControlledSeedOutcome {
+    seeds: SeedRunOutcome,
+    cancelled: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ControlledSeedError {
+    seed_index: Option<u128>,
+    source: ObservedClimbError,
+}
+
 impl<'a> BoundClimbScoring<'a> {
+    fn climb_seeds_controlled<O: CounterObserver, F: FnMut() -> bool>(
+        &self,
+        policy: &crate::AttackSeedPolicy,
+        backtrack_pairs: usize,
+        accounting: &mut ObservedAccounting<'_, O>,
+        requested: &mut F,
+    ) -> Result<ControlledSeedOutcome, ControlledSeedError> {
+        accounting.control.notify(accounting.observer);
+        let run = (|| {
+            let seeds = SeedCursor::new(self.initial, self.domain, policy).map_err(|source| {
+                ControlledSeedError {
+                    seed_index: None,
+                    source: TrialEvaluationError::Board(source).into(),
+                }
+            })?;
+            let mut result = ControlledSeedOutcome {
+                seeds: SeedRunOutcome {
+                    budget_stopped: false,
+                    evaluations_used: accounting.allowance.used,
+                    climbs_started: 0,
+                    climbs_completed: 0,
+                    best: None,
+                },
+                cancelled: false,
+            };
+            for (seed_index, board) in seeds {
+                let outcome = self
+                    .climb_cancellable(board, backtrack_pairs, accounting, &mut *requested)
+                    .map_err(|source| ControlledSeedError {
+                        seed_index: Some(seed_index),
+                        source,
+                    })?;
+                result.cancelled = outcome.cancelled;
+                result.seeds.budget_stopped = outcome.budget_stopped;
+                if let Some(current) = outcome.current {
+                    result.seeds.climbs_started += 1;
+                    if outcome.neighborhood_exhausted {
+                        result.seeds.climbs_completed += 1;
+                    }
+                    if result.seeds.best.as_ref().is_none_or(|best| {
+                        current.score.ranking().units() > best.current.score.ranking().units()
+                    }) {
+                        result.seeds.best = Some(SeedBest {
+                            seed_index,
+                            current,
+                            incomplete: outcome.cancelled || outcome.budget_stopped,
+                            final_objective_ascent: outcome.final_objective_ascent,
+                            neighborhood_exhausted: outcome.neighborhood_exhausted,
+                        });
+                    }
+                }
+                if outcome.cancelled || outcome.budget_stopped {
+                    break;
+                }
+            }
+            result.seeds.evaluations_used = accounting.allowance.used;
+            Ok(result)
+        })();
+        accounting.control.notify(accounting.observer);
+        run
+    }
+
     fn climb_seeds(
         &self,
         policy: &crate::AttackSeedPolicy,
@@ -2996,6 +3070,508 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    fn controlled_seed_probe(
+        context: &BoundClimbScoring<'_>,
+        counters: crate::attack_control::CounterSnapshot,
+        limit: u64,
+        mut requested: impl FnMut(usize) -> bool,
+    ) -> (
+        Result<ControlledSeedOutcome, ControlledSeedError>,
+        u64,
+        Recorder,
+        usize,
+    ) {
+        let mut allowance = EvaluationAllowance { used: 7, limit };
+        let mut control = AttackControl::with_counters(counters);
+        let mut observer = Recorder::default();
+        let mut polls = 0;
+        let result = context.climb_seeds_controlled(
+            &crate::AttackSeedPolicy::All,
+            0,
+            &mut ObservedAccounting {
+                allowance: &mut allowance,
+                control: &mut control,
+                observer: &mut observer,
+            },
+            &mut || {
+                polls += 1;
+                requested(polls)
+            },
+        );
+        assert_eq!(observer.0.first(), Some(&counters));
+        assert_eq!(observer.0.last(), Some(&control.snapshot()));
+        assert_eq!(
+            control.snapshot().outers_completed,
+            counters.outers_completed
+        );
+        (result, allowance.used, observer, polls)
+    }
+
+    #[test]
+    fn controlled_seeds_later_interrupted_winner() {
+        let (initial, domain) = fixture();
+        let first = crate::BoundResource::Trie(
+            crate::TrieModel::new(
+                initial.topology().alphabet().clone(),
+                vec![
+                    (vec!['C', 'A'], 4),
+                    (vec!['A', 'C'], 1),
+                    (vec!['C', 'B'], 2),
+                ],
+            )
+            .unwrap(),
+        );
+        for weight in [0, 3] {
+            let last = crate::BoundResource::Trie(
+                crate::TrieModel::new(
+                    initial.topology().alphabet().clone(),
+                    vec![(vec!['C', 'A'], 1), (vec!['A', 'C'], weight)],
+                )
+                .unwrap(),
+            );
+            let context = BoundClimbScoring::new(
+                &initial,
+                &domain,
+                "AA",
+                (MeasureId::Trie, Some(&first)),
+                (MeasureId::Trie, Some(&last)),
+                2,
+            );
+            for cancel in [false, true] {
+                // First seed consumes five; second start plus reserved rescore consumes two.
+                let (result, used, _, _) =
+                    controlled_seed_probe(&context, Default::default(), 14, |poll| {
+                        cancel && poll == 10
+                    });
+                let result = result.unwrap();
+                assert_eq!(used, 14);
+                assert_eq!(result.cancelled, cancel);
+                assert_eq!(result.seeds.budget_stopped, !cancel);
+                assert_eq!(
+                    (result.seeds.climbs_started, result.seeds.climbs_completed),
+                    (2, 1)
+                );
+                let best = result.seeds.best.unwrap();
+                assert_eq!(best.seed_index, u128::from(weight == 3));
+                assert_eq!(best.incomplete, weight == 3);
+                assert!(!best.final_objective_ascent);
+                assert_eq!(
+                    best.current.board,
+                    if weight == 3 {
+                        vec![('A', 'B')]
+                    } else {
+                        vec![]
+                    }
+                );
+                assert_eq!(best.neighborhood_exhausted, weight != 3);
+                assert_eq!(
+                    best.current.plaintext,
+                    if weight == 3 { "AC" } else { "CA" }
+                );
+                assert_eq!(
+                    best.current.score.ranking().units(),
+                    if weight == 3 { 3 << 32 } else { 1 << 32 }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn controlled_seeds_counter_sources_and_prior_facts() {
+        use crate::attack_control::CounterSnapshot;
+        let (initial, domain) = fixture();
+        let first = resource(&initial);
+        let context = BoundClimbScoring::new(
+            &initial,
+            &domain,
+            "AA",
+            (MeasureId::Trie, Some(&first)),
+            (MeasureId::Trie, Some(&first)),
+            1,
+        );
+        for (source, used) in [
+            (CounterOverflow::EvaluationsAdmitted, 8),
+            (CounterOverflow::EvaluationsCompleted, 8),
+            (CounterOverflow::ClimbsStarted, 8),
+            (CounterOverflow::ClimbsCompleted, 16),
+        ] {
+            let mut counters = CounterSnapshot {
+                outers_completed: u128::MAX,
+                ..Default::default()
+            };
+            match source {
+                CounterOverflow::EvaluationsAdmitted => counters.evaluations_admitted = u64::MAX,
+                CounterOverflow::EvaluationsCompleted => counters.evaluations_completed = u64::MAX,
+                CounterOverflow::ClimbsStarted => counters.climbs_started = u128::MAX,
+                CounterOverflow::ClimbsCompleted => counters.climbs_completed = u128::MAX,
+                _ => unreachable!(),
+            }
+            let (result, actual, recorder, _) =
+                controlled_seed_probe(&context, counters, 100, |_| false);
+            let mut expected = counters;
+            match source {
+                CounterOverflow::EvaluationsAdmitted => {}
+                CounterOverflow::EvaluationsCompleted => expected.evaluations_admitted = 1,
+                CounterOverflow::ClimbsStarted => {
+                    expected.evaluations_admitted = 1;
+                    expected.evaluations_completed = 1;
+                }
+                CounterOverflow::ClimbsCompleted => {
+                    expected.evaluations_admitted = 9;
+                    expected.evaluations_completed = 9;
+                    expected.climbs_started = 1;
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(recorder.0.last(), Some(&expected));
+            assert_eq!(actual, used);
+            assert_eq!(
+                result.unwrap_err(),
+                ControlledSeedError {
+                    seed_index: Some(0),
+                    source: ObservedClimbError::Counter(source),
+                }
+            );
+        }
+        let counters = CounterSnapshot {
+            evaluations_admitted: 11,
+            evaluations_completed: 10,
+            climbs_started: 5,
+            climbs_completed: 4,
+            outers_completed: u128::MAX,
+        };
+        let (result, used, recorder, _) = controlled_seed_probe(&context, counters, 100, |_| false);
+        let result = result.unwrap().seeds;
+        assert_eq!(
+            (result.climbs_started, result.climbs_completed, used),
+            (4, 4, 39)
+        );
+        let after = recorder.0.last().unwrap();
+        assert_eq!(
+            (after.evaluations_admitted, after.evaluations_completed),
+            (43, 42)
+        );
+        assert_eq!((after.climbs_started, after.climbs_completed), (9, 8));
+        let mut control = AttackControl::with_counters(counters);
+        assert!(control.poll_cancellation(true));
+        let mut allowance = EvaluationAllowance {
+            used: 7,
+            limit: 100,
+        };
+        let mut observer = Recorder::default();
+        let result = context
+            .climb_seeds_controlled(
+                &crate::AttackSeedPolicy::All,
+                0,
+                &mut ObservedAccounting {
+                    allowance: &mut allowance,
+                    control: &mut control,
+                    observer: &mut observer,
+                },
+                &mut || false,
+            )
+            .unwrap();
+        assert!(result.cancelled && result.seeds.best.is_none());
+        assert_eq!(allowance.used, 7);
+        assert!(observer.0.iter().all(|snapshot| *snapshot == counters));
+    }
+
+    #[test]
+    fn controlled_seeds_fixed_sole_seed_exact_rescore_and_exhaustion() {
+        let request = direct_request_with(serde_json::json!([]), true, true, |job| {
+            job["configuration"]["plugboard"] = serde_json::json!([["A", "B"]]);
+            job["space"]["plugboard"]["symbols"] = serde_json::json!(["C"]);
+        });
+        let initial = request.outer_candidates().next().unwrap().1.unwrap();
+        let before = initial.clone();
+        let context = BoundClimbScoring::new(
+            &initial,
+            request.domain(),
+            request.text(),
+            (MeasureId::Ic, None),
+            (MeasureId::Trie, request.bound_resource(MeasureId::Trie)),
+            2,
+        );
+        for limit in [9, 100] {
+            for stop in [2, 3] {
+                let (result, used, recorder, polls) =
+                    controlled_seed_probe(&context, Default::default(), limit, |poll| poll == stop);
+                let result = result.unwrap();
+                assert!(!result.cancelled && !result.seeds.budget_stopped);
+                assert_eq!((used, polls), (9, 2));
+                assert_eq!(
+                    (result.seeds.climbs_started, result.seeds.climbs_completed),
+                    (1, 1)
+                );
+                let best = result.seeds.best.unwrap();
+                assert_eq!(best.seed_index, 0);
+                assert!(best.current.board.is_empty());
+                assert_eq!(best.current.plaintext, "AC");
+                assert_eq!(best.current.score.ranking().units(), 1 << 32);
+                assert!(!best.incomplete && !best.final_objective_ascent);
+                assert!(best.neighborhood_exhausted);
+                let after = recorder.0.last().unwrap();
+                assert_eq!(
+                    (after.evaluations_admitted, after.evaluations_completed),
+                    (2, 2)
+                );
+                assert_eq!((after.climbs_started, after.climbs_completed), (1, 1));
+                assert_eq!(initial, before);
+                assert_eq!(initial.plugboard().map('A'), Some('B'));
+                assert_eq!(initial.plugboard().map('B'), Some('A'));
+            }
+        }
+    }
+
+    #[test]
+    fn controlled_seeds_natural_last_seed_no_speculative_poll() {
+        let (initial, domain) = fixture();
+        let first = resource(&initial);
+        let context = BoundClimbScoring::new(
+            &initial,
+            &domain,
+            "AA",
+            (MeasureId::Trie, Some(&first)),
+            (MeasureId::Trie, Some(&first)),
+            1,
+        );
+        for limit in [39, 100] {
+            for stop in [66, 67] {
+                let (result, used, recorder, polls) =
+                    controlled_seed_probe(&context, Default::default(), limit, |poll| poll == stop);
+                let result = result.unwrap();
+                assert!(!result.cancelled && !result.seeds.budget_stopped);
+                assert_eq!((used, polls), (39, 66));
+                assert_eq!(
+                    (result.seeds.climbs_started, result.seeds.climbs_completed),
+                    (4, 4)
+                );
+                let best = result.seeds.best.unwrap();
+                assert_eq!(best.seed_index, 0);
+                assert!(!best.incomplete && best.neighborhood_exhausted);
+                let after = recorder.0.last().unwrap();
+                assert_eq!(
+                    (after.evaluations_admitted, after.evaluations_completed),
+                    (32, 32)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn controlled_seeds_finalization_and_error_context() {
+        let (initial, domain) = fixture();
+        let first = resource(&initial);
+        let last = resource(&initial);
+        for (threshold, stop, used, paired) in [
+            (2, 2, 2, false),
+            (2, 8, 5, false),
+            (2, 9, 5, true),
+            (1, 9, 5, true),
+        ] {
+            let context = BoundClimbScoring::new(
+                &initial,
+                &domain,
+                "AA",
+                (MeasureId::Trie, Some(&first)),
+                (MeasureId::Trie, Some(&last)),
+                threshold,
+            );
+            let mut allowance = EvaluationAllowance {
+                used: 7,
+                limit: 100,
+            };
+            let mut control = AttackControl::default();
+            let mut observer = Recorder::default();
+            let mut polls = 0;
+            let result = context
+                .climb_seeds_controlled(
+                    &crate::AttackSeedPolicy::All,
+                    0,
+                    &mut ObservedAccounting {
+                        allowance: &mut allowance,
+                        control: &mut control,
+                        observer: &mut observer,
+                    },
+                    &mut || {
+                        polls += 1;
+                        polls == stop
+                    },
+                )
+                .unwrap();
+            assert!(result.cancelled);
+            assert_eq!(result.seeds.evaluations_used, 7 + used);
+            let best = result.seeds.best.unwrap();
+            assert!(best.incomplete);
+            assert_eq!(
+                best.current.board,
+                if paired { vec![('A', 'C')] } else { vec![] }
+            );
+            assert_eq!(control.snapshot().evaluations_completed, used);
+            assert_eq!(observer.0.last(), Some(&control.snapshot()));
+        }
+        for (missing_initial, stop, used) in
+            [(true, 2, 1), (false, 2, 2), (false, 8, 5), (false, 9, 5)]
+        {
+            let context = BoundClimbScoring::new(
+                &initial,
+                &domain,
+                "AA",
+                (
+                    MeasureId::Trie,
+                    if missing_initial { None } else { Some(&first) },
+                ),
+                (MeasureId::Trie, None),
+                if stop == 9 { 1 } else { 2 },
+            );
+            let mut allowance = EvaluationAllowance {
+                used: 7,
+                limit: 100,
+            };
+            let mut control = AttackControl::default();
+            let mut observer = Recorder::default();
+            let mut polls = 0;
+            let error = context
+                .climb_seeds_controlled(
+                    &crate::AttackSeedPolicy::All,
+                    0,
+                    &mut ObservedAccounting {
+                        allowance: &mut allowance,
+                        control: &mut control,
+                        observer: &mut observer,
+                    },
+                    &mut || {
+                        polls += 1;
+                        polls == stop
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(error.seed_index, Some(0));
+            assert_eq!(
+                error.source,
+                ObservedClimbError::Evaluation(TrialEvaluationError::MissingResource(
+                    MeasureId::Trie
+                ))
+            );
+            assert_eq!(allowance.used, 7 + used);
+            assert_eq!(control.snapshot().evaluations_completed, used - 1);
+            assert_eq!(observer.0.last(), Some(&control.snapshot()));
+        }
+    }
+
+    #[test]
+    fn controlled_seeds_legacy_equivalence_and_stops() {
+        let (initial, domain) = fixture();
+        let first = resource(&initial);
+        let context = BoundClimbScoring::new(
+            &initial,
+            &domain,
+            "AA",
+            (MeasureId::Trie, Some(&first)),
+            (MeasureId::Trie, Some(&first)),
+            1,
+        );
+        for (limit, cancel) in [(7, true), (7, false), (8, true), (16, false), (100, false)] {
+            let mut allowance = EvaluationAllowance { used: 7, limit };
+            let mut control = AttackControl::default();
+            let mut observer = Recorder::default();
+            let outcome = context
+                .climb_seeds_controlled(
+                    &crate::AttackSeedPolicy::All,
+                    0,
+                    &mut ObservedAccounting {
+                        allowance: &mut allowance,
+                        control: &mut control,
+                        observer: &mut observer,
+                    },
+                    &mut || cancel,
+                )
+                .unwrap();
+            assert_eq!(outcome.cancelled, cancel);
+            assert_eq!(observer.0.last(), Some(&control.snapshot()));
+            assert_eq!(control.snapshot().outers_completed, 0);
+            if cancel {
+                assert!(outcome.seeds.best.is_none());
+                assert!(!outcome.seeds.budget_stopped);
+                assert_eq!(allowance.used, 7);
+            } else {
+                let legacy = context
+                    .climb_seeds(
+                        &crate::AttackSeedPolicy::All,
+                        0,
+                        &mut EvaluationAllowance { used: 7, limit },
+                    )
+                    .unwrap();
+                assert_eq!(outcome.seeds.evaluations_used, legacy.evaluations_used);
+                assert_eq!(outcome.seeds.climbs_started, legacy.climbs_started);
+                assert_eq!(outcome.seeds.climbs_completed, legacy.climbs_completed);
+                assert_eq!(outcome.seeds.budget_stopped, legacy.budget_stopped);
+                assert_eq!(
+                    outcome.seeds.best.as_ref().map(|b| &b.current),
+                    legacy.best.as_ref().map(|b| &b.current)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn controlled_seeds_cancel_between_seeds() {
+        struct Observer<'a>(&'a std::cell::Cell<u128>, Recorder);
+        impl CounterObserver for Observer<'_> {
+            fn observe(&mut self, snapshot: crate::attack_control::CounterSnapshot) {
+                self.0.set(snapshot.climbs_completed);
+                self.1.observe(snapshot);
+            }
+        }
+        let (initial, domain) = fixture();
+        let first = resource(&initial);
+        let context = BoundClimbScoring::new(
+            &initial,
+            &domain,
+            "AA",
+            (MeasureId::Trie, Some(&first)),
+            (MeasureId::Trie, Some(&first)),
+            1,
+        );
+        let completed = std::cell::Cell::new(0);
+        let mut observer = Observer(&completed, Recorder::default());
+        let mut control = AttackControl::default();
+        let mut allowance = EvaluationAllowance {
+            used: 7,
+            limit: 100,
+        };
+        let result = context
+            .climb_seeds_controlled(
+                &crate::AttackSeedPolicy::All,
+                0,
+                &mut ObservedAccounting {
+                    allowance: &mut allowance,
+                    control: &mut control,
+                    observer: &mut observer,
+                },
+                &mut || completed.get() == 1,
+            )
+            .unwrap();
+        assert_eq!(result.seeds.evaluations_used, 16);
+        assert!(result.cancelled);
+        assert!(!result.seeds.budget_stopped);
+        assert_eq!(
+            (result.seeds.climbs_started, result.seeds.climbs_completed),
+            (1, 1)
+        );
+        let best = result.seeds.best.unwrap();
+        assert_eq!(best.seed_index, 0);
+        assert_eq!(best.current.board, vec![('A', 'C')]);
+        assert_eq!(best.current.plaintext, "CB");
+        assert_eq!(best.current.score.ranking().units(), 2 << 32);
+        assert!(!best.incomplete);
+        let snapshot = control.snapshot();
+        assert_eq!(snapshot.evaluations_admitted, 9);
+        assert_eq!(snapshot.evaluations_completed, 9);
+        assert_eq!(snapshot.outers_completed, 0);
+        assert_eq!(observer.1 .0.last(), Some(&snapshot));
     }
 
     #[test]
