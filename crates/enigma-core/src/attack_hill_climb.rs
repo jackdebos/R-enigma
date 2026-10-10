@@ -134,7 +134,89 @@ pub(crate) struct IndexedPartialRunError {
     pub(crate) source: PartialRunError,
 }
 
+#[derive(Debug)]
+struct ControlledPartialOutcome {
+    initial: ResolvedConfiguration,
+    outer_index: u128,
+    seeds: ControlledSeedOutcome,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ControlledPartialSource {
+    UnsupportedPass,
+    Climb(ObservedClimbError),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ControlledPartialError {
+    outer_index: u128,
+    seed_index: Option<u128>,
+    evaluations_used: u64,
+    source: ControlledPartialSource,
+}
+
+impl ControlledPartialError {
+    fn from_seed(outer_index: u128, evaluations_used: u64, error: ControlledSeedError) -> Self {
+        Self {
+            outer_index,
+            seed_index: error.seed_index,
+            evaluations_used,
+            source: ControlledPartialSource::Climb(error.source),
+        }
+    }
+}
+
 impl crate::AttackRequest {
+    fn climb_partial_outer_controlled<O: CounterObserver, F: FnMut() -> bool>(
+        &self,
+        initial: ResolvedConfiguration,
+        outer_index: u128,
+        accounting: &mut ObservedAccounting<'_, O>,
+        requested: &mut F,
+    ) -> Result<ControlledPartialOutcome, ControlledPartialError> {
+        accounting.control.notify(accounting.observer);
+        let result = (|| {
+            let settings = self.settings();
+            if settings.kind() != crate::AttackKind::PartialExhaustion {
+                return Err(ControlledPartialError {
+                    outer_index,
+                    seed_index: None,
+                    evaluations_used: accounting.allowance.used,
+                    source: ControlledPartialSource::UnsupportedPass,
+                });
+            }
+            let first = settings.initial_measure();
+            let last = settings.final_measure();
+            let scoring = BoundClimbScoring::new(
+                &initial,
+                self.domain(),
+                self.text(),
+                (first, self.bound_resource(first)),
+                (last, self.bound_resource(last)),
+                settings.switch_pairs(),
+            );
+            let seeds = scoring
+                .climb_seeds_controlled(
+                    settings
+                        .seed_policy()
+                        .expect("validated PE settings have seeds"),
+                    settings.backtrack_pairs(),
+                    accounting,
+                    requested,
+                )
+                .map_err(|error| {
+                    ControlledPartialError::from_seed(outer_index, accounting.allowance.used, error)
+                })?;
+            Ok(ControlledPartialOutcome {
+                initial,
+                outer_index,
+                seeds,
+            })
+        })();
+        accounting.control.notify(accounting.observer);
+        result
+    }
+
     /// Same-owner projection supplies absolute indices and fresh independent seeds.
     pub(crate) fn schedule_partial_outers(
         &self,
@@ -3514,6 +3596,423 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn controlled_partial_adapter_exact_error_mapping() {
+        let (initial, domain) = fixture();
+        let resource = resource(&initial);
+        for (input, bound, expected) in [
+            (
+                "AZ",
+                None,
+                TrialEvaluationError::Model(crate::ModelError::UnknownSymbol('Z')),
+            ),
+            (
+                "A",
+                None,
+                TrialEvaluationError::Measure(crate::MeasureError::InsufficientSamples {
+                    required: 2,
+                    actual: 1,
+                }),
+            ),
+            (
+                "AA",
+                Some(&resource),
+                TrialEvaluationError::IncompatibleResource(MeasureId::Ic),
+            ),
+        ] {
+            let context = BoundClimbScoring::new(
+                &initial,
+                &domain,
+                input,
+                (MeasureId::Ic, bound),
+                (MeasureId::Ic, bound),
+                0,
+            );
+            let (result, used, recorder, _) =
+                controlled_seed_probe(&context, Default::default(), 100, |_| false);
+            let mapped = ControlledPartialError::from_seed(99, used, result.unwrap_err());
+            assert_eq!(mapped.outer_index, 99);
+            assert_eq!(mapped.seed_index, Some(0));
+            assert_eq!(mapped.evaluations_used, 8);
+            assert_eq!(
+                mapped.source,
+                ControlledPartialSource::Climb(expected.into())
+            );
+            let snapshot = recorder.0.last().unwrap();
+            assert_eq!(
+                (
+                    snapshot.evaluations_admitted,
+                    snapshot.evaluations_completed
+                ),
+                (1, 0)
+            );
+        }
+        let wrong_domain = AttackPlugboardDomain::parse_json(
+            initial.topology().alphabet(),
+            &[('A', 'B')],
+            r#"{"kind":"attack","symbols":["C"],"max_pairs":1}"#,
+        )
+        .unwrap();
+        let context = BoundClimbScoring::new(
+            &initial,
+            &wrong_domain,
+            "AA",
+            (MeasureId::Ic, None),
+            (MeasureId::Ic, None),
+            0,
+        );
+        let (error, used, recorder, polls) =
+            controlled_seed_probe(&context, Default::default(), 100, |_| true);
+        let mapped = ControlledPartialError::from_seed(99, used, error.unwrap_err());
+        assert_eq!(
+            (
+                mapped.outer_index,
+                mapped.seed_index,
+                mapped.evaluations_used
+            ),
+            (99, None, 7)
+        );
+        assert_eq!(
+            mapped.source,
+            ControlledPartialSource::Climb(ObservedClimbError::Evaluation(
+                TrialEvaluationError::Board(
+                    crate::attack_evaluator::TrialBoardError::FixedFactsBinding
+                )
+            ))
+        );
+        assert_eq!(polls, 0);
+        assert_eq!(recorder.0.last().unwrap().evaluations_admitted, 0);
+    }
+
+    #[test]
+    fn controlled_partial_adapter_admitted_board_and_counter_mapping() {
+        let (initial, domain) = fixture();
+        let evaluator = TrialEvaluator::new(
+            &initial,
+            &domain,
+            "AA",
+            Direction::Decrypt,
+            MeasureId::Ic,
+            None,
+        );
+        let mut allowance = EvaluationAllowance {
+            used: 7,
+            limit: 100,
+        };
+        let mut control = AttackControl::default();
+        let mut observer = Recorder::default();
+        // Helper-qualified fault: this invalid trial reaches the evaluator after admission.
+        let source = ObservedAccounting {
+            allowance: &mut allowance,
+            control: &mut control,
+            observer: &mut observer,
+        }
+        .evaluate(&evaluator, &[('A', 'Z')], 0)
+        .unwrap_err();
+        let expected = evaluator.evaluate(&[('A', 'Z')]).unwrap_err();
+        assert!(matches!(expected, TrialEvaluationError::Board(_)));
+        let mapped = ControlledPartialError::from_seed(
+            99,
+            allowance.used,
+            ControlledSeedError {
+                seed_index: Some(2),
+                source,
+            },
+        );
+        assert_eq!(
+            mapped.source,
+            ControlledPartialSource::Climb(expected.into())
+        );
+        assert_eq!(
+            (
+                mapped.outer_index,
+                mapped.seed_index,
+                mapped.evaluations_used
+            ),
+            (99, Some(2), 8)
+        );
+        assert_eq!(
+            (
+                control.snapshot().evaluations_admitted,
+                control.snapshot().evaluations_completed
+            ),
+            (1, 0)
+        );
+        for source in [
+            CounterOverflow::EvaluationsAdmitted,
+            CounterOverflow::EvaluationsCompleted,
+            CounterOverflow::ClimbsStarted,
+            CounterOverflow::ClimbsCompleted,
+            CounterOverflow::OutersCompleted,
+        ] {
+            // Mapping only: the single-outer adapter never records outer completion.
+            let mapped = ControlledPartialError::from_seed(
+                99,
+                7,
+                ControlledSeedError {
+                    seed_index: Some(2),
+                    source: ObservedClimbError::Counter(source),
+                },
+            );
+            assert_eq!(
+                mapped.source,
+                ControlledPartialSource::Climb(ObservedClimbError::Counter(source))
+            );
+            assert_eq!(
+                (
+                    mapped.outer_index,
+                    mapped.seed_index,
+                    mapped.evaluations_used
+                ),
+                (99, Some(2), 7)
+            );
+        }
+    }
+
+    #[test]
+    fn controlled_partial_adapter_fixed_owner_later_cancel() {
+        let alphabet = ["A", "B", "C", "D", "E", "F"];
+        let value = serde_json::json!({"protocol_version":1,"machine":{"definition":{
+            "kind":"custom","value":{"alphabet":alphabet,
+            "wheels":[{"name":"r","wiring":alphabet,"turnovers":[]}],
+            "slots":[{"id":"r","role":"rotor","movement":"fixed","wheel":"r"}],
+            "stepping":{"rules":[]}}}},"job":{"kind":"search",
+            "configuration":{"slots":[{"id":"r","position":"A","ring":"A"}],
+                "plugboard":[["A","B"],["C","D"]]},
+            "space":{"plugboard":{"kind":"attack","symbols":["E","F"],"max_pairs":3}},
+            "text":"EE","passes":["partial_exhaustion"],"measures":["ic"],
+            "attack":{"kind":"partial_exhaustion","initial_measure":"ic","final_measure":"ic",
+                "switch_pairs":0,"backtrack_pairs":0,"evaluation_budget":100,
+                "seeds":{"kind":"empty_single","selection":"all"}}}});
+        let request = crate::ParsedAttackRequest::parse_json(&value.to_string())
+            .unwrap()
+            .bind_resources(&std::collections::BTreeMap::new())
+            .unwrap();
+        let initial = request.outer_candidates().next().unwrap().1.unwrap();
+        // Pair orientation and ordering are electrical facts, not provenance requirements.
+        let equivalent = TransformConfiguration::new(
+            vec![SlotConfiguration::new("r", "r", 'A', 'A')],
+            vec![('D', 'C'), ('B', 'A')],
+        )
+        .resolve(request.definition())
+        .unwrap();
+        let mut allowance = EvaluationAllowance {
+            used: 7,
+            limit: 100,
+        };
+        let mut control = AttackControl::default();
+        struct Observer<'a>(&'a std::cell::Cell<u128>, Recorder);
+        impl CounterObserver for Observer<'_> {
+            fn observe(&mut self, snapshot: crate::attack_control::CounterSnapshot) {
+                self.0.set(snapshot.climbs_completed);
+                self.1.observe(snapshot);
+            }
+        }
+        let completed = std::cell::Cell::new(0);
+        let mut observer = Observer(&completed, Recorder::default());
+        let result = request
+            .climb_partial_outer_controlled(
+                equivalent.clone(),
+                99,
+                &mut ObservedAccounting {
+                    allowance: &mut allowance,
+                    control: &mut control,
+                    observer: &mut observer,
+                },
+                // The next seed's entry poll follows notification of the prior completion.
+                &mut || completed.get() == 1,
+            )
+            .unwrap();
+        assert_eq!(initial.plugboard(), equivalent.plugboard());
+        assert_eq!(result.initial, equivalent);
+        assert_eq!(result.outer_index, 99);
+        assert_eq!(control.snapshot().climbs_completed, 1);
+        assert!(result.seeds.cancelled);
+        assert_eq!(result.seeds.seeds.evaluations_used, 9);
+        let best = result.seeds.seeds.best.unwrap();
+        assert_eq!(best.seed_index, 0);
+        assert_eq!(best.current.plaintext, "EE");
+        assert_eq!(best.current.score.ranking().units(), 6i128 << 32);
+        assert!(best.current.board.is_empty());
+        assert!(!best.incomplete);
+        assert!(best.final_objective_ascent && best.neighborhood_exhausted);
+        assert_eq!(control.snapshot().outers_completed, 0);
+        assert_eq!(observer.1 .0.last(), Some(&control.snapshot()));
+    }
+
+    #[test]
+    fn controlled_partial_adapter_binding_equivalence() {
+        for distinct in [false, true] {
+            for touching in [false, true] {
+                let request = direct_request_with(serde_json::json!([]), distinct, true, |job| {
+                    if touching {
+                        job["attack"]["seeds"]["selection"] = serde_json::json!("touching");
+                        job["attack"]["seeds"]["symbols"] = serde_json::json!(["B"]);
+                    }
+                });
+                let initial = request.outer_candidates().next().unwrap().1.unwrap();
+                let mut allowance = EvaluationAllowance {
+                    used: 7,
+                    limit: 100,
+                };
+                let mut control = AttackControl::default();
+                let mut observer = Recorder::default();
+                let result = request
+                    .climb_partial_outer_controlled(
+                        initial.clone(),
+                        88,
+                        &mut ObservedAccounting {
+                            allowance: &mut allowance,
+                            control: &mut control,
+                            observer: &mut observer,
+                        },
+                        &mut || false,
+                    )
+                    .unwrap();
+                let legacy = request
+                    .climb_partial_outer(
+                        initial,
+                        88,
+                        &mut EvaluationAllowance {
+                            used: 7,
+                            limit: 100,
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(result.initial, legacy.initial);
+                assert!(!result.seeds.cancelled);
+                assert_eq!(
+                    result.seeds.seeds.evaluations_used,
+                    legacy.seeds.evaluations_used
+                );
+                assert_eq!(
+                    result.seeds.seeds.climbs_completed,
+                    legacy.seeds.climbs_completed
+                );
+                let best = result.seeds.seeds.best.unwrap();
+                let expected = legacy.seeds.best.unwrap();
+                assert_eq!(best.seed_index, expected.seed_index);
+                assert_eq!(best.current, expected.current);
+                assert_eq!(best.incomplete, expected.incomplete);
+                assert_eq!(best.final_objective_ascent, expected.final_objective_ascent);
+                assert_eq!(best.neighborhood_exhausted, expected.neighborhood_exhausted);
+                assert_eq!(control.snapshot().outers_completed, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn controlled_partial_adapter_wrong_pass_and_counter_context() {
+        use crate::attack_control::CounterSnapshot;
+        for pe in [false, true] {
+            let request = direct_request(serde_json::json!([]), false, pe);
+            let initial = request.outer_candidates().next().unwrap().1.unwrap();
+            let mut allowance = EvaluationAllowance {
+                used: 7,
+                limit: 100,
+            };
+            let mut control = AttackControl::with_counters(CounterSnapshot {
+                evaluations_admitted: u64::MAX,
+                outers_completed: 3,
+                ..CounterSnapshot::default()
+            });
+            let mut observer = Recorder::default();
+            let mut polls = 0;
+            let error = request
+                .climb_partial_outer_controlled(
+                    initial,
+                    99,
+                    &mut ObservedAccounting {
+                        allowance: &mut allowance,
+                        control: &mut control,
+                        observer: &mut observer,
+                    },
+                    &mut || {
+                        polls += 1;
+                        false
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(error.outer_index, 99);
+            assert_eq!(error.seed_index, if pe { Some(0) } else { None });
+            assert_eq!(error.evaluations_used, if pe { 8 } else { 7 });
+            assert_eq!(allowance.used, error.evaluations_used);
+            assert_eq!(
+                error.source,
+                if pe {
+                    ControlledPartialSource::Climb(ObservedClimbError::Counter(
+                        CounterOverflow::EvaluationsAdmitted,
+                    ))
+                } else {
+                    ControlledPartialSource::UnsupportedPass
+                }
+            );
+            assert_eq!(polls, usize::from(pe));
+            assert_eq!(control.snapshot().outers_completed, 3);
+            assert_eq!(observer.0.last(), Some(&control.snapshot()));
+        }
+    }
+
+    #[test]
+    fn controlled_partial_adapter_cancel_preserves_owner_and_index() {
+        let request = direct_request(serde_json::json!([]), false, true);
+        let initial = request.outer_candidates().next().unwrap().1.unwrap();
+        let retained = initial.clone();
+        let index = u128::from(u64::MAX) + 7;
+        let mut allowance = EvaluationAllowance {
+            used: 7,
+            limit: 100,
+        };
+        let mut control = AttackControl::default();
+        struct Observer<'a>(&'a std::cell::Cell<u128>, Recorder);
+        impl CounterObserver for Observer<'_> {
+            fn observe(&mut self, snapshot: crate::attack_control::CounterSnapshot) {
+                self.0.set(snapshot.climbs_completed);
+                self.1.observe(snapshot);
+            }
+        }
+        let completed = std::cell::Cell::new(0);
+        let mut observer = Observer(&completed, Recorder::default());
+        let result = request
+            .climb_partial_outer_controlled(
+                initial,
+                index,
+                &mut ObservedAccounting {
+                    allowance: &mut allowance,
+                    control: &mut control,
+                    observer: &mut observer,
+                },
+                &mut || completed.get() == 1,
+            )
+            .expect("validated PE adapter must retain the completed seed on cancellation");
+        assert!(result.seeds.cancelled);
+        assert_eq!(result.initial, retained);
+        assert_eq!(result.outer_index, index);
+        assert_eq!(control.snapshot().outers_completed, 0);
+        assert_eq!(result.seeds.seeds.evaluations_used, 16);
+        let best = result.seeds.seeds.best.unwrap();
+        assert_eq!(best.current.plaintext, "CB");
+        let expected = TrialEvaluator::new(
+            &retained,
+            request.domain(),
+            request.text(),
+            Direction::Decrypt,
+            request.settings().final_measure(),
+            request.bound_resource(request.settings().final_measure()),
+        )
+        .evaluate(&best.current.board)
+        .unwrap();
+        assert_eq!(
+            (best.current.plaintext.clone(), best.current.score),
+            expected
+        );
+        assert_eq!(best.current.score.ranking().units(), 2i128 << 32);
+        assert_eq!(best.seed_index, 0);
+        assert!(!best.incomplete);
+        assert!(best.final_objective_ascent && best.neighborhood_exhausted);
+        assert_eq!(observer.1 .0.last(), Some(&control.snapshot()));
     }
 
     #[test]
