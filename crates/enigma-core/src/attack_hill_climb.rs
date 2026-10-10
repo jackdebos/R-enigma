@@ -1,5 +1,6 @@
 //! Private complete-neighborhood strict ascent with bound scoring and shared accounting.
 
+use crate::attack_control::{AttackControl, CounterObserver, CounterOverflow};
 use crate::attack_evaluator::{validated_trial_board, TrialEvaluationError, TrialEvaluator};
 use crate::attack_neighborhood::NeighborhoodCursor;
 use crate::{
@@ -473,6 +474,75 @@ impl EvaluationAllowance {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ObservedClimbError {
+    Evaluation(TrialEvaluationError),
+    Counter(CounterOverflow),
+}
+
+impl From<TrialEvaluationError> for ObservedClimbError {
+    fn from(error: TrialEvaluationError) -> Self {
+        Self::Evaluation(error)
+    }
+}
+
+/// One accounting path for all scoring phases; existing callers remain budget-only.
+trait EvaluationAccounting {
+    type Error: From<TrialEvaluationError>;
+    fn admit(&mut self, reserve: u64) -> Result<bool, Self::Error>;
+    fn transition(
+        &mut self,
+        _record: fn(&mut AttackControl) -> Result<(), CounterOverflow>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn evaluate(
+        &mut self,
+        evaluator: &TrialEvaluator<'_>,
+        board: &[(char, char)],
+        reserve: u64,
+    ) -> Result<Option<(String, MeasuredScore)>, Self::Error> {
+        if !self.admit(reserve)? {
+            return Ok(None);
+        }
+        let result = evaluator.evaluate(board)?;
+        self.transition(AttackControl::record_evaluation_completed)?;
+        Ok(Some(result))
+    }
+}
+
+impl EvaluationAccounting for EvaluationAllowance {
+    type Error = TrialEvaluationError;
+    fn admit(&mut self, reserve: u64) -> Result<bool, Self::Error> {
+        Ok(EvaluationAllowance::admit(self, reserve))
+    }
+}
+
+struct ObservedAccounting<'a, O> {
+    allowance: &'a mut EvaluationAllowance,
+    control: &'a mut AttackControl,
+    observer: &'a mut O,
+}
+
+impl<O: CounterObserver> EvaluationAccounting for ObservedAccounting<'_, O> {
+    type Error = ObservedClimbError;
+    fn admit(&mut self, reserve: u64) -> Result<bool, Self::Error> {
+        if !self.allowance.admit(reserve) {
+            return Ok(false);
+        }
+        self.transition(AttackControl::record_evaluation_admitted)?;
+        Ok(true)
+    }
+    fn transition(
+        &mut self,
+        record: fn(&mut AttackControl) -> Result<(), CounterOverflow>,
+    ) -> Result<(), Self::Error> {
+        record(self.control).map_err(ObservedClimbError::Counter)?;
+        self.control.notify(self.observer);
+        Ok(())
+    }
+}
+
 /// Both evaluators share immutable machine, domain, input and decrypt direction.
 struct BoundClimbScoring<'a> {
     initial: &'a ResolvedConfiguration,
@@ -583,6 +653,27 @@ impl<'a> BoundClimbScoring<'a> {
         backtrack_pairs: usize,
         allowance: &mut EvaluationAllowance,
     ) -> Result<ClimbOutcome, TrialEvaluationError> {
+        self.climb_accounted(board, backtrack_pairs, allowance)
+    }
+
+    fn climb_observed(
+        &self,
+        board: MutableBoard,
+        backtrack_pairs: usize,
+        accounting: &mut ObservedAccounting<'_, impl CounterObserver>,
+    ) -> Result<ClimbOutcome, ObservedClimbError> {
+        accounting.control.notify(accounting.observer);
+        let result = self.climb_accounted(board, backtrack_pairs, accounting);
+        accounting.control.notify(accounting.observer);
+        result
+    }
+
+    fn climb_accounted<A: EvaluationAccounting>(
+        &self,
+        board: MutableBoard,
+        backtrack_pairs: usize,
+        allowance: &mut A,
+    ) -> Result<ClimbOutcome, A::Error> {
         let Some(mut state) = self.start(board, allowance)? else {
             return Ok(ClimbOutcome {
                 current: None,
@@ -591,6 +682,7 @@ impl<'a> BoundClimbScoring<'a> {
                 neighborhood_exhausted: false,
             });
         };
+        allowance.transition(AttackControl::record_climb_started)?;
         let mut final_objective_ascent = false;
         let neighborhood_exhausted = loop {
             // Build from this state's context, never an independently bound evaluator.
@@ -629,6 +721,9 @@ impl<'a> BoundClimbScoring<'a> {
         let current = state
             .finalize(allowance)?
             .expect("driver preserved the final-score reservation");
+        if neighborhood_exhausted {
+            allowance.transition(AttackControl::record_climb_completed)?;
+        }
         Ok(ClimbOutcome {
             current: Some(current),
             budget_stopped: !neighborhood_exhausted,
@@ -674,24 +769,25 @@ impl<'a> BoundClimbScoring<'a> {
         }
     }
 
-    fn start(
+    fn start<A: EvaluationAccounting>(
         &self,
         board: MutableBoard,
-        allowance: &mut EvaluationAllowance,
-    ) -> Result<Option<ScoringState<'_, 'a>>, TrialEvaluationError> {
+        allowance: &mut A,
+    ) -> Result<Option<ScoringState<'_, 'a>>, A::Error> {
         validated_trial_board(self.initial, self.domain, &board)
             .map_err(TrialEvaluationError::Board)?;
         let final_phase = self.domain.fixed_pairs().len() + board.len() >= self.switch_pairs;
         let known_final = final_phase || self.identical;
-        if !allowance.admit(u64::from(!known_final)) {
-            return Ok(None);
-        }
         let evaluator = if final_phase {
             &self.final_evaluator
         } else {
             &self.initial_evaluator
         };
-        let (plaintext, score) = evaluator.evaluate(&board)?;
+        let Some((plaintext, score)) =
+            allowance.evaluate(evaluator, &board, u64::from(!known_final))?
+        else {
+            return Ok(None);
+        };
         Ok(Some(ScoringState {
             context: self,
             current: ScoredBoard {
@@ -712,15 +808,16 @@ impl ScoringState<'_, '_> {
 
     /// Caller must preserve reserve in the shared allowance. None reports denied admission.
     /// Consuming the state makes finalization once-only; it never starts another ascent.
-    fn finalize(
+    fn finalize<A: EvaluationAccounting>(
         mut self,
-        allowance: &mut EvaluationAllowance,
-    ) -> Result<Option<ScoredBoard>, TrialEvaluationError> {
+        allowance: &mut A,
+    ) -> Result<Option<ScoredBoard>, A::Error> {
         if !self.known_final {
-            if !allowance.admit(0) {
+            let Some((plaintext, score)) =
+                allowance.evaluate(&self.context.final_evaluator, &self.current.board, 0)?
+            else {
                 return Ok(None);
-            }
-            let (plaintext, score) = self.context.final_evaluator.evaluate(&self.current.board)?;
+            };
             self.current.plaintext = plaintext;
             self.current.score = score;
         }
@@ -731,11 +828,11 @@ impl ScoringState<'_, '_> {
     /// evaluated with THIS context's current objective; its call was already charged.
     /// This lifecycle does not verify selection. Caller must have preserved reserve.
     /// Consuming self prevents an unscored committed board escaping on any error.
-    fn commit_trial(
+    fn commit_trial<A: EvaluationAccounting>(
         mut self,
         trial: ScoredBoard,
-        allowance: &mut EvaluationAllowance,
-    ) -> Result<Option<Self>, TrialEvaluationError> {
+        allowance: &mut A,
+    ) -> Result<Option<Self>, A::Error> {
         validated_trial_board(self.context.initial, self.context.domain, &trial.board)
             .map_err(TrialEvaluationError::Board)?;
         self.current = trial;
@@ -746,11 +843,11 @@ impl ScoringState<'_, '_> {
         {
             self.final_phase = true;
             if !self.known_final {
-                if !allowance.admit(0) {
+                let Some((plaintext, score)) =
+                    allowance.evaluate(&self.context.final_evaluator, &self.current.board, 0)?
+                else {
                     return Ok(None);
-                }
-                let (plaintext, score) =
-                    self.context.final_evaluator.evaluate(&self.current.board)?;
+                };
                 self.current.plaintext = plaintext;
                 self.current.score = score;
             }
@@ -774,23 +871,23 @@ pub(super) struct NeighborhoodSelection<'a> {
 }
 
 impl NeighborhoodSelection<'_> {
-    fn scan(
+    fn scan<A: EvaluationAccounting>(
         &self,
         current: &[(char, char)],
         ranking: FixedScore,
-        allowance: &mut EvaluationAllowance,
+        allowance: &mut A,
         reserve: u64,
-    ) -> Result<ScanOutcome, TrialEvaluationError> {
+    ) -> Result<ScanOutcome, A::Error> {
         let cursor =
             NeighborhoodCursor::new(self.initial, self.domain, current, self.backtrack_pairs)
                 .map_err(TrialEvaluationError::Board)?;
         let mut best = None;
         let mut best_ranking = ranking;
         for board in cursor {
-            if !allowance.admit(reserve) {
+            let Some((plaintext, score)) = allowance.evaluate(self.evaluator, &board, reserve)?
+            else {
                 return Ok(ScanOutcome::Interrupted);
-            }
-            let (plaintext, score) = self.evaluator.evaluate(&board)?;
+            };
             if score.ranking().units() > best_ranking.units() {
                 best_ranking = score.ranking();
                 best = Some(ScoredBoard {
@@ -810,6 +907,231 @@ mod tests {
     use crate::{
         DefinitionSource, Direction, MeasureId, SlotConfiguration, TransformConfiguration,
     };
+
+    #[derive(Default)]
+    struct Recorder(Vec<crate::attack_control::CounterSnapshot>);
+
+    impl CounterObserver for Recorder {
+        fn observe(&mut self, snapshot: crate::attack_control::CounterSnapshot) {
+            self.0.push(snapshot);
+        }
+    }
+
+    #[test]
+    fn control_records_successful_and_failed_evaluations() {
+        let (initial, domain) = fixture();
+        let mut allowance = EvaluationAllowance { used: 7, limit: 10 };
+        let mut control = AttackControl::default();
+        let mut observer = Recorder::default();
+        let mut accounting = ObservedAccounting {
+            allowance: &mut allowance,
+            control: &mut control,
+            observer: &mut observer,
+        };
+        let evaluator = TrialEvaluator::new(
+            &initial,
+            &domain,
+            "AA",
+            Direction::Decrypt,
+            MeasureId::Ic,
+            None,
+        );
+        assert!(accounting.evaluate(&evaluator, &[], 0).unwrap().is_some());
+        let failing = TrialEvaluator::new(
+            &initial,
+            &domain,
+            "AA",
+            Direction::Decrypt,
+            MeasureId::Trie,
+            None,
+        );
+        assert_eq!(
+            accounting.evaluate(&failing, &[], 0),
+            Err(ObservedClimbError::Evaluation(
+                TrialEvaluationError::MissingResource(MeasureId::Trie)
+            ))
+        );
+        assert_eq!(allowance.used, 9);
+        assert_eq!(control.snapshot().evaluations_admitted, 2);
+        assert_eq!(control.snapshot().evaluations_completed, 1);
+    }
+
+    #[test]
+    fn observed_climb_preserves_phases_budgets_and_notifications() {
+        let (initial, domain) = fixture();
+        let first = resource(&initial);
+        // Distinct bindings cross at one pair, or rescore at termination at two.
+        for (threshold, distinct, limit, used, exhausted, paired, expected_ascent) in [
+            (2, false, 0, 0, false, false, false),
+            (2, false, 3, 3, false, false, false),
+            (2, false, 9, 9, true, true, true),
+            (1, true, 1, 0, false, false, false),
+            (1, true, 5, 5, false, true, false),
+            (2, true, 100, 10, true, true, false),
+        ] {
+            let last = resource(&initial);
+            let context = BoundClimbScoring::new(
+                &initial,
+                &domain,
+                "AA",
+                (MeasureId::Trie, Some(&first)),
+                (MeasureId::Trie, Some(if distinct { &last } else { &first })),
+                threshold,
+            );
+            let mut allowance = EvaluationAllowance {
+                used: 7,
+                limit: 7 + limit,
+            };
+            let mut control = AttackControl::default();
+            let mut observer = Recorder::default();
+            let outcome = context
+                .climb_observed(
+                    vec![],
+                    0,
+                    &mut ObservedAccounting {
+                        allowance: &mut allowance,
+                        control: &mut control,
+                        observer: &mut observer,
+                    },
+                )
+                .unwrap();
+            let snapshot = control.snapshot();
+            assert_eq!(
+                (
+                    snapshot.evaluations_admitted,
+                    snapshot.evaluations_completed
+                ),
+                (used, used)
+            );
+            assert_eq!(allowance.used, 7 + used);
+            assert_eq!(snapshot.climbs_started, u128::from(used > 0));
+            assert_eq!(snapshot.climbs_completed, u128::from(exhausted));
+            assert_eq!(snapshot.outers_completed, 0);
+            assert_eq!(outcome.neighborhood_exhausted, exhausted);
+            assert_eq!(outcome.budget_stopped, !exhausted);
+            assert_eq!(outcome.final_objective_ascent, expected_ascent);
+            if let Some(current) = outcome.current {
+                assert_eq!(
+                    current.board,
+                    if paired { vec![('A', 'C')] } else { vec![] }
+                );
+                assert_eq!(current.plaintext, if paired { "CB" } else { "CA" });
+                assert_eq!(
+                    current.score.ranking().units(),
+                    if paired { 2i128 << 32 } else { 0 }
+                );
+            } else {
+                assert_eq!(used, 0);
+            }
+            assert_eq!(observer.0.first(), Some(&Default::default()));
+            assert_eq!(observer.0.last(), Some(&snapshot));
+            assert_eq!(
+                observer.0.len() as u64,
+                2 + used * 2 + u64::from(used > 0) + u64::from(exhausted)
+            );
+            assert!(observer
+                .0
+                .windows(2)
+                .all(|pair| pair[1].evaluations_completed <= pair[1].evaluations_admitted));
+        }
+    }
+
+    #[test]
+    fn observed_errors_keep_charges_and_never_complete_the_climb() {
+        let (initial, domain) = fixture();
+        let resource = resource(&initial);
+        for (threshold, used) in [(1, 5), (2, 10)] {
+            let context = BoundClimbScoring::new(
+                &initial,
+                &domain,
+                "AA",
+                (MeasureId::Trie, Some(&resource)),
+                (MeasureId::Trie, None),
+                threshold,
+            );
+            let mut allowance = EvaluationAllowance {
+                used: 7,
+                limit: 107,
+            };
+            let mut control = AttackControl::default();
+            let mut observer = Recorder::default();
+            let error = context
+                .climb_observed(
+                    vec![],
+                    0,
+                    &mut ObservedAccounting {
+                        allowance: &mut allowance,
+                        control: &mut control,
+                        observer: &mut observer,
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(
+                error,
+                ObservedClimbError::Evaluation(TrialEvaluationError::MissingResource(
+                    MeasureId::Trie
+                ))
+            );
+            let snapshot = control.snapshot();
+            assert_eq!(
+                (
+                    snapshot.evaluations_admitted,
+                    snapshot.evaluations_completed
+                ),
+                (used, used - 1)
+            );
+            assert_eq!(
+                (
+                    snapshot.climbs_started,
+                    snapshot.climbs_completed,
+                    snapshot.outers_completed
+                ),
+                (1, 0, 0)
+            );
+            assert_eq!(allowance.used, 7 + used);
+            assert_eq!(observer.0.last(), Some(&snapshot));
+        }
+    }
+
+    #[test]
+    fn observed_counter_overflow_is_explicit() {
+        use crate::attack_control::CounterSnapshot;
+        let (initial, domain) = fixture();
+        let evaluator = TrialEvaluator::new(
+            &initial,
+            &domain,
+            "AA",
+            Direction::Decrypt,
+            MeasureId::Ic,
+            None,
+        );
+        for (admitted, completed, expected) in [
+            (u64::MAX, 0, CounterOverflow::EvaluationsAdmitted),
+            (0, u64::MAX, CounterOverflow::EvaluationsCompleted),
+        ] {
+            let mut control = AttackControl::with_counters(CounterSnapshot {
+                evaluations_admitted: admitted,
+                evaluations_completed: completed,
+                ..CounterSnapshot::default()
+            });
+            let mut allowance = EvaluationAllowance { used: 7, limit: 8 };
+            let mut observer = Recorder::default();
+            let error = ObservedAccounting {
+                allowance: &mut allowance,
+                control: &mut control,
+                observer: &mut observer,
+            }
+            .evaluate(&evaluator, &[], 0)
+            .unwrap_err();
+            assert_eq!(error, ObservedClimbError::Counter(expected));
+            assert_eq!(allowance.used, 8);
+            assert_eq!(control.snapshot().evaluations_completed, completed);
+            assert_eq!(
+                control.snapshot().evaluations_admitted,
+                if admitted == 0 { 1 } else { admitted }
+            );
+        }
+    }
 
     fn fixture() -> (ResolvedConfiguration, AttackPlugboardDomain) {
         let source = serde_json::json!({"kind": "custom", "value": {

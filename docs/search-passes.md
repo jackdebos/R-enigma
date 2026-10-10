@@ -292,10 +292,10 @@ the budget, timeout heuristic, cancellation or new wire event is specified.
 
 ### 6.1 Future private progress and cancellation — Task 12.1a
 
-**Normative private groundwork, not implemented.** Existing private HC/PE runtimes
-still lack this control/accounting hookup. Task 12 remains partial; this contract
-adds no public runtime, exports, events, CLI/platform controls or checkpoint/resume.
-The Task 11 budget-only behavior above remains the present-day implementation.
+**Normative private contract; accounting implemented for a single climb only.**
+Task 12.2a adds counter-only observation; budget-only callers retain Task 11 behavior.
+Cancellation and aggregate HC/PE control integration remain deferred, as do public
+runtime, exports, events, CLI/platform controls and checkpoint/resume.
 
 #### Accounting and completion
 

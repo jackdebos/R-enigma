@@ -33,6 +33,14 @@ pub(super) struct AttackControl {
 }
 
 impl AttackControl {
+    #[cfg(test)]
+    pub(super) fn with_counters(counters: CounterSnapshot) -> Self {
+        Self {
+            counters,
+            cancelled: false,
+        }
+    }
+
     pub(super) fn snapshot(&self) -> CounterSnapshot {
         self.counters
     }
