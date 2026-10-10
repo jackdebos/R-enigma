@@ -489,6 +489,9 @@ impl From<TrialEvaluationError> for ObservedClimbError {
 /// One accounting path for all scoring phases; existing callers remain budget-only.
 trait EvaluationAccounting {
     type Error: From<TrialEvaluationError>;
+    fn cancelled(&mut self) -> bool {
+        false
+    }
     fn admit(&mut self, reserve: u64) -> Result<bool, Self::Error>;
     fn transition(
         &mut self,
@@ -543,6 +546,33 @@ impl<O: CounterObserver> EvaluationAccounting for ObservedAccounting<'_, O> {
     }
 }
 
+/// Request polling is independent of counter notification and sticks in the control.
+struct CancellableAccounting<'a, 'b, O, F> {
+    observed: &'a mut ObservedAccounting<'b, O>,
+    requested: F,
+}
+
+impl<O: CounterObserver, F: FnMut() -> bool> EvaluationAccounting
+    for CancellableAccounting<'_, '_, O, F>
+{
+    type Error = ObservedClimbError;
+
+    fn cancelled(&mut self) -> bool {
+        self.observed.control.poll_cancellation((self.requested)())
+    }
+
+    fn admit(&mut self, reserve: u64) -> Result<bool, Self::Error> {
+        self.observed.admit(reserve)
+    }
+
+    fn transition(
+        &mut self,
+        record: fn(&mut AttackControl) -> Result<(), CounterOverflow>,
+    ) -> Result<(), Self::Error> {
+        self.observed.transition(record)
+    }
+}
+
 /// Both evaluators share immutable machine, domain, input and decrypt direction.
 struct BoundClimbScoring<'a> {
     initial: &'a ResolvedConfiguration,
@@ -571,6 +601,7 @@ struct ScoringState<'c, 'a> {
 pub(crate) struct ClimbOutcome {
     pub(crate) current: Option<ScoredBoard>,
     pub(crate) budget_stopped: bool,
+    pub(crate) cancelled: bool,
     pub(crate) final_objective_ascent: bool,
     pub(crate) neighborhood_exhausted: bool,
 }
@@ -668,21 +699,49 @@ impl<'a> BoundClimbScoring<'a> {
         result
     }
 
+    fn climb_cancellable(
+        &self,
+        board: MutableBoard,
+        backtrack_pairs: usize,
+        accounting: &mut ObservedAccounting<'_, impl CounterObserver>,
+        requested: impl FnMut() -> bool,
+    ) -> Result<ClimbOutcome, ObservedClimbError> {
+        accounting.control.notify(accounting.observer);
+        let result = self.climb_accounted(
+            board,
+            backtrack_pairs,
+            &mut CancellableAccounting {
+                observed: accounting,
+                requested,
+            },
+        );
+        accounting.control.notify(accounting.observer);
+        result
+    }
+
     fn climb_accounted<A: EvaluationAccounting>(
         &self,
         board: MutableBoard,
         backtrack_pairs: usize,
         allowance: &mut A,
     ) -> Result<ClimbOutcome, A::Error> {
-        let Some(mut state) = self.start(board, allowance)? else {
+        let mut cancelled = allowance.cancelled();
+        let started = if cancelled {
+            None
+        } else {
+            self.start(board, allowance)?
+        };
+        let Some(mut state) = started else {
             return Ok(ClimbOutcome {
                 current: None,
-                budget_stopped: true,
+                budget_stopped: !cancelled,
+                cancelled,
                 final_objective_ascent: false,
                 neighborhood_exhausted: false,
             });
         };
         allowance.transition(AttackControl::record_climb_started)?;
+        allowance.cancelled();
         let mut final_objective_ascent = false;
         let neighborhood_exhausted = loop {
             // Build from this state's context, never an independently bound evaluator.
@@ -705,6 +764,10 @@ impl<'a> BoundClimbScoring<'a> {
             )?;
             match outcome {
                 ScanOutcome::Interrupted => break false,
+                ScanOutcome::Cancelled => {
+                    cancelled = true;
+                    break false;
+                }
                 ScanOutcome::Complete(winner) => {
                     final_objective_ascent |= state.final_phase || self.identical;
                     let Some(winner) = winner else { break true };
@@ -713,6 +776,7 @@ impl<'a> BoundClimbScoring<'a> {
                     state = state
                         .commit_trial(winner, allowance)?
                         .expect("complete scan preserved the objective-crossing reservation");
+                    allowance.cancelled();
                 }
             }
         };
@@ -726,7 +790,8 @@ impl<'a> BoundClimbScoring<'a> {
         }
         Ok(ClimbOutcome {
             current: Some(current),
-            budget_stopped: !neighborhood_exhausted,
+            budget_stopped: !neighborhood_exhausted && !cancelled,
+            cancelled,
             final_objective_ascent,
             neighborhood_exhausted,
         })
@@ -861,6 +926,7 @@ impl ScoringState<'_, '_> {
 enum ScanOutcome {
     Complete(Option<ScoredBoard>),
     Interrupted,
+    Cancelled,
 }
 
 pub(super) struct NeighborhoodSelection<'a> {
@@ -878,12 +944,16 @@ impl NeighborhoodSelection<'_> {
         allowance: &mut A,
         reserve: u64,
     ) -> Result<ScanOutcome, A::Error> {
-        let cursor =
+        let mut cursor =
             NeighborhoodCursor::new(self.initial, self.domain, current, self.backtrack_pairs)
-                .map_err(TrialEvaluationError::Board)?;
+                .map_err(TrialEvaluationError::Board)?
+                .peekable();
         let mut best = None;
         let mut best_ranking = ranking;
-        for board in cursor {
+        while let Some(board) = cursor.next() {
+            if allowance.cancelled() {
+                return Ok(ScanOutcome::Cancelled);
+            }
             let Some((plaintext, score)) = allowance.evaluate(self.evaluator, &board, reserve)?
             else {
                 return Ok(ScanOutcome::Interrupted);
@@ -895,6 +965,13 @@ impl NeighborhoodSelection<'_> {
                     plaintext,
                     score,
                 });
+            }
+            if allowance.cancelled() {
+                // A completed losing scan has already established exhaustion.
+                if best.is_none() && cursor.peek().is_none() {
+                    return Ok(ScanOutcome::Complete(None));
+                }
+                return Ok(ScanOutcome::Cancelled);
             }
         }
         Ok(ScanOutcome::Complete(best))
@@ -915,6 +992,266 @@ mod tests {
         fn observe(&mut self, snapshot: crate::attack_control::CounterSnapshot) {
             self.0.push(snapshot);
         }
+    }
+
+    fn run_cancellation(
+        context: &BoundClimbScoring<'_>,
+        stop_poll: usize,
+        limit: u64,
+    ) -> (
+        Result<ClimbOutcome, ObservedClimbError>,
+        crate::attack_control::CounterSnapshot,
+        u64,
+        usize,
+    ) {
+        let mut allowance = EvaluationAllowance {
+            used: 7,
+            limit: 7 + limit,
+        };
+        let mut control = AttackControl::default();
+        let mut observer = Recorder::default();
+        let mut polls = 0;
+        let result = context.climb_cancellable(
+            vec![],
+            0,
+            &mut ObservedAccounting {
+                allowance: &mut allowance,
+                control: &mut control,
+                observer: &mut observer,
+            },
+            || {
+                polls += 1;
+                polls == stop_poll
+            },
+        );
+        let snapshot = control.snapshot();
+        assert_eq!(observer.0.last(), Some(&snapshot));
+        assert_eq!(snapshot.outers_completed, 0);
+        (result, snapshot, allowance.used - 7, polls)
+    }
+
+    #[test]
+    fn cancelled_scan_keeps_committed_board() {
+        let (initial, domain) = fixture();
+        let resource = resource(&initial);
+        let context = BoundClimbScoring::new(
+            &initial,
+            &domain,
+            "AA",
+            (MeasureId::Trie, Some(&resource)),
+            (MeasureId::Trie, Some(&resource)),
+            2,
+        );
+        // Successful provisional winners, including the last trial, never commit.
+        for (stop, used, committed) in [(4, 2, false), (6, 3, false), (8, 4, false), (9, 4, true)] {
+            let (result, snapshot, actual, _) = run_cancellation(&context, stop, 100);
+            let outcome = result.unwrap();
+            assert_eq!(
+                outcome.current.unwrap().board,
+                if committed { vec![('A', 'C')] } else { vec![] }
+            );
+            assert!(outcome.cancelled);
+            assert!(!outcome.budget_stopped && !outcome.neighborhood_exhausted);
+            assert_eq!(outcome.final_objective_ascent, committed);
+            assert_eq!(actual, used);
+            assert_eq!(
+                (
+                    snapshot.evaluations_admitted,
+                    snapshot.evaluations_completed
+                ),
+                (used, used)
+            );
+            assert_eq!((snapshot.climbs_started, snapshot.climbs_completed), (1, 0));
+        }
+    }
+
+    #[test]
+    fn cancellation_precedence_and_initial_result() {
+        let (initial, domain) = fixture();
+        let resource = resource(&initial);
+        let context = BoundClimbScoring::new(
+            &initial,
+            &domain,
+            "AA",
+            (MeasureId::Trie, Some(&resource)),
+            (MeasureId::Trie, Some(&resource)),
+            2,
+        );
+        for (stop, limit, used, cancelled, exhausted) in [
+            (1, 0, 0, true, false),
+            (1, 100, 0, true, false),
+            (2, 1, 1, true, false),
+            (3, 1, 1, true, false),
+            (0, 1, 1, false, false),
+            (19, 9, 9, false, true),
+        ] {
+            let (result, snapshot, actual, polls) = run_cancellation(&context, stop, limit);
+            let outcome = result.unwrap();
+            assert_eq!(
+                (outcome.cancelled, outcome.neighborhood_exhausted),
+                (cancelled, exhausted)
+            );
+            assert_eq!(outcome.budget_stopped, !cancelled && !exhausted);
+            assert_eq!(outcome.current.is_some(), used > 0);
+            assert_eq!(actual, used);
+            assert_eq!(snapshot.climbs_started, u128::from(used > 0));
+            assert_eq!(snapshot.climbs_completed, u128::from(exhausted));
+            if stop == 2 {
+                assert!(polls > stop);
+            } // True then false stays sticky.
+        }
+        let empty = AttackPlugboardDomain::parse_json(
+            initial.topology().alphabet(),
+            &[],
+            r#"{"kind":"attack","symbols":["A","B","C"],"max_pairs":0}"#,
+        )
+        .unwrap();
+        let context = BoundClimbScoring::new(
+            &initial,
+            &empty,
+            "AA",
+            (MeasureId::Trie, Some(&resource)),
+            (MeasureId::Trie, Some(&resource)),
+            2,
+        );
+        let (result, snapshot, used, _) = run_cancellation(&context, 2, 1);
+        let outcome = result.unwrap();
+        assert!(outcome.neighborhood_exhausted && !outcome.cancelled);
+        assert_eq!((used, snapshot.climbs_completed), (1, 1));
+    }
+
+    #[test]
+    fn cancelled_finalization_preserves_errors_and_usage() {
+        let (initial, domain) = fixture();
+        let first = resource(&initial);
+        let last = resource(&initial);
+        // Distinct objective binding reserves exactly one final rescore.
+        for (threshold, stop, used, paired) in [
+            (2, 2, 2, false),
+            (2, 8, 5, false),
+            (2, 9, 5, true),
+            (1, 9, 5, true),
+        ] {
+            let context = BoundClimbScoring::new(
+                &initial,
+                &domain,
+                "AA",
+                (MeasureId::Trie, Some(&first)),
+                (MeasureId::Trie, Some(&last)),
+                threshold,
+            );
+            let (result, snapshot, actual, _) = run_cancellation(&context, stop, used);
+            let outcome = result.unwrap();
+            let current = outcome.current.unwrap();
+            assert!(outcome.cancelled && !outcome.neighborhood_exhausted);
+            assert_eq!(
+                current.board,
+                if paired { vec![('A', 'C')] } else { vec![] }
+            );
+            assert_eq!(
+                current.score.ranking().units(),
+                if paired { 2i128 << 32 } else { 0 }
+            );
+            assert_eq!(actual, used);
+            assert_eq!(
+                (
+                    snapshot.evaluations_admitted,
+                    snapshot.evaluations_completed
+                ),
+                (used, used)
+            );
+            assert_eq!(snapshot.climbs_completed, 0);
+        }
+        for (missing_initial, stop, used, started) in [
+            (true, 2, 1, 0),
+            (false, 2, 2, 1),
+            (false, 8, 5, 1),
+            (false, 9, 5, 1),
+        ] {
+            let context = BoundClimbScoring::new(
+                &initial,
+                &domain,
+                "AA",
+                (
+                    MeasureId::Trie,
+                    if missing_initial { None } else { Some(&first) },
+                ),
+                (MeasureId::Trie, None),
+                if stop == 9 { 1 } else { 2 },
+            );
+            let (result, snapshot, actual, _) = run_cancellation(&context, stop, 100);
+            assert_eq!(
+                result.unwrap_err(),
+                ObservedClimbError::Evaluation(TrialEvaluationError::MissingResource(
+                    MeasureId::Trie
+                ))
+            );
+            assert_eq!(actual, used);
+            assert_eq!(
+                (
+                    snapshot.evaluations_admitted,
+                    snapshot.evaluations_completed
+                ),
+                (used, used - 1)
+            );
+            assert_eq!(
+                (snapshot.climbs_started, snapshot.climbs_completed),
+                (started, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn admitted_trial_error_precedes_pending_cancellation() {
+        let (initial, domain) = fixture();
+        let evaluator = TrialEvaluator::new(
+            &initial,
+            &domain,
+            "AA",
+            Direction::Decrypt,
+            MeasureId::Trie,
+            None,
+        );
+        let selection = NeighborhoodSelection {
+            initial: &initial,
+            domain: &domain,
+            evaluator: &evaluator,
+            backtrack_pairs: 0,
+        };
+        let mut allowance = EvaluationAllowance {
+            used: 7,
+            limit: 107,
+        };
+        let mut control = AttackControl::default();
+        let mut observer = Recorder::default();
+        let mut polls = 0;
+        let result = selection.scan(
+            &[],
+            FixedScore::from_units(0),
+            &mut CancellableAccounting {
+                observed: &mut ObservedAccounting {
+                    allowance: &mut allowance,
+                    control: &mut control,
+                    observer: &mut observer,
+                },
+                requested: || {
+                    polls += 1;
+                    polls > 1
+                },
+            },
+            0,
+        );
+        assert_eq!(
+            result,
+            Err(ObservedClimbError::Evaluation(
+                TrialEvaluationError::MissingResource(MeasureId::Trie)
+            ))
+        );
+        assert_eq!(polls, 1); // A failed evaluation never reaches the post-success poll.
+        assert_eq!(allowance.used, 8);
+        assert_eq!(control.snapshot().evaluations_admitted, 1);
+        assert_eq!(control.snapshot().evaluations_completed, 0);
+        assert_eq!(control.snapshot().climbs_completed, 0);
     }
 
     #[test]
