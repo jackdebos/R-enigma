@@ -40,6 +40,7 @@ pub(crate) enum DirectRunTermination {
     OuterSliceEnd,
     Completed,
     EvaluationBudget,
+    Cancelled,
 }
 
 #[derive(Debug)]
@@ -57,6 +58,19 @@ pub(crate) struct DirectRunOutcome {
 pub(crate) enum DirectRunError {
     Resolution(Vec<crate::SearchDiagnostic>),
     Climb(DirectClimbError),
+    Counter(CounterOverflow),
+    MissingOuter,
+}
+
+impl From<ObservedClimbError> for DirectRunError {
+    fn from(error: ObservedClimbError) -> Self {
+        match error {
+            ObservedClimbError::Evaluation(source) => {
+                Self::Climb(DirectClimbError::Evaluation(source))
+            }
+            ObservedClimbError::Counter(source) => Self::Counter(source),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -250,6 +264,87 @@ impl crate::AttackRequest {
     }
 
     /// Same-owner lazy projection closes the adapter's key/index provenance precondition.
+    fn schedule_direct_outers_controlled(
+        &self,
+        control: &mut AttackControl,
+        observer: &mut impl CounterObserver,
+        mut requested: impl FnMut() -> bool,
+    ) -> Result<DirectRunOutcome, IndexedDirectRunError> {
+        control.notify(observer);
+        let mut allowance = EvaluationAllowance {
+            used: 0,
+            limit: self.settings().evaluation_budget(),
+        };
+        let result = if self.settings().kind() != crate::AttackKind::HillClimb {
+            Err(IndexedDirectRunError {
+                outer_index: None,
+                evaluations_used: 0,
+                source: DirectRunError::Climb(DirectClimbError::UnsupportedPass),
+            })
+        } else {
+            schedule_controlled_direct(
+                self.gate().outer_selected(),
+                self.outer_candidates(),
+                &mut ObservedAccounting {
+                    allowance: &mut allowance,
+                    control,
+                    observer,
+                },
+                &mut requested,
+                |initial, index, accounting, requested| {
+                    let (scoring, start) = self
+                        .direct_scoring(&initial)
+                        .map_err(DirectRunError::Climb)?;
+                    let climb = scoring
+                        .climb_cancellable(
+                            start,
+                            self.settings().backtrack_pairs(),
+                            accounting,
+                            requested,
+                        )
+                        .map_err(DirectRunError::from)?;
+                    Ok(DirectOuterOutcome {
+                        initial,
+                        outer_index: index,
+                        start_index: 0,
+                        evaluations_used: accounting.allowance.used,
+                        climb,
+                    })
+                },
+            )
+        };
+        control.notify(observer);
+        result
+    }
+
+    /// Both direct entry points bind the same owner, objectives and owned start.
+    fn direct_scoring<'a>(
+        &'a self,
+        initial: &'a ResolvedConfiguration,
+    ) -> Result<(BoundClimbScoring<'a>, MutableBoard), DirectClimbError> {
+        let settings = self.settings();
+        if settings.kind() != crate::AttackKind::HillClimb {
+            return Err(DirectClimbError::UnsupportedPass);
+        }
+        let start = settings
+            .start()
+            .ok_or(DirectClimbError::MissingStart)?
+            .to_vec();
+        let first = settings.initial_measure();
+        let last = settings.final_measure();
+        Ok((
+            BoundClimbScoring::new(
+                initial,
+                self.domain(),
+                self.text(),
+                (first, self.bound_resource(first)),
+                (last, self.bound_resource(last)),
+                settings.switch_pairs(),
+            ),
+            start,
+        ))
+    }
+
     pub(crate) fn schedule_direct_outers(&self) -> Result<DirectRunOutcome, IndexedDirectRunError> {
         if self.settings().kind() != crate::AttackKind::HillClimb {
             return Err(IndexedDirectRunError {
@@ -334,22 +429,9 @@ impl crate::AttackRequest {
     ) -> Result<DirectOuterOutcome, IndexedDirectClimbError> {
         let settings = self.settings();
         let mut run = || -> Result<ClimbOutcome, DirectClimbError> {
-            if settings.kind() != crate::AttackKind::HillClimb {
-                return Err(DirectClimbError::UnsupportedPass);
-            }
-            let start = settings.start().ok_or(DirectClimbError::MissingStart)?;
-            let first = settings.initial_measure();
-            let last = settings.final_measure();
-            let scoring = BoundClimbScoring::new(
-                &initial,
-                self.domain(),
-                self.text(),
-                (first, self.bound_resource(first)),
-                (last, self.bound_resource(last)),
-                settings.switch_pairs(),
-            );
+            let (scoring, start) = self.direct_scoring(&initial)?;
             scoring
-                .climb(start.to_vec(), settings.backtrack_pairs(), allowance)
+                .climb(start, settings.backtrack_pairs(), allowance)
                 .map_err(DirectClimbError::Evaluation)
         };
         let climb = run().map_err(|source| IndexedDirectClimbError {
@@ -365,6 +447,100 @@ impl crate::AttackRequest {
             climb,
         })
     }
+}
+
+/// Known cardinality establishes exhaustion without resolving a speculative next outer.
+/// The adapter seam also permits deterministic indexed resolution/scoring fault tests.
+fn schedule_controlled_direct<O: CounterObserver, F: FnMut() -> bool>(
+    selected: u128,
+    mut outers: impl Iterator<
+        Item = (
+            u128,
+            Result<ResolvedConfiguration, Vec<crate::SearchDiagnostic>>,
+        ),
+    >,
+    accounting: &mut ObservedAccounting<'_, O>,
+    requested: &mut F,
+    mut climb: impl FnMut(
+        ResolvedConfiguration,
+        u128,
+        &mut ObservedAccounting<'_, O>,
+        &mut F,
+    ) -> Result<DirectOuterOutcome, DirectRunError>,
+) -> Result<DirectRunOutcome, IndexedDirectRunError> {
+    accounting.control.notify(accounting.observer);
+    let run = (|| {
+        let before = accounting.control.snapshot();
+        let mut result = DirectRunOutcome {
+            termination: DirectRunTermination::OuterSliceEnd,
+            outer_completed: 0,
+            climbs_started: 0,
+            climbs_completed: 0,
+            evaluations_used: accounting.allowance.used,
+            best: None,
+        };
+        for _ in 0..selected {
+            if accounting.control.poll_cancellation(requested()) {
+                result.termination = DirectRunTermination::Cancelled;
+                break;
+            }
+            let (index, initial) = outers.next().ok_or(IndexedDirectRunError {
+                outer_index: None,
+                evaluations_used: accounting.allowance.used,
+                source: DirectRunError::MissingOuter,
+            })?;
+            let outcome = (|| {
+                let initial = initial.map_err(DirectRunError::Resolution)?;
+                let outcome = climb(initial, index, accounting, requested)?;
+                if outcome.climb.neighborhood_exhausted {
+                    accounting
+                        .transition(AttackControl::record_outer_completed)
+                        .map_err(DirectRunError::from)?;
+                }
+                Ok(outcome)
+            })()
+            .map_err(|source| IndexedDirectRunError {
+                outer_index: Some(index),
+                evaluations_used: accounting.allowance.used,
+                source,
+            })?;
+            let cancelled = outcome.climb.cancelled;
+            let interrupted = outcome.climb.budget_stopped;
+            let now = accounting.control.snapshot();
+            // These counters only increase; subtraction retains prior caller facts without reset.
+            result.climbs_started = now.climbs_started - before.climbs_started;
+            result.climbs_completed = now.climbs_completed - before.climbs_completed;
+            result.outer_completed = now.outers_completed - before.outers_completed;
+            result.evaluations_used = accounting.allowance.used;
+            if let Some(current) = &outcome.climb.current {
+                if result.best.as_ref().is_none_or(|best| {
+                    current.score.ranking().units()
+                        > best
+                            .climb
+                            .current
+                            .as_ref()
+                            .expect("best has committed board")
+                            .score
+                            .ranking()
+                            .units()
+                }) {
+                    result.best = Some(outcome);
+                }
+            }
+            if cancelled || interrupted {
+                result.termination = if cancelled {
+                    DirectRunTermination::Cancelled
+                } else {
+                    DirectRunTermination::EvaluationBudget
+                };
+                break;
+            }
+            result.termination = DirectRunTermination::Completed;
+        }
+        Ok(result)
+    })();
+    accounting.control.notify(accounting.observer);
+    run
 }
 
 /// Lazy empty/single mutable remainders. Fixed knowledge stays in the bound domain.
@@ -2038,6 +2214,350 @@ mod tests {
                 DirectRunError::Climb(DirectClimbError::UnsupportedPass)
             ));
             assert_eq!(error.evaluations_used, 0);
+        }
+    }
+
+    #[test]
+    fn controlled_outer_cancel_between_outers() {
+        struct Observer<'a>(&'a std::cell::Cell<u128>, Recorder);
+        impl CounterObserver for Observer<'_> {
+            fn observe(&mut self, snapshot: crate::attack_control::CounterSnapshot) {
+                self.0.set(snapshot.outers_completed);
+                self.1.observe(snapshot);
+            }
+        }
+        let completed = std::cell::Cell::new(0);
+        let mut observer = Observer(&completed, Recorder::default());
+        let mut control = AttackControl::default();
+        let run = scheduler_request(9, false, false, 0)
+            .schedule_direct_outers_controlled(&mut control, &mut observer, || completed.get() == 1)
+            .unwrap();
+        assert_eq!(run.termination, DirectRunTermination::Cancelled);
+        assert_eq!(direct_counts(&run), (1, 1, 1, 9));
+        let best = run.best.unwrap();
+        assert_eq!(best.outer_index, 0);
+        assert_eq!(best.start_index, 0);
+        let current = best.climb.current.unwrap();
+        assert_eq!(current.board, vec![('A', 'C')]);
+        assert_eq!(current.plaintext, "CB");
+        assert_eq!(current.score.ranking().units(), 2i128 << 32);
+        assert!(best.climb.neighborhood_exhausted && best.climb.final_objective_ascent);
+        assert!(!best.climb.cancelled && !best.climb.budget_stopped);
+        let snapshot = control.snapshot();
+        assert_eq!(
+            (
+                snapshot.evaluations_admitted,
+                snapshot.evaluations_completed
+            ),
+            (9, 9)
+        );
+        assert_eq!(
+            (
+                snapshot.climbs_started,
+                snapshot.climbs_completed,
+                snapshot.outers_completed
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(observer.1 .0.last(), Some(&snapshot));
+        assert_eq!(observer.1 .0.first(), Some(&Default::default()));
+    }
+
+    fn direct_counts(run: &DirectRunOutcome) -> (u128, u128, u128, u64) {
+        (
+            run.outer_completed,
+            run.climbs_started,
+            run.climbs_completed,
+            run.evaluations_used,
+        )
+    }
+
+    fn controlled_run(request: &crate::AttackRequest, stop: usize) -> (DirectRunOutcome, Recorder) {
+        let mut control = AttackControl::default();
+        let mut observer = Recorder::default();
+        let mut polls = 0;
+        let run = request
+            .schedule_direct_outers_controlled(&mut control, &mut observer, || {
+                polls += 1;
+                polls == stop // Subsequent false polls must not clear cancellation.
+            })
+            .unwrap();
+        assert_eq!(observer.0.last(), Some(&control.snapshot()));
+        (run, observer)
+    }
+
+    #[test]
+    fn controlled_outer_entry_exhaustion_and_pass_precedence() {
+        for (offset, pe, reason) in [
+            (0, false, Some(DirectRunTermination::Cancelled)),
+            (3, false, Some(DirectRunTermination::OuterSliceEnd)),
+            (3, true, None),
+        ] {
+            let mut control = AttackControl::default();
+            let mut observer = Recorder::default();
+            control.poll_cancellation(offset == 0);
+            let mut polls = 0;
+            let run = scheduler_request(1, false, pe, offset).schedule_direct_outers_controlled(
+                &mut control,
+                &mut observer,
+                || {
+                    polls += 1;
+                    offset != 0
+                },
+            );
+            if let Some(reason) = reason {
+                let run = run.unwrap();
+                assert_eq!(run.termination, reason);
+                assert!(run.best.is_none());
+                assert_eq!(direct_counts(&run), (0, 0, 0, 0));
+            } else {
+                let error = run.unwrap_err();
+                assert!(matches!(
+                    error.source,
+                    DirectRunError::Climb(DirectClimbError::UnsupportedPass)
+                ));
+                assert_eq!(error.outer_index, None);
+            }
+            assert_eq!(polls, usize::from(offset == 0));
+            assert_eq!(control.snapshot(), Default::default());
+            assert_eq!(observer.0.last(), observer.0.first());
+        }
+    }
+
+    #[test]
+    fn controlled_outer_scan_and_reserved_finalization() {
+        // One outer-entry poll precedes the existing single-climb safe points.
+        for (stop, used, paired) in [
+            (3, 1, false),
+            (5, 2, false),
+            (7, 3, false),
+            (9, 4, false),
+            (10, 4, true),
+        ] {
+            let (run, snapshots) = controlled_run(&scheduler_request(100, false, false, 0), stop);
+            assert_eq!(run.termination, DirectRunTermination::Cancelled);
+            assert_eq!(direct_counts(&run), (0, 1, 0, used));
+            let best = run.best.unwrap();
+            let current = best.climb.current.unwrap();
+            assert_eq!(
+                current.board,
+                if paired { vec![('A', 'C')] } else { vec![] }
+            );
+            assert_eq!(current.plaintext, if paired { "CB" } else { "CA" });
+            assert_eq!(
+                current.score.ranking().units(),
+                if paired { 2i128 << 32 } else { 0 }
+            );
+            assert!(
+                best.climb.cancelled
+                    && !best.climb.budget_stopped
+                    && !best.climb.neighborhood_exhausted
+            );
+            assert_eq!(best.climb.final_objective_ascent, paired);
+            let final_snapshot = snapshots.0.last().unwrap();
+            assert_eq!(
+                (
+                    final_snapshot.evaluations_admitted,
+                    final_snapshot.evaluations_completed
+                ),
+                (used, used)
+            );
+        }
+        for distinct in [false, true] {
+            let (run, _) = controlled_run(&scheduler_request(100, distinct, false, 0), 3);
+            assert_eq!(run.evaluations_used, if distinct { 2 } else { 1 });
+            assert_eq!(run.best.unwrap().climb.current.unwrap().plaintext, "CA");
+        }
+    }
+
+    #[test]
+    fn controlled_outer_legacy_equivalence_and_prior_counters() {
+        for (budget, distinct, offset) in
+            [(100, false, 0), (100, true, 1), (9, false, 0), (1, true, 0)]
+        {
+            let request = scheduler_request(budget, distinct, false, offset);
+            let expected = request.schedule_direct_outers().unwrap();
+            let mut control = AttackControl::default();
+            control.record_climb_started().unwrap();
+            control.record_climb_completed().unwrap();
+            control.record_outer_completed().unwrap();
+            let before = control.snapshot();
+            let mut observer = Recorder::default();
+            let run = request
+                .schedule_direct_outers_controlled(&mut control, &mut observer, || false)
+                .unwrap();
+            assert_eq!(run.termination, expected.termination);
+            assert_eq!(direct_counts(&run), direct_counts(&expected));
+            if let Some(best) = run.best {
+                let expected = expected.best.unwrap();
+                assert_eq!(
+                    (best.outer_index, best.start_index),
+                    (expected.outer_index, expected.start_index)
+                );
+                assert_eq!(best.initial, expected.initial);
+                assert_eq!(best.climb.current, expected.climb.current);
+                assert_eq!(
+                    best.climb.neighborhood_exhausted,
+                    expected.climb.neighborhood_exhausted
+                );
+                assert_eq!(
+                    best.climb.final_objective_ascent,
+                    expected.climb.final_objective_ascent
+                );
+                assert_eq!(best.climb.budget_stopped, expected.climb.budget_stopped);
+                assert!(!best.climb.cancelled);
+            } else {
+                assert!(expected.best.is_none());
+            }
+            assert_eq!(observer.0[0], before);
+            assert_eq!(
+                control.snapshot().outers_completed,
+                before.outers_completed + run.outer_completed
+            );
+        }
+        let empty = direct_request_with(serde_json::json!([]), false, false, |job| {
+            job["space"]["plugboard"]["max_pairs"] = serde_json::json!(0);
+            job["attack"]["evaluation_budget"] = serde_json::json!(1);
+        });
+        // Initial success latches cancellation, but established empty exhaustion wins.
+        let (run, _) = controlled_run(&empty, 3);
+        assert_eq!(run.termination, DirectRunTermination::Completed);
+        assert_eq!(direct_counts(&run), (1, 1, 1, 1));
+        let fixed = direct_request_with(serde_json::json!([]), false, false, |job| {
+            job["configuration"]["plugboard"] = serde_json::json!([["A", "B"]]);
+            job["space"]["plugboard"]["symbols"] = serde_json::json!(["C"]);
+        });
+        let expected = fixed.schedule_direct_outers().unwrap().best.unwrap();
+        let (run, _) = controlled_run(&fixed, 0);
+        let best = run.best.unwrap();
+        assert_eq!(best.initial, expected.initial);
+        assert_eq!(best.initial.plugboard().map('A'), Some('B'));
+        assert_eq!(best.climb.current, expected.climb.current);
+    }
+
+    #[test]
+    fn controlled_outer_indexed_errors_and_terminal_snapshots() {
+        let request = scheduler_request(100, false, false, 0);
+        let index = u128::from(u64::MAX) + 7;
+        for fault in 0..4 {
+            let initial = request.outer_candidates().next().unwrap().1.unwrap();
+            let diagnostics = vec![crate::SearchDiagnostic::new(
+                "invalid_search_space",
+                "injected resolution",
+                "/job/space",
+            )];
+            let item = if fault == 0 {
+                Err(diagnostics.clone())
+            } else {
+                Ok(initial)
+            };
+            let mut allowance = EvaluationAllowance {
+                used: 7,
+                limit: 107,
+            };
+            let mut control = AttackControl::default();
+            let mut observer = Recorder::default();
+            let mut polls = 0;
+            let error = schedule_controlled_direct(
+                1,
+                std::iter::once((index, item)),
+                &mut ObservedAccounting {
+                    allowance: &mut allowance,
+                    control: &mut control,
+                    observer: &mut observer,
+                },
+                &mut || {
+                    polls += 1;
+                    polls == if fault == 3 { 9 } else { 3 }
+                },
+                |initial, index, accounting, requested| {
+                    let resource = request.bound_resource(MeasureId::Trie);
+                    let scoring = BoundClimbScoring::new(
+                        &initial,
+                        request.domain(),
+                        request.text(),
+                        (MeasureId::Trie, if fault == 1 { None } else { resource }),
+                        (MeasureId::Trie, if fault >= 2 { None } else { resource }),
+                        1,
+                    );
+                    let climb = scoring
+                        .climb_cancellable(vec![], 0, accounting, requested)
+                        .map_err(DirectRunError::from)?;
+                    Ok(DirectOuterOutcome {
+                        initial,
+                        outer_index: index,
+                        start_index: 0,
+                        evaluations_used: accounting.allowance.used,
+                        climb,
+                    })
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.outer_index, Some(index));
+            let snapshot = control.snapshot();
+            assert_eq!(observer.0.last(), Some(&snapshot));
+            assert_eq!(observer.0.first(), Some(&Default::default()));
+            assert_eq!(snapshot.outers_completed, 0);
+            assert_eq!(snapshot.climbs_completed, 0);
+            if fault == 0 {
+                match error.source {
+                    DirectRunError::Resolution(source) => assert_eq!(source, diagnostics),
+                    _ => panic!("resolution source lost"),
+                }
+                assert_eq!(error.evaluations_used, 7);
+            } else {
+                assert!(matches!(
+                    error.source,
+                    DirectRunError::Climb(DirectClimbError::Evaluation(
+                        TrialEvaluationError::MissingResource(MeasureId::Trie)
+                    ))
+                ));
+                let used = match fault {
+                    1 => 1,
+                    3 => 5,
+                    _ => 2,
+                };
+                assert_eq!(error.evaluations_used, 7 + used);
+                assert_eq!(
+                    (
+                        snapshot.evaluations_admitted,
+                        snapshot.evaluations_completed
+                    ),
+                    (used, used - 1)
+                );
+                assert_eq!(snapshot.climbs_started, u128::from(fault != 1));
+            }
+        }
+    }
+
+    #[test]
+    fn controlled_outer_checked_counter_failures() {
+        use crate::attack_control::CounterSnapshot;
+        for (expected, used) in [
+            (CounterOverflow::EvaluationsAdmitted, 1),
+            (CounterOverflow::EvaluationsCompleted, 1),
+            (CounterOverflow::ClimbsStarted, 1),
+            (CounterOverflow::ClimbsCompleted, 9),
+            (CounterOverflow::OutersCompleted, 9),
+        ] {
+            let mut before = CounterSnapshot::default();
+            match expected {
+                CounterOverflow::EvaluationsAdmitted => before.evaluations_admitted = u64::MAX,
+                CounterOverflow::EvaluationsCompleted => before.evaluations_completed = u64::MAX,
+                CounterOverflow::ClimbsStarted => before.climbs_started = u128::MAX,
+                CounterOverflow::ClimbsCompleted => before.climbs_completed = u128::MAX,
+                CounterOverflow::OutersCompleted => before.outers_completed = u128::MAX,
+            }
+            let mut control = AttackControl::with_counters(before);
+            let mut observer = Recorder::default();
+            let error = scheduler_request(100, false, false, 0)
+                .schedule_direct_outers_controlled(&mut control, &mut observer, || false)
+                .unwrap_err();
+            assert!(matches!(error.source, DirectRunError::Counter(source) if source == expected));
+            assert_eq!(error.outer_index, Some(0));
+            assert_eq!(error.evaluations_used, used);
+            assert_eq!(observer.0[0], before); // Retained copies never change.
+            assert_eq!(observer.0.last(), Some(&control.snapshot()));
         }
     }
 
