@@ -21,6 +21,107 @@ pub(crate) struct DirectOuterOutcome {
     pub(crate) climb: ClimbOutcome,
 }
 
+#[derive(Debug)]
+enum ProjectionError {
+    MissingCommittedBoard,
+    Board(crate::attack_evaluator::TrialBoardError),
+}
+
+impl std::fmt::Display for ProjectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingCommittedBoard => f.write_str("accepted best has no committed board"),
+            Self::Board(source) => source.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for ProjectionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Board(source) => Some(source),
+            Self::MissingCommittedBoard => None,
+        }
+    }
+}
+
+impl DirectOuterOutcome {
+    fn project(
+        self,
+        domain: &AttackPlugboardDomain,
+        measure: MeasureId,
+    ) -> Result<crate::AttackBest, ProjectionError> {
+        let current = self
+            .climb
+            .current
+            .ok_or(ProjectionError::MissingCommittedBoard)?;
+        let complete = validated_trial_board(&self.initial, domain, &current.board)
+            .map_err(ProjectionError::Board)?;
+        let alphabet = complete.alphabet();
+        let mut mutable_plugboard = current.board;
+        for (left, right) in &mut mutable_plugboard {
+            if alphabet.index_of(*left) > alphabet.index_of(*right) {
+                std::mem::swap(left, right);
+            }
+        }
+        mutable_plugboard.sort_by_key(|&(a, b)| (alphabet.index_of(a), alphabet.index_of(b)));
+        let mut pairs = Vec::new();
+        for &left in &alphabet.symbols {
+            let right = complete.map(left).expect("validated alphabet mapping");
+            if alphabet.index_of(left) < alphabet.index_of(right) {
+                pairs.push((left, right));
+            }
+        }
+        let slots = self
+            .initial
+            .topology()
+            .slots()
+            .iter()
+            .map(|slot| {
+                crate::SlotConfiguration::new(slot.id(), slot.wheel(), slot.position(), slot.ring())
+            })
+            .collect();
+        Ok(crate::AttackBest {
+            configuration: crate::TransformConfiguration::new(slots, pairs),
+            mutable_plugboard,
+            plaintext: current.plaintext,
+            score: current.score,
+            measure,
+            outer_index: self.outer_index,
+            start_index: self.start_index,
+            incomplete: self.climb.cancelled || self.climb.budget_stopped,
+            final_objective_ascent: self.climb.final_objective_ascent,
+            neighborhood_exhausted: self.climb.neighborhood_exhausted,
+        })
+    }
+}
+
+impl DirectRunOutcome {
+    fn project(
+        self,
+        counters: crate::attack_control::CounterSnapshot,
+        domain: &AttackPlugboardDomain,
+        measure: MeasureId,
+    ) -> Result<crate::AttackResult, ProjectionError> {
+        use crate::AttackTermination;
+        let termination = match self.termination {
+            DirectRunTermination::Completed => AttackTermination::Completed,
+            DirectRunTermination::OuterSliceEnd => AttackTermination::OuterSliceEnd,
+            DirectRunTermination::EvaluationBudget => AttackTermination::EvaluationBudget,
+            DirectRunTermination::Cancelled => AttackTermination::Cancelled,
+        };
+        Ok(crate::AttackResult {
+            termination,
+            counters: crate::AttackProgress(counters),
+            evaluations_used: self.evaluations_used,
+            best: self
+                .best
+                .map(|best| best.project(domain, measure))
+                .transpose()?,
+        })
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DirectClimbError {
     UnsupportedPass,
@@ -3291,6 +3392,173 @@ mod tests {
         assert_eq!(best.initial, expected.initial);
         assert_eq!(best.initial.plugboard().map('A'), Some('B'));
         assert_eq!(best.climb.current, expected.climb.current);
+    }
+
+    fn projection_fixture() -> (crate::AttackRequest, DirectOuterOutcome) {
+        let alphabet = ["🦀", "é", "Ω", "中"];
+        let json = serde_json::json!({
+            "protocol_version": 1, "machine": {"definition": {"kind": "custom", "value": {
+                "alphabet": alphabet, "wheels": [{"name": "r", "wiring": alphabet, "turnovers": []}],
+                "slots": [{"id": "r", "role": "rotor", "movement": "fixed", "wheel": "r"}],
+                "stepping": {"rules": []}
+            }}}, "job": {
+                "kind": "search", "configuration": {"slots": [{"id": "r", "position": "é", "ring": "Ω"}],
+                    "plugboard": [["中", "é"]]}, "text": "🦀🦀", "measures": ["ic"], "passes": ["hill_climb"],
+                "space": {"plugboard": {"kind": "attack", "symbols": ["🦀", "Ω"], "max_pairs": 2}},
+                "attack": {"kind": "hill_climb", "initial_measure": "ic", "final_measure": "ic",
+                    "switch_pairs": 2, "backtrack_pairs": 2, "evaluation_budget": 100, "start": [["Ω", "🦀"]]}
+            }
+        });
+        let request = crate::AttackRequest::parse_json(&json.to_string()).unwrap();
+        let initial = request.outer_candidates().next().unwrap().1.unwrap();
+        let outcome = request
+            .climb_direct_outer(
+                initial,
+                u128::MAX,
+                &mut EvaluationAllowance {
+                    used: 0,
+                    limit: 100,
+                },
+            )
+            .unwrap();
+        (request, outcome)
+    }
+
+    #[test]
+    fn public_projection_preserves_winning_key() {
+        let (request, mut outcome) = projection_fixture();
+        outcome.start_index = u128::MAX - 1;
+        let current = outcome.climb.current.as_ref().unwrap();
+        assert!(
+            !current.board.is_empty(),
+            "production climb must retain mutable pairs"
+        );
+        let plaintext = current.plaintext.clone();
+        let score = current.score;
+        let best = outcome.project(request.domain(), MeasureId::Ic).unwrap();
+        assert_eq!(
+            best.configuration().plugboard(),
+            &[('🦀', 'Ω'), ('é', '中')]
+        );
+        assert_eq!(best.mutable_plugboard(), &[('🦀', 'Ω')]);
+        assert_eq!(
+            best.configuration().slots(),
+            &[crate::SlotConfiguration::new("r", "r", 'é', 'Ω')]
+        );
+        assert_eq!(best.plaintext(), plaintext);
+        assert_eq!(best.score(), score);
+        assert_eq!(best.measure(), MeasureId::Ic);
+        assert_eq!(
+            (best.outer_index(), best.start_index()),
+            (u128::MAX, u128::MAX - 1)
+        );
+    }
+
+    fn projection_run(
+        best: Option<DirectOuterOutcome>,
+        termination: DirectRunTermination,
+    ) -> DirectRunOutcome {
+        DirectRunOutcome {
+            termination,
+            outer_completed: 0,
+            climbs_started: 0,
+            climbs_completed: 0,
+            evaluations_used: u64::MAX,
+            best,
+        }
+    }
+
+    #[test]
+    fn public_run_projection_preserves_full_width_values_and_independent_flags() {
+        use crate::attack_control::CounterSnapshot;
+        use crate::AttackTermination;
+        for (termination, expected) in [
+            (
+                DirectRunTermination::Completed,
+                AttackTermination::Completed,
+            ),
+            (
+                DirectRunTermination::OuterSliceEnd,
+                AttackTermination::OuterSliceEnd,
+            ),
+            (
+                DirectRunTermination::EvaluationBudget,
+                AttackTermination::EvaluationBudget,
+            ),
+            (
+                DirectRunTermination::Cancelled,
+                AttackTermination::Cancelled,
+            ),
+        ] {
+            let (request, _) = projection_fixture();
+            let counters = CounterSnapshot {
+                evaluations_admitted: u64::MAX - 1,
+                evaluations_completed: u64::MAX - 2,
+                climbs_started: u128::MAX,
+                climbs_completed: u128::MAX - 1,
+                outers_completed: u128::MAX - 2,
+            };
+            let null = projection_run(None, termination)
+                .project(counters, request.domain(), MeasureId::Ic)
+                .unwrap();
+            assert_eq!(null.termination(), expected);
+            assert!(null.best().is_none());
+            for flags in 0..16 {
+                let (request, mut best) = projection_fixture();
+                best.start_index = u128::MAX - 1;
+                best.climb.cancelled = flags & 1 != 0;
+                best.climb.budget_stopped = flags & 2 != 0;
+                best.climb.final_objective_ascent = flags & 4 != 0;
+                best.climb.neighborhood_exhausted = flags & 8 != 0;
+                let termination = match expected {
+                    AttackTermination::Completed => DirectRunTermination::Completed,
+                    AttackTermination::OuterSliceEnd => DirectRunTermination::OuterSliceEnd,
+                    AttackTermination::EvaluationBudget => DirectRunTermination::EvaluationBudget,
+                    AttackTermination::Cancelled => DirectRunTermination::Cancelled,
+                };
+                let result = projection_run(Some(best), termination)
+                    .project(counters, request.domain(), MeasureId::Ic)
+                    .unwrap();
+                assert_eq!(result.termination(), expected);
+                assert_eq!(result.counters(), crate::AttackProgress(counters));
+                assert_eq!(result.evaluations_used(), u64::MAX);
+                let best = result.best().unwrap();
+                assert_eq!(
+                    (best.outer_index(), best.start_index()),
+                    (u128::MAX, u128::MAX - 1)
+                );
+                assert_eq!(best.incomplete(), flags & 3 != 0);
+                assert_eq!(best.final_objective_ascent(), flags & 4 != 0);
+                assert_eq!(best.neighborhood_exhausted(), flags & 8 != 0);
+            }
+        }
+    }
+
+    #[test]
+    fn public_projection_rejects_malformed_best() {
+        for missing in [true, false] {
+            let (request, mut best) = projection_fixture();
+            if missing {
+                best.climb.current = None;
+            } else {
+                best.climb.current.as_mut().unwrap().board = vec![('🦀', '🦀')];
+            }
+            let error = projection_run(Some(best), DirectRunTermination::Completed)
+                .project(Default::default(), request.domain(), MeasureId::Ic)
+                .unwrap_err();
+            match error {
+                ProjectionError::MissingCommittedBoard => assert!(missing),
+                ProjectionError::Board(source) => {
+                    assert!(!missing);
+                    assert_eq!(
+                        source,
+                        crate::attack_evaluator::TrialBoardError::Model(
+                            crate::ModelError::PlugboardSelfPair('🦀')
+                        )
+                    );
+                }
+            }
+        }
     }
 
     #[test]

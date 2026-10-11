@@ -371,7 +371,12 @@ still owns checkpoint/resume design and implementation.
 
 ### 6.2 Planned public attack API — Task 12.7
 
-**Frozen adapter design, not exported or executable today.** Add one minimal
+**Owned result carriers are exported; execution remains deferred.** Task12.8b1
+exports `AttackProgress`, `AttackResult`, `AttackBest` and `AttackTermination`
+with documented getters and private fallible HC projections. Malformed accepted
+best states return private errors, never silently become null. Public error/source
+envelopes remain Task12.8b2; no runner, CLI or PE execution is enabled.
+The frozen future adapter adds one minimal
 `AttackRequest::run` facade for the already validated, resource-bound owner:
 
 ```rust,ignore
