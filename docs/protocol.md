@@ -20,6 +20,8 @@ This document marks protocol requirements as normative. Search-space grammar is
 specified in §3.3 and §7; [Scoring and external resources](scoring-resources.md)
 specifies the normative Task 10 measure/resource contract. Pass execution fields and
 checkpoint record layout remain deferred to their implementation tasks.
+[Task 12.7](search-passes.md#62-planned-public-attack-api--task-127) freezes the
+first public HC/PE adapter contract; §4.1 freezes its JSONL projection, not execution.
 [Task 11 plugboard attacks](search-passes.md) freezes the planned additive attack
 branch and pass settings; strict attack parsing and CLI validation are supported,
 but execution is not. Illustrative
@@ -327,7 +329,9 @@ starting at 1, and RFC 3339 UTC `ts`. Unknown event names/fields may be ignored 
 clients. A successful validated job emits one `started` first, then applicable events,
 then exactly one terminal `done`; runtime failure emits terminal `error`. Search may
 emit `progress`, `candidate`, `checkpoint`, and `hold` according to job lifecycle.
-Transform emits no candidate, hold, or checkpoint event. A validated `transform` job
+The first HC/PE release instead uses only `progress` and final `result` (§4.1);
+`candidate`, `checkpoint` and `hold` remain eventual Stage 1 requirements, not part
+of that release. Transform emits no candidate, hold, or checkpoint event. A validated `transform` job
 emits `started`, then exactly one `output` whose `output` member is the transformed
 text, then exactly one terminal `done` with `reason: "completed"`. `done` remains
 solely a lifecycle/reason event shared by transform and future search; it never carries
@@ -349,17 +353,107 @@ default. Example location: `/job/configuration/slots/1/position`. Error codes in
 `unsupported_pass`, `unsupported_measure`, `unsupported_resource`, `invalid_text`,
 `unsupported_topology`, `resource_limit` (including pre-execution count/budget bounds),
 and `internal_error`. `internal_error` is reserved for an
-internal invariant failure after `started`; it is never a request-validation failure.
+internal runtime failure after `started` (including evaluation, resolution or counter
+invariants); it is never a request-validation failure.
 Syntax errors point to the closest available containing path.
+
+### 4.1 Planned HC/PE search events — Task 12.7
+
+**Frozen design, not implemented:** existing `Event`/`DoneReason` and CLI still
+support transform only; validated attacks still return `unsupported_job` before
+`started`. No new request fields or execution permission follow from this section.
+Only one attack pass, `hill_climb` or `partial_exhaustion`, is eligible; recognition
+of other passes is not support. Mixed/deferred/legacy rejection remains unchanged.
+
+After all parsing, resource loading/binding, eligibility and count/budget validation,
+emit `started`, zero or more `progress`, one `result`, then exactly one terminal
+`done` or runtime `error`. Preflight failures retain the existing seq1 `error` only.
+On runtime error, `result` contains only the earlier successfully committed aggregate
+best, or null; do not invent a result for the failing climb. No `done` follows error.
+`result` is final, not a stream of provisional trials or a hold list.
+
+Payloads below supplement the existing event envelope; `done` stays reason-only:
+
+| Event | Required payload |
+| --- | --- |
+| `progress` | `counters`, `elapsed_ms` |
+| `result` | `best` (object or null), `counters`, `elapsed_ms` |
+| `done` | `reason`: `completed`, `outer_slice_end`, `evaluation_budget`, or `cancelled` |
+| Runtime `error` | Existing `code`, `message`, `location`; additionally `context` |
+
+`counters` has exactly `evaluations_admitted`, `evaluations_completed`,
+`climbs_started`, `climbs_completed`, `outers_completed` with the factual meanings
+in [accounting](search-passes.md#accounting-and-completion). `evaluations_used` in
+Core equals admitted usage, not completed work. No percentage, estimated remaining
+work, total mathematical-board count, rate or backend scheduling cursor is promised.
+
+`best` has exactly `configuration`, `mutable_plugboard`, `plaintext`, `score`,
+`outer_index`, `start_index`, `incomplete`, `final_objective_ascent`, and
+`neighborhood_exhausted`. `configuration` uses the complete transform key shape
+(§3.2): resolved initial slots in definition order and the **winning complete**
+plugboard, fixed pairs union committed mutable pairs. It is not the stepped key.
+`mutable_plugboard` separately contains just the winning mutable remainder. Pairs
+are oriented and sorted by ordered alphabet indices. `start_index` is 0 for direct
+HC and the dense seed index for PE; `outer_index` is absolute, unsliced.
+`score` has exactly `measure` (the requested final measure ID), `measured_q32`,
+and `ranking_q32`. Ranking is higher-is-better; do not negate measured entropy.
+The three boolean winner flags are independent of each other and of run termination;
+`incomplete` means that winning climb was interrupted. Ties retain earliest
+(outer index, start index). No best means JSON null, never a sentinel key or score.
+
+All new search count/index/elapsed fields are canonical unsigned decimal **strings**
+(`0` or a nonzero digit followed by digits), including u64 counts; Q32 fields are
+canonical signed decimal strings of raw i128 units (optional minus, no `+`, leading
+zeros or `-0`). The scale is exactly 2^32; no float, exponent or rounded decimal
+score is sent. u128 indices/counters retain their full range. Existing request
+integer grammar and transform envelope numbers (`protocol_version`, `seq`) do not
+change; strings are used consistently even inside the safe JSON integer range.
+
+Elapsed time is monotonic whole milliseconds since execution entry after preflight,
+not RFC3339 wall-clock subtraction; terminal values include final rescoring. The
+transport coalesces immutable private snapshots at safe callback boundaries using
+an explicitly supplied positive adapter progress interval, independent of cancel
+polling. Entry and final snapshots are available without waiting for the interval;
+the final counters always travel in `result`. Duplicate snapshots are allowed.
+There is no numeric default or request cadence field frozen here, nor a timer-thread,
+mid-evaluation callback or hard wall-clock delivery/cancellation bound. Timestamp
+`ts` remains supplied UTC wall time. No clock or I/O enters the private evaluator.
+
+Map established exhaustion of a nonempty requested slice to `completed`; an empty
+slice to `outer_slice_end`, not legacy `offset_end`/`limit_reached`. When work remains,
+map safe cancellation to `cancelled`, otherwise allowance stop to
+`evaluation_budget`. Errors dominate cancellation; exhaustion > cancellation >
+budget. Required reserved final rescoring must succeed before an interrupted current
+board is eligible; failed rescoring is error, never a provisional best or cancellation.
+
+Runtime `context` has exactly `outer_index`, `start_index` (nullable when unavailable),
+`evaluations_used`, `counters`, and `source`. `source` has `kind`, `message`, and
+`diagnostics` (array, empty unless resolution diagnostics exist). Kinds distinguish
+`resolution`, `evaluation`, `counter`, and `invariant`; each resolution diagnostic
+retains its original code/message/location. Runtime failures use `internal_error`
+and `/job` unless an original diagnostic supplies a more precise location. Preserve
+the original nested Core source in the API error, not a cancellation replacement;
+wire messages describe that source without pretending private Rust Debug names are
+stable codes. Charged failed calls remain admitted, never completed or refunded.
+
+An infallible observer cannot return a write/flush error through the evaluator.
+The adapter latches the first transport failure, stops further writes and requests
+cooperative cancellation independently of progress cadence. It still permits required
+final rescoring and retains any runtime error and charged usage. Report transport
+failure on stderr and exit nonzero; retain runtime failure as primary when both occur.
+Never retry a partially written JSONL line or promise `result`/terminal delivery on
+failed transport. On a healthy stream flush each emitted line; exactly-one-terminal
+ordering applies only while delivery succeeds, including final result write/flush.
 
 ## 5. Control
 
 | Action | Mechanism | Result |
 | --- | --- | --- |
-| Cancel | POSIX `SIGINT`/`SIGTERM`, Windows Ctrl+C, or `--cancel-file <path>` | Started search observes cancellation within a progress interval, emits hold and configured final checkpoint, then `done` with `reason: "cancelled"` |
+| Cancel (first HC/PE release) | Future `--cancel-file <path>` adapter; POSIX `SIGINT`/`SIGTERM` and Windows Ctrl+C integration separately pending | Cooperative safe-stop, final `result`, then `done` with `reason: "cancelled"`; no hold/checkpoint promise |
 | Pause/resume live job | Not in Stage 1 | Future extension |
 | Resume dead job | `--resume <checkpoint>` | Search only; see §6 |
-| Bound search | `space` offset/limit or `--max-keys` | `done` with `limit_reached` or `offset_end` |
+| Bound HC/PE search | `space.offset`/`space.limit`, `attack.evaluation_budget` | §4.1 slice/exhaustion/budget reasons; no new `--max-keys` attack control |
+| Other future bounded search | Planned `--max-keys` | Legacy planned `limit_reached`/`offset_end`, not HC/PE mappings |
 
 Transform has no search progress, cancellation, hold, or checkpoint contract in v1.
 
@@ -371,8 +465,13 @@ which wins over budget. Stops retain committed results and required reserved fin
 rescoring; original errors and charged usage are preserved, not masked by cancellation.
 This is not public timed progress or search execution: public runtime, JSONL events,
 platform signals/control files, hold and checkpoint cadence remain unimplemented.
-The public obligations above and in §4 remain design requirements, not shipped
-behavior. Checkpoint/resume remains Task 16 work under §6.
+The first-release obligations in §4.1 remain design requirements, not shipped
+behavior. Cancel-file integration (Task12.12) and POSIX/Windows signals (Task12.13)
+are provisional/unstarted: they may only feed a sticky cancellation request, never
+perform evaluation or JSONL writes in a signal handler. File contents/polling and
+platform setup/failure details must be specified before those adapters implement.
+Hold remains deferred, not removed from eventual Stage 1 goals; cancellation in the
+first release writes no hold or checkpoint. Checkpoint/resume remains Task 16 under §6.
 
 ## 6. Checkpoint and resume (record schema deferred)
 

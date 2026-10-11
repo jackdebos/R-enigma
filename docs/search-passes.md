@@ -64,8 +64,10 @@ loads and binds resources, then returns `unsupported_job`. Private HC/PE drivers
 and outer schedulers are implemented; public runtime and CLI execution remain unsupported.
 [Protocol](protocol.md) and [scoring/resources](scoring-resources.md) remain normative.
 This document specifies `hill_climb` and `partial_exhaustion`, plus the future private
-control contract in §6.1; it does not define public lifecycle, wire results, progress,
-cancellation, checkpoints, other passes or variants.
+control contract in §6.1 and planned public adapter in §6.2;
+[protocol §4.1](protocol.md#41-planned-hcpe-search-events--task-127) defines first-release
+lifecycle/results/progress. Neither contract enables execution. Checkpoints, other
+passes and variants remain separate work.
 
 ## 1. Two domain branches, no implicit unknown key
 
@@ -288,7 +290,8 @@ complete neighborhood can commit its winner but the next required operation
 cannot fit, retain that committed board and terminate with its final score.
 A zero-cost completion takes precedence over budget termination when there is
 no remaining work (including an empty legal neighborhood). No evaluation beyond
-the budget, timeout heuristic, cancellation or new wire event is specified.
+the budget or timeout heuristic is specified; cancellation is governed by §6.1 and
+planned public events by [protocol §4.1](protocol.md#41-planned-hcpe-search-events--task-127).
 
 ### 6.1 Private progress and cancellation — Task 12
 
@@ -363,16 +366,76 @@ Future public-adapter coalescing is separate work, not an observer cadence promi
 [Protocol control](protocol.md#5-control) retains its public obligations; Task 16
 still owns checkpoint/resume design and implementation.
 
+### 6.2 Planned public attack API — Task 12.7
+
+**Frozen adapter design, not exported or executable today.** Add one minimal
+`AttackRequest::run` facade for the already validated, resource-bound owner:
+
+```rust,ignore
+fn run(&self, observe: impl FnMut(AttackProgress),
+       cancel_requested: impl FnMut() -> bool)
+    -> Result<AttackResult, AttackRunError>;
+```
+
+This notation freezes names and ownership, not an existing Rust signature. The
+facade creates fresh whole-run control/allowance, selects the sole HC/PE scheduler,
+and never rereads resources or accepts caller-supplied raw outer candidates.
+Callbacks are synchronous; observation is infallible and counter-only, cancellation
+is polled separately and latched. Repeated runs start fresh. No public exports of
+private schedulers, allowances, seed cursors or evaluator/control types are needed.
+CLI/resource preflight still completes before `started`; Core parsing stays pure.
+
+| Planned type | Owned projection / boundary |
+| --- | --- |
+| `AttackProgress` | Five typed factual counters from §6.1; u64 evaluation counts, u128 climb/outer counts; no clock or candidate |
+| `AttackResult` | `AttackTermination`, final `AttackProgress`, optional `AttackBest` |
+| `AttackBest` | Complete initial winning key plus separate mutable remainder, plaintext, final `MeasuredScore` and `MeasureId`, u128 outer/start indices, three independent boolean flags |
+| `AttackRunError` | Original owned source, optional outer/start indices, cumulative admitted usage, final progress, optional earlier aggregate best |
+
+`AttackBest` projects direct `DirectOuterOutcome` or PE `SeedBest` without retaining
+trial boards. Its key combines resolved slot facts with fixed plus winning mutable
+pairs; never report the owner's initial fixed-only board as the winning complete key.
+Flags are `incomplete`, `final_objective_ascent`, `neighborhood_exhausted`; direct
+HC interruption derives from its cancellation/budget flags, PE from its seed winner.
+No ascent is implied merely by final scoring. Tie order and eligibility remain §3–6.
+An adapter must retain the earlier aggregate best on an error path: existing private
+error carriers retain source/indices/usage, **not** that best. This requires bounded
+internal error-path retention, not a new observer candidate payload or evaluation.
+Original evaluation/counter/resolution sources must be wrapped/projected into an
+owned `AttackRunSource` with resolution/evaluation/counter/invariant variants;
+raw scheduler error types stay private. Preserve nested source access and diagnostics,
+not just a formatted string or sentinel result. Result/best/progress/error fields use
+the wire names in protocol §4.1; Core replaces `elapsed_ms` with transport ownership,
+Q32 strings with `FixedScore` values and null with `Option`. `AttackTermination`
+variants are `Completed`, `OuterSliceEnd`, `EvaluationBudget`, `Cancelled`.
+
+`completed`, `outer_slice_end`, `evaluation_budget`, `cancelled` have exactly the
+[wire stop meanings](protocol.md#41-planned-hcpe-search-events--task-127). The public
+facade uses the controlled PE path (the older budget-only PE enum has no cancel).
+No current-climb result exists before initial success; a failed final rescore cannot
+make that board eligible. Errors dominate cancellation and preserve charged usage.
+The transport adds clock/coalescing and exact decimal-string encoding; Core keeps
+u64/u128/i128 values and Q32 units. Transport failures latch cancellation without
+turning the infallible observer into a fallible evaluator or hiding a runtime error.
+
+First-release JSONL is `started`, optional `progress`, final `result`, then `done`
+or runtime `error`; validation errors remain seq1-only. Holds remain an eventual
+Stage 1 requirement, deferred from this release; no candidate/hold/checkpoint event
+is promised. Task16 owns checkpoint/resume. File and POSIX/Windows adapters are
+separately unstarted under [protocol control](protocol.md#5-control); none is shipped.
+
 ## 7. Minimal core result, examples and limits
 
-The internal run result contains termination (`completed`, `outer_slice_end`, or
-`evaluation_budget`), evaluations used, outer candidates completed, climbs started
+The budget-only internal run result contains termination (`completed`, `outer_slice_end`,
+or `evaluation_budget`); controlled HC/PE also supports `cancelled`. It carries
+evaluations used, outer candidates completed, climbs started
 and completed, and an optional best committed board with resolved initial slot
 key, plaintext, final measured/ranking score, absolute outer index and seed/start
 index. A climb interrupted by budget is not completed. An outer candidate is
 completed only after all its climbs finish. Eligible final-scored committed boards
 include the interrupted climb's board, marked incomplete; ties select lowest
-(outer index, seed/start index). No hold capacity or JSONL payload is defined.
+(outer index, seed/start index). No hold capacity is defined; the planned public
+projection is §6.2 and protocol §4.1.
 Per-climb outcome records whether final-objective ascent occurred and whether its
 legal neighborhood was fully exhausted; final rescoring alone is not optimization.
 Runtime scoring/invariant errors fail explicitly, not as a termination or sentinel.
@@ -424,5 +487,6 @@ actual board cardinality rather than reference `num_plugs=0` net-change counter,
 retain our per-slot outer order, explicit domains/starts/objectives/thresholds,
 checked Q32 scoring, no-reflector decrypt support and deterministic shared budget.
 No floating-point score/trajectory parity or guaranteed key recovery is promised.
-Duet/quartet, DFS, mutable fixed facts, additional attacks and CLI execution remain
-out of scope; lifecycle/result transport and differential oracle remain later tasks.
+Duet/quartet, DFS, mutable fixed facts and additional attacks remain out of scope.
+Public lifecycle/result transport is frozen above but implementation remains later
+Task12 work; differential oracle remains Task17.
