@@ -419,18 +419,20 @@ impl crate::AttackRequest {
         control: &mut AttackControl,
         observer: &mut impl CounterObserver,
         mut requested: impl FnMut() -> bool,
-    ) -> Result<DirectRunOutcome, IndexedDirectRunError> {
+    ) -> Result<DirectRunOutcome, Box<ControlledDirectError>> {
         control.notify(observer);
         let mut allowance = EvaluationAllowance {
             used: 0,
             limit: self.settings().evaluation_budget(),
         };
         let result = if self.settings().kind() != crate::AttackKind::HillClimb {
-            Err(IndexedDirectRunError {
+            Err(Box::new(ControlledDirectError {
                 outer_index: None,
                 evaluations_used: 0,
                 source: DirectRunError::Climb(DirectClimbError::UnsupportedPass),
-            })
+                best: None,
+                counters: control.snapshot(),
+            }))
         } else {
             schedule_controlled_direct(
                 self.gate().outer_selected(),
@@ -732,6 +734,15 @@ fn schedule_controlled_partial_with_climb<O: CounterObserver, F: FnMut() -> bool
     run
 }
 
+#[derive(Debug)]
+struct ControlledDirectError {
+    outer_index: Option<u128>,
+    evaluations_used: u64,
+    source: DirectRunError,
+    best: Option<DirectOuterOutcome>,
+    counters: crate::attack_control::CounterSnapshot,
+}
+
 fn schedule_controlled_direct<O: CounterObserver, F: FnMut() -> bool>(
     selected: u128,
     mut outers: impl Iterator<
@@ -748,18 +759,18 @@ fn schedule_controlled_direct<O: CounterObserver, F: FnMut() -> bool>(
         &mut ObservedAccounting<'_, O>,
         &mut F,
     ) -> Result<DirectOuterOutcome, DirectRunError>,
-) -> Result<DirectRunOutcome, IndexedDirectRunError> {
+) -> Result<DirectRunOutcome, Box<ControlledDirectError>> {
     accounting.control.notify(accounting.observer);
+    let before = accounting.control.snapshot();
+    let mut result = DirectRunOutcome {
+        termination: DirectRunTermination::OuterSliceEnd,
+        outer_completed: 0,
+        climbs_started: 0,
+        climbs_completed: 0,
+        evaluations_used: accounting.allowance.used,
+        best: None,
+    };
     let run = (|| {
-        let before = accounting.control.snapshot();
-        let mut result = DirectRunOutcome {
-            termination: DirectRunTermination::OuterSliceEnd,
-            outer_completed: 0,
-            climbs_started: 0,
-            climbs_completed: 0,
-            evaluations_used: accounting.allowance.used,
-            best: None,
-        };
         for _ in 0..selected {
             if accounting.control.poll_cancellation(requested()) {
                 result.termination = DirectRunTermination::Cancelled;
@@ -818,10 +829,19 @@ fn schedule_controlled_direct<O: CounterObserver, F: FnMut() -> bool>(
             }
             result.termination = DirectRunTermination::Completed;
         }
-        Ok(result)
+        Ok(())
     })();
     accounting.control.notify(accounting.observer);
-    run
+    run.map_err(|error: IndexedDirectRunError| {
+        Box::new(ControlledDirectError {
+            outer_index: error.outer_index,
+            evaluations_used: error.evaluations_used,
+            source: error.source,
+            best: result.best.take(),
+            counters: accounting.control.snapshot(),
+        })
+    })?;
+    Ok(result)
 }
 
 /// Lazy empty/single mutable remainders. Fixed knowledge stays in the bound domain.
@@ -3274,6 +3294,193 @@ mod tests {
     }
 
     #[test]
+    fn controlled_direct_error_retains_prior_best() {
+        let request = scheduler_request(100, false, false, 0);
+        let expected = request
+            .climb_direct_outer(
+                request.outer_candidates().next().unwrap().1.unwrap(),
+                0,
+                &mut EvaluationAllowance {
+                    used: 0,
+                    limit: 100,
+                },
+            )
+            .unwrap();
+        let mut allowance = EvaluationAllowance {
+            used: 0,
+            limit: 100,
+        };
+        let mut control = AttackControl::default();
+        let mut observer = Recorder::default();
+        let error = schedule_controlled_direct(
+            2,
+            request.outer_candidates().take(1),
+            &mut ObservedAccounting {
+                allowance: &mut allowance,
+                control: &mut control,
+                observer: &mut observer,
+            },
+            &mut || false,
+            |initial, index, accounting, requested| {
+                let (scoring, start) = request
+                    .direct_scoring(&initial)
+                    .map_err(DirectRunError::Climb)?;
+                let climb = scoring
+                    .climb_cancellable(start, 0, accounting, requested)
+                    .map_err(DirectRunError::from)?;
+                Ok(DirectOuterOutcome {
+                    initial,
+                    outer_index: index,
+                    start_index: 0,
+                    evaluations_used: accounting.allowance.used,
+                    climb,
+                })
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error.source, DirectRunError::MissingOuter));
+        assert_eq!(error.outer_index, None);
+        assert_eq!(error.counters.outers_completed, 1);
+        assert_eq!(observer.0.last(), Some(&error.counters));
+        assert_eq!(error.evaluations_used, expected.evaluations_used);
+        let best = error
+            .best
+            .expect("accepted first outer must survive later failure");
+        assert_eq!(best.outer_index, expected.outer_index);
+        assert_eq!(best.initial, expected.initial);
+        assert_eq!(best.climb.current, expected.climb.current);
+    }
+
+    #[test]
+    fn controlled_direct_later_faults_keep_only_accepted_outer() {
+        let request = scheduler_request(100, false, false, 0);
+        let expected = request
+            .climb_direct_outer(
+                request.outer_candidates().next().unwrap().1.unwrap(),
+                0,
+                &mut EvaluationAllowance {
+                    used: 0,
+                    limit: 100,
+                },
+            )
+            .unwrap();
+        for fault in 0..4 {
+            let diagnostics = vec![crate::SearchDiagnostic::new(
+                "invalid_search_space",
+                "injected later resolution",
+                "/job/space",
+            )];
+            let outers = request.outer_candidates().take(2).map(|(index, initial)| {
+                (
+                    index,
+                    if fault == 0 && index == 1 {
+                        Err(diagnostics.clone())
+                    } else {
+                        initial
+                    },
+                )
+            });
+            let mut allowance = EvaluationAllowance {
+                used: 7,
+                limit: 107,
+            };
+            let mut control = AttackControl::default();
+            let mut observer = Recorder::default();
+            let error = schedule_controlled_direct(
+                2,
+                outers,
+                &mut ObservedAccounting {
+                    allowance: &mut allowance,
+                    control: &mut control,
+                    observer: &mut observer,
+                },
+                &mut || false,
+                |initial, index, accounting, requested| {
+                    if index == 1 && fault >= 2 {
+                        let mut counters = accounting.control.snapshot();
+                        if fault == 2 {
+                            counters.evaluations_admitted = u64::MAX;
+                        } else {
+                            counters.outers_completed = u128::MAX;
+                        }
+                        *accounting.control = AttackControl::with_counters(counters);
+                    }
+                    let scoring = BoundClimbScoring::new(
+                        &initial,
+                        request.domain(),
+                        request.text(),
+                        (
+                            MeasureId::Trie,
+                            if index == 1 && fault == 1 {
+                                None
+                            } else {
+                                request.bound_resource(MeasureId::Trie)
+                            },
+                        ),
+                        (MeasureId::Trie, request.bound_resource(MeasureId::Trie)),
+                        1,
+                    );
+                    let climb = scoring
+                        .climb_cancellable(vec![], 0, accounting, requested)
+                        .map_err(DirectRunError::from)?;
+                    Ok(DirectOuterOutcome {
+                        initial,
+                        outer_index: index,
+                        start_index: 0,
+                        evaluations_used: accounting.allowance.used,
+                        climb,
+                    })
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.outer_index, Some(1));
+            assert_eq!(error.counters, control.snapshot());
+            assert_eq!(observer.0.last(), Some(&error.counters));
+            let additional = match fault {
+                0 => 0,
+                1 | 2 => 1,
+                _ => expected.evaluations_used,
+            };
+            assert_eq!(
+                error.evaluations_used,
+                7 + expected.evaluations_used + additional
+            );
+            assert_eq!(allowance.used, error.evaluations_used);
+            match fault {
+                0 => assert!(
+                    matches!(error.source, DirectRunError::Resolution(ref actual) if *actual == diagnostics)
+                ),
+                1 => assert!(matches!(
+                    error.source,
+                    DirectRunError::Climb(DirectClimbError::Evaluation(
+                        TrialEvaluationError::MissingResource(MeasureId::Trie)
+                    ))
+                )),
+                2 => {
+                    assert!(matches!(
+                        error.source,
+                        DirectRunError::Counter(CounterOverflow::EvaluationsAdmitted)
+                    ));
+                    assert_eq!(error.counters.evaluations_admitted, u64::MAX);
+                    assert_eq!(
+                        error.counters.evaluations_completed,
+                        expected.evaluations_used
+                    );
+                }
+                _ => assert!(matches!(
+                    error.source,
+                    DirectRunError::Counter(CounterOverflow::OutersCompleted)
+                )),
+            }
+            let best = error.best.unwrap();
+            assert_eq!(best.outer_index, 0);
+            assert_eq!(best.initial, expected.initial);
+            assert_eq!(best.climb.current, expected.climb.current);
+            assert_eq!(best.evaluations_used, 7 + expected.evaluations_used);
+        }
+    }
+
+    #[test]
     fn controlled_outer_indexed_errors_and_terminal_snapshots() {
         let request = scheduler_request(100, false, false, 0);
         let index = u128::from(u64::MAX) + 7;
@@ -3332,6 +3539,8 @@ mod tests {
             )
             .unwrap_err();
             assert_eq!(error.outer_index, Some(index));
+            assert!(error.best.is_none());
+            assert_eq!(error.counters, control.snapshot());
             let snapshot = control.snapshot();
             assert_eq!(observer.0.last(), Some(&snapshot));
             assert_eq!(observer.0.first(), Some(&Default::default()));
@@ -3391,6 +3600,8 @@ mod tests {
             let error = scheduler_request(100, false, false, 0)
                 .schedule_direct_outers_controlled(&mut control, &mut observer, || false)
                 .unwrap_err();
+            assert!(error.best.is_none());
+            assert_eq!(error.counters, control.snapshot());
             assert!(matches!(error.source, DirectRunError::Counter(source) if source == expected));
             assert_eq!(error.outer_index, Some(0));
             assert_eq!(error.evaluations_used, used);

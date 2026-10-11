@@ -14,6 +14,29 @@ pub(super) enum TrialEvaluationError {
     Measure(MeasureError),
 }
 
+impl std::fmt::Display for TrialEvaluationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Board(error) => write!(f, "trial board: {error}"),
+            Self::Model(error) => write!(f, "trial model: {error}"),
+            Self::Measure(error) => write!(f, "trial measure: {error}"),
+            Self::MissingResource(id) => write!(f, "missing trial resource: {id:?}"),
+            Self::IncompatibleResource(id) => write!(f, "incompatible trial resource: {id:?}"),
+        }
+    }
+}
+
+impl std::error::Error for TrialEvaluationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Board(error) => Some(error),
+            Self::Model(error) => Some(error),
+            Self::Measure(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
 pub(super) struct TrialEvaluator<'a> {
     initial: &'a ResolvedConfiguration,
     domain: &'a AttackPlugboardDomain,
@@ -94,6 +117,27 @@ pub(crate) enum TrialBoardError {
     Model(ModelError),
 }
 
+impl std::fmt::Display for TrialBoardError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Model(error) => write!(f, "trial board model: {error}"),
+            Self::AlphabetBinding => f.write_str("trial board alphabet binding mismatch"),
+            Self::FixedFactsBinding => f.write_str("trial board fixed facts mismatch"),
+            Self::OutsideMutable(symbol) => write!(f, "symbol outside mutable board: {symbol}"),
+            Self::TotalCapacity => f.write_str("trial board capacity exceeded"),
+        }
+    }
+}
+
+impl std::error::Error for TrialBoardError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Model(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
 /// Accept only mutable guesses, bound to the selected initial scrambler.
 /// Fixed facts are compared by mapping; their stored order and orientation stay untouched.
 pub(crate) fn validated_trial_board(
@@ -131,6 +175,42 @@ pub(crate) fn validated_trial_board(
 mod tests {
     use super::*;
     use crate::{Alphabet, DefinitionSource, SlotConfiguration, TransformConfiguration};
+
+    #[test]
+    fn owned_trial_errors_preserve_causal_sources() {
+        use std::error::Error;
+        let model =
+            TrialEvaluationError::Board(TrialBoardError::Model(ModelError::UnknownSymbol('Z')));
+        let board = model
+            .source()
+            .unwrap()
+            .downcast_ref::<TrialBoardError>()
+            .unwrap();
+        assert_eq!(
+            board.source().unwrap().downcast_ref::<ModelError>(),
+            Some(&ModelError::UnknownSymbol('Z'))
+        );
+        let direct = TrialEvaluationError::Model(ModelError::EmptyAlphabet);
+        assert_eq!(
+            direct.source().unwrap().downcast_ref::<ModelError>(),
+            Some(&ModelError::EmptyAlphabet)
+        );
+        let cause = MeasureError::InsufficientSamples {
+            required: 2,
+            actual: 1,
+        };
+        let measure = TrialEvaluationError::Measure(cause.clone());
+        assert_eq!(
+            measure.source().unwrap().downcast_ref::<MeasureError>(),
+            Some(&cause)
+        );
+        assert!(TrialEvaluationError::MissingResource(MeasureId::Trie)
+            .source()
+            .is_none());
+        assert!(TrialBoardError::TotalCapacity.source().is_none());
+        assert!(!model.to_string().is_empty());
+        assert!(!measure.to_string().is_empty());
+    }
 
     fn initial(alphabet: &Alphabet, fixed: &[(char, char)]) -> ResolvedConfiguration {
         let symbols = &alphabet.symbols;

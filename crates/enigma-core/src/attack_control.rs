@@ -21,6 +21,14 @@ pub(super) enum CounterOverflow {
     OutersCompleted,
 }
 
+impl std::fmt::Display for CounterOverflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "attack counter overflow: {self:?}")
+    }
+}
+
+impl std::error::Error for CounterOverflow {}
+
 /// A synchronous, infallible notification carrying counters, never candidates.
 pub(super) trait CounterObserver {
     fn observe(&mut self, snapshot: CounterSnapshot);

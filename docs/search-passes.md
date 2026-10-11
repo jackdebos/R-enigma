@@ -315,7 +315,10 @@ Private immutable snapshots carry checked counters for the shared whole run:
 | `climbs_completed` | `u128` | Normal neighborhood exhaustion and required final score succeed |
 | `outers_completed` | `u128` | All climbs for that outer complete |
 
-Existing `evaluations_used` remains admission accounting, not completed work.
+Existing `evaluations_used` records charged allowance, not completed work.
+Allowance is charged before the checked `evaluations_admitted` increment; on rare
+counter overflow, used may exceed admitted. Preserve both factual values, without
+refunds or fabricated increments.
 Initial, trial, objective-switch and final evaluations all follow these rules.
 Failed evaluations remain admitted but not completed; there are no refunds.
 Reservations protect required final scoring; only an actually admitted call is charged.
@@ -378,7 +381,7 @@ fn run(&self, observe: impl FnMut(AttackProgress),
 ```
 
 This notation freezes names and ownership, not an existing Rust signature. The
-facade creates fresh whole-run control/allowance, selects the sole HC/PE scheduler,
+eventual facade creates fresh whole-run control/allowance, selects the sole HC/PE scheduler,
 and never rereads resources or accepts caller-supplied raw outer candidates.
 Callbacks are synchronous; observation is infallible and counter-only, cancellation
 is polled separately and latched. Repeated runs start fresh. No public exports of
@@ -403,7 +406,12 @@ error carriers retain source/indices/usage, **not** that best. This requires bou
 internal error-path retention, not a new observer candidate payload or evaluation.
 Original evaluation/counter/resolution sources must be wrapped/projected into an
 owned `AttackRunSource` with resolution/evaluation/counter/invariant variants;
-raw scheduler error types stay private. Preserve nested source access and diagnostics,
+raw scheduler error types stay private. During HC-only Task12.8, add an explicit
+unsupported-execution source for valid PE until12.9; it is an API availability error,
+not evaluation/invariant failure. Reject before enumeration, evaluation, cancellation
+polling or observer work, with absent indices, zero usage/counters and no best.
+Reconcile this temporary category with the eventual HC/PE source taxonomy at12.9.
+Preserve nested source access and diagnostics,
 not just a formatted string or sentinel result. Result/best/progress/error fields use
 the wire names in protocol §4.1; Core replaces `elapsed_ms` with transport ownership,
 Q32 strings with `FixedScore` values and null with `Option`. `AttackTermination`

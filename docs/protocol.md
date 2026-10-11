@@ -368,6 +368,10 @@ of other passes is not support. Mixed/deferred/legacy rejection remains unchange
 After all parsing, resource loading/binding, eligibility and count/budget validation,
 emit `started`, zero or more `progress`, one `result`, then exactly one terminal
 `done` or runtime `error`. Preflight failures retain the existing seq1 `error` only.
+Task12.8 stages Core HC availability only; valid PE remains unsupported until12.9.
+Its Core unsupported-execution availability error is not a runtime error: wire
+validation/preflight still emits seq1 `unsupported_job` before `started`, with no
+`result` or work events. This staging does not authorize CLI changes or wire execution.
 On runtime error, `result` contains only the earlier successfully committed aggregate
 best, or null; do not invent a result for the failing climb. No `done` follows error.
 `result` is final, not a stream of provisional trials or a hold list.
@@ -384,7 +388,9 @@ Payloads below supplement the existing event envelope; `done` stays reason-only:
 `counters` has exactly `evaluations_admitted`, `evaluations_completed`,
 `climbs_started`, `climbs_completed`, `outers_completed` with the factual meanings
 in [accounting](search-passes.md#accounting-and-completion). `evaluations_used` in
-Core equals admitted usage, not completed work. No percentage, estimated remaining
+Core records charged allowance, not completed work. Charge precedes the checked
+admitted-counter increment: rare overflow may leave used > admitted; preserve both
+factual values, never refund usage or fabricate counters. No percentage, estimated remaining
 work, total mathematical-board count, rate or backend scheduling cursor is promised.
 
 `best` has exactly `configuration`, `mutable_plugboard`, `plaintext`, `score`,
