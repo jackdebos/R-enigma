@@ -290,12 +290,15 @@ A zero-cost completion takes precedence over budget termination when there is
 no remaining work (including an empty legal neighborhood). No evaluation beyond
 the budget, timeout heuristic, cancellation or new wire event is specified.
 
-### 6.1 Future private progress and cancellation — Task 12.1a
+### 6.1 Private progress and cancellation — Task 12
 
-**Normative private contract; accounting implemented for a single climb only.**
-Task 12.2a adds counter-only observation; budget-only callers retain Task 11 behavior.
-Cancellation and aggregate HC/PE control integration remain deferred, as do public
-runtime, exports, events, CLI/platform controls and checkpoint/resume.
+**Private HC and PE control integration is implemented through Task 12.5.**
+Single climbs, HC outer scheduling, PE seeds/resolved owners and PE outer scheduling
+share checked accounting, counter snapshots and cooperative cancellation.
+Budget-only callers retain Task 11 behavior; this is not a public execution surface.
+Public search runtime/exports, JSONL events, timed progress, platform signals and
+control files, hold and checkpoint cadence remain unimplemented. Checkpoint/resume
+belongs to Task 16; Task 12 remains in progress at private documentary acceptance.
 
 #### Accounting and completion
 
@@ -349,7 +352,7 @@ final rescoring nor an earlier completed winner makes a cancelled run complete.
 
 #### Counter-only observation boundary
 
-A future private observer is synchronous and infallible and receives immutable
+The implemented private observer is synchronous and infallible and receives immutable
 counters only: at entry, after successful evaluations, at accounting transitions,
 and at terminal success, cancellation or error. Duplicate snapshots are allowed.
 No callback runs mid-evaluation; cancellation polling is independent of observer

@@ -1,4 +1,4 @@
-//! Private counter and cancellation foundation; runtime integration is deferred.
+//! Private counters and cancellation integrated with HC and PE runtimes; public control is deferred.
 //!
 //! Accounting records facts only. Callers own transition eligibility, stop
 //! precedence, observer cadence and any reserved final-objective rescore.

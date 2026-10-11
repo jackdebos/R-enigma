@@ -363,12 +363,16 @@ Syntax errors point to the closest available containing path.
 
 Transform has no search progress, cancellation, hold, or checkpoint contract in v1.
 
-[Task 12.1a private groundwork](search-passes.md#61-future-private-progress-and-cancellation--task-121a)
-freezes future counter-only observation and cooperative safe-stop semantics, not an
-implemented control/accounting hookup or public execution surface. It does not
-weaken the public `started`/progress, hold, configured final-checkpoint or cancellation
-obligations above and in §4. No public schema or cadence is added; adapter integration
-remains deferred, and checkpoint/resume remains Task 16 work under §6.
+[Task 12 private integration](search-passes.md#61-private-progress-and-cancellation--task-12)
+implements shared accounting, counter-only snapshots and cooperative cancellation
+for private HC climbs/outer scheduling and PE seeds/resolved owners/outer scheduling.
+Admitted evaluations are nonpreemptive; established exhaustion wins over cancellation,
+which wins over budget. Stops retain committed results and required reserved final
+rescoring; original errors and charged usage are preserved, not masked by cancellation.
+This is not public timed progress or search execution: public runtime, JSONL events,
+platform signals/control files, hold and checkpoint cadence remain unimplemented.
+The public obligations above and in §4 remain design requirements, not shipped
+behavior. Checkpoint/resume remains Task 16 work under §6.
 
 ## 6. Checkpoint and resume (record schema deferred)
 
