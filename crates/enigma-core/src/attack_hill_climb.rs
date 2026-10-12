@@ -3331,6 +3331,72 @@ mod tests {
     }
 
     #[test]
+    fn public_pe_later_interrupted_outer_replaces_aggregate_winner() {
+        let fixture = |first_only| {
+            partial_scheduler_request(100, true, |job| {
+                job["text"] = serde_json::json!("CB");
+                job["space"]["plugboard"]["symbols"] = serde_json::json!(["A", "B"]);
+                job["space"]["slots"] = serde_json::json!([{
+                    "id":"r", "positions": if first_only { vec!["A"] } else { vec!["A", "B"] }
+                }]);
+            })
+        };
+        let earlier = public_pe_probe(&fixture(true), |_| false);
+        let later = public_pe_probe(&fixture(false), |p| {
+            p.outers_completed() == 1 && p.climbs_started() == 3
+        });
+        public_pe_facts(
+            &earlier,
+            crate::AttackTermination::Completed,
+            (8, 2, 2, 1),
+            Some((0, 0, "AC", 1, false, true, true)),
+        );
+        public_pe_facts(
+            &later,
+            crate::AttackTermination::Cancelled,
+            (10, 3, 2, 1),
+            Some((1, 0, "BA", 2, true, false, false)),
+        );
+        // The completed A outer establishes an eligible aggregate winner. The B
+        // outer is stopped after its empty seed starts, before any climb completes.
+        // Its reserved final rescore still makes that unfinished seed eligible.
+        for (result, position, evaluations, flags) in [
+            (&earlier, 'A', 8, (false, true, true)),
+            (&later, 'B', 10, (true, false, false)),
+        ] {
+            let best = result.best().unwrap();
+            assert_eq!(
+                best.configuration(),
+                &crate::TransformConfiguration::new(
+                    vec![crate::SlotConfiguration::new("r", "r", position, 'A')],
+                    vec![],
+                )
+            );
+            assert!(best.mutable_plugboard().is_empty());
+            let terminal = result.counters();
+            assert_eq!(result.evaluations_used(), evaluations);
+            assert_eq!(terminal.evaluations_admitted(), evaluations);
+            assert_eq!(terminal.evaluations_completed(), evaluations);
+            assert_eq!(best.incomplete(), flags.0);
+            assert_eq!(best.final_objective_ascent(), flags.1);
+            assert_eq!(best.neighborhood_exhausted(), flags.2);
+        }
+        let earlier_best = earlier.best().unwrap();
+        let later_best = later.best().unwrap();
+        assert!(later_best.score().ranking().units() > earlier_best.score().ranking().units());
+        assert_eq!(later_best.outer_index(), 1);
+        assert_eq!(later_best.start_index(), 0);
+        assert_eq!(later_best.plaintext(), "BA");
+        assert_eq!(later_best.score().ranking().units(), 2_i128 << 32);
+        // Eight evaluations belonged to the completed outer; the interrupted
+        // empty seed admitted its initial score and one reserved final rescore.
+        assert_eq!(later.evaluations_used() - earlier.evaluations_used(), 2);
+        assert_eq!(later.counters().climbs_started(), 3);
+        assert_eq!(later.counters().climbs_completed(), 2);
+        assert_eq!(later.counters().outers_completed(), 1);
+    }
+
+    #[test]
     fn public_pe_observation_cancellation_boundaries() {
         let request = partial_scheduler_request(100, true, |_| {});
         // An interrupted later outer must not replace the earlier eligible winner.

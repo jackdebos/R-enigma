@@ -305,13 +305,14 @@ planned public events by [protocol §4.1](protocol.md#41-planned-hcpe-search-eve
 
 ### 6.1 Private progress and cancellation — Task 12
 
-**Private HC and PE control integration is implemented through Task 12.5.**
+**Core HC and PE execution is publicly available through `AttackRequest::run` (§6.2).**
 Single climbs, HC outer scheduling, PE seeds/resolved owners and PE outer scheduling
 share checked accounting, counter snapshots and cooperative cancellation.
-Budget-only callers retain Task 11 behavior; §6.2 exposes only the controlled HC path.
-JSONL events, timed progress, platform signals and
-control files, hold and checkpoint cadence remain unimplemented. Checkpoint/resume
-belongs to Task 16; Task 12 remains in progress at private documentary acceptance.
+Budget-only callers retain Task 11 behavior; both controlled paths use fresh
+per-invocation control and evaluation allowances.
+CLI/wire integration, JSONL events, timed progress, platform signals and control
+files, hold and checkpoint cadence remain deferred. Checkpoint/resume belongs to
+Task 16; Task 12 remains in progress.
 
 #### Accounting and completion
 
