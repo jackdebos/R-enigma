@@ -1,4 +1,4 @@
-//! Owned attack projections; public execution remains deferred.
+//! Owned attack projections for the public synchronous HC facade.
 
 use crate::attack_control::CounterSnapshot;
 use crate::{MeasureId, MeasuredScore, TransformConfiguration};
@@ -150,7 +150,7 @@ pub enum AttackRunCategory {
     Counter,
     /// Missing scheduler facts or violated internal assumptions.
     Invariant,
-    /// Taxonomy only; public execution is not implemented here.
+    /// The validated attack kind has no public execution implementation.
     UnsupportedExecution,
 }
 
@@ -175,6 +175,7 @@ pub(crate) enum RunPayload {
     Evaluation(crate::attack_evaluator::TrialEvaluationError),
     Counter(crate::attack_control::CounterOverflow),
     Invariant(&'static str),
+    UnsupportedExecution,
 }
 
 /// Opaque owned original cause. Nested causes remain available through `Error`.
@@ -197,6 +198,7 @@ impl AttackRunSource {
             RunPayload::Evaluation(_) => AttackRunCategory::Evaluation,
             RunPayload::Counter(_) => AttackRunCategory::Counter,
             RunPayload::Invariant(_) => AttackRunCategory::Invariant,
+            RunPayload::UnsupportedExecution => AttackRunCategory::UnsupportedExecution,
         }
     }
     /// Original resolution diagnostics, without formatting conversion.
@@ -231,6 +233,9 @@ impl std::fmt::Display for AttackRunSource {
             RunPayload::Evaluation(source) => source.fmt(f),
             RunPayload::Counter(source) => source.fmt(f),
             RunPayload::Invariant(message) => f.write_str(message),
+            RunPayload::UnsupportedExecution => {
+                f.write_str("public execution supports hill_climb only")
+            }
         }
     }
 }
@@ -251,7 +256,11 @@ impl std::error::Error for AttackRunSource {
 /// fn replace(error: &mut enigma_core::AttackRunError) { error.outer_index = None; }
 /// ```
 #[derive(Debug)]
-pub struct AttackRunError {
+pub struct AttackRunError(Box<AttackRunErrorData>);
+
+/// Private complete envelope; boxing preserves the public result signature.
+#[derive(Debug)]
+pub(crate) struct AttackRunErrorData {
     pub(crate) source: AttackRunSource,
     pub(crate) outer_index: Option<u128>,
     pub(crate) start_index: Option<u128>,
@@ -261,31 +270,36 @@ pub struct AttackRunError {
 }
 
 impl AttackRunError {
+    pub(crate) fn new(data: AttackRunErrorData) -> Self {
+        Self(Box::new(data))
+    }
+
     /// Original owned runtime cause, independent of best projection failure.
     pub fn run_source(&self) -> &AttackRunSource {
-        &self.source
+        &self.0.source
     }
     /// Failure outer, absent when an outer is missing or enumeration has not begun.
     pub fn outer_index(&self) -> Option<u128> {
-        self.outer_index
+        self.0.outer_index
     }
     /// Failure start, absent during resolution or missing-outer failures.
     pub fn start_index(&self) -> Option<u128> {
-        self.start_index
+        self.0.start_index
     }
     /// Cumulative charged allowance, not admitted count.
     pub fn evaluations_used(&self) -> u64 {
-        self.evaluations_used
+        self.0.evaluations_used
     }
     /// Final factual snapshot, including any earlier accepted work.
     pub fn counters(&self) -> AttackProgress {
-        self.counters
+        self.0.counters
     }
     /// `Ok(None)` means absent; `Err` means retained best could not be projected.
     pub fn best(
         &self,
     ) -> Result<Option<&AttackBest>, &(dyn std::error::Error + Send + Sync + 'static)> {
-        self.best
+        self.0
+            .best
             .as_ref()
             .map(Option::as_ref)
             .map_err(|error| error.as_ref())
@@ -294,13 +308,13 @@ impl AttackRunError {
 
 impl std::fmt::Display for AttackRunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.source.fmt(f)
+        self.0.source.fmt(f)
     }
 }
 
 impl std::error::Error for AttackRunError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
+        Some(&self.0.source)
     }
 }
 
@@ -321,14 +335,14 @@ mod tests {
             TrialEvaluationError::MissingResource(MeasureId::Trie),
             TrialEvaluationError::IncompatibleResource(MeasureId::Trie),
         ] {
-            let error = AttackRunError {
+            let error = AttackRunError::new(AttackRunErrorData {
                 source: AttackRunSource(RunPayload::Evaluation(payload)),
                 outer_index: None,
                 start_index: None,
                 evaluations_used: 0,
                 counters: AttackProgress(CounterSnapshot::default()),
                 best: Ok(None),
-            };
+            });
             assert_eq!(error.run_source().category(), AttackRunCategory::Evaluation);
             assert!(error.run_source().diagnostics().is_none());
             assert!(error.run_source().overflow().is_none());
@@ -338,6 +352,8 @@ mod tests {
                 .unwrap()
                 .downcast_ref::<AttackRunSource>()
                 .unwrap();
+            assert!(std::ptr::eq(source, error.run_source()));
+            assert_eq!(error.to_string(), source.to_string());
             let trial = source
                 .source()
                 .unwrap()

@@ -20,7 +20,7 @@ This document marks protocol requirements as normative. Search-space grammar is
 specified in §3.3 and §7; [Scoring and external resources](scoring-resources.md)
 specifies the normative Task 10 measure/resource contract. Pass execution fields and
 checkpoint record layout remain deferred to their implementation tasks.
-[Task 12.7](search-passes.md#62-planned-public-attack-api--task-127) freezes the
+[Core HC API](search-passes.md#62-public-core-hc-api--task-128) freezes the
 first public HC/PE adapter contract; §4.1 freezes its JSONL projection, not execution.
 [Task 11 plugboard attacks](search-passes.md) freezes the planned additive attack
 branch and pass settings; strict attack parsing and CLI validation are supported,
@@ -313,8 +313,9 @@ The CLI loads and binds resources, checks eligibility, then emits one seq1
 `unsupported_job` at `/job/kind`: `attack execution is not implemented`.
 Structural, loading, model-binding and eligibility errors precede that result.
 Missing or other discriminators retain legacy search validation. Private HC/PE
-evaluation, seed exhaustion and ordered outer scheduling are implemented;
-public runtime and CLI execution remain unsupported.
+evaluation, seed exhaustion and ordered outer scheduling are implemented.
+Core `AttackRequest::run` supports synchronous HC with counter-only observation
+and independently polled cancellation; public PE and CLI execution remain unsupported.
 
 Stage 1 plans `hill_climb`, `partial_exhaustion` with backtracking, `reswapping`, `trie`,
 and `measure`; measures include index of coincidence, Sinkov n-gram statistics,

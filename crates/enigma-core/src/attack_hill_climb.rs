@@ -3,6 +3,7 @@
 use crate::attack_control::{AttackControl, CounterObserver, CounterOverflow};
 use crate::attack_evaluator::{validated_trial_board, TrialEvaluationError, TrialEvaluator};
 use crate::attack_neighborhood::NeighborhoodCursor;
+use crate::attack_result::AttackRunErrorData;
 use crate::{
     AttackPlugboardDomain, BoundResource, Direction, FixedScore, MeasureId, MeasuredScore,
     ResolvedConfiguration,
@@ -96,7 +97,78 @@ impl DirectOuterOutcome {
     }
 }
 
+struct ProgressObserver<F>(F);
+
+impl<F: FnMut(crate::AttackProgress)> CounterObserver for ProgressObserver<F> {
+    fn observe(&mut self, snapshot: crate::attack_control::CounterSnapshot) {
+        (self.0)(crate::AttackProgress(snapshot));
+    }
+}
+
+impl crate::AttackRequest {
+    /// Run this resource-bound owner with fresh accounting and latched cancellation.
+    ///
+    /// Observation is synchronous, infallible and counter-only; duplicate snapshots
+    /// are allowed. Cancellation is independently polled at safe boundaries, never
+    /// mid-evaluation. Partial exhaustion rejects before either callback is called.
+    pub fn run(
+        &self,
+        observe: impl FnMut(crate::AttackProgress),
+        cancel_requested: impl FnMut() -> bool,
+    ) -> Result<crate::AttackResult, crate::AttackRunError> {
+        if self.settings().kind() != crate::AttackKind::HillClimb {
+            return Err(crate::AttackRunError::new(AttackRunErrorData {
+                source: crate::AttackRunSource(
+                    crate::attack_result::RunPayload::UnsupportedExecution,
+                ),
+                outer_index: None,
+                start_index: None,
+                evaluations_used: 0,
+                counters: crate::AttackProgress(crate::attack_control::CounterSnapshot::default()),
+                best: Ok(None),
+            }));
+        }
+        let mut control = AttackControl::default();
+        let mut observer = ProgressObserver(observe);
+        match self.schedule_direct_outers_controlled(&mut control, &mut observer, cancel_requested)
+        {
+            Ok(outcome) => outcome.project_public(
+                control.snapshot(),
+                self.domain(),
+                self.settings().final_measure(),
+            ),
+            Err(error) => Err(error.project(self.domain(), self.settings().final_measure())),
+        }
+    }
+}
+
 impl DirectRunOutcome {
+    // Bridge a fallible success projection without losing terminal accounting.
+    fn project_public(
+        self,
+        counters: crate::attack_control::CounterSnapshot,
+        domain: &AttackPlugboardDomain,
+        measure: MeasureId,
+    ) -> Result<crate::AttackResult, crate::AttackRunError> {
+        let evaluations_used = self.evaluations_used;
+        let indices = self
+            .best
+            .as_ref()
+            .map(|best| (best.outer_index, best.start_index));
+        self.project(counters, domain, measure).map_err(|error| {
+            crate::AttackRunError::new(AttackRunErrorData {
+                source: crate::AttackRunSource(crate::attack_result::RunPayload::Invariant(
+                    "accepted best projection failed",
+                )),
+                outer_index: indices.map(|(outer, _)| outer),
+                start_index: indices.map(|(_, start)| start),
+                evaluations_used,
+                counters: crate::AttackProgress(counters),
+                best: Err(Box::new(error)),
+            })
+        })
+    }
+
     fn project(
         self,
         counters: crate::attack_control::CounterSnapshot,
@@ -865,7 +937,7 @@ impl ControlledDirectError {
                 RunPayload::Invariant("unsupported direct pass")
             }
         };
-        crate::AttackRunError {
+        crate::AttackRunError::new(AttackRunErrorData {
             source: crate::AttackRunSource(source),
             outer_index: self.outer_index,
             start_index,
@@ -876,7 +948,7 @@ impl ControlledDirectError {
                 .map(|best| best.project(domain, measure))
                 .transpose()
                 .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>),
-        }
+        })
     }
 }
 
@@ -3458,6 +3530,46 @@ mod tests {
             )
             .unwrap();
         (request, outcome)
+    }
+
+    #[test]
+    fn public_success_projection_fault_retains_terminal_facts() {
+        // Synthetic corruption of an otherwise real completed outcome, not a
+        // naturally reachable failure of a validated external request.
+        let (request, mut best) = projection_fixture();
+        best.climb.current = None;
+        let counters = crate::attack_control::CounterSnapshot {
+            evaluations_admitted: 7,
+            evaluations_completed: 7,
+            climbs_started: 3,
+            climbs_completed: 3,
+            outers_completed: 2,
+        };
+        let error = DirectRunOutcome {
+            termination: DirectRunTermination::Completed,
+            outer_completed: 2,
+            climbs_started: 3,
+            climbs_completed: 3,
+            evaluations_used: 7,
+            best: Some(best),
+        }
+        .project_public(counters, request.domain(), MeasureId::Ic)
+        .unwrap_err();
+        assert_eq!(
+            error.run_source().category(),
+            crate::AttackRunCategory::Invariant
+        );
+        assert_eq!(error.evaluations_used(), 7);
+        assert_eq!(error.counters(), crate::AttackProgress(counters));
+        assert_eq!(
+            (error.outer_index(), error.start_index()),
+            (Some(u128::MAX), Some(0))
+        );
+        assert!(matches!(
+            error.best().unwrap_err().downcast_ref::<ProjectionError>(),
+            Some(ProjectionError::MissingCommittedBoard)
+        ));
+        assert!(error.to_string().contains("projection failed"));
     }
 
     #[test]
