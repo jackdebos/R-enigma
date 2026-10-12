@@ -320,21 +320,28 @@ enum ControlledPartialSource {
     Climb(ObservedClimbError),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 struct ControlledPartialError {
     outer_index: u128,
     seed_index: Option<u128>,
     evaluations_used: u64,
     source: ControlledPartialSource,
+    best: Option<Box<(ResolvedConfiguration, SeedBest)>>,
 }
 
 impl ControlledPartialError {
-    fn from_seed(outer_index: u128, evaluations_used: u64, error: ControlledSeedError) -> Self {
+    fn from_seed(
+        outer_index: u128,
+        evaluations_used: u64,
+        initial: ResolvedConfiguration,
+        error: ControlledSeedError,
+    ) -> Self {
         Self {
             outer_index,
             seed_index: error.seed_index,
             evaluations_used,
             source: ControlledPartialSource::Climb(error.source),
+            best: error.best.map(|best| Box::new((initial, *best))),
         }
     }
 }
@@ -424,6 +431,7 @@ impl crate::AttackRequest {
                     seed_index: None,
                     evaluations_used: accounting.allowance.used,
                     source: ControlledPartialSource::UnsupportedPass,
+                    best: None,
                 });
             }
             let first = settings.initial_measure();
@@ -446,7 +454,12 @@ impl crate::AttackRequest {
                     requested,
                 )
                 .map_err(|error| {
-                    ControlledPartialError::from_seed(outer_index, accounting.allowance.used, error)
+                    ControlledPartialError::from_seed(
+                        outer_index,
+                        accounting.allowance.used,
+                        initial.clone(),
+                        error,
+                    )
                 })?;
             Ok(ControlledPartialOutcome {
                 initial,
@@ -1317,10 +1330,11 @@ struct ControlledSeedOutcome {
     cancelled: bool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 struct ControlledSeedError {
     seed_index: Option<u128>,
     source: ObservedClimbError,
+    best: Option<Box<SeedBest>>,
 }
 
 impl<'a> BoundClimbScoring<'a> {
@@ -1331,12 +1345,35 @@ impl<'a> BoundClimbScoring<'a> {
         accounting: &mut ObservedAccounting<'_, O>,
         requested: &mut F,
     ) -> Result<ControlledSeedOutcome, ControlledSeedError> {
+        self.climb_seeds_controlled_with(
+            policy,
+            accounting,
+            requested,
+            |_, board, accounting, requested| {
+                self.climb_cancellable(board, backtrack_pairs, accounting, requested)
+            },
+        )
+    }
+
+    fn climb_seeds_controlled_with<O: CounterObserver, F: FnMut() -> bool>(
+        &self,
+        policy: &crate::AttackSeedPolicy,
+        accounting: &mut ObservedAccounting<'_, O>,
+        requested: &mut F,
+        mut climb: impl FnMut(
+            u128,
+            MutableBoard,
+            &mut ObservedAccounting<'_, O>,
+            &mut F,
+        ) -> Result<ClimbOutcome, ObservedClimbError>,
+    ) -> Result<ControlledSeedOutcome, ControlledSeedError> {
         accounting.control.notify(accounting.observer);
         let run = (|| {
             let seeds = SeedCursor::new(self.initial, self.domain, policy).map_err(|source| {
                 ControlledSeedError {
                     seed_index: None,
                     source: TrialEvaluationError::Board(source).into(),
+                    best: None,
                 }
             })?;
             let mut result = ControlledSeedOutcome {
@@ -1350,11 +1387,13 @@ impl<'a> BoundClimbScoring<'a> {
                 cancelled: false,
             };
             for (seed_index, board) in seeds {
-                let outcome = self
-                    .climb_cancellable(board, backtrack_pairs, accounting, &mut *requested)
-                    .map_err(|source| ControlledSeedError {
-                        seed_index: Some(seed_index),
-                        source,
+                let outcome =
+                    climb(seed_index, board, accounting, &mut *requested).map_err(|source| {
+                        ControlledSeedError {
+                            seed_index: Some(seed_index),
+                            source,
+                            best: result.seeds.best.take().map(Box::new),
+                        }
                     })?;
                 result.cancelled = outcome.cancelled;
                 result.seeds.budget_stopped = outcome.budget_stopped;
@@ -2951,9 +2990,11 @@ mod tests {
                 Err(ControlledPartialError::from_seed(
                     index,
                     accounting.allowance.used,
+                    initial.clone(),
                     ControlledSeedError {
                         seed_index: Some(2),
                         source,
+                        best: None,
                     },
                 ))
             },
@@ -4785,6 +4826,202 @@ mod tests {
     }
 
     #[test]
+    fn controlled_seeds_retains_completed_best_after_later_fault() {
+        use crate::attack_control::CounterSnapshot;
+        let (initial, domain) = fixture();
+        let first = resource(&initial);
+        let context = BoundClimbScoring::new(
+            &initial,
+            &domain,
+            "AA",
+            (MeasureId::Trie, Some(&first)),
+            (MeasureId::Trie, Some(&first)),
+            1,
+        );
+        let mut allowance = EvaluationAllowance {
+            used: 0,
+            limit: 100,
+        };
+        let mut control = AttackControl::default();
+        let mut observer = Recorder::default();
+        let expected = context
+            .climb_cancellable(
+                vec![],
+                0,
+                &mut ObservedAccounting {
+                    allowance: &mut allowance,
+                    control: &mut control,
+                    observer: &mut observer,
+                },
+                &mut || false,
+            )
+            .unwrap();
+        let expected_current = expected.current.as_ref().unwrap();
+        let first_used = allowance.used;
+        for fault in 0..3 {
+            let broken = BoundClimbScoring::new(
+                &initial,
+                &domain,
+                "AA",
+                (
+                    MeasureId::Trie,
+                    if fault == 0 { None } else { Some(&first) },
+                ),
+                (MeasureId::Trie, None),
+                2,
+            );
+            let mut allowance = EvaluationAllowance {
+                used: 7,
+                limit: 100,
+            };
+            let mut control = AttackControl::with_counters(CounterSnapshot {
+                climbs_completed: if fault == 2 { u128::MAX - 1 } else { 0 },
+                ..Default::default()
+            });
+            let mut observer = Recorder::default();
+            // Only later seeds use the injected missing-resource context. The
+            // counter case uses the unmodified production climb for every seed.
+            let error = context
+                .climb_seeds_controlled_with(
+                    &crate::AttackSeedPolicy::All,
+                    &mut ObservedAccounting {
+                        allowance: &mut allowance,
+                        control: &mut control,
+                        observer: &mut observer,
+                    },
+                    &mut || false,
+                    |index, board, accounting, requested| {
+                        let scoring = if index == 0 || fault == 2 {
+                            &context
+                        } else {
+                            &broken
+                        };
+                        scoring.climb_cancellable(board, 0, accounting, requested)
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(error.seed_index, Some(1));
+            let expected_source = if fault == 2 {
+                ObservedClimbError::Counter(CounterOverflow::ClimbsCompleted)
+            } else {
+                TrialEvaluationError::MissingResource(MeasureId::Trie).into()
+            };
+            assert_eq!(error.source, expected_source);
+            assert!(allowance.used > 7 + first_used);
+            let snapshot = control.snapshot();
+            assert_eq!(snapshot.evaluations_admitted, allowance.used - 7);
+            assert_eq!(
+                snapshot.evaluations_completed,
+                snapshot.evaluations_admitted - u64::from(fault != 2)
+            );
+            if fault == 0 {
+                assert_eq!(snapshot.evaluations_completed, first_used);
+            } else {
+                // The later climb scores successfully before its final fault.
+                assert!(snapshot.evaluations_completed > first_used);
+            }
+            assert_eq!(observer.0.last(), Some(&snapshot));
+            let mapped =
+                ControlledPartialError::from_seed(99, allowance.used, initial.clone(), error);
+            assert_eq!(mapped.outer_index, 99);
+            assert_eq!(mapped.seed_index, Some(1));
+            assert_eq!(mapped.evaluations_used, allowance.used);
+            assert_eq!(
+                mapped.source,
+                ControlledPartialSource::Climb(expected_source)
+            );
+            let (key, best) = *mapped.best.expect("earlier final-scored seed retained");
+            assert_eq!(key, initial);
+            assert_eq!(best.seed_index, 0);
+            assert_eq!(best.current.board, expected_current.board);
+            assert_eq!(best.current.plaintext, expected_current.plaintext);
+            assert_eq!(best.current.score, expected_current.score);
+            assert_eq!(
+                best.incomplete,
+                expected.cancelled || expected.budget_stopped
+            );
+            assert_eq!(best.final_objective_ascent, expected.final_objective_ascent);
+            assert_eq!(best.neighborhood_exhausted, expected.neighborhood_exhausted);
+        }
+    }
+
+    #[test]
+    fn controlled_partial_retains_owned_fixed_key_after_later_counter_fault() {
+        use crate::attack_control::CounterSnapshot;
+        let value = serde_json::json!({"protocol_version":1,"machine":{"definition":{
+            "kind":"custom","value":{"alphabet":["A","B","C","D","E"],
+            "wheels":[{"name":"r","wiring":["B","A","D","E","C"],"turnovers":[]}],
+            "slots":[{"id":"r","role":"rotor","movement":"movable","wheel":"r"}],
+            "stepping":{"rules":[{"when":{"always":true},"advance":["r"]}]}}}},
+            "job":{"kind":"search","configuration":{"slots":[{"id":"r","position":"A","ring":"A"}],
+            "plugboard":[["A","B"]]},"space":{"plugboard":{"kind":"attack",
+            "symbols":["C","D","E"],"max_pairs":2}},"text":"CCDD","passes":["partial_exhaustion"],
+            "measures":["ic"],"attack":{"kind":"partial_exhaustion","initial_measure":"ic",
+            "final_measure":"ic","switch_pairs":0,"backtrack_pairs":0,"evaluation_budget":100,
+            "seeds":{"kind":"empty_single","selection":"all"}}}});
+        let request = crate::AttackRequest::parse_json(&value.to_string()).unwrap();
+        let initial = request.outer_candidates().next().unwrap().1.unwrap();
+        let before = initial.clone();
+        let mut allowance = EvaluationAllowance {
+            used: 0,
+            limit: 100,
+        };
+        let mut control = AttackControl::with_counters(CounterSnapshot {
+            climbs_started: u128::MAX - 1,
+            ..Default::default()
+        });
+        let mut observer = Recorder::default();
+        let error = request
+            .climb_partial_outer_controlled(
+                initial,
+                73,
+                &mut ObservedAccounting {
+                    allowance: &mut allowance,
+                    control: &mut control,
+                    observer: &mut observer,
+                },
+                &mut || false,
+            )
+            .unwrap_err();
+        assert_eq!(error.outer_index, 73);
+        assert_eq!(error.seed_index, Some(1));
+        assert_eq!(error.evaluations_used, allowance.used);
+        assert_eq!(
+            error.source,
+            ControlledPartialSource::Climb(ObservedClimbError::Counter(
+                CounterOverflow::ClimbsStarted
+            ))
+        );
+        let (key, best) = *error.best.unwrap();
+        assert_eq!(key, before);
+        assert_eq!(key.plugboard().map('A'), Some('B'));
+        assert_eq!(key.plugboard().map('B'), Some('A'));
+        assert_eq!(best.seed_index, 0);
+        assert!(best
+            .current
+            .board
+            .iter()
+            .all(|&(a, b)| { !['A', 'B'].contains(&a) && !['A', 'B'].contains(&b) }));
+        let evaluated = TrialEvaluator::new(
+            &key,
+            request.domain(),
+            request.text(),
+            Direction::Decrypt,
+            MeasureId::Ic,
+            None,
+        )
+        .evaluate(&best.current.board)
+        .unwrap();
+        assert_eq!(best.current.plaintext, evaluated.0);
+        assert_eq!(best.current.score, evaluated.1);
+        assert!(!best.incomplete);
+        assert!(best.neighborhood_exhausted);
+        assert_eq!(control.snapshot().climbs_started, u128::MAX);
+        assert_eq!(control.snapshot().climbs_completed, 1);
+        assert_eq!(observer.0.last(), Some(&control.snapshot()));
+    }
+
+    #[test]
     fn controlled_seeds_counter_sources_and_prior_facts() {
         use crate::attack_control::CounterSnapshot;
         let (initial, domain) = fixture();
@@ -4833,13 +5070,10 @@ mod tests {
             }
             assert_eq!(recorder.0.last(), Some(&expected));
             assert_eq!(actual, used);
-            assert_eq!(
-                result.unwrap_err(),
-                ControlledSeedError {
-                    seed_index: Some(0),
-                    source: ObservedClimbError::Counter(source),
-                }
-            );
+            let error = result.unwrap_err();
+            assert_eq!(error.seed_index, Some(0));
+            assert_eq!(error.source, ObservedClimbError::Counter(source));
+            assert!(error.best.is_none());
         }
         let counters = CounterSnapshot {
             evaluations_admitted: 11,
@@ -5055,6 +5289,7 @@ mod tests {
                 )
                 .unwrap_err();
             assert_eq!(error.seed_index, Some(0));
+            assert!(error.best.is_none());
             assert_eq!(
                 error.source,
                 ObservedClimbError::Evaluation(TrialEvaluationError::MissingResource(
@@ -5156,7 +5391,8 @@ mod tests {
             );
             let (result, used, recorder, _) =
                 controlled_seed_probe(&context, Default::default(), 100, |_| false);
-            let mapped = ControlledPartialError::from_seed(99, used, result.unwrap_err());
+            let mapped =
+                ControlledPartialError::from_seed(99, used, initial.clone(), result.unwrap_err());
             assert_eq!(mapped.outer_index, 99);
             assert_eq!(mapped.seed_index, Some(0));
             assert_eq!(mapped.evaluations_used, 8);
@@ -5189,7 +5425,8 @@ mod tests {
         );
         let (error, used, recorder, polls) =
             controlled_seed_probe(&context, Default::default(), 100, |_| true);
-        let mapped = ControlledPartialError::from_seed(99, used, error.unwrap_err());
+        let mapped =
+            ControlledPartialError::from_seed(99, used, initial.clone(), error.unwrap_err());
         assert_eq!(
             (
                 mapped.outer_index,
@@ -5240,9 +5477,11 @@ mod tests {
         let mapped = ControlledPartialError::from_seed(
             99,
             allowance.used,
+            initial.clone(),
             ControlledSeedError {
                 seed_index: Some(2),
                 source,
+                best: None,
             },
         );
         assert_eq!(
@@ -5275,9 +5514,11 @@ mod tests {
             let mapped = ControlledPartialError::from_seed(
                 99,
                 7,
+                initial.clone(),
                 ControlledSeedError {
                     seed_index: Some(2),
                     source: ObservedClimbError::Counter(source),
+                    best: None,
                 },
             );
             assert_eq!(

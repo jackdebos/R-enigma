@@ -44,6 +44,13 @@ final-score best ownership. Whole seed-run completion stays independent of winne
 original indexed resolution/evaluation errors retain cumulative usage.
 Private HC/PE aggregates and the public Core HC facade are implemented;
 public PE, full wire results and CLI execution remain deferred.
+Task 12.9a privately retains the best earlier successful, final-scored seed when a
+later seed fails. Its error envelope owns the original resolved initial key separately
+from the committed mutable board, preserving the failure source/index and charged usage.
+Failed climbs, provisional scan winners and failed final rescoring never supply that best.
+The controlled whole-run PE scheduler still drops this seed-local best on error;
+whole-outer retention/projections remain Task 12.9b work. Public HC is unchanged,
+and public PE still rejects execution with `UnsupportedExecution` until Task 12.9c.
 
 For this settings fragment, malformed raw JSON (including duplicate keys, trailing
 input and nonobjects), missing fields and invalid kind/objectives/budget use
