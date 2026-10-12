@@ -1,6 +1,6 @@
 # Plugboard attack contract — Task 11
 
-Status: **Core HC execution and Core/CLI attack validation are supported; public PE and CLI execution remain deferred.**
+Status: **Core HC/PE execution and Core/CLI attack validation are supported; CLI execution remains deferred.**
 Task 11.2a provides only `AttackPlugboardDomain::parse_json`: strict typed fragment
 validation with immutable known fixed pairs. It is separate from legacy search
 spaces and grants neither complete request acceptance nor candidate enumeration.
@@ -18,7 +18,7 @@ carriers and the HC facade are exposed; raw candidate APIs remain private. Publi
 `job.space.plugboard.kind` is `"attack"`, with wire kind still `"search"`.
 The CLI loads resources once, binds and checks eligibility, then emits one seq1
 `unsupported_job` error at `/job/kind` (`attack execution is not implemented`),
-without work events. CLI execution remains unsupported; Core HC uses §6.2.
+without work events. CLI execution remains unsupported; Core HC/PE uses §6.2.
 Task 11.4a adds private budget-aware complete-neighborhood best-improvement selection only.
 Task 11.4b.1 adds a private bound scoring lifecycle: start-phase selection, shared final-score
 reservation, committed-board objective switching and once-only finalization, without an ascent loop.
@@ -42,8 +42,8 @@ usage or the indexed original evaluator error. Task 11.6c.2 privately schedules 
 same-owner PE outers with one allowance, checked aggregate counts and stable committed
 final-score best ownership. Whole seed-run completion stays independent of winner flags;
 original indexed resolution/evaluation errors retain cumulative usage.
-Private HC/PE aggregates and the public Core HC facade are implemented;
-public PE, full wire results and CLI execution remain deferred.
+Private HC/PE aggregates and the public Core HC/PE facade are implemented;
+full wire results and CLI execution remain deferred.
 Task 12.9a privately retains the best earlier successful, final-scored seed when a
 later seed fails. Its error envelope owns the original resolved initial key separately
 from the committed mutable board, preserving the failure source/index and charged usage.
@@ -53,7 +53,7 @@ failing outers, selecting strictly better final scores and preserving earliest t
 Outer-completion accounting precedes acceptance: overflow retains only the prior aggregate.
 Private owned PE projections preserve terminal usage/counters, nullable failure indices,
 original causes and separate malformed-best errors. Public HC is unchanged;
-public PE still rejects execution with `UnsupportedExecution` until Task 12.9c.
+Task 12.9c exposes these PE projections through the same public run facade.
 
 For this settings fragment, malformed raw JSON (including duplicate keys, trailing
 input and nonobjects), missing fields and invalid kind/objectives/budget use
@@ -71,10 +71,10 @@ change existing root/domain diagnostic policies.
 Task 11 first validates a known scrambler with unknown plugboard, then nests the
 same attack inside outer scrambler enumeration. Current CLI search only validates,
 loads and binds resources, then returns `unsupported_job`. Private HC/PE drivers
-and outer schedulers are implemented; Core HC is public, but CLI execution is unsupported.
+and outer schedulers are implemented; Core HC/PE is public, but CLI execution is unsupported.
 [Protocol](protocol.md) and [scoring/resources](scoring-resources.md) remain normative.
 This document specifies `hill_climb` and `partial_exhaustion`, plus the future private
-control contract in §6.1 and public HC adapter in §6.2;
+control contract in §6.1 and public HC/PE adapter in §6.2;
 [protocol §4.1](protocol.md#41-planned-hcpe-search-events--task-127) defines first-release
 lifecycle/results/progress. That wire contract does not enable CLI execution. Checkpoints, other
 passes and variants remain separate work.
@@ -309,7 +309,7 @@ planned public events by [protocol §4.1](protocol.md#41-planned-hcpe-search-eve
 Single climbs, HC outer scheduling, PE seeds/resolved owners and PE outer scheduling
 share checked accounting, counter snapshots and cooperative cancellation.
 Budget-only callers retain Task 11 behavior; §6.2 exposes only the controlled HC path.
-Public PE execution, JSONL events, timed progress, platform signals and
+JSONL events, timed progress, platform signals and
 control files, hold and checkpoint cadence remain unimplemented. Checkpoint/resume
 belongs to Task 16; Task 12 remains in progress at private documentary acceptance.
 
@@ -381,13 +381,13 @@ still owns checkpoint/resume design and implementation.
 
 ### 6.2 Public Core HC API — Task 12.8
 
-**`AttackRequest::run` executes HC on an already validated, resource-bound owner.**
+**`AttackRequest::run` executes HC or PE on an already validated, resource-bound owner.**
 Owned `AttackProgress`, `AttackResult`, `AttackBest`, `AttackTermination` and
 `AttackRunError`/`AttackRunSource` expose factual counters, committed winners and
 original causes. Malformed accepted best projections return explicit errors,
 never silently become null; success-projection failures retain terminal counters
 and usage with an invariant cause and the concrete failure through `best()`.
-CLI and public PE execution remain deferred. The synchronous facade is:
+CLI execution remains deferred. The synchronous facade is:
 
 ```rust,ignore
 fn run(&self, observe: impl FnMut(AttackProgress),
@@ -396,10 +396,10 @@ fn run(&self, observe: impl FnMut(AttackProgress),
 ```
 
 Each invocation creates fresh whole-run control/allowance and reuses the controlled
-same-owner lazy HC scheduler with absolute outer indices. It never rereads resources
-or accepts caller-supplied raw outer candidates. Valid PE rejects before enumeration,
-evaluation, observation or cancellation polling: `UnsupportedExecution`, no indices,
-zero charged usage and all counters zero, with best `Ok(None)`.
+same-owner lazy HC or PE scheduler with absolute outer indices and dense PE seed
+indices. It never rereads resources or accepts caller-supplied raw outer candidates.
+PE cancellation and budget stops retain eligible final-scored seed winners; winner
+incompleteness is independent of whole-run termination.
 Callbacks are synchronous; observation is infallible and counter-only, cancellation
 is polled separately and latched. Repeated runs start fresh. No public exports of
 private schedulers, allowances, seed cursors or evaluator/control types are needed.
@@ -413,7 +413,7 @@ CLI/resource preflight still completes before `started`; Core parsing stays pure
 | `AttackRunError` | Original owned source, optional outer/start indices, cumulative charged usage, final progress, fallible optional earlier aggregate best |
 
 `AttackBest` projects direct `DirectOuterOutcome` without retaining trial boards;
-Private PE `SeedBest` projection reuses that owned key validation. Its key combines resolved slot facts with fixed plus winning mutable
+PE `SeedBest` projection reuses that owned key validation. Its key combines resolved slot facts with fixed plus winning mutable
 pairs; never report the owner's initial fixed-only board as the winning complete key.
 Flags are `incomplete`, `final_objective_ascent`, `neighborhood_exhausted`; direct
 HC interruption derives from its cancellation/budget flags, PE from its seed winner.
@@ -429,12 +429,10 @@ absence or an owned projection error by reference for malformed retained best. T
 separate fallible channel preserves the original runtime cause and all accounting
 instead of silently dropping a malformed winner or replacing the runtime failure.
 Original evaluation/counter/resolution sources are wrapped in an owned
-`AttackRunSource`; raw scheduler error types stay private. The HC-only facade
-returns `UnsupportedExecution` for valid PE until12.9: an API availability error,
-not an evaluation/invariant failure. Rejection precedes enumeration, evaluation,
-cancellation polling and observation, with absent indices, zero usage/counters
-and best `Ok(None)`.
-Reconcile this temporary category with the eventual HC/PE source taxonomy at12.9.
+`AttackRunSource`; raw scheduler error types stay private. PE errors preserve the
+original failure indices, earlier eligible seed/outer winner and terminal accounting
+through the same owned envelope. The public `UnsupportedExecution` category remains
+available for compatibility, but valid HC/PE runs no longer produce that rejection.
 Preserve nested source access and diagnostics,
 not just a formatted string or sentinel result. Result/best/progress/error fields use
 the wire names in protocol §4.1; Core replaces `elapsed_ms` with transport ownership,
@@ -443,7 +441,7 @@ variants are `Completed`, `OuterSliceEnd`, `EvaluationBudget`, `Cancelled`.
 
 `completed`, `outer_slice_end`, `evaluation_budget`, `cancelled` have exactly the
 [wire stop meanings](protocol.md#41-planned-hcpe-search-events--task-127). The public
-HC facade uses the controlled HC path; public PE execution remains deferred.
+facade uses the corresponding controlled HC/PE path; CLI execution remains deferred.
 No current-climb result exists before initial success; a failed final rescore cannot
 make that board eligible. Errors dominate cancellation and preserve charged usage.
 The transport adds clock/coalescing and exact decimal-string encoding; Core keeps
@@ -476,7 +474,7 @@ These are **valid planned search-job fragments**, completed by protocol root
 `protocol_version: 1` and bundled `machine.definition` for `enigma-i`. They are
 not known-answer vectors. Direct Core attack parsing, binding and eligibility checks
 validate them. Safe public root Core/CLI validation and private execution are
-implemented; public HC runs in Core only, while public PE and CLI execution remain deferred.
+implemented; public HC/PE runs in Core only, while CLI execution remains deferred.
 
 ```json
 {

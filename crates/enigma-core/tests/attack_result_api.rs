@@ -177,30 +177,45 @@ fn public_run_budget_stop_and_exact_budget_completion() {
 }
 
 #[test]
-fn public_run_rejects_valid_pe_without_callbacks() {
-    use std::error::Error;
-    let error = fixture(100, 0, true)
-        .run(
-            |_| panic!("unsupported execution must not observe"),
-            || panic!("unsupported execution must not poll cancellation"),
-        )
-        .unwrap_err();
-    assert_eq!(
-        error.run_source().category(),
-        AttackRunCategory::UnsupportedExecution
-    );
-    assert!(error
-        .source()
+fn public_pe_projects_unicode_mutable_winner() {
+    let mut last = None;
+    let mut value = fixture_value(100, 0, true);
+    value["machine"]["definition"]["value"]["wheels"][0]["wiring"] =
+        serde_json::json!(["é", "🦀", "Ω", "中"]);
+    value["job"]["measures"] = serde_json::json!(["trie"]);
+    value["job"]["attack"]["initial_measure"] = serde_json::json!("trie");
+    value["job"]["attack"]["final_measure"] = serde_json::json!("trie");
+    value["job"]["resources"] = serde_json::json!({"trie": {"path": "dictionary.json"}});
+    let dictionary = serde_json::json!({"resource_version":1,"kind":"dictionary","alphabet":["🦀","é","Ω","中"],"entries":[{"word":["中","中"],"weight":1}]}).to_string();
+    let supplied = std::collections::BTreeMap::from([("trie".to_owned(), dictionary.as_str())]);
+    let request = enigma_core::ParsedAttackRequest::parse_json(&value.to_string())
         .unwrap()
-        .downcast_ref::<AttackRunSource>()
-        .is_some());
-    assert!(!error.run_source().to_string().is_empty());
-    assert!(error.run_source().diagnostics().is_none());
-    assert!(error.run_source().overflow().is_none());
-    assert_eq!((error.outer_index(), error.start_index()), (None, None));
-    assert_eq!(error.evaluations_used(), 0);
-    assert_eq!(counts(error.counters()), (0, 0, 0, 0, 0));
-    assert!(error.best().unwrap().is_none());
+        .bind_resources(&supplied)
+        .unwrap();
+    let result = request
+        .run(|p| last = Some(p), || false)
+        .expect("public PE executes");
+    assert_eq!(result.termination(), AttackTermination::Completed);
+    assert_eq!(last, Some(result.counters()));
+    assert_eq!(counts(result.counters()), (5, 5, 2, 2, 1));
+    assert_eq!(result.evaluations_used(), 5);
+    let best = result.best().unwrap();
+    assert_eq!(
+        best.configuration().plugboard(),
+        &[('🦀', 'Ω'), ('é', '中')]
+    );
+    assert_eq!(best.mutable_plugboard(), &[('🦀', 'Ω')]);
+    assert_eq!(
+        best.configuration().slots(),
+        &[enigma_core::SlotConfiguration::new("r", "r", 'é', 'Ω')]
+    );
+    assert_eq!(best.plaintext(), "中中");
+    assert_eq!(best.measure(), enigma_core::MeasureId::Trie);
+    assert_eq!(best.score().ranking().units(), 1 << 32);
+    assert_eq!((best.outer_index(), best.start_index()), (0, 0));
+    assert!(!best.incomplete());
+    assert!(best.final_objective_ascent());
+    assert!(best.neighborhood_exhausted());
 }
 
 #[test]

@@ -110,26 +110,28 @@ impl crate::AttackRequest {
     ///
     /// Observation is synchronous, infallible and counter-only; duplicate snapshots
     /// are allowed. Cancellation is independently polled at safe boundaries, never
-    /// mid-evaluation. Partial exhaustion rejects before either callback is called.
+    /// mid-evaluation. HC and PE reuse their validated same-owner schedulers.
     pub fn run(
         &self,
         observe: impl FnMut(crate::AttackProgress),
         cancel_requested: impl FnMut() -> bool,
     ) -> Result<crate::AttackResult, crate::AttackRunError> {
-        if self.settings().kind() != crate::AttackKind::HillClimb {
-            return Err(crate::AttackRunError::new(AttackRunErrorData {
-                source: crate::AttackRunSource(
-                    crate::attack_result::RunPayload::UnsupportedExecution,
-                ),
-                outer_index: None,
-                start_index: None,
-                evaluations_used: 0,
-                counters: crate::AttackProgress(crate::attack_control::CounterSnapshot::default()),
-                best: Ok(None),
-            }));
-        }
         let mut control = AttackControl::default();
         let mut observer = ProgressObserver(observe);
+        if self.settings().kind() == crate::AttackKind::PartialExhaustion {
+            return match self.schedule_partial_outers_controlled(
+                &mut control,
+                &mut observer,
+                cancel_requested,
+            ) {
+                Ok(outcome) => outcome.project_public(
+                    control.snapshot(),
+                    self.domain(),
+                    self.settings().final_measure(),
+                ),
+                Err(error) => Err(error.project(self.domain(), self.settings().final_measure())),
+            };
+        }
         match self.schedule_direct_outers_controlled(&mut control, &mut observer, cancel_requested)
         {
             Ok(outcome) => outcome.project_public(
@@ -3135,6 +3137,294 @@ mod tests {
         assert_eq!(error.evaluations_used(), 32);
         assert_eq!(error.outer_index(), Some(42));
         assert_eq!(error.start_index(), None);
+    }
+
+    fn public_pe_probe(
+        request: &crate::AttackRequest,
+        stop: impl Fn(crate::AttackProgress) -> bool,
+    ) -> crate::AttackResult {
+        let cancel = std::cell::Cell::new(false);
+        let mut last = None;
+        let result = request
+            .run(
+                |p| {
+                    cancel.set(stop(p));
+                    last = Some(p);
+                },
+                || cancel.get(),
+            )
+            .expect("public PE executes");
+        assert_eq!(last, Some(result.counters()));
+        assert_eq!(
+            result.evaluations_used(),
+            result.counters().evaluations_admitted()
+        );
+        assert_eq!(
+            result.evaluations_used(),
+            result.counters().evaluations_completed()
+        );
+        result
+    }
+
+    type PublicPeWinner<'a> = (u128, u128, &'a str, i128, bool, bool, bool);
+
+    fn public_pe_facts(
+        result: &crate::AttackResult,
+        termination: crate::AttackTermination,
+        counts: (u64, u128, u128, u128),
+        winner: Option<PublicPeWinner<'_>>,
+    ) {
+        let p = result.counters();
+        assert_eq!(result.termination(), termination, "{result:?}");
+        assert_eq!(
+            (
+                result.evaluations_used(),
+                p.climbs_started(),
+                p.climbs_completed(),
+                p.outers_completed()
+            ),
+            counts,
+            "{result:?}"
+        );
+        assert_eq!(result.best().is_some(), winner.is_some());
+        if let Some((outer, seed, text, score, incomplete, ascent, exhausted)) = winner {
+            let best = result.best().unwrap();
+            assert_eq!((best.outer_index(), best.start_index()), (outer, seed));
+            assert_eq!(best.plaintext(), text);
+            assert_eq!(best.measure(), MeasureId::Trie);
+            assert_eq!(best.score().ranking().units(), score << 32);
+            assert_eq!(best.configuration().plugboard(), best.mutable_plugboard());
+            assert_eq!(
+                best.configuration().slots(),
+                &[crate::SlotConfiguration::new(
+                    "r",
+                    "r",
+                    ['A', 'B', 'C'][outer as usize],
+                    'A'
+                )]
+            );
+            assert_eq!(best.incomplete(), incomplete);
+            assert_eq!(best.final_objective_ascent(), ascent);
+            assert_eq!(best.neighborhood_exhausted(), exhausted);
+        }
+    }
+
+    #[test]
+    fn public_pe_seed_winner_order_and_interruption() {
+        use crate::AttackTermination::{Completed, EvaluationBudget};
+        for (distinct, touching, budget, termination, counts, seed, text, score, flags) in [
+            (
+                false,
+                false,
+                100,
+                Completed,
+                (32, 4, 4, 1),
+                0,
+                "CB",
+                2,
+                (false, true, true),
+            ),
+            (
+                true,
+                false,
+                7,
+                EvaluationBudget,
+                (7, 2, 1, 0),
+                1,
+                "AC",
+                1,
+                (true, false, false),
+            ),
+            (
+                true,
+                true,
+                7,
+                EvaluationBudget,
+                (7, 2, 1, 0),
+                1,
+                "CB",
+                2,
+                (true, false, false),
+            ),
+        ] {
+            let request = direct_request_with(serde_json::json!([]), distinct, true, |job| {
+                job["attack"]["evaluation_budget"] = serde_json::json!(budget);
+                if touching {
+                    job["attack"]["seeds"] = serde_json::json!({"kind":"empty_single","selection":"touching","symbols":["C"]});
+                }
+            });
+            let result = public_pe_probe(&request, |_| false);
+            public_pe_facts(
+                &result,
+                termination,
+                counts,
+                Some((0, seed, text, score, flags.0, flags.1, flags.2)),
+            );
+            let pair = if touching || !distinct {
+                ('A', 'C')
+            } else {
+                ('A', 'B')
+            };
+            assert_eq!(result.best().unwrap().mutable_plugboard(), &[pair]);
+        }
+    }
+
+    #[test]
+    fn public_pe_outer_winner_order_and_interruption() {
+        use crate::AttackTermination::{Completed, EvaluationBudget};
+        for (distinct, text, budget, offset, termination, counts, winner, plain, score, flags) in [
+            (
+                true,
+                "CB",
+                6,
+                0,
+                Completed,
+                (6, 3, 3, 3),
+                1,
+                "BA",
+                2,
+                (false, false, true),
+            ),
+            (
+                false,
+                "A",
+                2,
+                1,
+                Completed,
+                (2, 2, 2, 2),
+                1,
+                "A",
+                0,
+                (false, true, true),
+            ),
+            (
+                true,
+                "CB",
+                5,
+                0,
+                EvaluationBudget,
+                (4, 2, 2, 2),
+                1,
+                "BA",
+                2,
+                (false, false, true),
+            ),
+        ] {
+            let request = partial_scheduler_request(budget, distinct, |job| {
+                job["text"] = serde_json::json!(text);
+                job["space"]["offset"] = serde_json::json!(offset);
+                job["space"]["plugboard"]["max_pairs"] = serde_json::json!(0);
+            });
+            let result = public_pe_probe(&request, |_| false);
+            public_pe_facts(
+                &result,
+                termination,
+                counts,
+                Some((winner, 0, plain, score, flags.0, flags.1, flags.2)),
+            );
+            assert_eq!(
+                result.best().unwrap().configuration().slots(),
+                &[crate::SlotConfiguration::new("r", "r", 'B', 'A')]
+            );
+            assert!(result.best().unwrap().mutable_plugboard().is_empty());
+        }
+    }
+
+    #[test]
+    fn public_pe_observation_cancellation_boundaries() {
+        let request = partial_scheduler_request(100, true, |_| {});
+        // An interrupted later outer must not replace the earlier eligible winner.
+        let interrupted_outer = public_pe_probe(&request, |p| {
+            p.outers_completed() == 1 && p.climbs_started() == 5
+        });
+        public_pe_facts(
+            &interrupted_outer,
+            crate::AttackTermination::Cancelled,
+            (30, 5, 4, 1),
+            Some((0, 1, "CB", 2, false, true, true)),
+        );
+        for (boundary, counts, winner) in [
+            (0, (0, 0, 0, 0), None),
+            (1, (32, 4, 4, 1), Some((0, 0, "CB", 2, false, true, true))),
+            (2, (9, 1, 1, 0), Some((0, 0, "CB", 2, false, true, true))),
+            (3, (2, 1, 0, 0), Some((0, 0, "CA", 0, true, false, false))),
+        ] {
+            let request = partial_scheduler_request(100, false, |_| {});
+            let result = public_pe_probe(&request, |p| match boundary {
+                0 => true,
+                1 => p.outers_completed() == 1,
+                2 => p.climbs_completed() == 1,
+                _ => p.evaluations_completed() >= 2,
+            });
+            public_pe_facts(&result, crate::AttackTermination::Cancelled, counts, winner);
+        }
+        // Distinct objectives must spend the reserved final rescore after cancellation.
+        let request = partial_scheduler_request(100, true, |_| {});
+        let result = public_pe_probe(&request, |p| p.evaluations_completed() >= 2);
+        public_pe_facts(
+            &result,
+            crate::AttackTermination::Cancelled,
+            (3, 1, 0, 0),
+            Some((0, 0, "CA", 0, true, false, false)),
+        );
+    }
+
+    #[test]
+    fn public_pe_budget_and_empty_precedence() {
+        use crate::AttackTermination::{Completed, EvaluationBudget, OuterSliceEnd};
+        for (budget, distinct, offset, cancel, termination, counts, winner) in [
+            (1, false, 3, true, OuterSliceEnd, (0, 0, 0, 0), None),
+            (
+                32,
+                false,
+                0,
+                false,
+                Completed,
+                (32, 4, 4, 1),
+                Some((0, 0, "CB", 2, false, true, true)),
+            ),
+            (1, true, 0, false, EvaluationBudget, (0, 0, 0, 0), None),
+            (
+                2,
+                true,
+                0,
+                false,
+                EvaluationBudget,
+                (2, 1, 0, 0),
+                Some((0, 0, "CA", 0, true, false, false)),
+            ),
+        ] {
+            let request = partial_scheduler_request(budget, distinct, |job| {
+                job["space"]["offset"] = serde_json::json!(offset);
+                job["space"]["limit"] = serde_json::json!(1);
+            });
+            let result = public_pe_probe(&request, |_| cancel);
+            public_pe_facts(&result, termination, counts, winner);
+        }
+    }
+
+    #[test]
+    fn public_pe_restarts_after_cancel_and_completion() {
+        let request = partial_scheduler_request(32, false, |job| {
+            job["space"]["limit"] = serde_json::json!(1);
+        });
+        let cancelled = public_pe_probe(&request, |_| true);
+        public_pe_facts(
+            &cancelled,
+            crate::AttackTermination::Cancelled,
+            (0, 0, 0, 0),
+            None,
+        );
+        for _ in 0..2 {
+            let complete = public_pe_probe(&request, |_| false);
+            public_pe_facts(
+                &complete,
+                crate::AttackTermination::Completed,
+                (32, 4, 4, 1),
+                Some((0, 0, "CB", 2, false, true, true)),
+            );
+            assert_eq!(complete.best().unwrap().mutable_plugboard(), &[('A', 'C')]);
+        }
     }
 
     #[test]

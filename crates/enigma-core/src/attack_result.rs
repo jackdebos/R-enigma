@@ -175,7 +175,6 @@ pub(crate) enum RunPayload {
     Evaluation(crate::attack_evaluator::TrialEvaluationError),
     Counter(crate::attack_control::CounterOverflow),
     Invariant(&'static str),
-    UnsupportedExecution,
 }
 
 /// Opaque owned original cause. Nested causes remain available through `Error`.
@@ -198,7 +197,6 @@ impl AttackRunSource {
             RunPayload::Evaluation(_) => AttackRunCategory::Evaluation,
             RunPayload::Counter(_) => AttackRunCategory::Counter,
             RunPayload::Invariant(_) => AttackRunCategory::Invariant,
-            RunPayload::UnsupportedExecution => AttackRunCategory::UnsupportedExecution,
         }
     }
     /// Original resolution diagnostics, without formatting conversion.
@@ -233,9 +231,6 @@ impl std::fmt::Display for AttackRunSource {
             RunPayload::Evaluation(source) => source.fmt(f),
             RunPayload::Counter(source) => source.fmt(f),
             RunPayload::Invariant(message) => f.write_str(message),
-            RunPayload::UnsupportedExecution => {
-                f.write_str("public execution supports hill_climb only")
-            }
         }
     }
 }

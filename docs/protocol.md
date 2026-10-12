@@ -314,8 +314,8 @@ The CLI loads and binds resources, checks eligibility, then emits one seq1
 Structural, loading, model-binding and eligibility errors precede that result.
 Missing or other discriminators retain legacy search validation. Private HC/PE
 evaluation, seed exhaustion and ordered outer scheduling are implemented.
-Core `AttackRequest::run` supports synchronous HC with counter-only observation
-and independently polled cancellation; public PE and CLI execution remain unsupported.
+Core `AttackRequest::run` supports synchronous HC/PE with counter-only observation
+and independently polled cancellation; CLI execution remains unsupported.
 
 Stage 1 plans `hill_climb`, `partial_exhaustion` with backtracking, `reswapping`, `trie`,
 and `measure`; measures include index of coincidence, Sinkov n-gram statistics,
@@ -369,10 +369,10 @@ of other passes is not support. Mixed/deferred/legacy rejection remains unchange
 After all parsing, resource loading/binding, eligibility and count/budget validation,
 emit `started`, zero or more `progress`, one `result`, then exactly one terminal
 `done` or runtime `error`. Preflight failures retain the existing seq1 `error` only.
-Task12.8 stages Core HC availability only; valid PE remains unsupported until12.9.
-Its Core unsupported-execution availability error is not a runtime error: wire
-validation/preflight still emits seq1 `unsupported_job` before `started`, with no
-`result` or work events. This staging does not authorize CLI changes or wire execution.
+Task12.8 exposes Core HC; Task12.9c adds Core PE through the same synchronous API.
+Core availability does not enable wire execution: validation/preflight still emits
+seq1 `unsupported_job` before `started`, with no `result` or work events.
+This staging does not authorize CLI changes or wire execution.
 On runtime error, `result` contains only the earlier successfully committed aggregate
 best, or null; do not invent a result for the failing climb. No `done` follows error.
 `result` is final, not a stream of provisional trials or a hold list.
