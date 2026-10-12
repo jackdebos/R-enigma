@@ -398,7 +398,7 @@ CLI/resource preflight still completes before `started`; Core parsing stays pure
 | `AttackProgress` | Five typed factual counters from §6.1; u64 evaluation counts, u128 climb/outer counts; no clock or candidate |
 | `AttackResult` | `AttackTermination`, final `AttackProgress`, optional `AttackBest` |
 | `AttackBest` | Complete initial winning key plus separate mutable remainder, plaintext, final `MeasuredScore` and `MeasureId`, u128 outer/start indices, three independent boolean flags |
-| `AttackRunError` | Original owned source, optional outer/start indices, cumulative admitted usage, final progress, optional earlier aggregate best |
+| `AttackRunError` | Original owned source, optional outer/start indices, cumulative charged usage, final progress, fallible optional earlier aggregate best |
 
 `AttackBest` projects direct `DirectOuterOutcome` or PE `SeedBest` without retaining
 trial boards. Its key combines resolved slot facts with fixed plus winning mutable
@@ -406,14 +406,20 @@ pairs; never report the owner's initial fixed-only board as the winning complete
 Flags are `incomplete`, `final_objective_ascent`, `neighborhood_exhausted`; direct
 HC interruption derives from its cancellation/budget flags, PE from its seed winner.
 No ascent is implied merely by final scoring. Tie order and eligibility remain §3–6.
-An adapter must retain the earlier aggregate best on an error path: existing private
-error carriers retain source/indices/usage, **not** that best. This requires bounded
-internal error-path retention, not a new observer candidate payload or evaluation.
+The controlled-direct private error already owns the earlier accepted aggregate best,
+source, outer index, charged usage and terminal snapshot. Its public projection keeps
+those facts; resolution and missing-outer failures have no start index, while known
+direct-climb failures use start0, never the earlier winner's index. Failed-outer
+provisional boards are not eligible. `AttackRunError::best()` returns `Ok(None)` for
+absence or an owned projection error by reference for malformed retained best. This
+separate fallible channel preserves the original runtime cause and all accounting
+instead of silently dropping a malformed winner or replacing the runtime failure.
 Original evaluation/counter/resolution sources must be wrapped/projected into an
 owned `AttackRunSource` with resolution/evaluation/counter/invariant variants;
-raw scheduler error types stay private. During HC-only Task12.8, add an explicit
-unsupported-execution source for valid PE until12.9; it is an API availability error,
-not evaluation/invariant failure. Reject before enumeration, evaluation, cancellation
+raw scheduler error types stay private. During HC-only Task12.8, declare the explicit
+`UnsupportedExecution` category for valid PE until12.9; it is an API availability
+error, not evaluation/invariant failure. Rejection behavior belongs to the later
+public runner, not these carriers: before enumeration, evaluation, cancellation
 polling or observer work, with absent indices, zero usage/counters and no best.
 Reconcile this temporary category with the eventual HC/PE source taxonomy at12.9.
 Preserve nested source access and diagnostics,

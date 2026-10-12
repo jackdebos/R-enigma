@@ -844,6 +844,42 @@ struct ControlledDirectError {
     counters: crate::attack_control::CounterSnapshot,
 }
 
+impl ControlledDirectError {
+    fn project(self, domain: &AttackPlugboardDomain, measure: MeasureId) -> crate::AttackRunError {
+        use crate::attack_result::RunPayload;
+        let start_index = match &self.source {
+            DirectRunError::Resolution(_) | DirectRunError::MissingOuter => None,
+            _ => self.outer_index.map(|_| 0),
+        };
+        let source = match self.source {
+            DirectRunError::Resolution(diagnostics) => RunPayload::Resolution(diagnostics),
+            DirectRunError::Climb(DirectClimbError::Evaluation(source)) => {
+                RunPayload::Evaluation(source)
+            }
+            DirectRunError::Counter(source) => RunPayload::Counter(source),
+            DirectRunError::MissingOuter => RunPayload::Invariant("missing selected outer"),
+            DirectRunError::Climb(DirectClimbError::MissingStart) => {
+                RunPayload::Invariant("missing direct start")
+            }
+            DirectRunError::Climb(DirectClimbError::UnsupportedPass) => {
+                RunPayload::Invariant("unsupported direct pass")
+            }
+        };
+        crate::AttackRunError {
+            source: crate::AttackRunSource(source),
+            outer_index: self.outer_index,
+            start_index,
+            evaluations_used: self.evaluations_used,
+            counters: crate::AttackProgress(self.counters),
+            best: self
+                .best
+                .map(|best| best.project(domain, measure))
+                .transpose()
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>),
+        }
+    }
+}
+
 fn schedule_controlled_direct<O: CounterObserver, F: FnMut() -> bool>(
     selected: u128,
     mut outers: impl Iterator<
@@ -3562,7 +3598,7 @@ mod tests {
     }
 
     #[test]
-    fn controlled_direct_error_retains_prior_best() {
+    fn public_error_projection_retains_prior_best() {
         let request = scheduler_request(100, false, false, 0);
         let expected = request
             .climb_direct_outer(
@@ -3611,12 +3647,198 @@ mod tests {
         assert_eq!(error.counters.outers_completed, 1);
         assert_eq!(observer.0.last(), Some(&error.counters));
         assert_eq!(error.evaluations_used, expected.evaluations_used);
+        let expected = expected.project(request.domain(), MeasureId::Trie).unwrap();
+        let error = error.project(request.domain(), MeasureId::Trie);
+        assert_eq!(error.outer_index(), None);
+        assert_eq!(error.start_index(), None);
+        assert_eq!(error.counters(), crate::AttackProgress(control.snapshot()));
+        assert_eq!(error.evaluations_used(), allowance.used);
         let best = error
-            .best
-            .expect("accepted first outer must survive later failure");
-        assert_eq!(best.outer_index, expected.outer_index);
-        assert_eq!(best.initial, expected.initial);
-        assert_eq!(best.climb.current, expected.climb.current);
+            .best()
+            .unwrap()
+            .expect("accepted first outer survives failure");
+        assert_eq!(best.configuration(), expected.configuration());
+        assert_eq!(best.mutable_plugboard(), expected.mutable_plugboard());
+        assert_eq!(best.plaintext(), expected.plaintext());
+        assert_eq!(best.score(), expected.score());
+        assert_eq!(best.measure(), expected.measure());
+        assert_eq!(best.outer_index(), expected.outer_index());
+        assert_eq!(best.start_index(), expected.start_index());
+        assert_eq!(best.incomplete(), expected.incomplete());
+        assert_eq!(
+            best.final_objective_ascent(),
+            expected.final_objective_ascent()
+        );
+        assert_eq!(
+            best.neighborhood_exhausted(),
+            expected.neighborhood_exhausted()
+        );
+    }
+
+    #[test]
+    fn public_error_context_and_all_overflows() {
+        use crate::{AttackCounterOverflow as Public, AttackRunCategory};
+        let request = scheduler_request(100, false, false, 0);
+        let diagnostics = vec![crate::SearchDiagnostic::new(
+            "invalid_search_space",
+            "injected resolution",
+            "/job/space",
+        )];
+        let snapshot = crate::attack_control::CounterSnapshot {
+            evaluations_admitted: u64::MAX,
+            evaluations_completed: u64::MAX - 1,
+            climbs_started: u128::MAX,
+            climbs_completed: u128::MAX - 1,
+            outers_completed: u128::MAX - 2,
+        };
+        let project = |source, outer_index| {
+            ControlledDirectError {
+                source,
+                outer_index,
+                evaluations_used: u64::MAX,
+                counters: snapshot,
+                best: None,
+            }
+            .project(request.domain(), MeasureId::Trie)
+        };
+        let index = u128::MAX;
+        let resolution = project(DirectRunError::Resolution(diagnostics.clone()), Some(index));
+        assert_eq!(
+            resolution.run_source().category(),
+            AttackRunCategory::Resolution
+        );
+        assert_eq!(
+            resolution.run_source().diagnostics(),
+            Some(diagnostics.as_slice())
+        );
+        assert_eq!(resolution.outer_index(), Some(index));
+        assert_eq!(resolution.start_index(), None);
+        assert!(resolution.best().unwrap().is_none());
+        assert!(resolution.to_string().contains("injected resolution"));
+        for source in [
+            DirectRunError::MissingOuter,
+            DirectRunError::Climb(DirectClimbError::MissingStart),
+            DirectRunError::Climb(DirectClimbError::UnsupportedPass),
+        ] {
+            let missing_outer = matches!(source, DirectRunError::MissingOuter);
+            let error = project(source, if missing_outer { None } else { Some(index) });
+            assert_eq!(error.run_source().category(), AttackRunCategory::Invariant);
+            assert!(error.run_source().diagnostics().is_none());
+            assert!(error.run_source().overflow().is_none());
+            assert_eq!(
+                error.start_index(),
+                if missing_outer { None } else { Some(0) }
+            );
+        }
+        for (private, public) in [
+            (
+                CounterOverflow::EvaluationsAdmitted,
+                Public::EvaluationsAdmitted,
+            ),
+            (
+                CounterOverflow::EvaluationsCompleted,
+                Public::EvaluationsCompleted,
+            ),
+            (CounterOverflow::ClimbsStarted, Public::ClimbsStarted),
+            (CounterOverflow::ClimbsCompleted, Public::ClimbsCompleted),
+            (CounterOverflow::OutersCompleted, Public::OutersCompleted),
+        ] {
+            let error = project(DirectRunError::Counter(private), Some(index));
+            assert_eq!(error.run_source().category(), AttackRunCategory::Counter);
+            assert_eq!(error.run_source().overflow(), Some(public));
+            assert_eq!(error.outer_index(), Some(index));
+            assert_eq!(error.start_index(), Some(0));
+            assert_eq!(error.evaluations_used(), u64::MAX);
+            assert_eq!(error.counters(), crate::AttackProgress(snapshot));
+        }
+        let mut allowance = EvaluationAllowance {
+            used: 7,
+            limit: 100,
+        };
+        let mut control = AttackControl::with_counters(snapshot);
+        let mut observer = Recorder::default();
+        let mut accounting = ObservedAccounting {
+            allowance: &mut allowance,
+            control: &mut control,
+            observer: &mut observer,
+        };
+        let source = accounting.admit(0).unwrap_err();
+        let error = ControlledDirectError {
+            source: DirectRunError::from(source),
+            outer_index: Some(index),
+            evaluations_used: allowance.used,
+            counters: control.snapshot(),
+            best: None,
+        }
+        .project(request.domain(), MeasureId::Trie);
+        assert_eq!(error.evaluations_used(), 8);
+        assert_eq!(error.counters(), crate::AttackProgress(control.snapshot()));
+        assert_eq!(allowance.used, 8, "overflow happens after charging");
+        assert_eq!(
+            control.snapshot(),
+            snapshot,
+            "failed admission does not mutate counters"
+        );
+        assert_eq!(
+            error.run_source().overflow(),
+            Some(Public::EvaluationsAdmitted)
+        );
+    }
+
+    #[test]
+    fn public_error_malformed_best_preserves_runtime_cause() {
+        use std::error::Error;
+        let request = scheduler_request(100, false, false, 0);
+        let mut best = request
+            .climb_direct_outer(
+                request.outer_candidates().next().unwrap().1.unwrap(),
+                0,
+                &mut EvaluationAllowance {
+                    used: 0,
+                    limit: 100,
+                },
+            )
+            .unwrap();
+        best.climb.current = None; // Inject a malformed private retained carrier.
+        let error = ControlledDirectError {
+            source: DirectRunError::Climb(DirectClimbError::Evaluation(
+                TrialEvaluationError::Model(crate::ModelError::UnknownSymbol('Z')),
+            )),
+            outer_index: Some(u128::MAX),
+            evaluations_used: 9,
+            counters: crate::attack_control::CounterSnapshot::default(),
+            best: Some(best),
+        }
+        .project(request.domain(), MeasureId::Trie);
+        assert!(matches!(
+            error.best().unwrap_err().downcast_ref::<ProjectionError>(),
+            Some(ProjectionError::MissingCommittedBoard)
+        ));
+        assert_eq!(error.outer_index(), Some(u128::MAX));
+        assert_eq!(error.start_index(), Some(0));
+        assert_eq!(error.evaluations_used(), 9);
+        assert_eq!(
+            error.counters(),
+            crate::AttackProgress(crate::attack_control::CounterSnapshot::default())
+        );
+        assert_eq!(
+            error.run_source().category(),
+            crate::AttackRunCategory::Evaluation
+        );
+        let source = error
+            .source()
+            .unwrap()
+            .downcast_ref::<crate::AttackRunSource>()
+            .unwrap();
+        let trial = source
+            .source()
+            .unwrap()
+            .downcast_ref::<TrialEvaluationError>()
+            .unwrap();
+        assert_eq!(
+            trial.source().unwrap().downcast_ref::<crate::ModelError>(),
+            Some(&crate::ModelError::UnknownSymbol('Z'))
+        );
     }
 
     #[test]
@@ -3740,11 +3962,40 @@ mod tests {
                     DirectRunError::Counter(CounterOverflow::OutersCompleted)
                 )),
             }
-            let best = error.best.unwrap();
+            let best = error.best.as_ref().unwrap();
             assert_eq!(best.outer_index, 0);
             assert_eq!(best.initial, expected.initial);
             assert_eq!(best.climb.current, expected.climb.current);
             assert_eq!(best.evaluations_used, 7 + expected.evaluations_used);
+            let error = error.project(request.domain(), MeasureId::Trie);
+            assert_eq!(error.outer_index(), Some(1));
+            assert_eq!(error.start_index(), if fault == 0 { None } else { Some(0) });
+            assert_eq!(error.evaluations_used(), allowance.used);
+            assert_eq!(error.counters(), crate::AttackProgress(control.snapshot()));
+            if fault == 0 {
+                assert_eq!(
+                    error.run_source().diagnostics(),
+                    Some(diagnostics.as_slice())
+                );
+            }
+            let best = error.best().unwrap().unwrap();
+            let current = expected.climb.current.as_ref().unwrap();
+            assert_eq!(best.plaintext(), current.plaintext);
+            assert_eq!(best.score(), current.score);
+            assert_eq!(best.outer_index(), 0);
+            assert_eq!(best.start_index(), 0);
+            assert_eq!(
+                best.incomplete(),
+                expected.climb.cancelled || expected.climb.budget_stopped
+            );
+            assert_eq!(
+                best.neighborhood_exhausted(),
+                expected.climb.neighborhood_exhausted
+            );
+            assert_eq!(
+                best.final_objective_ascent(),
+                expected.climb.final_objective_ascent
+            );
         }
     }
 

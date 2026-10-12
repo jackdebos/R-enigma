@@ -52,7 +52,10 @@ mod attack_hill_climb;
 mod attack_neighborhood;
 mod attack_result;
 pub use attack_gate::AttackGate;
-pub use attack_result::{AttackBest, AttackProgress, AttackResult, AttackTermination};
+pub use attack_result::{
+    AttackBest, AttackCounterOverflow, AttackProgress, AttackResult, AttackRunCategory,
+    AttackRunError, AttackRunSource, AttackTermination,
+};
 mod binding;
 mod candidate;
 mod capability;
