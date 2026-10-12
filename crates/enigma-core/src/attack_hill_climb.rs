@@ -377,6 +377,123 @@ struct ControlledPartialRunError {
     seed_index: Option<u128>,
     evaluations_used: u64,
     source: ControlledPartialRunSource,
+    best: Option<DirectOuterOutcome>,
+    counters: crate::attack_control::CounterSnapshot,
+}
+
+impl SeedBest {
+    fn into_direct(self, initial: ResolvedConfiguration, outer_index: u128) -> DirectOuterOutcome {
+        DirectOuterOutcome {
+            initial,
+            outer_index,
+            start_index: self.seed_index,
+            evaluations_used: 0,
+            climb: ClimbOutcome {
+                current: Some(self.current),
+                budget_stopped: self.incomplete,
+                cancelled: false,
+                final_objective_ascent: self.final_objective_ascent,
+                neighborhood_exhausted: self.neighborhood_exhausted,
+            },
+        }
+    }
+}
+
+impl ControlledPartialOutcome {
+    fn into_direct(self) -> DirectOuterOutcome {
+        match self.seeds.seeds.best {
+            Some(seed) => seed.into_direct(self.initial, self.outer_index),
+            None => DirectOuterOutcome {
+                initial: self.initial,
+                outer_index: self.outer_index,
+                start_index: 0,
+                evaluations_used: self.seeds.seeds.evaluations_used,
+                climb: ClimbOutcome {
+                    current: None,
+                    budget_stopped: false,
+                    cancelled: false,
+                    final_objective_ascent: false,
+                    neighborhood_exhausted: false,
+                },
+            },
+        }
+    }
+}
+
+impl ControlledPartialRun {
+    fn project_public(
+        self,
+        counters: crate::attack_control::CounterSnapshot,
+        domain: &AttackPlugboardDomain,
+        measure: MeasureId,
+    ) -> Result<crate::AttackResult, crate::AttackRunError> {
+        if let Some(best) = &self.best {
+            if best.seeds.seeds.best.is_none() {
+                return Err(crate::AttackRunError::new(AttackRunErrorData {
+                    source: crate::AttackRunSource(crate::attack_result::RunPayload::Invariant(
+                        "accepted best projection failed",
+                    )),
+                    outer_index: Some(best.outer_index),
+                    start_index: None,
+                    evaluations_used: self.evaluations_used,
+                    counters: crate::AttackProgress(counters),
+                    best: Err(Box::new(ProjectionError::MissingCommittedBoard)),
+                }));
+            }
+        }
+        let termination = match self.termination {
+            ControlledPartialTermination::Completed => DirectRunTermination::Completed,
+            ControlledPartialTermination::OuterSliceEnd => DirectRunTermination::OuterSliceEnd,
+            ControlledPartialTermination::Cancelled => DirectRunTermination::Cancelled,
+            ControlledPartialTermination::EvaluationBudget => {
+                DirectRunTermination::EvaluationBudget
+            }
+        };
+        DirectRunOutcome {
+            termination,
+            outer_completed: self.outer_completed,
+            climbs_started: self.climbs_started,
+            climbs_completed: self.climbs_completed,
+            evaluations_used: self.evaluations_used,
+            best: self.best.map(ControlledPartialOutcome::into_direct),
+        }
+        .project_public(counters, domain, measure)
+    }
+}
+
+impl ControlledPartialRunError {
+    fn project(self, domain: &AttackPlugboardDomain, measure: MeasureId) -> crate::AttackRunError {
+        use crate::attack_result::RunPayload;
+        let source = match self.source {
+            ControlledPartialRunSource::Resolution(diagnostics) => {
+                RunPayload::Resolution(diagnostics)
+            }
+            ControlledPartialRunSource::MissingOuter => {
+                RunPayload::Invariant("missing selected outer")
+            }
+            ControlledPartialRunSource::Climb(ControlledPartialSource::UnsupportedPass) => {
+                RunPayload::Invariant("unsupported partial pass")
+            }
+            ControlledPartialRunSource::Climb(ControlledPartialSource::Climb(source)) => {
+                match source {
+                    ObservedClimbError::Evaluation(source) => RunPayload::Evaluation(source),
+                    ObservedClimbError::Counter(source) => RunPayload::Counter(source),
+                }
+            }
+        };
+        crate::AttackRunError::new(AttackRunErrorData {
+            source: crate::AttackRunSource(source),
+            outer_index: self.outer_index,
+            start_index: self.seed_index,
+            evaluations_used: self.evaluations_used,
+            counters: crate::AttackProgress(self.counters),
+            best: self
+                .best
+                .map(|best| best.project(domain, measure))
+                .transpose()
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>),
+        })
+    }
 }
 
 impl crate::AttackRequest {
@@ -397,6 +514,8 @@ impl crate::AttackRequest {
                 seed_index: None,
                 evaluations_used: 0,
                 source: ControlledPartialRunSource::Climb(ControlledPartialSource::UnsupportedPass),
+                best: None,
+                counters: control.snapshot(),
             }))
         } else {
             schedule_controlled_partial(
@@ -851,6 +970,11 @@ fn schedule_controlled_partial_with_climb<O: CounterObserver, F: FnMut() -> bool
                     seed_index: None,
                     evaluations_used: accounting.allowance.used,
                     source: ControlledPartialRunSource::MissingOuter,
+                    best: result
+                        .best
+                        .take()
+                        .map(ControlledPartialOutcome::into_direct),
+                    counters: accounting.control.snapshot(),
                 })
             })?;
             let initial = initial.map_err(|source| ControlledPartialRunError {
@@ -858,13 +982,48 @@ fn schedule_controlled_partial_with_climb<O: CounterObserver, F: FnMut() -> bool
                 seed_index: None,
                 evaluations_used: accounting.allowance.used,
                 source: ControlledPartialRunSource::Resolution(source),
+                best: result
+                    .best
+                    .take()
+                    .map(ControlledPartialOutcome::into_direct),
+                counters: accounting.control.snapshot(),
             })?;
             let outcome = climb(initial, index, accounting, requested).map_err(|error| {
+                let mut best = result
+                    .best
+                    .take()
+                    .map(ControlledPartialOutcome::into_direct);
+                if let Some(retained) = error.best {
+                    let (initial, seed) = *retained;
+                    let candidate = seed.into_direct(initial, error.outer_index);
+                    if best.as_ref().is_none_or(|prior| {
+                        candidate
+                            .climb
+                            .current
+                            .as_ref()
+                            .expect("retained seed")
+                            .score
+                            .ranking()
+                            .units()
+                            > prior
+                                .climb
+                                .current
+                                .as_ref()
+                                .expect("accepted seed")
+                                .score
+                                .ranking()
+                                .units()
+                    }) {
+                        best = Some(candidate);
+                    }
+                }
                 ControlledPartialRunError {
                     outer_index: Some(error.outer_index),
                     seed_index: error.seed_index,
-                    evaluations_used: error.evaluations_used,
+                    evaluations_used: accounting.allowance.used,
                     source: ControlledPartialRunSource::Climb(error.source),
+                    best,
+                    counters: accounting.control.snapshot(),
                 }
             })?;
             let cancelled = outcome.seeds.cancelled;
@@ -880,6 +1039,11 @@ fn schedule_controlled_partial_with_climb<O: CounterObserver, F: FnMut() -> bool
                         source: ControlledPartialRunSource::Climb(ControlledPartialSource::Climb(
                             source,
                         )),
+                        best: result
+                            .best
+                            .take()
+                            .map(ControlledPartialOutcome::into_direct),
+                        counters: accounting.control.snapshot(),
                     })?;
             }
             let now = accounting.control.snapshot();
@@ -2538,6 +2702,442 @@ mod tests {
     }
 
     #[test]
+    fn controlled_partial_error_retains_prior_owned_projection() {
+        let request = partial_scheduler_request(100, false, |_| {});
+        let expected = request
+            .schedule_partial_outers_controlled(
+                &mut AttackControl::default(),
+                &mut Recorder::default(),
+                || false,
+            )
+            .unwrap()
+            .best
+            .unwrap()
+            .into_direct()
+            .project(request.domain(), request.settings().final_measure())
+            .unwrap();
+        for resolution in [false, true] {
+            let failure_index = u128::from(u64::MAX) + 9;
+            let mut outers: Vec<_> = request.outer_candidates().take(1).collect();
+            if resolution {
+                outers.push((failure_index, Err(vec![])));
+            }
+            let mut allowance = EvaluationAllowance {
+                used: 0,
+                limit: 100,
+            };
+            let mut control = AttackControl::default();
+            let mut recorder = Recorder::default();
+            let error = schedule_controlled_partial(
+                &request,
+                2,
+                outers.into_iter(),
+                &mut ObservedAccounting {
+                    allowance: &mut allowance,
+                    control: &mut control,
+                    observer: &mut recorder,
+                },
+                &mut || false,
+            )
+            .unwrap_err();
+            assert_eq!(error.counters, control.snapshot());
+            assert_eq!(recorder.0.last(), Some(&error.counters));
+            let error = error.project(request.domain(), request.settings().final_measure());
+            assert_eq!(error.outer_index(), resolution.then_some(failure_index));
+            assert_eq!(error.start_index(), None);
+            assert_eq!(error.evaluations_used(), allowance.used);
+            let best = error
+                .best()
+                .unwrap()
+                .expect("first accepted outer survives later failure");
+            assert_eq!(best.configuration(), expected.configuration());
+            assert_eq!(best.mutable_plugboard(), expected.mutable_plugboard());
+            assert_eq!(best.plaintext(), expected.plaintext());
+            assert_eq!(best.score(), expected.score());
+            assert_eq!(best.outer_index(), 0);
+            assert_eq!(best.start_index(), expected.start_index());
+            assert_eq!(best.incomplete(), expected.incomplete());
+            assert_eq!(
+                best.final_objective_ascent(),
+                expected.final_objective_ascent()
+            );
+            assert_eq!(
+                best.neighborhood_exhausted(),
+                expected.neighborhood_exhausted()
+            );
+        }
+    }
+
+    fn partial_projection_outer(
+        request: &crate::AttackRequest,
+        index: u128,
+    ) -> ControlledPartialOutcome {
+        request
+            .climb_partial_outer_controlled(
+                request.outer_candidates().next().unwrap().1.unwrap(),
+                index,
+                &mut ObservedAccounting {
+                    allowance: &mut EvaluationAllowance {
+                        used: 0,
+                        limit: 100,
+                    },
+                    control: &mut AttackControl::default(),
+                    observer: &mut Recorder::default(),
+                },
+                &mut || false,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn controlled_partial_failing_outer_seed_strict_selection() {
+        let request = partial_scheduler_request(100, false, |_| {});
+        let failure = u128::from(u64::MAX) + 11;
+        for delta in [-1, 0, 1] {
+            let prior = partial_projection_outer(&request, 4);
+            let prior_score = prior
+                .seeds
+                .seeds
+                .best
+                .as_ref()
+                .unwrap()
+                .current
+                .score
+                .ranking()
+                .units();
+            let mut retained = partial_projection_outer(&request, failure);
+            let mut seed = retained.seeds.seeds.best.take().unwrap();
+            seed.seed_index = u128::from(u64::MAX) + 3;
+            seed.current.score =
+                MeasuredScore::higher_is_better(FixedScore::from_units(prior_score + delta));
+            seed.incomplete = true;
+            seed.neighborhood_exhausted = false;
+            let mut prior = Some(prior);
+            let mut retained = Some((retained.initial, seed));
+            let mut control = AttackControl::default();
+            let mut recorder = Recorder::default();
+            let error = schedule_controlled_partial_with_climb(
+                2,
+                request.outer_candidates().take(2),
+                &mut ObservedAccounting {
+                    allowance: &mut EvaluationAllowance {
+                        used: 7,
+                        limit: 100,
+                    },
+                    control: &mut control,
+                    observer: &mut recorder,
+                },
+                &mut || false,
+                |_, _, _, _| {
+                    if let Some(prior) = prior.take() {
+                        return Ok(prior);
+                    }
+                    Err(ControlledPartialError {
+                        outer_index: failure,
+                        seed_index: Some(u128::MAX),
+                        evaluations_used: 7,
+                        source: ControlledPartialSource::Climb(ObservedClimbError::Counter(
+                            CounterOverflow::ClimbsStarted,
+                        )),
+                        best: retained.take().map(Box::new),
+                    })
+                },
+            )
+            .unwrap_err();
+            assert_eq!(recorder.0.last(), Some(&error.counters));
+            let error = error.project(request.domain(), MeasureId::Trie);
+            assert_eq!(error.outer_index(), Some(failure));
+            assert_eq!(error.start_index(), Some(u128::MAX));
+            let best = error.best().unwrap().unwrap();
+            assert_eq!(best.outer_index(), if delta > 0 { failure } else { 4 });
+            assert_eq!(best.score().ranking().units(), prior_score + delta.max(0));
+            assert_eq!(best.incomplete(), delta > 0);
+            assert_eq!(best.neighborhood_exhausted(), delta <= 0);
+            assert_ne!(Some(best.start_index()), error.start_index());
+        }
+    }
+
+    #[test]
+    fn controlled_partial_actual_later_counter_fault_and_outer_acceptance_order() {
+        use crate::attack_control::CounterSnapshot;
+        let request = partial_scheduler_request(100, false, |_| {});
+        for outer_overflow in [false, true] {
+            let prior = if outer_overflow {
+                CounterSnapshot {
+                    outers_completed: u128::MAX - 1,
+                    ..Default::default()
+                }
+            } else {
+                CounterSnapshot {
+                    climbs_started: u128::MAX - 5,
+                    ..Default::default()
+                }
+            };
+            let mut control = AttackControl::with_counters(prior);
+            let mut recorder = Recorder::default();
+            let error = request
+                .schedule_partial_outers_controlled(&mut control, &mut recorder, || false)
+                .unwrap_err();
+            assert_eq!(error.outer_index, Some(1));
+            assert_eq!(
+                error.seed_index,
+                if outer_overflow { None } else { Some(1) }
+            );
+            assert_eq!(error.counters, control.snapshot());
+            assert_eq!(recorder.0.last(), Some(&error.counters));
+            let best = error.best.as_ref().unwrap();
+            if outer_overflow {
+                assert_eq!(
+                    best.outer_index, 0,
+                    "unaccounted current outer is not accepted"
+                );
+            }
+            let error = error.project(request.domain(), MeasureId::Trie);
+            assert_eq!(
+                error.run_source().overflow(),
+                Some(if outer_overflow {
+                    crate::AttackCounterOverflow::OutersCompleted
+                } else {
+                    crate::AttackCounterOverflow::ClimbsStarted
+                })
+            );
+            assert_eq!(error.counters(), crate::AttackProgress(control.snapshot()));
+            assert!(error.best().unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn controlled_partial_success_projection_independent_flags_and_terminals() {
+        use crate::{attack_control::CounterSnapshot, AttackTermination};
+        let request = partial_scheduler_request(100, false, |_| {});
+        let snapshot = CounterSnapshot {
+            evaluations_admitted: u64::MAX,
+            evaluations_completed: u64::MAX - 1,
+            climbs_started: u128::MAX,
+            climbs_completed: u128::MAX - 1,
+            outers_completed: u128::MAX - 2,
+        };
+        for (termination, expected) in [
+            (
+                ControlledPartialTermination::Completed,
+                AttackTermination::Completed,
+            ),
+            (
+                ControlledPartialTermination::OuterSliceEnd,
+                AttackTermination::OuterSliceEnd,
+            ),
+            (
+                ControlledPartialTermination::Cancelled,
+                AttackTermination::Cancelled,
+            ),
+            (
+                ControlledPartialTermination::EvaluationBudget,
+                AttackTermination::EvaluationBudget,
+            ),
+        ] {
+            for flags in 0..8 {
+                let mut best = partial_projection_outer(&request, u128::MAX);
+                let seed = best.seeds.seeds.best.as_mut().unwrap();
+                seed.seed_index = u128::from(u64::MAX) + 2;
+                seed.incomplete = flags & 1 != 0;
+                seed.final_objective_ascent = flags & 2 != 0;
+                seed.neighborhood_exhausted = flags & 4 != 0;
+                let run = ControlledPartialRun {
+                    termination: match expected {
+                        AttackTermination::Completed => ControlledPartialTermination::Completed,
+                        AttackTermination::OuterSliceEnd => {
+                            ControlledPartialTermination::OuterSliceEnd
+                        }
+                        AttackTermination::Cancelled => ControlledPartialTermination::Cancelled,
+                        AttackTermination::EvaluationBudget => {
+                            ControlledPartialTermination::EvaluationBudget
+                        }
+                    },
+                    outer_completed: 1,
+                    climbs_started: 4,
+                    climbs_completed: 4,
+                    evaluations_used: u64::MAX,
+                    best: Some(best),
+                }
+                .project_public(snapshot, request.domain(), MeasureId::Trie)
+                .unwrap();
+                assert_eq!(run.termination(), expected);
+                assert_eq!(run.counters(), crate::AttackProgress(snapshot));
+                assert_eq!(run.evaluations_used(), u64::MAX);
+                let best = run.best().unwrap();
+                assert_eq!(
+                    (best.outer_index(), best.start_index()),
+                    (u128::MAX, u128::from(u64::MAX) + 2)
+                );
+                assert_eq!(
+                    (
+                        best.incomplete(),
+                        best.final_objective_ascent(),
+                        best.neighborhood_exhausted()
+                    ),
+                    (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0)
+                );
+            }
+            let empty = ControlledPartialRun {
+                termination,
+                outer_completed: 0,
+                climbs_started: 0,
+                climbs_completed: 0,
+                evaluations_used: 7,
+                best: None,
+            }
+            .project_public(snapshot, request.domain(), MeasureId::Trie)
+            .unwrap();
+            assert!(empty.best().is_none());
+        }
+    }
+
+    #[test]
+    fn controlled_partial_projection_malformed_best_and_original_causes() {
+        use crate::attack_evaluator::TrialBoardError;
+        use std::error::Error;
+        let request = partial_scheduler_request(100, false, |_| {});
+        let snapshot = crate::attack_control::CounterSnapshot {
+            evaluations_completed: 17,
+            ..Default::default()
+        };
+        for source in [
+            TrialEvaluationError::Board(TrialBoardError::Model(crate::ModelError::UnknownSymbol(
+                'Z',
+            ))),
+            TrialEvaluationError::Model(crate::ModelError::EmptyAlphabet),
+            TrialEvaluationError::Measure(crate::MeasureError::Arithmetic(
+                crate::ScoreError::Overflow,
+            )),
+        ] {
+            let mut best = partial_projection_outer(&request, 0).into_direct();
+            best.climb.current.as_mut().unwrap().board = vec![('A', 'A')];
+            let error = ControlledPartialRunError {
+                outer_index: Some(u128::MAX),
+                seed_index: Some(u128::MAX - 1),
+                evaluations_used: 19,
+                source: ControlledPartialRunSource::Climb(ControlledPartialSource::Climb(
+                    ObservedClimbError::Evaluation(source),
+                )),
+                best: Some(best),
+                counters: snapshot,
+            }
+            .project(request.domain(), MeasureId::Trie);
+            assert!(matches!(
+                error.best().unwrap_err().downcast_ref::<ProjectionError>(),
+                Some(ProjectionError::Board(_))
+            ));
+            assert_eq!(error.counters(), crate::AttackProgress(snapshot));
+            assert_eq!(error.evaluations_used(), 19);
+            assert!(std::ptr::eq(
+                error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<crate::AttackRunSource>()
+                    .unwrap(),
+                error.run_source()
+            ));
+            let trial = error
+                .run_source()
+                .source()
+                .unwrap()
+                .downcast_ref::<TrialEvaluationError>()
+                .unwrap();
+            match trial {
+                TrialEvaluationError::Board(board) => {
+                    assert!(std::ptr::eq(
+                        trial
+                            .source()
+                            .unwrap()
+                            .downcast_ref::<TrialBoardError>()
+                            .unwrap(),
+                        board
+                    ));
+                    assert_eq!(
+                        board.source().unwrap().downcast_ref::<crate::ModelError>(),
+                        Some(&crate::ModelError::UnknownSymbol('Z'))
+                    );
+                }
+                TrialEvaluationError::Model(model) => assert!(std::ptr::eq(
+                    trial
+                        .source()
+                        .unwrap()
+                        .downcast_ref::<crate::ModelError>()
+                        .unwrap(),
+                    model
+                )),
+                TrialEvaluationError::Measure(measure) => {
+                    assert!(std::ptr::eq(
+                        trial
+                            .source()
+                            .unwrap()
+                            .downcast_ref::<crate::MeasureError>()
+                            .unwrap(),
+                        measure
+                    ));
+                    assert_eq!(
+                        measure
+                            .source()
+                            .unwrap()
+                            .downcast_ref::<crate::ScoreError>(),
+                        Some(&crate::ScoreError::Overflow)
+                    );
+                }
+                _ => panic!("unexpected injected source"),
+            }
+        }
+        let mut best = partial_projection_outer(&request, 0);
+        best.seeds.seeds.best.as_mut().unwrap().current.board = vec![('A', 'A')];
+        let error = ControlledPartialRun {
+            termination: ControlledPartialTermination::Cancelled,
+            outer_completed: 1,
+            climbs_started: 4,
+            climbs_completed: 4,
+            evaluations_used: 19,
+            best: Some(best),
+        }
+        .project_public(snapshot, request.domain(), MeasureId::Trie)
+        .unwrap_err();
+        assert!(error.best().is_err());
+        assert_eq!(error.counters(), crate::AttackProgress(snapshot));
+        assert_eq!(error.evaluations_used(), 19);
+        assert_eq!(error.outer_index(), Some(0));
+        assert_eq!(
+            error.run_source().category(),
+            crate::AttackRunCategory::Invariant
+        );
+    }
+
+    #[test]
+    fn controlled_partial_projection_missing_seed_is_not_absence() {
+        let request = partial_scheduler_request(100, false, |_| {});
+        let mut best = partial_projection_outer(&request, 42);
+        best.seeds.seeds.best = None; // Malformed accepted aggregate, not an absent aggregate.
+        let snapshot = crate::attack_control::CounterSnapshot {
+            outers_completed: 1,
+            ..Default::default()
+        };
+        let error = ControlledPartialRun {
+            termination: ControlledPartialTermination::Completed,
+            outer_completed: 1,
+            climbs_started: 4,
+            climbs_completed: 4,
+            evaluations_used: 32,
+            best: Some(best),
+        }
+        .project_public(snapshot, request.domain(), MeasureId::Trie)
+        .unwrap_err();
+        assert!(matches!(
+            error.best().unwrap_err().downcast_ref::<ProjectionError>(),
+            Some(ProjectionError::MissingCommittedBoard)
+        ));
+        assert_eq!(error.counters(), crate::AttackProgress(snapshot));
+        assert_eq!(error.evaluations_used(), 32);
+        assert_eq!(error.outer_index(), Some(42));
+        assert_eq!(error.start_index(), None);
+    }
+
+    #[test]
     fn controlled_partial_outer_cancel_between_outers() {
         let request = partial_scheduler_request(32, false, |_| {});
         // Independently validate the fixture by running the entire first seed run.
@@ -2798,6 +3398,29 @@ mod tests {
                 ControlledPartialSource::Climb(ObservedClimbError::Counter(actual))
             ) if actual == expected));
             assert_eq!(recorder.0.last(), Some(&control.snapshot()));
+            assert_eq!(error.counters, control.snapshot());
+            let projected = error.project(request.domain(), MeasureId::Trie);
+            assert_eq!(projected.evaluations_used(), used);
+            assert_eq!(
+                projected.counters(),
+                crate::AttackProgress(control.snapshot())
+            );
+            assert_eq!(projected.start_index(), seed);
+            assert!(projected.best().unwrap().is_none());
+            assert_eq!(
+                projected.run_source().overflow(),
+                Some(match expected {
+                    CounterOverflow::EvaluationsAdmitted =>
+                        crate::AttackCounterOverflow::EvaluationsAdmitted,
+                    CounterOverflow::EvaluationsCompleted =>
+                        crate::AttackCounterOverflow::EvaluationsCompleted,
+                    CounterOverflow::ClimbsStarted => crate::AttackCounterOverflow::ClimbsStarted,
+                    CounterOverflow::ClimbsCompleted =>
+                        crate::AttackCounterOverflow::ClimbsCompleted,
+                    CounterOverflow::OutersCompleted =>
+                        crate::AttackCounterOverflow::OutersCompleted,
+                })
+            );
         }
         let mut control = AttackControl::default();
         let mut recorder = Recorder::default();
@@ -5019,6 +5642,14 @@ mod tests {
         assert_eq!(control.snapshot().climbs_started, u128::MAX);
         assert_eq!(control.snapshot().climbs_completed, 1);
         assert_eq!(observer.0.last(), Some(&control.snapshot()));
+        let projected = best
+            .into_direct(key, 73)
+            .project(request.domain(), MeasureId::Ic)
+            .unwrap();
+        assert!(projected.configuration().plugboard().contains(&('A', 'B')));
+        assert_eq!(projected.start_index(), 0);
+        assert!(!projected.incomplete());
+        assert!(projected.neighborhood_exhausted());
     }
 
     #[test]

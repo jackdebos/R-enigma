@@ -48,9 +48,12 @@ Task 12.9a privately retains the best earlier successful, final-scored seed when
 later seed fails. Its error envelope owns the original resolved initial key separately
 from the committed mutable board, preserving the failure source/index and charged usage.
 Failed climbs, provisional scan winners and failed final rescoring never supply that best.
-The controlled whole-run PE scheduler still drops this seed-local best on error;
-whole-outer retention/projections remain Task 12.9b work. Public HC is unchanged,
-and public PE still rejects execution with `UnsupportedExecution` until Task 12.9c.
+Task 12.9b privately retains earlier accepted outers and eligible earlier seeds in
+failing outers, selecting strictly better final scores and preserving earliest ties.
+Outer-completion accounting precedes acceptance: overflow retains only the prior aggregate.
+Private owned PE projections preserve terminal usage/counters, nullable failure indices,
+original causes and separate malformed-best errors. Public HC is unchanged;
+public PE still rejects execution with `UnsupportedExecution` until Task 12.9c.
 
 For this settings fragment, malformed raw JSON (including duplicate keys, trailing
 input and nonobjects), missing fields and invalid kind/objectives/budget use
@@ -410,11 +413,13 @@ CLI/resource preflight still completes before `started`; Core parsing stays pure
 | `AttackRunError` | Original owned source, optional outer/start indices, cumulative charged usage, final progress, fallible optional earlier aggregate best |
 
 `AttackBest` projects direct `DirectOuterOutcome` without retaining trial boards;
-PE `SeedBest` projection remains future work. Its key combines resolved slot facts with fixed plus winning mutable
+Private PE `SeedBest` projection reuses that owned key validation. Its key combines resolved slot facts with fixed plus winning mutable
 pairs; never report the owner's initial fixed-only board as the winning complete key.
 Flags are `incomplete`, `final_objective_ascent`, `neighborhood_exhausted`; direct
 HC interruption derives from its cancellation/budget flags, PE from its seed winner.
-No ascent is implied merely by final scoring. Tie order and eligibility remain §3–6.
+PE seed incompleteness is independent of whole-run termination; failure indices never
+replace the retained winner's outer/seed indices. No ascent is implied merely by final
+scoring. Tie order and eligibility remain §3–6.
 The controlled-direct private error already owns the earlier accepted aggregate best,
 source, outer index, charged usage and terminal snapshot. Its public projection keeps
 those facts; resolution and missing-outer failures have no start index, while known
