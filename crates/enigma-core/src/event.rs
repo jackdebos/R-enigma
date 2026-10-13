@@ -1,6 +1,6 @@
 //! Protocol event stream types (`docs/protocol.md` §4).
 //!
-//! This module is pure data plus two pure helpers: it serializes the protocol events
+//! This module is pure data plus pure helpers: it serializes the protocol events
 //! and converts Unix timestamps to RFC 3339 UTC. It performs no I/O and reads no clock;
 //! the transport supplies the timestamp. `protocol_version`, `seq`, and `ts` are added
 //! to every encoded event so callers only choose the event payload and its position.
@@ -8,7 +8,31 @@
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::PROTOCOL_VERSION;
+use crate::{AttackProgress, AttackTermination, PROTOCOL_VERSION};
+
+/// Wire-only factual counters, encoded as canonical unsigned decimal strings.
+///
+/// Constructed from an immutable runtime snapshot, without serializing runtime types.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ProgressCounters {
+    evaluations_admitted: String,
+    evaluations_completed: String,
+    climbs_started: String,
+    climbs_completed: String,
+    outers_completed: String,
+}
+
+impl From<AttackProgress> for ProgressCounters {
+    fn from(progress: AttackProgress) -> Self {
+        Self {
+            evaluations_admitted: progress.evaluations_admitted().to_string(),
+            evaluations_completed: progress.evaluations_completed().to_string(),
+            climbs_started: progress.climbs_started().to_string(),
+            climbs_completed: progress.climbs_completed().to_string(),
+            outers_completed: progress.outers_completed().to_string(),
+        }
+    }
+}
 
 /// A single protocol event, tagged in JSON by `event` in `snake_case`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -20,6 +44,13 @@ pub enum Event {
     Output {
         /// The transformed text.
         output: String,
+    },
+    /// A factual search snapshot with caller-supplied elapsed milliseconds.
+    Progress {
+        /// All five factual counters, distinct from charged allowance usage.
+        counters: ProgressCounters,
+        /// Canonical unsigned decimal milliseconds; no clock is read here.
+        elapsed_ms: String,
     },
     /// The single terminal lifecycle event of a successful job.
     Done {
@@ -49,6 +80,36 @@ pub enum Event {
 pub enum DoneReason {
     /// The job ran to completion.
     Completed,
+    /// The requested outer slice was empty.
+    OuterSliceEnd,
+    /// Evaluation allowance prevented remaining work.
+    EvaluationBudget,
+    /// Cooperative cancellation stopped remaining work.
+    Cancelled,
+}
+
+impl From<AttackTermination> for DoneReason {
+    fn from(termination: AttackTermination) -> Self {
+        match termination {
+            AttackTermination::Completed => Self::Completed,
+            AttackTermination::OuterSliceEnd => Self::OuterSliceEnd,
+            AttackTermination::EvaluationBudget => Self::EvaluationBudget,
+            AttackTermination::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+impl Event {
+    /// Projects a runtime snapshot and elapsed whole milliseconds into wire data.
+    ///
+    /// The caller measures elapsed time; this helper reads no clock, schedules no
+    /// work, and does not infer timing from the envelope timestamp.
+    pub fn progress(progress: AttackProgress, elapsed_ms: u128) -> Self {
+        Self::Progress {
+            counters: progress.into(),
+            elapsed_ms: elapsed_ms.to_string(),
+        }
+    }
 }
 
 /// Serializes `event` as one JSON object with `protocol_version`, `seq`, and `ts`.
@@ -109,11 +170,113 @@ mod tests {
     use super::{encode, rfc3339_utc, DoneReason, Event};
     use serde_json::{json, Value};
 
+    use crate::attack_control::CounterSnapshot;
+    use crate::{AttackProgress, AttackTermination};
+
     const TS: &str = "2023-11-14T22:13:20Z";
 
     fn encoded(event: &Event) -> Value {
         serde_json::from_str(&encode(event, 7, TS).expect("encode succeeds"))
             .expect("encode emits valid JSON")
+    }
+
+    #[test]
+    fn progress_uses_decimal_strings() {
+        // Synthetic snapshot: schema evidence, not a full-width runtime execution.
+        let progress = AttackProgress(CounterSnapshot {
+            evaluations_admitted: 17,
+            evaluations_completed: 13,
+            climbs_started: 11,
+            climbs_completed: 7,
+            outers_completed: 3,
+        });
+        assert_eq!(
+            encoded(&Event::progress(progress, 23)),
+            json!({
+                "event": "progress",
+                "counters": {
+                    "evaluations_admitted": "17",
+                    "evaluations_completed": "13",
+                    "climbs_started": "11",
+                    "climbs_completed": "7",
+                    "outers_completed": "3"
+                },
+                "elapsed_ms": "23",
+                "protocol_version": 1,
+                "seq": 7,
+                "ts": TS
+            })
+        );
+        assert_eq!(progress.evaluations_completed(), 13);
+    }
+
+    #[test]
+    fn progress_preserves_zero_and_full_width_values() {
+        for (evaluations, climbs, elapsed) in [(0, 0, 0), (u64::MAX, u128::MAX, u128::MAX)] {
+            let progress = AttackProgress(CounterSnapshot {
+                evaluations_admitted: evaluations,
+                evaluations_completed: evaluations,
+                climbs_started: climbs,
+                climbs_completed: climbs,
+                outers_completed: climbs,
+            });
+            let event = Event::progress(progress, elapsed);
+            let timestamp = "caller timestamp unchanged";
+            let value: Value =
+                serde_json::from_str(&encode(&event, u64::MAX, timestamp).unwrap()).unwrap();
+            assert_eq!(value["protocol_version"], json!(1));
+            assert_eq!(value["seq"], json!(u64::MAX));
+            assert_eq!(value["ts"], timestamp);
+            assert_eq!(value["elapsed_ms"], elapsed.to_string());
+            let counters = value["counters"].as_object().unwrap();
+            assert_eq!(counters.len(), 5);
+            for field in ["evaluations_admitted", "evaluations_completed"] {
+                assert_eq!(counters[field], evaluations.to_string());
+            }
+            for field in ["climbs_started", "climbs_completed", "outers_completed"] {
+                assert_eq!(counters[field], climbs.to_string());
+            }
+            assert_eq!(value.as_object().unwrap().len(), 6);
+        }
+    }
+
+    #[test]
+    fn all_attack_terminations_map_to_exact_done_reasons() {
+        for (termination, reason, wire) in [
+            (
+                AttackTermination::Completed,
+                DoneReason::Completed,
+                "completed",
+            ),
+            (
+                AttackTermination::OuterSliceEnd,
+                DoneReason::OuterSliceEnd,
+                "outer_slice_end",
+            ),
+            (
+                AttackTermination::EvaluationBudget,
+                DoneReason::EvaluationBudget,
+                "evaluation_budget",
+            ),
+            (
+                AttackTermination::Cancelled,
+                DoneReason::Cancelled,
+                "cancelled",
+            ),
+        ] {
+            let mapped = DoneReason::from(termination);
+            assert_eq!(mapped, reason);
+            assert_eq!(
+                encoded(&Event::Done { reason: mapped }),
+                json!({
+                    "event": "done",
+                    "reason": wire,
+                    "protocol_version": 1,
+                    "seq": 7,
+                    "ts": TS
+                })
+            );
+        }
     }
 
     #[test]
