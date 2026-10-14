@@ -6,6 +6,9 @@
 //! test harness without divergence. Parsing, validation and computation live in
 //! `enigma-core`; this module only moves bytes and emits protocol events.
 
+// TT-A is test-only staging; TT-B will activate the private search adapter.
+#[cfg(test)]
+mod attack_transport;
 mod resource_loader;
 
 use std::collections::BTreeMap;
