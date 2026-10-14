@@ -201,6 +201,8 @@ pub(crate) enum DirectClimbError {
     Evaluation(TrialEvaluationError),
 }
 
+// Legacy direct-adapter diagnostics remain available to regression tests.
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct IndexedDirectClimbError {
     pub(crate) outer_index: u128,
@@ -254,7 +256,9 @@ pub(crate) struct IndexedDirectRunError {
     pub(crate) source: DirectRunError,
 }
 
+// Legacy partial-path carriers support adapter and scheduler regression tests.
 /// Single resolved outer only; seed completion is independent of winner flags.
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct PartialOuterOutcome {
     pub(crate) initial: ResolvedConfiguration,
@@ -262,12 +266,14 @@ pub(crate) struct PartialOuterOutcome {
     pub(crate) seeds: SeedRunOutcome,
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PartialClimbError {
     UnsupportedPass,
     Evaluation(TrialEvaluationError),
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct IndexedPartialClimbError {
     pub(crate) outer_index: u128,
@@ -275,6 +281,7 @@ pub(crate) struct IndexedPartialClimbError {
     pub(crate) source: PartialClimbError,
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PartialRunTermination {
     OuterSliceEnd,
@@ -282,6 +289,7 @@ pub(crate) enum PartialRunTermination {
     EvaluationBudget,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct PartialRunOutcome {
     pub(crate) termination: PartialRunTermination,
@@ -293,12 +301,14 @@ pub(crate) struct PartialRunOutcome {
     pub(crate) best: Option<PartialOuterOutcome>,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) enum PartialRunError {
     Resolution(Vec<crate::SearchDiagnostic>),
     Climb(PartialClimbError),
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct IndexedPartialRunError {
     /// None only for pass rejection before enumeration or evaluation.
@@ -579,7 +589,9 @@ impl crate::AttackRequest {
         result
     }
 
+    // Legacy request adapters preserve route-equivalence regression coverage.
     /// Same-owner projection supplies absolute indices and fresh independent seeds.
+    #[cfg(test)]
     pub(crate) fn schedule_partial_outers(
         &self,
     ) -> Result<PartialRunOutcome, IndexedPartialRunError> {
@@ -663,6 +675,7 @@ impl crate::AttackRequest {
 
     /// Caller supplies a resolved initial/index from this owner's outer projection.
     /// This private adapter retains that index but does not validate provenance.
+    #[cfg(test)]
     pub(crate) fn climb_partial_outer(
         &self,
         initial: ResolvedConfiguration,
@@ -790,6 +803,7 @@ impl crate::AttackRequest {
         ))
     }
 
+    #[cfg(test)]
     pub(crate) fn schedule_direct_outers(&self) -> Result<DirectRunOutcome, IndexedDirectRunError> {
         if self.settings().kind() != crate::AttackKind::HillClimb {
             return Err(IndexedDirectRunError {
@@ -866,6 +880,7 @@ impl crate::AttackRequest {
 
     /// Internal caller must supply an initial key/index from THIS owner's private
     /// outer projection. This adapter does not validate provenance or schedule outers.
+    #[cfg(test)]
     pub(crate) fn climb_direct_outer(
         &self,
         initial: ResolvedConfiguration,
@@ -1364,6 +1379,8 @@ trait EvaluationAccounting {
     }
 }
 
+// Budget-only accounting supports legacy tests; production uses controlled accounting.
+#[cfg(test)]
 impl EvaluationAccounting for EvaluationAllowance {
     type Error = TrialEvaluationError;
     fn admit(&mut self, reserve: u64) -> Result<bool, Self::Error> {
@@ -1576,6 +1593,8 @@ impl<'a> BoundClimbScoring<'a> {
         run
     }
 
+    // Legacy scoring wrappers retain budget and observation regression coverage.
+    #[cfg(test)]
     fn climb_seeds(
         &self,
         policy: &crate::AttackSeedPolicy,
@@ -1628,6 +1647,7 @@ impl<'a> BoundClimbScoring<'a> {
         Ok(result)
     }
 
+    #[cfg(test)]
     fn climb(
         &self,
         board: MutableBoard,
@@ -1637,6 +1657,7 @@ impl<'a> BoundClimbScoring<'a> {
         self.climb_accounted(board, backtrack_pairs, allowance)
     }
 
+    #[cfg(test)]
     fn climb_observed(
         &self,
         board: MutableBoard,
