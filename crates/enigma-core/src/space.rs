@@ -1164,11 +1164,7 @@ fn parse_carrier_with<T>(
         measures,
         resources,
     };
-    // The preflight error type is exactly this function's `Vec<SearchDiagnostic>` error
-    // type, so propagate it explicitly without relying on a `?` conversion.
-    if let Err(diagnostics) = Capabilities::stage1().preflight_parsed(&request) {
-        return Err(diagnostics);
-    }
+    Capabilities::stage1().preflight_parsed(&request)?;
     Ok((request, extra))
 }
 
