@@ -360,13 +360,15 @@ Syntax errors point to the closest available containing path.
 
 ### 4.1 Planned HC/PE search events — Task 12.7
 
-**Partially implemented (Task12.10a+b):** Core provides pure progress and result
+**Partially implemented (Task12.10a+b+c):** Core provides pure progress and result
 wire projections from `AttackProgress`/`AttackResult` and caller-supplied elapsed
 milliseconds, decimal-string counters, indices, Q32 units and elapsed time, and all
 four `DoneReason` mappings. Result preserves the complete initial winning key,
 mutable remainder, final score and independent flags; genuine absence is null.
-Runtime-error context/fallible projection (12.10c), transport and CLI integration
-remain deferred. CLI still returns `unsupported_job` for validated attacks before
+`Event::runtime_error` projects a borrowed failure into a result/error pair with
+optional boxed context. Malformed retained best fails with `RuntimeProjectionError`,
+which retains the original runtime cause and separate best-projection cause;
+only genuine absence becomes null. Transport and CLI integration remain deferred. CLI still returns `unsupported_job` for validated attacks before
 `started`; these helpers read no clocks and perform no I/O or orchestration.
 Only one attack pass, `hill_climb` or `partial_exhaustion`, is eligible; recognition
 of other passes is not support. Mixed/deferred/legacy rejection remains unchanged.

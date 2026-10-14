@@ -94,7 +94,10 @@ pub use configuration::{
 };
 pub use definition::{Definition, DefinitionDiagnostic, DefinitionSlot, DefinitionSource};
 pub use engine::{Direction, Engine};
-pub use event::{encode, rfc3339_utc, BestResult, DoneReason, Event, ProgressCounters};
+pub use event::{
+    encode, rfc3339_utc, BestResult, DoneReason, Event, ProgressCounters, RuntimeContext,
+    RuntimeProjectionError,
+};
 pub use request::{ParsedRequest, RequestDiagnostic, TransformRequest, MAX_REQUEST_BYTES};
 pub use space::{
     AttackKind, AttackPlugboardDomain, AttackRequest, AttackSeedPolicy, AttackSettings,

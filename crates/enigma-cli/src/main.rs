@@ -295,6 +295,7 @@ fn write_error_line(
         location: location.to_owned(),
         expected: None,
         hint: None,
+        context: None,
     };
     emit(out, &event, seq, &now_ts())?;
     out.flush()

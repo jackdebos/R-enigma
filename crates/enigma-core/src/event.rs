@@ -8,7 +8,69 @@
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::{AttackBest, AttackProgress, AttackResult, AttackTermination, PROTOCOL_VERSION};
+use crate::{
+    AttackBest, AttackProgress, AttackResult, AttackRunCategory, AttackRunError, AttackTermination,
+    PROTOCOL_VERSION,
+};
+
+/// Wire-only runtime failure facts; elapsed time belongs to the paired result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RuntimeContext {
+    outer_index: Option<String>,
+    start_index: Option<String>,
+    evaluations_used: String,
+    counters: ProgressCounters,
+    source: RuntimeSource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct RuntimeSource {
+    kind: &'static str,
+    message: String,
+    diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct RuntimeDiagnostic {
+    code: &'static str,
+    message: String,
+    location: String,
+}
+
+/// Non-wire failure to project a retained best, preserving both independent causes.
+#[derive(Debug)]
+pub struct RuntimeProjectionError<'a> {
+    original: &'a AttackRunError,
+    best_projection: &'a (dyn std::error::Error + Send + Sync + 'static),
+}
+
+impl<'a> RuntimeProjectionError<'a> {
+    /// Original runtime envelope, never replaced by a best-projection failure.
+    pub fn original(&self) -> &'a AttackRunError {
+        self.original
+    }
+
+    /// Separate retained-best projection cause, with its original identity.
+    pub fn best_projection(&self) -> &'a (dyn std::error::Error + Send + Sync + 'static) {
+        self.best_projection
+    }
+}
+
+impl std::fmt::Display for RuntimeProjectionError<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}; retained best projection: {}",
+            self.original, self.best_projection
+        )
+    }
+}
+
+impl std::error::Error for RuntimeProjectionError<'_> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.original)
+    }
+}
 
 /// Wire-only factual counters, encoded as canonical unsigned decimal strings.
 ///
@@ -148,6 +210,9 @@ pub enum Event {
         /// Optional actionable remediation hint.
         #[serde(skip_serializing_if = "Option::is_none")]
         hint: Option<String>,
+        /// Optional runtime facts, omitted for legacy validation/transport errors.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context: Option<Box<RuntimeContext>>,
     },
 }
 
@@ -179,11 +244,80 @@ impl From<AttackTermination> for DoneReason {
 impl Event {
     /// Projects an owned runtime result without clocks, I/O or execution orchestration.
     pub fn result(result: &AttackResult, elapsed_ms: u128) -> Self {
+        Self::result_snapshot(result.best(), result.counters(), elapsed_ms)
+    }
+
+    fn result_snapshot(
+        best: Option<&AttackBest>,
+        counters: AttackProgress,
+        elapsed_ms: u128,
+    ) -> Self {
         Self::Result {
-            best: result.best().map(|best| Box::new(BestResult::from(best))),
-            counters: result.counters().into(),
+            best: best.map(|best| Box::new(BestResult::from(best))),
+            counters: counters.into(),
             elapsed_ms: elapsed_ms.to_string(),
         }
+    }
+
+    /// Projects a borrowed runtime failure as `(result, terminal error)`.
+    ///
+    /// A malformed retained best fails closed; only genuine absence becomes null.
+    /// Delivery and elapsed measurement remain the caller's responsibility.
+    pub fn runtime_error(
+        error: &AttackRunError,
+        elapsed_ms: u128,
+    ) -> Result<(Self, Self), RuntimeProjectionError<'_>> {
+        let best = error
+            .best()
+            .map_err(|best_projection| RuntimeProjectionError {
+                original: error,
+                best_projection,
+            })?;
+        let source = error.run_source();
+        let diagnostics: Vec<_> = source
+            .diagnostics()
+            .unwrap_or_default()
+            .iter()
+            .map(|diagnostic| RuntimeDiagnostic {
+                code: diagnostic.code(),
+                message: diagnostic.message().to_owned(),
+                location: diagnostic.location().to_owned(),
+            })
+            .collect();
+        let location = diagnostics
+            .first()
+            .map_or("/job", |diagnostic| diagnostic.location.as_str())
+            .to_owned();
+        let message = source.to_string();
+        let context = RuntimeContext {
+            outer_index: error.outer_index().map(|index| index.to_string()),
+            start_index: error.start_index().map(|index| index.to_string()),
+            evaluations_used: error.evaluations_used().to_string(),
+            counters: error.counters().into(),
+            source: RuntimeSource {
+                kind: match source.category() {
+                    AttackRunCategory::Resolution => "resolution",
+                    AttackRunCategory::Evaluation => "evaluation",
+                    AttackRunCategory::Counter => "counter",
+                    AttackRunCategory::Invariant | AttackRunCategory::UnsupportedExecution => {
+                        "invariant"
+                    }
+                },
+                message: message.clone(),
+                diagnostics,
+            },
+        };
+        Ok((
+            Self::result_snapshot(best, error.counters(), elapsed_ms),
+            Self::Error {
+                code: "internal_error".to_owned(),
+                message,
+                location,
+                expected: None,
+                hint: None,
+                context: Some(Box::new(context)),
+            },
+        ))
     }
 
     /// Projects a runtime snapshot and elapsed whole milliseconds into wire data.
@@ -301,6 +435,24 @@ mod tests {
             .unwrap()
     }
 
+    // Public winners below are real runs; their failure envelopes are injected,
+    // not evidence that validated public requests naturally fail.
+    fn assert_runtime_winner_projection(result: crate::AttackResult) {
+        use crate::attack_result::{AttackRunErrorData, AttackRunSource, RunPayload};
+        let expected = encoded(&Event::result(&result, u128::MAX));
+        let error = crate::AttackRunError::new(AttackRunErrorData {
+            source: AttackRunSource(RunPayload::Invariant("injected after accepted winner")),
+            outer_index: Some(u128::MAX),
+            start_index: None,
+            evaluations_used: result.evaluations_used(),
+            counters: result.counters(),
+            best: Ok(result.best),
+        });
+        let (projected, terminal) = Event::runtime_error(&error, u128::MAX).unwrap();
+        assert_eq!(encoded(&projected), expected);
+        assert_eq!(encoded(&terminal)["context"]["source"]["kind"], "invariant");
+    }
+
     #[test]
     fn result_public_pe_nonempty_unicode_winner() {
         let mut value = result_fixture_value(true, 0);
@@ -339,6 +491,7 @@ mod tests {
             wire["best"]["score"]["ranking_q32"],
             best.score().ranking().units().to_string()
         );
+        assert_runtime_winner_projection(result);
     }
 
     #[test]
@@ -382,6 +535,7 @@ mod tests {
         // Two pre-keypress advances leave z at 中, not its initial é; identity wiring
         // keeps plaintext stable but cannot hide a stepped-position projection bug.
         assert_ne!(wire["best"]["configuration"]["slots"][0]["position"], "中");
+        assert_runtime_winner_projection(result);
     }
 
     #[test]
@@ -638,6 +792,7 @@ mod tests {
             location: "/job/direction".to_owned(),
             expected: None,
             hint: None,
+            context: None,
         });
         assert_eq!(
             value,
@@ -664,6 +819,7 @@ mod tests {
                 location: "/job/direction".to_owned(),
                 expected: Some("encrypt or decrypt".to_owned()),
                 hint: Some("pick a direction".to_owned()),
+                context: None,
             }),
             json!({
                 "event": "error",
@@ -677,6 +833,217 @@ mod tests {
                 "ts": TS
             })
         );
+    }
+
+    fn runtime_causes() -> Vec<crate::attack_result::RunPayload> {
+        use crate::attack_control::CounterOverflow::*;
+        use crate::attack_evaluator::{TrialBoardError, TrialEvaluationError as Trial};
+        use crate::attack_result::RunPayload::*;
+        use crate::{MeasureError, ModelError, ScoreError, SearchDiagnostic};
+        vec![
+            Resolution(vec![]),
+            Resolution(vec![SearchDiagnostic::new(
+                "original_code",
+                "original message",
+                "/job/space/slots/0",
+            )]),
+            Evaluation(Trial::Board(TrialBoardError::Model(
+                ModelError::UnknownSymbol('Ω'),
+            ))),
+            Evaluation(Trial::Model(ModelError::EmptyAlphabet)),
+            Evaluation(Trial::Measure(MeasureError::Arithmetic(
+                ScoreError::Overflow,
+            ))),
+            Invariant("original invariant"),
+            Counter(EvaluationsAdmitted),
+            Counter(EvaluationsCompleted),
+            Counter(ClimbsStarted),
+            Counter(ClimbsCompleted),
+            Counter(OutersCompleted),
+        ]
+    }
+
+    #[test]
+    fn runtime_projection_preserves_original_and_best_errors() {
+        use crate::attack_control::CounterOverflow as PrivateCounter;
+        use crate::attack_evaluator::{TrialBoardError, TrialEvaluationError};
+        use crate::attack_result::{AttackRunErrorData, AttackRunSource, RunPayload};
+        use crate::{MeasureError, ModelError, ScoreError};
+        use std::error::Error;
+        // Injected causes exercise projection, not naturally failing public runs.
+        for malformed in [false, true] {
+            for payload in runtime_causes() {
+                let expected_counter = match &payload {
+                    RunPayload::Counter(counter) => Some(*counter),
+                    _ => None,
+                };
+                let (kind, location) = match &payload {
+                    RunPayload::Resolution(d) if !d.is_empty() => {
+                        ("resolution", "/job/space/slots/0")
+                    }
+                    RunPayload::Resolution(_) => ("resolution", "/job"),
+                    RunPayload::Evaluation(_) => ("evaluation", "/job"),
+                    RunPayload::Counter(_) => ("counter", "/job"),
+                    RunPayload::Invariant(_) => ("invariant", "/job"),
+                };
+                let error = crate::AttackRunError::new(AttackRunErrorData {
+                    source: AttackRunSource(payload),
+                    outer_index: None,
+                    start_index: None,
+                    evaluations_used: 0,
+                    counters: AttackProgress(CounterSnapshot::default()),
+                    best: if malformed {
+                        Err(Box::new(ModelError::EmptyAlphabet))
+                    } else {
+                        Ok(None)
+                    },
+                });
+                if !malformed {
+                    let (result, terminal) = Event::runtime_error(&error, 0).unwrap();
+                    let diagnostics: Vec<_> = error
+                        .run_source()
+                        .diagnostics()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|d| {
+                            json!({"code": d.code(), "message": d.message(),
+                                "location": d.location()})
+                        })
+                        .collect();
+                    assert_eq!(
+                        encoded(&terminal),
+                        json!({
+                            "event": "error", "code": "internal_error", "message": error.to_string(),
+                            "location": location, "context": {
+                                "outer_index": null, "start_index": null, "evaluations_used": "0",
+                                "counters": {"evaluations_admitted": "0", "evaluations_completed": "0",
+                                    "climbs_started": "0", "climbs_completed": "0", "outers_completed": "0"},
+                                "source": {"kind": kind, "message": error.to_string(), "diagnostics": diagnostics}
+                            }, "protocol_version": 1, "seq": 7, "ts": TS
+                        })
+                    );
+                    assert_eq!(
+                        encoded(&result),
+                        json!({
+                            "event": "result", "best": null, "counters": super::ProgressCounters::from(error.counters()),
+                            "elapsed_ms": "0", "protocol_version": 1, "seq": 7, "ts": TS
+                        })
+                    );
+                    continue;
+                }
+                let failure = Event::runtime_error(&error, 0).unwrap_err();
+                assert!(std::ptr::eq(failure.original(), &error));
+                assert!(std::ptr::eq(
+                    failure.best_projection(),
+                    error.best().unwrap_err()
+                ));
+                let original = failure
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<crate::AttackRunError>()
+                    .unwrap();
+                assert!(std::ptr::eq(original, &error));
+                let cause = original
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<AttackRunSource>()
+                    .unwrap();
+                assert!(std::ptr::eq(cause, error.run_source()));
+                if let Some(counter) = expected_counter {
+                    use crate::AttackCounterOverflow as PublicCounter;
+                    assert_eq!(
+                        cause.source().unwrap().downcast_ref::<PrivateCounter>(),
+                        Some(&counter)
+                    );
+                    let expected = match counter {
+                        PrivateCounter::EvaluationsAdmitted => PublicCounter::EvaluationsAdmitted,
+                        PrivateCounter::EvaluationsCompleted => PublicCounter::EvaluationsCompleted,
+                        PrivateCounter::ClimbsStarted => PublicCounter::ClimbsStarted,
+                        PrivateCounter::ClimbsCompleted => PublicCounter::ClimbsCompleted,
+                        PrivateCounter::OutersCompleted => PublicCounter::OutersCompleted,
+                    };
+                    assert_eq!(cause.overflow(), Some(expected));
+                }
+                assert_eq!(
+                    failure.best_projection().downcast_ref::<ModelError>(),
+                    Some(&ModelError::EmptyAlphabet)
+                );
+                if let Some(trial) = cause
+                    .source()
+                    .and_then(|s| s.downcast_ref::<TrialEvaluationError>())
+                {
+                    let nested = trial.source().unwrap();
+                    match trial {
+                        TrialEvaluationError::Board(_) => {
+                            let board = nested.downcast_ref::<TrialBoardError>().unwrap();
+                            assert_eq!(
+                                board.source().unwrap().downcast_ref::<ModelError>(),
+                                Some(&ModelError::UnknownSymbol('Ω'))
+                            );
+                        }
+                        TrialEvaluationError::Model(_) => assert_eq!(
+                            nested.downcast_ref::<ModelError>(),
+                            Some(&ModelError::EmptyAlphabet)
+                        ),
+                        TrialEvaluationError::Measure(_) => {
+                            let measure = nested.downcast_ref::<MeasureError>().unwrap();
+                            assert_eq!(
+                                measure.source().unwrap().downcast_ref::<ScoreError>(),
+                                Some(&ScoreError::Overflow)
+                            );
+                        }
+                        _ => unreachable!("only three injected evaluation chains"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_context_preserves_independent_indices_usage_and_counters() {
+        use crate::attack_result::{AttackRunErrorData, AttackRunSource, RunPayload};
+        for outer_index in [None, Some(0), Some(u128::MAX)] {
+            for start_index in [None, Some(0), Some(u128::MAX)] {
+                let error = crate::AttackRunError::new(AttackRunErrorData {
+                    source: AttackRunSource(RunPayload::Invariant("full width")),
+                    outer_index,
+                    start_index,
+                    evaluations_used: u64::MAX,
+                    counters: AttackProgress(CounterSnapshot {
+                        evaluations_admitted: u64::MAX - 1,
+                        evaluations_completed: u64::MAX - 2,
+                        climbs_started: u128::MAX,
+                        climbs_completed: u128::MAX - 1,
+                        outers_completed: u128::MAX - 2,
+                    }),
+                    best: Ok(None),
+                });
+                let (result, terminal) = Event::runtime_error(&error, u128::MAX).unwrap();
+                let context = encoded(&terminal)["context"].clone();
+                assert_eq!(
+                    context["outer_index"],
+                    json!(outer_index.map(|i| i.to_string()))
+                );
+                assert_eq!(
+                    context["start_index"],
+                    json!(start_index.map(|i| i.to_string()))
+                );
+                assert_eq!(context["evaluations_used"], u64::MAX.to_string());
+                assert_eq!(
+                    context["counters"],
+                    json!({
+                        "evaluations_admitted": (u64::MAX - 1).to_string(),
+                        "evaluations_completed": (u64::MAX - 2).to_string(),
+                        "climbs_started": u128::MAX.to_string(),
+                        "climbs_completed": (u128::MAX - 1).to_string(),
+                        "outers_completed": (u128::MAX - 2).to_string()
+                    })
+                );
+                assert_eq!(encoded(&result)["elapsed_ms"], u128::MAX.to_string());
+                assert_eq!(encoded(&result)["counters"], context["counters"]);
+                assert!(context.get("elapsed_ms").is_none());
+            }
+        }
     }
 
     #[test]
