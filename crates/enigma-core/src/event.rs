@@ -8,7 +8,7 @@
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::{AttackProgress, AttackTermination, PROTOCOL_VERSION};
+use crate::{AttackBest, AttackProgress, AttackResult, AttackTermination, PROTOCOL_VERSION};
 
 /// Wire-only factual counters, encoded as canonical unsigned decimal strings.
 ///
@@ -34,6 +34,74 @@ impl From<AttackProgress> for ProgressCounters {
     }
 }
 
+/// Wire-only committed winner, projected without changing runtime ordering or scores.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BestResult {
+    configuration: WinningConfiguration,
+    mutable_plugboard: Vec<(char, char)>,
+    plaintext: String,
+    score: WinningScore,
+    outer_index: String,
+    start_index: String,
+    incomplete: bool,
+    final_objective_ascent: bool,
+    neighborhood_exhausted: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct WinningConfiguration {
+    slots: Vec<WinningSlot>,
+    plugboard: Vec<(char, char)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct WinningSlot {
+    id: String,
+    wheel: String,
+    position: char,
+    ring: char,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct WinningScore {
+    measure: String,
+    measured_q32: String,
+    ranking_q32: String,
+}
+
+impl From<&AttackBest> for BestResult {
+    fn from(best: &AttackBest) -> Self {
+        let configuration = best.configuration();
+        Self {
+            configuration: WinningConfiguration {
+                slots: configuration
+                    .slots()
+                    .iter()
+                    .map(|slot| WinningSlot {
+                        id: slot.id().to_owned(),
+                        wheel: slot.wheel().to_owned(),
+                        position: slot.position(),
+                        ring: slot.ring(),
+                    })
+                    .collect(),
+                plugboard: configuration.plugboard().to_vec(),
+            },
+            mutable_plugboard: best.mutable_plugboard().to_vec(),
+            plaintext: best.plaintext().to_owned(),
+            score: WinningScore {
+                measure: best.measure().id().to_owned(),
+                measured_q32: best.score().measured().units().to_string(),
+                ranking_q32: best.score().ranking().units().to_string(),
+            },
+            outer_index: best.outer_index().to_string(),
+            start_index: best.start_index().to_string(),
+            incomplete: best.incomplete(),
+            final_objective_ascent: best.final_objective_ascent(),
+            neighborhood_exhausted: best.neighborhood_exhausted(),
+        }
+    }
+}
+
 /// A single protocol event, tagged in JSON by `event` in `snake_case`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -50,6 +118,15 @@ pub enum Event {
         /// All five factual counters, distinct from charged allowance usage.
         counters: ProgressCounters,
         /// Canonical unsigned decimal milliseconds; no clock is read here.
+        elapsed_ms: String,
+    },
+    /// Final committed search winner and factual whole-run snapshot.
+    Result {
+        /// Null only when the runtime result genuinely has no winner.
+        best: Option<Box<BestResult>>,
+        /// All five factual counters, not charged allowance usage.
+        counters: ProgressCounters,
+        /// Caller-supplied canonical unsigned decimal milliseconds.
         elapsed_ms: String,
     },
     /// The single terminal lifecycle event of a successful job.
@@ -100,6 +177,15 @@ impl From<AttackTermination> for DoneReason {
 }
 
 impl Event {
+    /// Projects an owned runtime result without clocks, I/O or execution orchestration.
+    pub fn result(result: &AttackResult, elapsed_ms: u128) -> Self {
+        Self::Result {
+            best: result.best().map(|best| Box::new(BestResult::from(best))),
+            counters: result.counters().into(),
+            elapsed_ms: elapsed_ms.to_string(),
+        }
+    }
+
     /// Projects a runtime snapshot and elapsed whole milliseconds into wire data.
     ///
     /// The caller measures elapsed time; this helper reads no clock, schedules no
@@ -178,6 +264,226 @@ mod tests {
     fn encoded(event: &Event) -> Value {
         serde_json::from_str(&encode(event, 7, TS).expect("encode succeeds"))
             .expect("encode emits valid JSON")
+    }
+
+    fn result_fixture_value(pe: bool, offset: u64) -> Value {
+        let alphabet = ["🦀", "é", "Ω", "中"];
+        let mut value = json!({
+            "protocol_version": 1, "machine": {"definition": {"kind": "custom", "value": {
+                "alphabet": alphabet, "wheels": [{"name": "r", "wiring": alphabet, "turnovers": []}],
+                "slots": [{"id": "r", "role": "rotor", "movement": "fixed", "wheel": "r"}],
+                "stepping": {"rules": []}
+            }}}, "job": {
+                "kind": "search", "configuration": {"slots": [{"id": "r", "position": "é", "ring": "Ω"}],
+                    "plugboard": [["中", "é"]]}, "text": "🦀🦀", "measures": ["ic"], "passes": ["hill_climb"],
+                "space": {"offset": offset, "plugboard": {"kind": "attack", "symbols": ["🦀", "Ω"], "max_pairs": 2}},
+                "attack": {"kind": "hill_climb", "initial_measure": "ic", "final_measure": "ic",
+                    "switch_pairs": 2, "backtrack_pairs": 2, "evaluation_budget": 100, "start": [["Ω", "🦀"]]}
+            }
+        });
+        if pe {
+            value["job"]["passes"] = json!(["partial_exhaustion"]);
+            let attack = value["job"]["attack"].as_object_mut().unwrap();
+            attack.insert("kind".into(), json!("partial_exhaustion"));
+            attack.remove("start");
+            attack.insert(
+                "seeds".into(),
+                json!({"kind": "empty_single", "selection": "all"}),
+            );
+        }
+        value
+    }
+
+    fn result_fixture(pe: bool, offset: u64) -> crate::AttackResult {
+        crate::AttackRequest::parse_json(&result_fixture_value(pe, offset).to_string())
+            .unwrap()
+            .run(|_| {}, || false)
+            .unwrap()
+    }
+
+    #[test]
+    fn result_public_pe_nonempty_unicode_winner() {
+        let mut value = result_fixture_value(true, 0);
+        value["machine"]["definition"]["value"]["wheels"][0]["wiring"] =
+            json!(["é", "🦀", "Ω", "中"]);
+        value["job"]["measures"] = json!(["ic", "trie"]);
+        value["job"]["attack"]["final_measure"] = json!("trie");
+        value["job"]["resources"] = json!({"trie": {"path": "dictionary.json"}});
+        let dictionary = json!({"resource_version": 1, "kind": "dictionary",
+            "alphabet": ["🦀", "é", "Ω", "中"],
+            "entries": [{"word": ["中", "中"], "weight": 1}]})
+        .to_string();
+        let supplied = std::collections::BTreeMap::from([("trie".to_owned(), dictionary.as_str())]);
+        let result = crate::ParsedAttackRequest::parse_json(&value.to_string())
+            .unwrap()
+            .bind_resources(&supplied)
+            .unwrap()
+            .run(|_| {}, || false)
+            .unwrap();
+        let wire = encoded(&Event::result(&result, 0));
+        let best = result.best().unwrap();
+        assert_eq!(best.mutable_plugboard(), &[('🦀', 'Ω')]);
+        assert_eq!(
+            wire["best"]["configuration"]["plugboard"],
+            json!([["🦀", "Ω"], ["é", "中"]])
+        );
+        assert_eq!(wire["best"]["mutable_plugboard"], json!([["🦀", "Ω"]]));
+        assert_eq!(wire["best"]["plaintext"], "中中");
+        assert_eq!(
+            wire["best"]["score"],
+            json!({"measure": "trie",
+            "measured_q32": "4294967296", "ranking_q32": "4294967296"})
+        );
+        assert_eq!(wire["best"]["start_index"], best.start_index().to_string());
+        assert_eq!(
+            wire["best"]["score"]["ranking_q32"],
+            best.score().ranking().units().to_string()
+        );
+    }
+
+    #[test]
+    fn result_public_entropy_keeps_initial_moving_slots_in_definition_order() {
+        let mut value = result_fixture_value(false, 0);
+        value["machine"]["definition"]["value"]["slots"] = json!([
+            {"id": "z", "role": "rotor", "movement": "movable", "wheel": "r"},
+            {"id": "a", "role": "rotor", "movement": "fixed", "wheel": "r"}
+        ]);
+        value["machine"]["definition"]["value"]["stepping"] =
+            json!({"rules": [{"when": {"always": true}, "advance": ["z"]}]});
+        let slots = json!([
+            {"id": "z", "wheel": "r", "position": "é", "ring": "Ω"},
+            {"id": "a", "wheel": "r", "position": "中", "ring": "🦀"}
+        ]);
+        value["job"]["configuration"]["slots"] = slots.clone();
+        value["job"]["text"] = json!("🦀é");
+        value["job"]["measures"] = json!(["ic", "entropy"]);
+        value["job"]["attack"]["final_measure"] = json!("entropy");
+        let result = crate::AttackRequest::parse_json(&value.to_string())
+            .unwrap()
+            .run(|_| {}, || false)
+            .unwrap();
+        let wire = encoded(&Event::result(&result, 0));
+        let best = result.best().unwrap();
+        assert_eq!(wire["best"]["configuration"]["slots"], slots);
+        assert_eq!(wire["best"]["plaintext"], "🦀é");
+        assert_eq!(
+            wire["best"]["score"],
+            json!({"measure": "entropy",
+            "measured_q32": "4294967296", "ranking_q32": "-4294967296"})
+        );
+        assert_eq!(
+            wire["best"]["score"]["measured_q32"],
+            best.score().measured().units().to_string()
+        );
+        assert_eq!(
+            wire["best"]["score"]["ranking_q32"],
+            best.score().ranking().units().to_string()
+        );
+        // Two pre-keypress advances leave z at 中, not its initial é; identity wiring
+        // keeps plaintext stable but cannot hide a stepped-position projection bug.
+        assert_ne!(wire["best"]["configuration"]["slots"][0]["position"], "中");
+    }
+
+    #[test]
+    fn result_preserves_winning_key() {
+        for pe in [false, true] {
+            let result = result_fixture(pe, 0);
+            let best = result.best().unwrap();
+            let slots: Vec<Value> = best
+                .configuration()
+                .slots()
+                .iter()
+                .map(|slot| {
+                    json!({"id": slot.id(), "wheel": slot.wheel(),
+                    "position": slot.position(), "ring": slot.ring()})
+                })
+                .collect();
+            assert_eq!(
+                encoded(&Event::result(&result, 23)),
+                json!({
+                    "event": "result", "best": {
+                        "configuration": {"slots": slots, "plugboard": best.configuration().plugboard()},
+                        "mutable_plugboard": best.mutable_plugboard(), "plaintext": best.plaintext(),
+                        "score": {"measure": best.measure().id(),
+                            "measured_q32": best.score().measured().units().to_string(),
+                            "ranking_q32": best.score().ranking().units().to_string()},
+                        "outer_index": best.outer_index().to_string(), "start_index": best.start_index().to_string(),
+                        "incomplete": best.incomplete(), "final_objective_ascent": best.final_objective_ascent(),
+                        "neighborhood_exhausted": best.neighborhood_exhausted()
+                    }, "counters": super::ProgressCounters::from(result.counters()),
+                    "elapsed_ms": "23", "protocol_version": 1, "seq": 7, "ts": TS
+                })
+            );
+            assert_eq!(
+                slots,
+                json!([{"id": "r", "wheel": "r", "position": "é", "ring": "Ω"}])
+                    .as_array()
+                    .unwrap()
+                    .clone()
+            );
+            assert_eq!(
+                best.configuration().plugboard()[0],
+                if pe { ('é', '中') } else { ('🦀', 'Ω') }
+            );
+        }
+    }
+
+    #[test]
+    fn result_empty_slice_is_genuine_null() {
+        for pe in [false, true] {
+            let result = result_fixture(pe, 1);
+            assert_eq!(result.termination(), AttackTermination::OuterSliceEnd);
+            assert!(result.best().is_none());
+            let value = encoded(&Event::result(&result, 0));
+            assert_eq!(value["best"], Value::Null);
+            assert_eq!(value["elapsed_ms"], "0");
+            assert_eq!(
+                value["counters"],
+                encoded(&Event::progress(result.counters(), 0))["counters"]
+            );
+            assert_eq!(value.as_object().unwrap().len(), 7);
+        }
+    }
+
+    #[test]
+    fn result_synthetic_scores_indices_and_independent_flags() {
+        // Owned synthetic carriers prove schema, not runtime reachability of extrema or flags.
+        let mut result = result_fixture(false, 0);
+        for units in [i128::MIN, -1, 0, i128::MAX] {
+            result.best.as_mut().unwrap().score =
+                crate::MeasuredScore::higher_is_better(crate::FixedScore::from_units(units));
+            let value = encoded(&Event::result(&result, 0));
+            assert_eq!(value["best"]["score"]["measured_q32"], units.to_string());
+            assert_eq!(value["best"]["score"]["ranking_q32"], units.to_string());
+        }
+        let alphabet = crate::Alphabet::new("🦀éΩ中".chars().collect()).unwrap();
+        let entropy = crate::shannon_entropy(&alphabet, "🦀é").unwrap();
+        assert_ne!(entropy.measured(), entropy.ranking());
+        for mask in 0..8 {
+            let best = result.best.as_mut().unwrap();
+            best.score = entropy;
+            best.measure = crate::MeasureId::Entropy;
+            best.outer_index = u128::MAX;
+            best.start_index = u128::MAX;
+            best.incomplete = mask & 1 != 0;
+            best.final_objective_ascent = mask & 2 != 0;
+            best.neighborhood_exhausted = mask & 4 != 0;
+            let value = encoded(&Event::result(&result, u128::MAX));
+            let best = result.best().unwrap();
+            assert_eq!(value["elapsed_ms"], u128::MAX.to_string());
+            let wire = &value["best"];
+            assert_eq!(wire["outer_index"], u128::MAX.to_string());
+            assert_eq!(wire["start_index"], u128::MAX.to_string());
+            assert_eq!(
+                wire["score"],
+                json!({"measure": best.measure().id(),
+                "measured_q32": entropy.measured().units().to_string(),
+                "ranking_q32": entropy.ranking().units().to_string()})
+            );
+            assert_eq!(wire["incomplete"], mask & 1 != 0);
+            assert_eq!(wire["final_objective_ascent"], mask & 2 != 0);
+            assert_eq!(wire["neighborhood_exhausted"], mask & 4 != 0);
+        }
     }
 
     #[test]

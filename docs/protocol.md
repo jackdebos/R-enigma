@@ -360,12 +360,14 @@ Syntax errors point to the closest available containing path.
 
 ### 4.1 Planned HC/PE search events — Task 12.7
 
-**Partially implemented (Task12.10a):** Core provides pure progress wire projection
-from `AttackProgress` and caller-supplied elapsed milliseconds, decimal-string
-serialization of all five counters and elapsed time, and all four `DoneReason`
-mappings. Best/result schema (12.10b) and runtime-error context/fallible projection
-(12.10c) remain deferred. CLI still returns `unsupported_job` for validated attacks
-before `started`; no clocks, transport or execution permission follow from this section.
+**Partially implemented (Task12.10a+b):** Core provides pure progress and result
+wire projections from `AttackProgress`/`AttackResult` and caller-supplied elapsed
+milliseconds, decimal-string counters, indices, Q32 units and elapsed time, and all
+four `DoneReason` mappings. Result preserves the complete initial winning key,
+mutable remainder, final score and independent flags; genuine absence is null.
+Runtime-error context/fallible projection (12.10c), transport and CLI integration
+remain deferred. CLI still returns `unsupported_job` for validated attacks before
+`started`; these helpers read no clocks and perform no I/O or orchestration.
 Only one attack pass, `hill_climb` or `partial_exhaustion`, is eligible; recognition
 of other passes is not support. Mixed/deferred/legacy rejection remains unchanged.
 
