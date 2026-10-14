@@ -17,8 +17,6 @@ pub(crate) struct DirectOuterOutcome {
     pub(crate) initial: ResolvedConfiguration,
     pub(crate) outer_index: u128,
     pub(crate) start_index: u128,
-    /// Cumulative caller allowance usage, including earlier work.
-    pub(crate) evaluations_used: u64,
     pub(crate) climb: ClimbOutcome,
 }
 
@@ -326,7 +324,6 @@ enum ControlledPartialSource {
 struct ControlledPartialError {
     outer_index: u128,
     seed_index: Option<u128>,
-    evaluations_used: u64,
     source: ControlledPartialSource,
     best: Option<Box<(ResolvedConfiguration, SeedBest)>>,
 }
@@ -334,14 +331,12 @@ struct ControlledPartialError {
 impl ControlledPartialError {
     fn from_seed(
         outer_index: u128,
-        evaluations_used: u64,
         initial: ResolvedConfiguration,
         error: ControlledSeedError,
     ) -> Self {
         Self {
             outer_index,
             seed_index: error.seed_index,
-            evaluations_used,
             source: ControlledPartialSource::Climb(error.source),
             best: error.best.map(|best| Box::new((initial, *best))),
         }
@@ -389,7 +384,6 @@ impl SeedBest {
             initial,
             outer_index,
             start_index: self.seed_index,
-            evaluations_used: 0,
             climb: ClimbOutcome {
                 current: Some(self.current),
                 budget_stopped: self.incomplete,
@@ -409,7 +403,6 @@ impl ControlledPartialOutcome {
                 initial: self.initial,
                 outer_index: self.outer_index,
                 start_index: 0,
-                evaluations_used: self.seeds.seeds.evaluations_used,
                 climb: ClimbOutcome {
                     current: None,
                     budget_stopped: false,
@@ -550,7 +543,6 @@ impl crate::AttackRequest {
                 return Err(ControlledPartialError {
                     outer_index,
                     seed_index: None,
-                    evaluations_used: accounting.allowance.used,
                     source: ControlledPartialSource::UnsupportedPass,
                     best: None,
                 });
@@ -575,12 +567,7 @@ impl crate::AttackRequest {
                     requested,
                 )
                 .map_err(|error| {
-                    ControlledPartialError::from_seed(
-                        outer_index,
-                        accounting.allowance.used,
-                        initial.clone(),
-                        error,
-                    )
+                    ControlledPartialError::from_seed(outer_index, initial.clone(), error)
                 })?;
             Ok(ControlledPartialOutcome {
                 initial,
@@ -766,7 +753,6 @@ impl crate::AttackRequest {
                         initial,
                         outer_index: index,
                         start_index: 0,
-                        evaluations_used: accounting.allowance.used,
                         climb,
                     })
                 },
@@ -902,7 +888,6 @@ impl crate::AttackRequest {
             initial,
             outer_index,
             start_index: 0,
-            evaluations_used: allowance.used,
             climb,
         })
     }
@@ -2837,7 +2822,6 @@ mod tests {
                     Err(ControlledPartialError {
                         outer_index: failure,
                         seed_index: Some(u128::MAX),
-                        evaluations_used: 7,
                         source: ControlledPartialSource::Climb(ObservedClimbError::Counter(
                             CounterOverflow::ClimbsStarted,
                         )),
@@ -3968,7 +3952,6 @@ mod tests {
                     .unwrap_err();
                 Err(ControlledPartialError::from_seed(
                     index,
-                    accounting.allowance.used,
                     initial.clone(),
                     ControlledSeedError {
                         seed_index: Some(2),
@@ -4732,14 +4715,15 @@ mod tests {
     #[test]
     fn public_error_projection_retains_prior_best() {
         let request = scheduler_request(100, false, false, 0);
+        let mut expected_allowance = EvaluationAllowance {
+            used: 0,
+            limit: 100,
+        };
         let expected = request
             .climb_direct_outer(
                 request.outer_candidates().next().unwrap().1.unwrap(),
                 0,
-                &mut EvaluationAllowance {
-                    used: 0,
-                    limit: 100,
-                },
+                &mut expected_allowance,
             )
             .unwrap();
         let mut allowance = EvaluationAllowance {
@@ -4768,7 +4752,6 @@ mod tests {
                     initial,
                     outer_index: index,
                     start_index: 0,
-                    evaluations_used: accounting.allowance.used,
                     climb,
                 })
             },
@@ -4778,7 +4761,7 @@ mod tests {
         assert_eq!(error.outer_index, None);
         assert_eq!(error.counters.outers_completed, 1);
         assert_eq!(observer.0.last(), Some(&error.counters));
-        assert_eq!(error.evaluations_used, expected.evaluations_used);
+        assert_eq!(error.evaluations_used, expected_allowance.used);
         let expected = expected.project(request.domain(), MeasureId::Trie).unwrap();
         let error = error.project(request.domain(), MeasureId::Trie);
         assert_eq!(error.outer_index(), None);
@@ -4976,14 +4959,15 @@ mod tests {
     #[test]
     fn controlled_direct_later_faults_keep_only_accepted_outer() {
         let request = scheduler_request(100, false, false, 0);
+        let mut expected_allowance = EvaluationAllowance {
+            used: 0,
+            limit: 100,
+        };
         let expected = request
             .climb_direct_outer(
                 request.outer_candidates().next().unwrap().1.unwrap(),
                 0,
-                &mut EvaluationAllowance {
-                    used: 0,
-                    limit: 100,
-                },
+                &mut expected_allowance,
             )
             .unwrap();
         for fault in 0..4 {
@@ -5049,7 +5033,6 @@ mod tests {
                         initial,
                         outer_index: index,
                         start_index: 0,
-                        evaluations_used: accounting.allowance.used,
                         climb,
                     })
                 },
@@ -5061,11 +5044,11 @@ mod tests {
             let additional = match fault {
                 0 => 0,
                 1 | 2 => 1,
-                _ => expected.evaluations_used,
+                _ => expected_allowance.used,
             };
             assert_eq!(
                 error.evaluations_used,
-                7 + expected.evaluations_used + additional
+                7 + expected_allowance.used + additional
             );
             assert_eq!(allowance.used, error.evaluations_used);
             match fault {
@@ -5086,7 +5069,7 @@ mod tests {
                     assert_eq!(error.counters.evaluations_admitted, u64::MAX);
                     assert_eq!(
                         error.counters.evaluations_completed,
-                        expected.evaluations_used
+                        expected_allowance.used
                     );
                 }
                 _ => assert!(matches!(
@@ -5098,7 +5081,7 @@ mod tests {
             assert_eq!(best.outer_index, 0);
             assert_eq!(best.initial, expected.initial);
             assert_eq!(best.climb.current, expected.climb.current);
-            assert_eq!(best.evaluations_used, 7 + expected.evaluations_used);
+            assert_eq!(best.start_index, expected.start_index);
             let error = error.project(request.domain(), MeasureId::Trie);
             assert_eq!(error.outer_index(), Some(1));
             assert_eq!(error.start_index(), if fault == 0 { None } else { Some(0) });
@@ -5183,7 +5166,6 @@ mod tests {
                         initial,
                         outer_index: index,
                         start_index: 0,
-                        evaluations_used: accounting.allowance.used,
                         climb,
                     })
                 },
@@ -5274,7 +5256,7 @@ mod tests {
             let outcome = request
                 .climb_direct_outer(initial.unwrap(), index, &mut allowance)
                 .unwrap();
-            costs.push(outcome.evaluations_used);
+            costs.push(allowance.used);
             if expected_best
                 .as_ref()
                 .is_none_or(|best: &DirectOuterOutcome| {
@@ -5470,7 +5452,6 @@ mod tests {
             assert_eq!(result.start_index, 0);
             assert_eq!(result.initial, expected_initial);
             assert_eq!(result.initial.plugboard().map('A'), Some('A'));
-            assert_eq!(result.evaluations_used, cost);
             assert_eq!(allowance.used, cost);
             let current = result.climb.current.unwrap();
             assert_eq!(current.board, vec![('A', 'C')]);
@@ -5486,7 +5467,7 @@ mod tests {
             assert!(denied.climb.current.is_none());
             assert!(denied.climb.budget_stopped);
             assert!(!denied.climb.neighborhood_exhausted);
-            assert_eq!(denied.evaluations_used, cost);
+            assert_eq!(allowance.used, cost);
         }
     }
 
@@ -5504,7 +5485,6 @@ mod tests {
             let result = request
                 .climb_direct_outer(initial, 17, &mut allowance)
                 .unwrap();
-            assert_eq!(result.evaluations_used, used);
             assert_eq!(allowance.used, used);
             assert!(result.climb.budget_stopped);
             assert!(!result.climb.neighborhood_exhausted);
@@ -5900,11 +5880,10 @@ mod tests {
                 assert!(snapshot.evaluations_completed > first_used);
             }
             assert_eq!(observer.0.last(), Some(&snapshot));
-            let mapped =
-                ControlledPartialError::from_seed(99, allowance.used, initial.clone(), error);
+            let mapped = ControlledPartialError::from_seed(99, initial.clone(), error);
             assert_eq!(mapped.outer_index, 99);
             assert_eq!(mapped.seed_index, Some(1));
-            assert_eq!(mapped.evaluations_used, allowance.used);
+            assert!(mapped.best.is_some());
             assert_eq!(
                 mapped.source,
                 ControlledPartialSource::Climb(expected_source)
@@ -5964,7 +5943,8 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.outer_index, 73);
         assert_eq!(error.seed_index, Some(1));
-        assert_eq!(error.evaluations_used, allowance.used);
+        assert!(allowance.used > 0);
+        assert_eq!(allowance.used, control.snapshot().evaluations_completed);
         assert_eq!(
             error.source,
             ControlledPartialSource::Climb(ObservedClimbError::Counter(
@@ -6379,10 +6359,10 @@ mod tests {
             let (result, used, recorder, _) =
                 controlled_seed_probe(&context, Default::default(), 100, |_| false);
             let mapped =
-                ControlledPartialError::from_seed(99, used, initial.clone(), result.unwrap_err());
+                ControlledPartialError::from_seed(99, initial.clone(), result.unwrap_err());
             assert_eq!(mapped.outer_index, 99);
             assert_eq!(mapped.seed_index, Some(0));
-            assert_eq!(mapped.evaluations_used, 8);
+            assert_eq!(used, 8);
             assert_eq!(
                 mapped.source,
                 ControlledPartialSource::Climb(expected.into())
@@ -6412,16 +6392,8 @@ mod tests {
         );
         let (error, used, recorder, polls) =
             controlled_seed_probe(&context, Default::default(), 100, |_| true);
-        let mapped =
-            ControlledPartialError::from_seed(99, used, initial.clone(), error.unwrap_err());
-        assert_eq!(
-            (
-                mapped.outer_index,
-                mapped.seed_index,
-                mapped.evaluations_used
-            ),
-            (99, None, 7)
-        );
+        let mapped = ControlledPartialError::from_seed(99, initial.clone(), error.unwrap_err());
+        assert_eq!((mapped.outer_index, mapped.seed_index, used), (99, None, 7));
         assert_eq!(
             mapped.source,
             ControlledPartialSource::Climb(ObservedClimbError::Evaluation(
@@ -6463,7 +6435,6 @@ mod tests {
         assert!(matches!(expected, TrialEvaluationError::Board(_)));
         let mapped = ControlledPartialError::from_seed(
             99,
-            allowance.used,
             initial.clone(),
             ControlledSeedError {
                 seed_index: Some(2),
@@ -6476,11 +6447,7 @@ mod tests {
             ControlledPartialSource::Climb(expected.into())
         );
         assert_eq!(
-            (
-                mapped.outer_index,
-                mapped.seed_index,
-                mapped.evaluations_used
-            ),
+            (mapped.outer_index, mapped.seed_index, allowance.used),
             (99, Some(2), 8)
         );
         assert_eq!(
@@ -6500,7 +6467,6 @@ mod tests {
             // Mapping only: the single-outer adapter never records outer completion.
             let mapped = ControlledPartialError::from_seed(
                 99,
-                7,
                 initial.clone(),
                 ControlledSeedError {
                     seed_index: Some(2),
@@ -6512,14 +6478,7 @@ mod tests {
                 mapped.source,
                 ControlledPartialSource::Climb(ObservedClimbError::Counter(source))
             );
-            assert_eq!(
-                (
-                    mapped.outer_index,
-                    mapped.seed_index,
-                    mapped.evaluations_used
-                ),
-                (99, Some(2), 7)
-            );
+            assert_eq!((mapped.outer_index, mapped.seed_index), (99, Some(2)));
         }
     }
 
@@ -6689,8 +6648,8 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.outer_index, 99);
             assert_eq!(error.seed_index, if pe { Some(0) } else { None });
-            assert_eq!(error.evaluations_used, if pe { 8 } else { 7 });
-            assert_eq!(allowance.used, error.evaluations_used);
+            assert_eq!(allowance.used, if pe { 8 } else { 7 });
+            assert_eq!(control.snapshot().evaluations_admitted, u64::MAX);
             assert_eq!(
                 error.source,
                 if pe {
