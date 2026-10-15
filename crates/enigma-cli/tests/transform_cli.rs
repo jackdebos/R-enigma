@@ -3,6 +3,10 @@
 //! These drive the real `enigma` binary, pipe a protocol request through the transport,
 //! and assert the emitted JSONL event stream. They never call the engine directly.
 
+mod support;
+
+use support::successful_events;
+
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
 
@@ -89,33 +93,11 @@ fn unique_suffix() -> u128 {
 #[test]
 fn valid_transform_emits_started_output_done() {
     let output = run_with_stdin(&valid_request());
-    assert!(output.status.success(), "exit status: {:?}", output.status);
-    assert!(
-        output.stderr.is_empty(),
-        "stderr: {:?}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let events = json_lines(&output.stdout);
+    let events = successful_events(&output);
     assert_eq!(events.len(), 3, "events: {events:?}");
     assert_eq!(events[0]["event"], json!("started"));
     assert_eq!(events[1]["event"], json!("output"));
     assert_eq!(events[2]["event"], json!("done"));
-
-    for (index, event) in events.iter().enumerate() {
-        assert_eq!(
-            event["protocol_version"],
-            json!(1),
-            "event {index}: {event:?}"
-        );
-        assert_eq!(
-            event["seq"],
-            json!(index as u64 + 1),
-            "event {index}: {event:?}"
-        );
-        let ts = event["ts"].as_str().expect("ts is a string");
-        assert!(!ts.is_empty(), "event {index} has an empty ts");
-    }
 
     assert_eq!(events[2]["reason"], json!("completed"));
 
@@ -128,8 +110,7 @@ fn valid_transform_emits_started_output_done() {
     decrypt["job"]["text"] = json!(transformed);
     decrypt["job"]["direction"] = json!("decrypt");
     let round_trip = run_with_stdin(&decrypt);
-    assert!(round_trip.status.success());
-    let round_events = json_lines(&round_trip.stdout);
+    let round_events = successful_events(&round_trip);
     assert_eq!(round_events[1]["output"], json!("AAAA"));
 }
 
@@ -178,13 +159,7 @@ fn positional_file_path_emits_the_same_stream() {
         .expect("failed to run enigma with a file path");
     let _ = std::fs::remove_file(&path);
 
-    assert!(output.status.success(), "exit status: {:?}", output.status);
-    assert!(
-        output.stderr.is_empty(),
-        "stderr: {:?}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let events = json_lines(&output.stdout);
+    let events = successful_events(&output);
     assert_eq!(events.len(), 3, "events: {events:?}");
     assert_eq!(events[0]["event"], json!("started"));
     assert_eq!(events[1]["event"], json!("output"));
