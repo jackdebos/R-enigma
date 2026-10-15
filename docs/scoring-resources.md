@@ -12,11 +12,12 @@ implemented. Pure supplied-content binding (`ParsedSearchRequest::bind_resources
 validates reference keys, budgets, and compatibility before producing an enumerable
 `SearchRequest` with retained typed scoring models (`bound_resource`). Resource-free
 conversion remains available. The CLI uses shared strict `ParsedRequest` dispatch,
-loads bounded external resources, and binds search contents. Core HC/PE execution,
-fallible wire projections and a private test-only timed JSONL adapter exist; this
-does not activate production CLI search. See protocol
-[current availability](protocol.md#41-planned-hcpe-search-events--task-127) for the
-unsupported CLI boundary and selected future production cadence.
+loads bounded external resources, and binds search contents before execution.
+Core HC/PE execution and fallible wire projections feed the shared production CLI
+adapter. See protocol
+[current availability](protocol.md#41-planned-hcpe-search-events--task-127) for
+HC/PE lifecycle, internal 250 ms safe-callback coalescing and legacy unsupported search.
+UTC timestamps and monotonic elapsed time are separate; no timer delivery is promised.
 Slice 10.1 froze this contract before those implementation slices; the formulas below
 remain normative.
 See [Engine Protocol](protocol.md) for the surrounding request and event contract.
@@ -208,10 +209,11 @@ supplied text and never perform filesystem I/O.
 
 Shared strict job dispatch must distinguish transform and search without weakening
 duplicate-key detection or interpreting invalid search JSON as a transform. Transform
-never loads scoring resources. Current production search dispatch validates and
-binds resources before the unsupported-search result documented in protocol current
-availability; resource validation errors take precedence. The test-only adapter does
-not change this dispatch or the resource contracts.
+never loads scoring resources. Production search dispatch validates and binds
+resources and finalizes eligibility/count/budget preflight before HC/PE execution;
+failures remain seq1-only errors. Legacy search retains its unsupported result after
+resource validation. Activation changes no resource contract; signals/control files,
+hold and checkpoints remain deferred.
 
 ## 4. Score representation and reproducible logarithms
 
@@ -373,4 +375,5 @@ The semantic source is canonical `ffraenz/bomm`, pinned at
 Strict external JSON, Unicode handling, limits, checked fixed-point arithmetic,
 orientation, and safe sample rejection are this project's contract decisions.
 The article/thesis was not fetched; article confirmation and executable parity are
-not claimed. Search execution and differential validation remain later tasks.
+not claimed. Validated HC/PE execution is available; external differential
+validation remains a later task.

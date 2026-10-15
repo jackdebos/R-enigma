@@ -1,4 +1,5 @@
-//! Real transport tests: validation is not search execution.
+//! Real transport tests for legacy validation and executable HC/PE attacks.
+mod support;
 use serde_json::{json, Value};
 use std::fs;
 use std::io::Write;
@@ -310,7 +311,7 @@ fn attack(pass: &str, selection: &str, ids: &[&str]) -> Value {
 }
 
 #[test]
-fn public_attack_free_and_bound_validation_is_not_execution() {
+fn public_attack_free_and_bound_execution() {
     let f = Fixture::new();
     f.write("sinkov_bigram.json", model(2).to_string());
     for (pass, selection) in [
@@ -319,14 +320,72 @@ fn public_attack_free_and_bound_validation_is_not_execution() {
         ("partial_exhaustion", "touching"),
     ] {
         for ids in [&["ic"][..], &["sinkov_bigram"][..]] {
-            let event = error(
-                f.stdin(&attack(pass, selection, ids)),
-                "unsupported_job",
-                "/job/kind",
-            );
-            assert_eq!(event["message"], "attack execution is not implemented");
+            let request = attack(pass, selection, ids);
+            let events = attack_events(&f.stdin(&request));
+            let parsed =
+                enigma_core::ParsedAttackRequest::parse_json(&request.to_string()).unwrap();
+            let text = model(2).to_string();
+            let supplied = if ids == ["ic"] {
+                std::collections::BTreeMap::new()
+            } else {
+                std::collections::BTreeMap::from([("sinkov_bigram".into(), text.as_str())])
+            };
+            let bound = parsed.bind_resources(&supplied).unwrap();
+            let expected = bound.run(|_| {}, || false).unwrap();
+            let actual = &events[events.len() - 2];
+            let projected = serde_json::to_value(enigma_core::Event::result(&expected, 0)).unwrap();
+            for field in ["best", "counters"] {
+                assert_eq!(
+                    actual[field], projected[field],
+                    "{pass}/{selection}/{ids:?}"
+                );
+            }
+            assert!(!actual["best"].is_null());
+            let terminal = serde_json::to_value(enigma_core::Event::Done {
+                reason: expected.termination().into(),
+            })
+            .unwrap();
+            assert_eq!(events.last().unwrap()["reason"], terminal["reason"]);
         }
     }
+}
+
+fn attack_events(output: &Output) -> Vec<Value> {
+    let events = support::successful_events(output);
+    assert_eq!(events.first().unwrap()["event"], "started");
+    assert_eq!(events.last().unwrap()["event"], "done");
+    assert_eq!(events[events.len() - 2]["event"], "result");
+    let mut elapsed = 0;
+    for event in &events[1..events.len() - 1] {
+        assert!(matches!(
+            event["event"].as_str(),
+            Some("progress" | "result")
+        ));
+        let decimal = |value: &Value| {
+            let text = value.as_str().unwrap();
+            let number = text.parse::<u128>().unwrap();
+            assert_eq!(text, number.to_string());
+            number
+        };
+        let next = decimal(&event["elapsed_ms"]);
+        assert!(next >= elapsed);
+        elapsed = next;
+        for value in event["counters"].as_object().unwrap().values() {
+            decimal(value);
+        }
+    }
+    assert!(events[1..events.len() - 2]
+        .iter()
+        .all(|event| event["event"] == "progress"));
+    assert_eq!(
+        events[events.len() - 3]["counters"],
+        events[events.len() - 2]["counters"]
+    );
+    assert_eq!(
+        events[events.len() - 3]["elapsed_ms"],
+        events[events.len() - 2]["elapsed_ms"]
+    );
+    events
 }
 
 #[test]
@@ -414,11 +473,7 @@ fn outer_attack(slots: usize, bound: bool) -> Value {
 #[test]
 fn public_attack_load_bind_gate_precedence_and_full_cardinality() {
     let f = Fixture::new();
-    error(
-        f.stdin(&outer_attack(5, false)),
-        "unsupported_job",
-        "/job/kind",
-    );
+    attack_events(&f.stdin(&outer_attack(5, false)));
     error(
         f.stdin(&outer_attack(8, false)),
         "resource_limit",
@@ -457,11 +512,7 @@ fn public_attack_load_bind_gate_precedence_and_full_cardinality() {
         .to_string(),
     );
     error(f.stdin(&overflow), "resource_limit", "/job/space");
-    error(
-        f.stdin(&outer_attack(5, true)),
-        "unsupported_job",
-        "/job/kind",
-    );
+    attack_events(&f.stdin(&outer_attack(5, true)));
 }
 
 #[test]

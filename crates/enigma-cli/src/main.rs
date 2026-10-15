@@ -6,17 +6,16 @@
 //! test harness without divergence. Parsing, validation and computation live in
 //! `enigma-core`; this module only moves bytes and emits protocol events.
 
-// TT-A is test-only staging; TT-B will activate the private search adapter.
-#[cfg(test)]
 mod attack_transport;
 mod resource_loader;
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read, Write};
+use std::num::NonZeroU128;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use enigma_core::{
     encode, rfc3339_utc, DoneReason, Event, ParsedAttackRequest, ParsedRequest,
@@ -206,12 +205,31 @@ fn run_attack(request: ParsedAttackRequest, origin: &Path, out: &mut impl Write)
         .map(|(id, text)| (id.clone(), text.as_str()))
         .collect();
     match request.bind_resources(&supplied) {
-        Ok(_validated) => failure(
-            out,
-            "unsupported_job",
-            "attack execution is not implemented",
-            "/job/kind",
-        ),
+        Ok(validated) => {
+            let entry = Instant::now();
+            match attack_transport::run(
+                &validated,
+                out,
+                || entry.elapsed(),
+                now_ts,
+                NonZeroU128::new(250).unwrap(),
+                || false,
+            ) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    if let Some(runtime) = error.runtime {
+                        eprintln!("{runtime}");
+                    }
+                    if let Some(projection) = error.projection {
+                        eprintln!("error: failed to project attack result: {projection}");
+                    }
+                    if let Some(transport) = error.transport {
+                        eprintln!("error: failed to write protocol event: {transport}");
+                    }
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Err(diagnostics) => {
             for diagnostic in &diagnostics {
                 eprintln!("{diagnostic}");
@@ -384,11 +402,27 @@ mod attack_tests {
         value
     }
 
+    fn success(value: &Value, origin: &Path) {
+        let parsed = ParsedAttackRequest::parse_json(&value.to_string()).unwrap();
+        let mut output = Vec::new();
+        assert_eq!(run_attack(parsed, origin, &mut output), ExitCode::SUCCESS);
+        let events: Vec<Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events[0]["event"], "started");
+        assert!(events[1..events.len() - 2]
+            .iter()
+            .all(|event| event["event"] == "progress"));
+        assert_eq!(events[events.len() - 2]["event"], "result");
+        assert_eq!(events.last().unwrap()["event"], "done");
+    }
+
     #[test]
-    fn validated_attack_is_not_execution() {
+    fn validated_attack_executes() {
         for value in [request(), partial("all"), partial("touching"), outer(5)] {
-            let event = check(&value, Path::new("."), "unsupported_job", "/job/kind");
-            assert_eq!(event["message"], "attack execution is not implemented");
+            success(&value, Path::new("."));
         }
         check(&outer(8), Path::new("."), "resource_limit", "/job/space");
     }
@@ -530,7 +564,7 @@ mod attack_tests {
             check(&backed(request()), &origin, code, location);
         }
         fs::write(&path, model.to_string()).unwrap();
-        check(&backed(request()), &origin, "unsupported_job", "/job/kind");
+        success(&backed(request()), &origin);
         model["alphabet"] = outer(8)["machine"]["definition"]["value"]["alphabet"].clone();
         model["entries"][0]["gram"] = json!(["Ā", "Ā"]);
         fs::write(&path, model.to_string()).unwrap();
@@ -570,7 +604,8 @@ mod attack_tests {
                 fail_write,
                 fail_flush,
             };
-            let parsed = ParsedAttackRequest::parse_json(&request().to_string()).unwrap();
+            // Valid structure, deterministic eligibility failure before any work events.
+            let parsed = ParsedAttackRequest::parse_json(&outer(8).to_string()).unwrap();
             assert_eq!(
                 run_attack(parsed, Path::new("."), &mut out),
                 ExitCode::FAILURE

@@ -1,9 +1,8 @@
 # Plugboard attack contract — Task 11
 
-Status: **Core HC/PE execution, fallible wire projections and a private test-only
-JSONL adapter exist; production CLI search execution remains unsupported.**
-[Current availability](protocol.md#41-planned-hcpe-search-events--task-127) distinguishes
-implemented staging from pending CLI activation and selected future 250 ms cadence.
+Status: **Core HC/PE execution and the shared production CLI JSONL adapter ship.**
+[Current availability](protocol.md#41-planned-hcpe-search-events--task-127) describes
+validated HC/PE execution, legacy unsupported search and internal 250 ms coalescing.
 Task 11.2a provides only `AttackPlugboardDomain::parse_json`: strict typed fragment
 validation with immutable known fixed pairs. It is separate from legacy search
 spaces and grants neither complete request acceptance nor candidate enumeration.
@@ -19,8 +18,8 @@ plus resource-free `AttackRequest::parse_json`. Both promotion routes check elig
 before returning privately owned inputs, retained models and counts. Owned result
 carriers and the HC facade are exposed; raw candidate APIs remain private. Public root dispatch selects this owner only when
 `job.space.plugboard.kind` is `"attack"`, with wire kind still `"search"`.
-The CLI loads resources once, binds and checks eligibility before the unsupported
-execution result described in current availability; Core HC/PE uses §6.2.
+The CLI loads resources once, binds and checks eligibility/counts/budgets before
+HC/PE execution through §6.2; failures remain seq1-only errors.
 Task 11.4a adds private budget-aware complete-neighborhood best-improvement selection only.
 Task 11.4b.1 adds a private bound scoring lifecycle: start-phase selection, shared final-score
 reservation, committed-board objective switching and once-only finalization, without an ascent loop.
@@ -45,7 +44,7 @@ same-owner PE outers with one allowance, checked aggregate counts and stable com
 final-score best ownership. Whole seed-run completion stays independent of winner flags;
 original indexed resolution/evaluation errors retain cumulative usage.
 Private HC/PE aggregates, the public Core HC/PE facade and fallible wire result
-projections are implemented; production CLI activation remains deferred.
+projections are implemented and used by the production CLI adapter.
 Task 12.9a privately retains the best earlier successful, final-scored seed when a
 later seed fails. Its error envelope owns the original resolved initial key separately
 from the committed mutable board, preserving the failure source/index and charged usage.
@@ -77,7 +76,7 @@ summarized above; private HC/PE drivers and outer schedulers are implemented.
 This document specifies `hill_climb` and `partial_exhaustion`, plus the implemented private
 control contract in §6.1 and public Core HC/PE facade in §6.2;
 [protocol §4.1](protocol.md#41-planned-hcpe-search-events--task-127) defines first-release
-lifecycle/results/progress. That wire contract does not enable CLI execution. Checkpoints, other
+lifecycle/results/progress, now delivered by the CLI for HC/PE. Checkpoints, other
 passes and variants remain separate work.
 
 ## 1. Two domain branches, no implicit unknown key
@@ -311,9 +310,9 @@ Single climbs, HC outer scheduling, PE seeds/resolved owners and PE outer schedu
 share checked accounting, counter snapshots and cooperative cancellation.
 Budget-only callers retain Task 11 behavior; both controlled paths use fresh
 per-invocation control and evaluation allowances.
-Fallible JSONL projections and a test-only timed adapter exist; production CLI
-activation, platform signals/control files, hold and checkpoint cadence remain
-deferred. Checkpoint/resume belongs to Task 16; Task 12 remains in progress.
+Fallible JSONL projections and the shared timed HC/PE adapter ship in the CLI.
+Platform signals/control files, hold and checkpoint cadence remain deferred.
+Checkpoint/resume belongs to Task 16; Task 12 remains in progress.
 
 #### Accounting and completion
 
@@ -377,10 +376,11 @@ No callback runs mid-evaluation; cancellation polling is independent of observer
 cadence. Error snapshots retain admitted usage and only successful completions.
 
 This boundary decides no clock, rate, I/O, hold capacity or candidate payload.
-The test-only adapter coalesces at safe callbacks using supplied clocks and a
-positive interval, flushes each line, emits terminal snapshots without waiting,
-and latches delivery failures with independently polled cancellation. This is not
-an observer cadence promise; production CLI activation remains separate work.
+The production adapter coalesces at safe callbacks using monotonic elapsed time,
+UTC event timestamps and an internal positive 250 ms interval. It flushes each line,
+emits terminal snapshots without waiting and latches delivery failures with
+independently polled cancellation. Synchronous callbacks guarantee no timer delivery
+or wall-clock cadence; external cancellation currently supplies false.
 [Protocol control](protocol.md#5-control) retains its public obligations; Task 16
 still owns checkpoint/resume design and implementation.
 
@@ -392,7 +392,7 @@ Owned `AttackProgress`, `AttackResult`, `AttackBest`, `AttackTermination` and
 original causes. Malformed accepted best projections return explicit errors,
 never silently become null; success-projection failures retain terminal counters
 and usage with an invariant cause and the concrete failure through `best()`.
-CLI execution remains deferred. The synchronous facade is:
+The CLI uses this same synchronous facade for HC and PE:
 
 ```rust,ignore
 fn run(&self, observe: impl FnMut(AttackProgress),
@@ -446,7 +446,7 @@ variants are `Completed`, `OuterSliceEnd`, `EvaluationBudget`, `Cancelled`.
 
 `completed`, `outer_slice_end`, `evaluation_budget`, `cancelled` have exactly the
 [wire stop meanings](protocol.md#41-planned-hcpe-search-events--task-127). The public
-facade uses the corresponding controlled HC/PE path; CLI execution remains deferred.
+facade and production CLI use the corresponding controlled HC/PE path.
 No current-climb result exists before initial success; a failed final rescore cannot
 make that board eligible. Errors dominate cancellation and preserve charged usage.
 The transport adds clock/coalescing and exact decimal-string encoding; Core keeps
@@ -479,7 +479,7 @@ These are **valid planned search-job fragments**, completed by protocol root
 `protocol_version: 1` and bundled `machine.definition` for `enigma-i`. They are
 not known-answer vectors. Direct Core attack parsing, binding and eligibility checks
 validate them. Safe public root Core/CLI validation and private execution are
-implemented; public HC/PE runs in Core only, while CLI execution remains deferred.
+implemented; public HC/PE runs through Core and the production CLI adapter.
 
 ```json
 {
@@ -523,6 +523,6 @@ retain our per-slot outer order, explicit domains/starts/objectives/thresholds,
 checked Q32 scoring, no-reflector decrypt support and deterministic shared budget.
 No floating-point score/trajectory parity or guaranteed key recovery is promised.
 Duet/quartet, DFS, mutable fixed facts and additional attacks remain out of scope.
-Public lifecycle/result transport is frozen above and implemented in the test-only
-adapter; production CLI activation remains later Task12 work. Differential oracle
+Public lifecycle/result transport is frozen above and implemented in the production
+HC/PE adapter; deferred controls remain later Task12 work. Differential oracle
 remains Task17.

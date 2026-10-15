@@ -1,4 +1,4 @@
-//! Private synchronous JSONL adapter. TT-B will register this module in production.
+//! Private synchronous JSONL adapter for validated HC/PE execution.
 
 use std::cell::{Cell, RefCell};
 use std::io::{self, Write};

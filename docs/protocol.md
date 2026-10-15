@@ -1,7 +1,7 @@
 # Engine Protocol
 
-Status: **Protocol v1 is unpublished pre-implementation design; Rust implementation is
-pending.** It replaces the former superset-of-`bomm` proposal. It makes no promise to
+Status: **Protocol v1 is unpublished; transform and validated HC/PE execution ship
+in Rust. Legacy search and deferred controls remain unimplemented.** It replaces the former superset-of-`bomm` proposal. It makes no promise to
 accept `bomm` query files unchanged; `bomm` remains a differential oracle. See
 `odd/tasks/enigma-engine.md` for task status. No UI is in Stage 1; UI begins in Stage 2.
 
@@ -21,10 +21,10 @@ specified in §3.3 and §7; [Scoring and external resources](scoring-resources.m
 specifies the normative Task 10 measure/resource contract. Pass execution fields and
 checkpoint record layout remain deferred to their implementation tasks.
 [Core HC API](search-passes.md#62-public-core-hc-api--task-128) freezes the
-first public HC/PE adapter contract; §4.1 freezes its JSONL projection, not execution.
+first public HC/PE adapter contract; §4.1 specifies its shipped JSONL lifecycle.
 [Task 11 plugboard attacks](search-passes.md) freezes the planned additive attack
-branch and pass settings; strict attack parsing and CLI validation are supported,
-but execution is not. Illustrative
+branch and pass settings; strict attack parsing, CLI validation and HC/PE execution
+are supported. Illustrative
 search concepts below are not executable request examples. Representability does not imply catalog availability or
 search support.
 
@@ -303,20 +303,19 @@ Task 9 implements the structural boundary and capability
 framework. Task 10 implements deterministic IC, Shannon entropy, Sinkov n-gram and
 weighted trie scoring, strict external resource parsers, typed measure/resource
 selection, pure content binding, and bounded CLI loading. The CLI uses shared strict
-dispatch to validate and bind search resources before returning one `unsupported_job`
-error, with no `started`, `output`, `done`, or enumeration; resource errors precede
-that result. Valid search is still not executable in the current CLI. Transform
-never loads resources. This status does not change transform grammar or events.
+dispatch to validate and bind search resources before execution. Legacy search still
+returns one `unsupported_job` error without work events; resource errors precede
+that result. Validated HC/PE attacks execute through the shared adapter. Transform
+never loads resources; its grammar and events are unchanged.
 
 [Task 11](search-passes.md) adds strict attack dispatch when
 `job.space.plugboard.kind` is `"attack"`, still with `job.kind = "search"`.
-The CLI loads and binds resources, checks eligibility, then emits one seq1
-`unsupported_job` at `/job/kind`: `attack execution is not implemented`.
-Structural, loading, model-binding and eligibility errors precede that result.
-Missing or other discriminators retain legacy search validation. Private HC/PE
-evaluation, seed exhaustion and ordered outer scheduling are implemented.
-Core `AttackRequest::run` supports synchronous HC/PE with counter-only observation
-and independently polled cancellation; CLI execution remains unsupported.
+The CLI loads and binds resources and checks eligibility, counts and budgets before
+execution. Structural, loading, model-binding and eligibility failures emit only a
+seq1 `error`, without work events. Missing or other discriminators retain legacy
+search validation and unsupported execution. HC/PE evaluation, seed exhaustion and
+ordered outer scheduling use Core `AttackRequest::run` through the shared synchronous
+adapter, with counter-only observation and independently polled cancellation.
 
 Stage 1 plans `hill_climb`, `partial_exhaustion` with backtracking, `reswapping`, `trie`,
 and `measure`; measures include index of coincidence, Sinkov n-gram statistics,
@@ -361,11 +360,10 @@ Syntax errors point to the closest available containing path.
 
 ### 4.1 Planned HC/PE search events — Task 12.7
 
-**Current availability (Task12.11 staged):** Transform execution works. Production
-CLI HC/PE attacks and legacy search still return seq1 `unsupported_job` after
-validation/preflight, before `started`, with no work events. Core HC/PE execution,
-fallible wire projections and a private test-only synchronous JSONL adapter exist;
-the adapter is not registered in production. CLI activation remains pending.
+**Current availability (Task12.11):** Transform and validated HC/PE attacks execute
+in the production CLI. HC/PE share the synchronous JSONL adapter and fallible Core
+projections. Legacy search still returns seq1 `unsupported_job` after preflight,
+without work events. All preflight failures remain seq1-only errors.
 
 Core provides pure progress and result
 wire projections from `AttackProgress`/`AttackResult` and caller-supplied elapsed
@@ -384,8 +382,8 @@ After all parsing, resource loading/binding, eligibility and count/budget valida
 emit `started`, zero or more `progress`, one `result`, then exactly one terminal
 `done` or runtime `error`. Preflight failures retain the existing seq1 `error` only.
 Task12.8 exposes Core HC; Task12.9c adds Core PE through the same synchronous API.
-The lifecycle below is implemented by the test-only adapter, not yet exposed by
-the production CLI; Core availability alone does not activate CLI execution.
+The lifecycle below is implemented by the shared production HC/PE adapter;
+legacy search remains unsupported.
 On runtime error, `result` contains only the earlier successfully committed aggregate
 best, or null; do not invent a result for the failing climb. No `done` follows error.
 `result` is final, not a stream of provisional trials or a hold list.
@@ -435,9 +433,9 @@ transport coalesces immutable private snapshots at safe callback boundaries usin
 an explicitly supplied positive adapter progress interval, independent of cancel
 polling. Entry and final snapshots are available without waiting for the interval;
 the final counters always travel in `result`. Duplicate snapshots are allowed.
-The selected future production adapter interval is **250 ms**; this is not shipped
-CLI behavior or a request cadence field. The test-only adapter accepts a supplied
-positive interval and supplied monotonic and UTC clocks. Delivery is synchronous
+The shipped internal production interval is **250 ms**, not a request cadence field.
+The adapter receives a positive interval, monotonic elapsed clock and UTC event
+timestamps from the CLI boundary. Delivery is synchronous
 at safe callbacks, with no timer threads, mid-evaluation callbacks or hard wall-clock
 delivery/cancellation bound. Timestamp `ts` remains supplied UTC wall time.
 No clock or I/O enters the private evaluator.
@@ -486,10 +484,10 @@ for private HC climbs/outer scheduling and PE seeds/resolved owners/outer schedu
 Admitted evaluations are nonpreemptive; established exhaustion wins over cancellation,
 which wins over budget. Stops retain committed results and required reserved final
 rescoring; original errors and charged usage are preserved, not masked by cancellation.
-Core runtime, fallible JSONL projections and the test-only timed adapter exist
-(§4.1); production CLI search execution is not activated. Platform signals/control
-files, hold and checkpoint cadence remain unimplemented. The first-release CLI
-obligations in §4.1 are not shipped behavior. Cancel-file integration (Task12.12) and POSIX/Windows signals (Task12.13)
+Core runtime, fallible JSONL projections and the timed HC/PE adapter ship in the
+production CLI (§4.1). Platform signals/control files, hold and checkpoint cadence
+remain unimplemented; external cancellation currently supplies false. Cancel-file
+integration (Task12.12) and POSIX/Windows signals (Task12.13)
 are provisional/unstarted: they may only feed a sticky cancellation request, never
 perform evaluation or JSONL writes in a signal handler. File contents/polling and
 platform setup/failure details must be specified before those adapters implement.
@@ -550,7 +548,7 @@ Task 17 is the differential-oracle validation task.
 
 ## 10. Version and status
 
-`protocol_version: 1` denotes this unpublished, pre-implementation design. Unknown
+`protocol_version: 1` denotes this unpublished contract. Unknown
 versions and fields fail before work. Incompatible changes to field meaning,
 validation, traversal, or event ordering after v1 ships require a version bump. Detailed
 pass execution fields other than the [planned Task 11 contract](search-passes.md)
