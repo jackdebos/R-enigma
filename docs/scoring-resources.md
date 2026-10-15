@@ -12,11 +12,13 @@ implemented. Pure supplied-content binding (`ParsedSearchRequest::bind_resources
 validates reference keys, budgets, and compatibility before producing an enumerable
 `SearchRequest` with retained typed scoring models (`bound_resource`). Resource-free
 conversion remains available. The CLI uses shared strict `ParsedRequest` dispatch,
-loads bounded external resources, and binds search contents before rejecting search
-execution with `unsupported_job`.
+loads bounded external resources, and binds search contents. Core HC/PE execution,
+fallible wire projections and a private test-only timed JSONL adapter exist; this
+does not activate production CLI search. See protocol
+[current availability](protocol.md#41-planned-hcpe-search-events--task-127) for the
+unsupported CLI boundary and selected future production cadence.
 Slice 10.1 froze this contract before those implementation slices; the formulas below
 remain normative.
-The current CLI cannot execute search, including structurally valid search requests.
 See [Engine Protocol](protocol.md) for the surrounding request and event contract.
 
 ## 1. Quick path and measure selection
@@ -206,11 +208,10 @@ supplied text and never perform filesystem I/O.
 
 Shared strict job dispatch must distinguish transform and search without weakening
 duplicate-key detection or interpreting invalid search JSON as a transform. Transform
-never loads scoring resources. The CLI now validates and binds search resources,
-then emits exactly one `unsupported_job` error at `/job/kind`, sequence 1, with a
-failure exit: no `started`, `output`, `progress`, `done`, candidate enumeration or
-other work events. Resource validation errors precede that unsupported-search result.
-This validation path does not implement search execution.
+never loads scoring resources. Current production search dispatch validates and
+binds resources before the unsupported-search result documented in protocol current
+availability; resource validation errors take precedence. The test-only adapter does
+not change this dispatch or the resource contracts.
 
 ## 4. Score representation and reproducible logarithms
 

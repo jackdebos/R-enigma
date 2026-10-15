@@ -298,7 +298,8 @@ filename's directory; stdin paths are relative to the working directory captured
 once. Absolute paths are allowed; no expansion, URL loading, automatic symlink
 canonicalization, or sandbox restriction is introduced.
 
-**Implementation status:** Task 9 implements the structural boundary and capability
+**Implementation status:** Current execution availability is summarized in §4.1.
+Task 9 implements the structural boundary and capability
 framework. Task 10 implements deterministic IC, Shannon entropy, Sinkov n-gram and
 weighted trie scoring, strict external resource parsers, typed measure/resource
 selection, pure content binding, and bounded CLI loading. The CLI uses shared strict
@@ -360,7 +361,13 @@ Syntax errors point to the closest available containing path.
 
 ### 4.1 Planned HC/PE search events — Task 12.7
 
-**Partially implemented (Task12.10a+b+c):** Core provides pure progress and result
+**Current availability (Task12.11 staged):** Transform execution works. Production
+CLI HC/PE attacks and legacy search still return seq1 `unsupported_job` after
+validation/preflight, before `started`, with no work events. Core HC/PE execution,
+fallible wire projections and a private test-only synchronous JSONL adapter exist;
+the adapter is not registered in production. CLI activation remains pending.
+
+Core provides pure progress and result
 wire projections from `AttackProgress`/`AttackResult` and caller-supplied elapsed
 milliseconds, decimal-string counters, indices, Q32 units and elapsed time, and all
 four `DoneReason` mappings. Result preserves the complete initial winning key,
@@ -368,8 +375,8 @@ mutable remainder, final score and independent flags; genuine absence is null.
 `Event::runtime_error` projects a borrowed failure into a result/error pair with
 optional boxed context. Malformed retained best fails with `RuntimeProjectionError`,
 which retains the original runtime cause and separate best-projection cause;
-only genuine absence becomes null. Transport and CLI integration remain deferred. CLI still returns `unsupported_job` for validated attacks before
-`started`; these helpers read no clocks and perform no I/O or orchestration.
+only genuine absence becomes null. These projection helpers read no clocks and
+perform no I/O or orchestration; the private adapter supplies that boundary.
 Only one attack pass, `hill_climb` or `partial_exhaustion`, is eligible; recognition
 of other passes is not support. Mixed/deferred/legacy rejection remains unchanged.
 
@@ -377,9 +384,8 @@ After all parsing, resource loading/binding, eligibility and count/budget valida
 emit `started`, zero or more `progress`, one `result`, then exactly one terminal
 `done` or runtime `error`. Preflight failures retain the existing seq1 `error` only.
 Task12.8 exposes Core HC; Task12.9c adds Core PE through the same synchronous API.
-Core availability does not enable wire execution: validation/preflight still emits
-seq1 `unsupported_job` before `started`, with no `result` or work events.
-This staging does not authorize CLI changes or wire execution.
+The lifecycle below is implemented by the test-only adapter, not yet exposed by
+the production CLI; Core availability alone does not activate CLI execution.
 On runtime error, `result` contains only the earlier successfully committed aggregate
 best, or null; do not invent a result for the failing climb. No `done` follows error.
 `result` is final, not a stream of provisional trials or a hold list.
@@ -429,9 +435,12 @@ transport coalesces immutable private snapshots at safe callback boundaries usin
 an explicitly supplied positive adapter progress interval, independent of cancel
 polling. Entry and final snapshots are available without waiting for the interval;
 the final counters always travel in `result`. Duplicate snapshots are allowed.
-There is no numeric default or request cadence field frozen here, nor a timer-thread,
-mid-evaluation callback or hard wall-clock delivery/cancellation bound. Timestamp
-`ts` remains supplied UTC wall time. No clock or I/O enters the private evaluator.
+The selected future production adapter interval is **250 ms**; this is not shipped
+CLI behavior or a request cadence field. The test-only adapter accepts a supplied
+positive interval and supplied monotonic and UTC clocks. Delivery is synchronous
+at safe callbacks, with no timer threads, mid-evaluation callbacks or hard wall-clock
+delivery/cancellation bound. Timestamp `ts` remains supplied UTC wall time.
+No clock or I/O enters the private evaluator.
 
 Map established exhaustion of a nonempty requested slice to `completed`; an empty
 slice to `outer_slice_end`, not legacy `offset_end`/`limit_reached`. When work remains,
@@ -477,10 +486,10 @@ for private HC climbs/outer scheduling and PE seeds/resolved owners/outer schedu
 Admitted evaluations are nonpreemptive; established exhaustion wins over cancellation,
 which wins over budget. Stops retain committed results and required reserved final
 rescoring; original errors and charged usage are preserved, not masked by cancellation.
-This is not public timed progress or search execution: public runtime, JSONL events,
-platform signals/control files, hold and checkpoint cadence remain unimplemented.
-The first-release obligations in §4.1 remain design requirements, not shipped
-behavior. Cancel-file integration (Task12.12) and POSIX/Windows signals (Task12.13)
+Core runtime, fallible JSONL projections and the test-only timed adapter exist
+(§4.1); production CLI search execution is not activated. Platform signals/control
+files, hold and checkpoint cadence remain unimplemented. The first-release CLI
+obligations in §4.1 are not shipped behavior. Cancel-file integration (Task12.12) and POSIX/Windows signals (Task12.13)
 are provisional/unstarted: they may only feed a sticky cancellation request, never
 perform evaluation or JSONL writes in a signal handler. File contents/polling and
 platform setup/failure details must be specified before those adapters implement.
