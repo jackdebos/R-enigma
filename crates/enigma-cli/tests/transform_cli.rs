@@ -37,8 +37,13 @@ fn valid_request() -> Value {
 }
 
 fn run_with_stdin(request: &Value) -> Output {
+    run_with_args(&["--request", "-"], request)
+}
+
+/// Runs the binary with arbitrary arguments, writing the request to stdin.
+fn run_with_args(args: &[&str], request: &Value) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_enigma"))
-        .args(["--request", "-"])
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -212,6 +217,45 @@ fn unknown_argument_shape_is_a_usage_error() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Usage:"), "stderr: {stderr}");
+}
+
+#[test]
+fn cancel_file_is_accepted_before_or_after_input_but_rejected_for_transform() {
+    for args in [
+        &["--cancel-file", "marker", "--request", "-"][..],
+        &["--request", "-", "--cancel-file", "marker"][..],
+    ] {
+        let output = run_with_args(args, &valid_request());
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        let events = json_lines(&output.stdout);
+        assert_eq!(events.len(), 1, "events: {events:?}");
+        assert_eq!(events[0]["event"], json!("error"));
+        assert_eq!(events[0]["seq"], json!(1));
+        assert_eq!(events[0]["code"], json!("unsupported_job"));
+        assert_eq!(events[0]["location"], json!("/job/kind"));
+        assert!(events[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--cancel-file"));
+    }
+}
+
+#[test]
+fn malformed_cancel_file_arguments_are_usage_errors() {
+    for args in [
+        &["--request", "-", "--cancel-file"][..],
+        &["--cancel-file", "--request", "-"][..],
+        &["--request", "-", "--cancel-file", "--marker"][..],
+        &["--cancel-file", "a", "--cancel-file", "b", "--request", "-"][..],
+        &["--cancel-file", "a", "--request", "-", "--cancel-file", "b"][..],
+        &["--cancel-file", "a"][..],
+    ] {
+        let output = run_with_args(args, &valid_request());
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("Usage:"), "stderr: {stderr}");
+    }
 }
 
 #[test]

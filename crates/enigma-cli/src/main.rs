@@ -7,8 +7,6 @@
 //! `enigma-core`; this module only moves bytes and emits protocol events.
 
 mod attack_transport;
-// Staged privately until CLI activation in CF-B.
-#[cfg(test)]
 mod cancel_file;
 mod resource_loader;
 
@@ -20,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use cancel_file::CancelFile;
 use enigma_core::{
     encode, rfc3339_utc, DoneReason, Event, ParsedAttackRequest, ParsedRequest,
     ParsedSearchRequest, TransformRequest, MAX_REQUEST_BYTES,
@@ -34,8 +33,12 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match resolve_input(&args, &cwd) {
-        Ok((bytes, origin)) => run(bytes, &origin),
+    let resolved = split_cancel_file(&args).and_then(|(input, cancel_file)| {
+        let cancel_file = cancel_file.map(|path| cwd.join(path));
+        resolve_input(input, &cwd).map(|(bytes, origin)| (bytes, origin, cancel_file))
+    });
+    match resolved {
+        Ok((bytes, origin, cancel_file)) => run(bytes, &origin, cancel_file.as_deref()),
         Err(InputError::Usage) => {
             print_usage();
             ExitCode::from(2)
@@ -64,6 +67,23 @@ enum InputError {
     Io(String),
     /// The request exceeds `MAX_REQUEST_BYTES` and was rejected before parsing.
     ResourceLimit,
+}
+
+/// Splits one optional `--cancel-file <path>` pair from before or after the input form.
+///
+/// A duplicate pair, a missing value or a `--`-prefixed value is a usage error. The
+/// path is returned unresolved; the caller joins it to the invocation cwd.
+fn split_cancel_file(args: &[String]) -> Result<(&[String], Option<&str>), InputError> {
+    let (input, value) = match args {
+        [flag, value, input @ ..] | [input @ .., flag, value] if flag == "--cancel-file" => {
+            (input, value)
+        }
+        _ => return Ok((args, None)),
+    };
+    if value.starts_with("--") || input.iter().any(|arg| arg == "--cancel-file") {
+        return Err(InputError::Usage);
+    }
+    Ok((input, Some(value)))
 }
 
 /// Resolves the accepted argument shapes into raw request bytes.
@@ -125,12 +145,20 @@ fn print_usage() {
     eprintln!("       enigma --request -        read the request from stdin");
     eprintln!("       enigma --request <path>   read the request from a file");
     eprintln!();
+    eprintln!("Options (before or after the request form):");
+    eprintln!("  --cancel-file <path>   cancel a hill_climb/partial_exhaustion attack");
+    eprintln!("                         once <path> exists as a regular file");
+    eprintln!();
     eprintln!("One JSON event is written per line to stdout; diagnostics go to stderr.");
     eprintln!("See docs/protocol.md for the contract and odd/tasks/enigma-engine.md for the plan.");
 }
 
+/// Rejection message for `--cancel-file` on jobs without a cancellation contract.
+const CANCEL_FILE_UNSUPPORTED: &str =
+    "--cancel-file is supported only for hill_climb and partial_exhaustion attacks";
+
 /// Decodes input as UTF-8, parses and validates the request, and runs the transport.
-fn run(bytes: Vec<u8>, origin: &Path) -> ExitCode {
+fn run(bytes: Vec<u8>, origin: &Path, cancel_file: Option<&Path>) -> ExitCode {
     let json = match String::from_utf8(bytes) {
         Ok(json) => json,
         Err(error) => {
@@ -144,9 +172,14 @@ fn run(bytes: Vec<u8>, origin: &Path) -> ExitCode {
     };
 
     match ParsedRequest::parse_json(&json) {
+        Ok(ParsedRequest::Transform(_)) if cancel_file.is_some() => {
+            search_error("unsupported_job", CANCEL_FILE_UNSUPPORTED, "/job/kind")
+        }
         Ok(ParsedRequest::Transform(request)) => run_transform(request),
-        Ok(ParsedRequest::Search(request)) => run_search(request, origin),
-        Ok(ParsedRequest::Attack(request)) => run_attack(request, origin, &mut io::stdout().lock()),
+        Ok(ParsedRequest::Search(request)) => run_search(request, origin, cancel_file.is_some()),
+        Ok(ParsedRequest::Attack(request)) => {
+            run_attack(request, origin, cancel_file, &mut io::stdout().lock())
+        }
         Err(diagnostics) => {
             // Pre-validation failure: exactly one `error` at seq 1, no `started`.
             let first = &diagnostics[0];
@@ -165,7 +198,7 @@ fn run(bytes: Vec<u8>, origin: &Path) -> ExitCode {
 
 /// Load owned UTF-8 once, then borrow it into the pure core binding boundary.
 /// Successful binding is not execution: never enumerate candidates or emit work.
-fn run_search(request: ParsedSearchRequest, origin: &Path) -> ExitCode {
+fn run_search(request: ParsedSearchRequest, origin: &Path, cancel_file: bool) -> ExitCode {
     let contents = match resource_loader::load(request.resources(), origin) {
         Ok(contents) => contents,
         Err(error) => return search_error(error.code, &error.message, &error.location),
@@ -175,11 +208,14 @@ fn run_search(request: ParsedSearchRequest, origin: &Path) -> ExitCode {
         .map(|(id, text)| (id.clone(), text.as_str()))
         .collect();
     match request.bind_resources(&supplied) {
-        Ok(_validated) => search_error(
-            "unsupported_job",
-            "search execution is not implemented",
-            "/job/kind",
-        ),
+        Ok(_validated) => {
+            let message = if cancel_file {
+                CANCEL_FILE_UNSUPPORTED
+            } else {
+                "search execution is not implemented"
+            };
+            search_error("unsupported_job", message, "/job/kind")
+        }
         Err(diagnostics) => {
             let first = &diagnostics[0];
             for diagnostic in &diagnostics {
@@ -191,7 +227,13 @@ fn run_search(request: ParsedSearchRequest, origin: &Path) -> ExitCode {
 }
 
 /// Binding finalizes eligibility, so no second gate check or resource read is needed.
-fn run_attack(request: ParsedAttackRequest, origin: &Path, out: &mut impl Write) -> ExitCode {
+/// The cancel marker is first inspected only after load and bind succeed.
+fn run_attack(
+    request: ParsedAttackRequest,
+    origin: &Path,
+    cancel_file: Option<&Path>,
+    out: &mut impl Write,
+) -> ExitCode {
     let failure = |out: &mut _, code: &str, message: &str, location: &str| {
         if let Err(error) = write_error_line(out, code, message, location, 1) {
             eprintln!("error: failed to write protocol event: {error}");
@@ -209,14 +251,22 @@ fn run_attack(request: ParsedAttackRequest, origin: &Path, out: &mut impl Write)
         .collect();
     match request.bind_resources(&supplied) {
         Ok(validated) => {
+            let marker = cancel_file.map(|path| CancelFile::new(path.to_owned()));
+            let mut marker = match marker.transpose() {
+                Ok(marker) => marker,
+                Err(error) => {
+                    eprintln!("error: failed to inspect cancel file: {error}");
+                    return ExitCode::from(2);
+                }
+            };
             let entry = Instant::now();
-            match attack_transport::run(
+            let status = match attack_transport::run(
                 &validated,
                 out,
                 || entry.elapsed(),
                 now_ts,
                 NonZeroU128::new(250).unwrap(),
-                || false,
+                || marker.as_mut().is_some_and(CancelFile::poll),
             ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
@@ -231,6 +281,14 @@ fn run_attack(request: ParsedAttackRequest, origin: &Path, out: &mut impl Write)
                     }
                     ExitCode::FAILURE
                 }
+            };
+            // The adapter stops polling once stopped, so check the latch afterwards.
+            match marker.as_ref().and_then(CancelFile::runtime_error) {
+                Some(error) => {
+                    eprintln!("error: failed to inspect cancel file: {error}");
+                    ExitCode::FAILURE
+                }
+                None => status,
             }
         }
         Err(diagnostics) => {
@@ -360,7 +418,10 @@ mod attack_tests {
     fn check(value: &Value, origin: &Path, code: &str, location: &str) -> Value {
         let parsed = ParsedAttackRequest::parse_json(&value.to_string()).unwrap();
         let mut output = Vec::new();
-        assert_eq!(run_attack(parsed, origin, &mut output), ExitCode::FAILURE);
+        assert_eq!(
+            run_attack(parsed, origin, None, &mut output),
+            ExitCode::FAILURE
+        );
         let text = String::from_utf8(output).unwrap();
         let lines: Vec<_> = text.lines().collect();
         assert_eq!(lines.len(), 1, "no work events: {text}");
@@ -408,7 +469,10 @@ mod attack_tests {
     fn success(value: &Value, origin: &Path) {
         let parsed = ParsedAttackRequest::parse_json(&value.to_string()).unwrap();
         let mut output = Vec::new();
-        assert_eq!(run_attack(parsed, origin, &mut output), ExitCode::SUCCESS);
+        assert_eq!(
+            run_attack(parsed, origin, None, &mut output),
+            ExitCode::SUCCESS
+        );
         let events: Vec<Value> = String::from_utf8(output)
             .unwrap()
             .lines()
@@ -610,7 +674,7 @@ mod attack_tests {
             // Valid structure, deterministic eligibility failure before any work events.
             let parsed = ParsedAttackRequest::parse_json(&outer(8).to_string()).unwrap();
             assert_eq!(
-                run_attack(parsed, Path::new("."), &mut out),
+                run_attack(parsed, Path::new("."), None, &mut out),
                 ExitCode::FAILURE
             );
             assert_eq!(out.flushes, usize::from(!fail_write));

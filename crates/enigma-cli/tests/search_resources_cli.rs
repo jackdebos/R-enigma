@@ -26,9 +26,14 @@ impl Fixture {
         path
     }
     fn stdin(&self, request: &Value) -> Output {
+        self.stdin_with(request, &[])
+    }
+    /// Extra arguments follow the input form.
+    fn stdin_with(&self, request: &Value, extra: &[&str]) -> Output {
         let mut child = Command::new(env!("CARGO_BIN_EXE_enigma"))
             .current_dir(&self.0)
             .args(["--request", "-"])
+            .args(extra)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -43,8 +48,13 @@ impl Fixture {
         child.wait_with_output().unwrap()
     }
     fn file(&self, path: &str) -> Output {
+        self.file_with(path, &[])
+    }
+    /// Extra arguments precede the input form.
+    fn file_with(&self, path: &str, extra: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_enigma"))
             .current_dir(&self.0)
+            .args(extra)
             .arg(path)
             .output()
             .unwrap()
@@ -522,4 +532,81 @@ fn missing_request_stays_stderr_only_exit_two() {
     assert_eq!(out.status.code(), Some(2));
     assert!(out.stdout.is_empty());
     assert!(!out.stderr.is_empty());
+}
+
+#[test]
+fn cancel_file_marker_cancels_attacks_relative_to_invocation_cwd() {
+    let f = Fixture::new();
+    f.write("marker", "ignored contents");
+    let cancel = ["--cancel-file", "marker"];
+    for pass in ["hill_climb", "partial_exhaustion"] {
+        let request = attack(pass, "all", &["ic"]);
+        // The marker exists only at the invocation cwd, never beside the request.
+        f.write("sub/request.json", request.to_string());
+        for output in [
+            f.stdin_with(&request, &cancel),
+            f.file_with("sub/request.json", &cancel),
+        ] {
+            let events = attack_events(&output);
+            assert!(events[events.len() - 2]["best"].is_null(), "{pass}");
+            assert_eq!(events.last().unwrap()["reason"], "cancelled", "{pass}");
+        }
+        assert_eq!(fs::read(f.0.join("marker")).unwrap(), b"ignored contents");
+    }
+}
+
+#[test]
+fn missing_cancel_file_runs_attacks_normally() {
+    let f = Fixture::new();
+    for pass in ["hill_climb", "partial_exhaustion"] {
+        let request = attack(pass, "all", &["ic"]);
+        let plain = attack_events(&f.stdin(&request));
+        let flagged = attack_events(&f.stdin_with(&request, &["--cancel-file", "missing/marker"]));
+        let (plain_result, flagged_result) = (&plain[plain.len() - 2], &flagged[flagged.len() - 2]);
+        assert!(!flagged_result["best"].is_null(), "{pass}");
+        for field in ["best", "counters"] {
+            assert_eq!(flagged_result[field], plain_result[field], "{pass}");
+        }
+        assert_eq!(
+            flagged.last().unwrap()["reason"],
+            plain.last().unwrap()["reason"]
+        );
+        assert!(!f.0.join("missing").exists());
+    }
+}
+
+#[test]
+fn cancel_file_inspection_follows_request_and_resource_validation() {
+    let f = Fixture::new();
+    // A directory marker is an initial inspection error, even when run as root.
+    let directory = ["--cancel-file", "."];
+    for pass in ["hill_climb", "partial_exhaustion"] {
+        let output = f.stdin_with(&attack(pass, "all", &["ic"]), &directory);
+        assert_eq!(output.status.code(), Some(2), "{pass}");
+        assert!(output.stdout.is_empty(), "{pass}");
+        assert!(!output.stderr.is_empty(), "{pass}");
+        let mut invalid = attack(pass, "all", &["ic"]);
+        invalid["protocol_version"] = json!(2);
+        error(
+            f.stdin_with(&invalid, &directory),
+            "unsupported_version",
+            "/protocol_version",
+        );
+        error(
+            f.stdin_with(&attack(pass, "all", &["ic", "trie"]), &directory),
+            "unsupported_resource",
+            "/job/resources/trie/path",
+        );
+    }
+    let event = error(
+        f.stdin_with(&request(&["ic"]), &directory),
+        "unsupported_job",
+        "/job/kind",
+    );
+    assert!(event["message"].as_str().unwrap().contains("--cancel-file"));
+    error(
+        f.stdin_with(&request(&["trie"]), &directory),
+        "unsupported_resource",
+        "/job/resources/trie/path",
+    );
 }

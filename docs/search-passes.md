@@ -380,7 +380,8 @@ The production adapter coalesces at safe callbacks using monotonic elapsed time,
 UTC event timestamps and an internal positive 250 ms interval. It flushes each line,
 emits terminal snapshots without waiting and latches delivery failures with
 independently polled cancellation. Synchronous callbacks guarantee no timer delivery
-or wall-clock cadence; external cancellation currently supplies false.
+or wall-clock cadence; external cancellation comes only from the optional
+`--cancel-file` marker ([protocol §5](protocol.md#5-control)).
 [Protocol control](protocol.md#5-control) retains its public obligations; Task 16
 still owns checkpoint/resume design and implementation.
 

@@ -37,7 +37,9 @@ search support.
 
 `stdout` contains one JSON object per line (JSONL), without embedded newlines.
 Diagnostics go to `stderr`. Stage 1 accepts a positional request file path,
-`--request <path>` for a file, or `--request -` for stdin. A future Stage 2 listener
+`--request <path>` for a file, or `--request -` for stdin. One optional
+`--cancel-file <path>` pair may precede or follow that input form (§5); a duplicate
+pair, missing value or `--`-prefixed value is a usage error. A future Stage 2 listener
 carries the same messages. No UI is part of Stage 1.
 
 ## 3. Request
@@ -470,7 +472,7 @@ ordering applies only while delivery succeeds, including final result write/flus
 
 | Action | Mechanism | Result |
 | --- | --- | --- |
-| Cancel (first HC/PE release) | Future `--cancel-file <path>` adapter; POSIX `SIGINT`/`SIGTERM` and Windows Ctrl+C integration separately pending | Cooperative safe-stop, final `result`, then `done` with `reason: "cancelled"`; no hold/checkpoint promise |
+| Cancel (first HC/PE release) | `--cancel-file <path>` marker (shipped); POSIX `SIGINT`/`SIGTERM` and Windows Ctrl+C integration separately pending | Cooperative safe-stop, final `result`, then `done` with `reason: "cancelled"`; no hold/checkpoint promise |
 | Pause/resume live job | Not in Stage 1 | Future extension |
 | Resume dead job | `--resume <checkpoint>` | Search only; see §6 |
 | Bound HC/PE search | `space.offset`/`space.limit`, `attack.evaluation_budget` | §4.1 slice/exhaustion/budget reasons; no new `--max-keys` attack control |
@@ -486,18 +488,17 @@ which wins over budget. Stops retain committed results and required reserved fin
 rescoring; original errors and charged usage are preserved, not masked by cancellation.
 Core runtime, fallible JSONL projections and the timed HC/PE adapter ship in the
 production CLI (§4.1). Platform signals/control files, hold and checkpoint cadence
-remain unimplemented; external cancellation currently supplies false. Task12.12
-has a staged private cancel-file poller and the accepted contract below; CLI parsing
-and activation are pending. `--cancel-file` is not yet supported by the shipped CLI.
+remain unimplemented. Task12.12 ships `--cancel-file` as the only external
+cancellation source, per the contract below; without it cancellation stays false.
 POSIX/Windows signals (Task12.13) remain pending; handlers may only feed a sticky
 cancellation request, never perform evaluation or JSONL writes.
 
-### Reserved `--cancel-file <path>` contract (activation pending)
+### `--cancel-file <path>` contract
 
-The option is reserved for validated HC/PE attacks, and must be rejected for
-transform and unsupported search jobs. Relative paths use the invocation working
-directory, not the request-file directory. CLI capture/resolution and argument
-grammar remain pending; the private poller uses the caller's cwd for relative paths.
+The option applies to validated HC/PE attacks. Transform and unsupported search
+jobs reject it with a seq 1 `unsupported_job` error at `/job/kind` and exit 1;
+request parse, resource load and bind errors take precedence. Relative paths use
+the invocation working directory, not the request-file directory.
 
 The marker is existence-only: accept a regular file or a symlink resolving to one,
 without reading contents. Missing paths, missing parents and dangling symlinks mean
@@ -506,12 +507,14 @@ never creates, consumes or deletes the marker; an existing marker applies to eac
 new run. Once observed, cancellation stays set even if the marker disappears.
 
 Validate the request and resources before initial marker inspection and before
-`started`; initial inspection errors prevent execution. During execution, inspect
+`started`; initial inspection errors prevent execution, writing only a stderr
+diagnostic with exit 2 and empty stdout. During execution, inspect
 at every Core cancellation callback, independently of progress cadence, until
 cancellation or error is latched. No clock, timer thread or hard latency guarantee
 is introduced. A runtime inspection error latches the first error and requests safe
 stop; it remains inspectable even after the adapter stops polling. Report it on
-stderr and exit nonzero without suppressing adapter, transport or Core errors.
+stderr after any adapter, transport or Core diagnostics, never instead of them,
+and exit 1.
 
 Normal cancellation retains eligible results, emits `result` then `done` with
 `reason: "cancelled"`, and exits zero on healthy delivery. Established exhaustion
