@@ -486,11 +486,38 @@ which wins over budget. Stops retain committed results and required reserved fin
 rescoring; original errors and charged usage are preserved, not masked by cancellation.
 Core runtime, fallible JSONL projections and the timed HC/PE adapter ship in the
 production CLI (§4.1). Platform signals/control files, hold and checkpoint cadence
-remain unimplemented; external cancellation currently supplies false. Cancel-file
-integration (Task12.12) and POSIX/Windows signals (Task12.13)
-are provisional/unstarted: they may only feed a sticky cancellation request, never
-perform evaluation or JSONL writes in a signal handler. File contents/polling and
-platform setup/failure details must be specified before those adapters implement.
+remain unimplemented; external cancellation currently supplies false. Task12.12
+has a staged private cancel-file poller and the accepted contract below; CLI parsing
+and activation are pending. `--cancel-file` is not yet supported by the shipped CLI.
+POSIX/Windows signals (Task12.13) remain pending; handlers may only feed a sticky
+cancellation request, never perform evaluation or JSONL writes.
+
+### Reserved `--cancel-file <path>` contract (activation pending)
+
+The option is reserved for validated HC/PE attacks, and must be rejected for
+transform and unsupported search jobs. Relative paths use the invocation working
+directory, not the request-file directory. CLI capture/resolution and argument
+grammar remain pending; the private poller uses the caller's cwd for relative paths.
+
+The marker is existence-only: accept a regular file or a symlink resolving to one,
+without reading contents. Missing paths, missing parents and dangling symlinks mean
+no cancellation request. Other file types and metadata errors are failures. The CLI
+never creates, consumes or deletes the marker; an existing marker applies to each
+new run. Once observed, cancellation stays set even if the marker disappears.
+
+Validate the request and resources before initial marker inspection and before
+`started`; initial inspection errors prevent execution. During execution, inspect
+at every Core cancellation callback, independently of progress cadence, until
+cancellation or error is latched. No clock, timer thread or hard latency guarantee
+is introduced. A runtime inspection error latches the first error and requests safe
+stop; it remains inspectable even after the adapter stops polling. Report it on
+stderr and exit nonzero without suppressing adapter, transport or Core errors.
+
+Normal cancellation retains eligible results, emits `result` then `done` with
+`reason: "cancelled"`, and exits zero on healthy delivery. Established exhaustion
+and runtime-error precedence remain authoritative (§4.1); observing a marker does
+not override them. No signals, hold, checkpoint, cleanup or marker ownership is
+added by this contract. Core remains clock- and I/O-free.
 Hold remains deferred, not removed from eventual Stage 1 goals; cancellation in the
 first release writes no hold or checkpoint. Checkpoint/resume remains Task 16 under §6.
 

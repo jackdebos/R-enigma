@@ -7,6 +7,9 @@
 //! `enigma-core`; this module only moves bytes and emits protocol events.
 
 mod attack_transport;
+// Staged privately until CLI activation in CF-B.
+#[cfg(test)]
+mod cancel_file;
 mod resource_loader;
 
 use std::collections::BTreeMap;
