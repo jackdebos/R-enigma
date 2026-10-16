@@ -51,6 +51,7 @@ mod attack_gate;
 mod attack_hill_climb;
 mod attack_neighborhood;
 mod attack_result;
+mod attack_reswapping;
 pub use attack_gate::AttackGate;
 pub use attack_result::{
     AttackBest, AttackCounterOverflow, AttackProgress, AttackResult, AttackRunCategory,

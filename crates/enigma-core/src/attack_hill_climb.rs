@@ -1518,7 +1518,7 @@ impl EvaluationAllowance {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum ObservedClimbError {
+pub(super) enum ObservedClimbError {
     Evaluation(TrialEvaluationError),
     Counter(CounterOverflow),
 }
@@ -1530,7 +1530,7 @@ impl From<TrialEvaluationError> for ObservedClimbError {
 }
 
 /// One accounting path for all scoring phases; existing callers remain budget-only.
-trait EvaluationAccounting {
+pub(super) trait EvaluationAccounting {
     type Error: From<TrialEvaluationError>;
     fn cancelled(&mut self) -> bool {
         false
@@ -1566,10 +1566,10 @@ impl EvaluationAccounting for EvaluationAllowance {
     }
 }
 
-struct ObservedAccounting<'a, O> {
-    allowance: &'a mut EvaluationAllowance,
-    control: &'a mut AttackControl,
-    observer: &'a mut O,
+pub(super) struct ObservedAccounting<'a, O> {
+    pub(super) allowance: &'a mut EvaluationAllowance,
+    pub(super) control: &'a mut AttackControl,
+    pub(super) observer: &'a mut O,
 }
 
 impl<O: CounterObserver> EvaluationAccounting for ObservedAccounting<'_, O> {
