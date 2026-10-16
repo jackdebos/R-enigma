@@ -388,6 +388,7 @@ pub struct AttackSettings {
     switch_pairs: usize,
     backtrack_pairs: usize,
     evaluation_budget: u64,
+    hold_capacity: usize,
     initialization: AttackInitialization,
     stages: Vec<AttackStage>,
     stage_measure_explicit: Vec<bool>,
@@ -454,6 +455,7 @@ impl AttackSettings {
                 "switch_pairs",
                 "backtrack_pairs",
                 "evaluation_budget",
+                "hold",
                 "start",
                 "seeds",
                 "reswapping",
@@ -512,6 +514,18 @@ impl AttackSettings {
         };
         let switch_pairs = threshold("switch_pairs")?;
         let backtrack_pairs = threshold("backtrack_pairs")?;
+        let hold_capacity = settings.get("hold").map_or(Ok(100), |value| {
+            value
+                .as_u64()
+                .filter(|capacity| (1..=1000).contains(capacity))
+                .map(|capacity| capacity as usize)
+                .ok_or_else(|| {
+                    vec![invalid(
+                        "hold must be an integer in [1, 1000]",
+                        child(PATH, "hold"),
+                    )]
+                })
+        })?;
         let evaluation_budget = required(settings, "evaluation_budget", PATH)?
             .as_u64()
             .filter(|&budget| budget > 0)
@@ -623,6 +637,7 @@ impl AttackSettings {
             switch_pairs,
             backtrack_pairs,
             evaluation_budget,
+            hold_capacity,
             initialization,
             stages,
             stage_measure_explicit,
@@ -652,6 +667,10 @@ impl AttackSettings {
     /// Positive whole-run evaluation budget; syntax, not execution feasibility.
     pub fn evaluation_budget(&self) -> u64 {
         self.evaluation_budget
+    }
+    /// Finalist capacity in [1, 1000], defaulting to 100 when omitted.
+    pub fn hold_capacity(&self) -> usize {
+        self.hold_capacity
     }
     /// Mutable starting pairs in source order and orientation, excluding fixed facts.
     pub fn start(&self) -> Option<&[(char, char)]> {
@@ -2083,6 +2102,90 @@ mod tests {
     }
 
     #[test]
+    fn hold_capacity_defaults_bounds_and_equality() {
+        for (alphabet, domain, mut value) in [settings_fixture(), seed_fixture()] {
+            let passes = [value["kind"].as_str().unwrap().to_owned()];
+            let parse = |value: &Value| {
+                AttackSettings::parse_json(
+                    &alphabet,
+                    &domain,
+                    &passes,
+                    &[MeasureId::Ic, MeasureId::Entropy],
+                    &value.to_string(),
+                )
+                .unwrap()
+            };
+            let default = parse(&value);
+            assert_eq!(default.hold_capacity(), 100);
+            value["hold"] = json!(100);
+            assert_eq!(default, parse(&value));
+            for capacity in [1, 1000] {
+                value["hold"] = json!(capacity);
+                let settings = parse(&value);
+                assert_eq!(settings.hold_capacity(), capacity);
+                assert_ne!(default, settings);
+            }
+        }
+    }
+
+    #[test]
+    fn hold_capacity_invalid_integer_lexemes() {
+        for (alphabet, domain, mut value) in [settings_fixture(), seed_fixture()] {
+            let passes = [value["kind"].as_str().unwrap().to_owned()];
+            value["hold"] = json!("REPLACE");
+            for literal in [
+                "0",
+                "1001",
+                "-1",
+                "-0",
+                "null",
+                "\"1\"",
+                "true",
+                "false",
+                "1.5",
+                "1.0",
+                "1e0",
+                "18446744073709551616",
+                "[]",
+                "{}",
+            ] {
+                let raw = value.to_string().replace("\"REPLACE\"", literal);
+                let errors = AttackSettings::parse_json(
+                    &alphabet,
+                    &domain,
+                    &passes,
+                    &[MeasureId::Ic, MeasureId::Entropy],
+                    &raw,
+                )
+                .unwrap_err();
+                assert_eq!(
+                    (errors[0].code(), errors[0].location()),
+                    ("invalid_request", "/job/attack/hold"),
+                    "{raw}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hold_capacity_raw_alphabet_and_unknown_precedence() {
+        let (alphabet, domain, mut value) = settings_fixture();
+        value["hold"] = json!(0);
+        value["a~/b"] = json!(null);
+        settings_error(&value, "unknown_field", "/a~0~1b");
+        let other = Alphabet::new(vec!['B', 'A', 'é', '🦀', 'C', 'D']).unwrap();
+        let raw = value.to_string();
+        let errors = AttackSettings::parse_json(&other, &domain, &[], &[], &raw).unwrap_err();
+        assert_eq!(errors[0].location(), "/job/attack");
+        assert!(errors[0].message().contains("different ordered alphabet"));
+        let duplicate = raw.replace("\"hold\":0", "\"hold\":0,\"hold\":0");
+        let errors = AttackSettings::parse_json(&other, &domain, &[], &[], &duplicate).unwrap_err();
+        assert!(errors[0].message().contains("invalid JSON"));
+        assert_eq!(errors[0].code(), "invalid_request");
+        assert_eq!(alphabet.len(), other.len());
+    }
+
+    #[test]
     fn settings_value_entry_valid_initializations() {
         let (alphabet, domain, value) = settings_fixture();
         let settings = AttackSettings::parse_value(
@@ -3322,6 +3425,65 @@ mod tests {
             "start": [["D", "C"]]
         });
         value
+    }
+
+    #[test]
+    fn hold_capacity_full_request_preflight_precedence() {
+        for (pointer, replacement, expected) in [
+            ("/job/text", json!("A"), ("invalid_text", "/job/text")),
+            (
+                "/job/attack/evaluation_budget",
+                json!(0),
+                ("invalid_request", "/job/attack/evaluation_budget"),
+            ),
+            (
+                "/job/resources",
+                json!({"ic":{"path":"unused"}}),
+                ("unsupported_resource", "/job/resources/ic/path"),
+            ),
+        ] {
+            let mut value = attack_request();
+            let (parent, key) = pointer.rsplit_once('/').unwrap();
+            value.pointer_mut(parent).unwrap()[key] = replacement;
+            let errors = AttackRequest::parse_json(&value.to_string()).unwrap_err();
+            assert_eq!((errors[0].code(), errors[0].location()), expected);
+            value["job"]["attack"]["hold"] = json!(0);
+            let errors = AttackRequest::parse_json(&value.to_string()).unwrap_err();
+            assert_eq!(
+                (errors[0].code(), errors[0].location()),
+                ("invalid_request", "/job/attack/hold")
+            );
+        }
+    }
+
+    #[test]
+    fn hold_capacity_precedes_outer_count_overflow() {
+        let alphabet: Vec<String> = (0..256)
+            .map(|i| char::from_u32(0x100 + i).unwrap().to_string())
+            .collect();
+        let mut value = attack_request();
+        value["machine"]["definition"]["value"] = json!({
+            "alphabet":alphabet, "wheels":[{"name":"r","wiring":alphabet,"turnovers":[]}],
+            "slots":(0..8).map(|i| json!({"id":format!("r{i}"),"role":"rotor","movement":"fixed","wheel":"r"})).collect::<Vec<_>>(),
+            "stepping":{"rules":[]}
+        });
+        value["job"]["configuration"]["slots"] = json!([]);
+        value["job"]["text"] = json!(alphabet[0].repeat(2));
+        value["job"]["space"] = json!({"limit":1,
+            "slots":(0..8).map(|i| json!({"id":format!("r{i}"),"positions":alphabet,"rings":alphabet})).collect::<Vec<_>>(),
+            "plugboard":{"kind":"attack","symbols":&alphabet[..2],"max_pairs":1}});
+        value["job"]["attack"]["start"] = json!([]);
+        let errors = AttackRequest::parse_json(&value.to_string()).unwrap_err();
+        assert_eq!(
+            (errors[0].code(), errors[0].location()),
+            ("resource_limit", "/job/space")
+        );
+        value["job"]["attack"]["hold"] = json!(0);
+        let errors = AttackRequest::parse_json(&value.to_string()).unwrap_err();
+        assert_eq!(
+            (errors[0].code(), errors[0].location()),
+            ("invalid_request", "/job/attack/hold")
+        );
     }
 
     #[test]
