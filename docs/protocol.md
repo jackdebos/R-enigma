@@ -227,7 +227,8 @@ A search job has `kind: "search"` and exactly `configuration`, `text`, `space`,
 known choices (§3.2), `space` carries the explicit variable domains and bounds,
 `passes` and `measures` select behavior, and `resources` parameterizes it. This
 section is normative for the §3.2/§3.3 structure; it does not claim that any search
-pass executes (Tasks 11–13 implement the passes).
+pass executes (Tasks 11–13 implement the passes; Task 13 chained stages:
+[search-passes §9](search-passes.md#9-chained-stages--task-13)).
 
 `space` is an object allowing exactly `slots`, `plugboard`, `offset`, and `limit`; all
 four are optional, so an empty object means the fixed choices are already complete.
@@ -322,6 +323,8 @@ adapter, with counter-only observation and independently polled cancellation.
 Stage 1 plans `hill_climb`, `partial_exhaustion` with backtracking, `reswapping`, `trie`,
 and `measure`; measures include index of coincidence, Sinkov n-gram statistics,
 Shannon entropy, and trie scoring. This plan does not assert parser or search support.
+The chained `reswapping`/`trie`/`measure` stages are specified (not yet implemented) in
+[search-passes §9](search-passes.md#9-chained-stages--task-13).
 Representability by the definition schema does not imply algorithm support for arbitrary
 alphabet, wheel count, stepping rule, or topology.
 
@@ -378,7 +381,9 @@ which retains the original runtime cause and separate best-projection cause;
 only genuine absence becomes null. These projection helpers read no clocks and
 perform no I/O or orchestration; the private adapter supplies that boundary.
 Only one attack pass, `hill_climb` or `partial_exhaustion`, is eligible; recognition
-of other passes is not support. Mixed/deferred/legacy rejection remains unchanged.
+of other passes is not support. Mixed/deferred/legacy rejection remains unchanged
+until the specified [Task 13 chained stages](search-passes.md#9-chained-stages--task-13)
+ship; they add an ordered `stages` array to `result` (§9.6 there).
 
 After all parsing, resource loading/binding, eligibility and count/budget validation,
 emit `started`, zero or more `progress`, one `result`, then exactly one terminal
@@ -599,6 +604,7 @@ Task 17 is the differential-oracle validation task.
 versions and fields fail before work. Incompatible changes to field meaning,
 validation, traversal, or event ordering after v1 ships require a version bump. Detailed
 pass execution fields other than the [planned Task 11 contract](search-passes.md)
+(including its [Task 13 chained stages](search-passes.md#9-chained-stages--task-13))
 and checkpoint schemas remain deferred; they must be specified
 before their implementation, not presumed executable or imported from `bomm`.
 Search-space and [measure/resource schemas](scoring-resources.md) are specified as

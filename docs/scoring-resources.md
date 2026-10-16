@@ -323,6 +323,8 @@ TrieQ32 = raw * SCALE
 ```
 
 Higher scores rank better; explicit penalty weights can make the result negative.
+The measure itself never adds a base score; only the chained `trie` stage sums an
+explicit base ranking ([search-passes §9.4](search-passes.md#94-trie-and-measure)).
 Using the example dictionary, `"ABA"` matches `A` twice, `AB` once, and `BA` once:
 `raw = 1 + 1 + 3 - 2 = 3`, so `TrieQ32 = 3 * SCALE`. This demonstrates overlaps
 and the weighted prefix `A` independently of the longer word `AB`.

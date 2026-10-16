@@ -76,8 +76,8 @@ summarized above; private HC/PE drivers and outer schedulers are implemented.
 This document specifies `hill_climb` and `partial_exhaustion`, plus the implemented private
 control contract in §6.1 and public Core HC/PE facade in §6.2;
 [protocol §4.1](protocol.md#41-planned-hcpe-search-events--task-127) defines first-release
-lifecycle/results/progress, now delivered by the CLI for HC/PE. Checkpoints, other
-passes and variants remain separate work.
+lifecycle/results/progress, now delivered by the CLI for HC/PE. Chained stages are
+specified in [§9](#9-chained-stages--task-13); checkpoints and variants remain separate work.
 
 ## 1. Two domain branches, no implicit unknown key
 
@@ -156,12 +156,14 @@ path; unknown keys use `unknown_field`. Missing/mismatched attack settings are
 `invalid_request`. Recognized but deferred `reswapping`, `trie`, and `measure`
 remain structurally recognized, but are `unsupported_pass` for Task 11 execution.
 Mixed passes likewise fail before work; no cross-pass hold/objective state exists.
+(Task 13 supersedes this for chained stages after the sole HC/PE pass: §9.)
 Legacy structural requests without `attack` keep their existing parsing meaning.
 
 Both objectives use already declared and retained Task 10 scorers. All selected
 measures, including those not used as objectives, must satisfy existing minimum
 text lengths and resource binding rules before execution. No model rereads, score
-sum, implicit trie base score, or new smoothing is introduced. Compare checked
+sum, implicit trie base score, or new smoothing is introduced (sole trie-stage
+exception: §9.4). Compare checked
 Q32 **ranking** values, maximizing them; entropy uses negative measured entropy.
 Initial and final raw scores are not directly compared across different measures.
 Unused *resource references* remain invalid; non-objective declared measures are
@@ -528,3 +530,121 @@ Duet/quartet, DFS, mutable fixed facts and additional attacks remain out of scop
 Public lifecycle/result transport is frozen above and implemented in the production
 HC/PE adapter; hold and checkpoint controls remain Task14/Task16 work.
 Differential oracle remains Task17.
+
+## 9. Chained stages — Task 13
+
+Status: **specified, not implemented.** Until Task 13.2/13.3 land, requests listing
+these stages keep failing with `unsupported_pass`. Task 13 supersedes, for this
+branch only, the §2 sentences rejecting `reswapping`, `trie`, `measure` and mixed
+passes; §1–§8 otherwise stay normative. Pinned bomm basis:
+[attack.c, lines 81–91](https://github.com/ffraenz/bomm/blob/aeb2f2bf00dfdee68e972f90ae7e83b387b188e9/src/attack.c#L81-L91),
+`src/passes/reswapping.c`, `trie.c` and `measure.c` at the same commit.
+
+### 9.1 Request shape and admission
+
+`job.passes` stays a unique identifier array. Its first element must be `hill_climb`
+or `partial_exhaustion` (the sole HC/PE pass), followed by zero or more distinct
+stages from `reswapping`, `trie`, `measure` in any order. `job.attack.kind` equals
+that first element. A stage listed first, a stages-only list, a second HC/PE pass
+or any other identifier is `unsupported_pass` at `/job/passes`. Uniqueness means
+each stage runs at most once (bomm allows repeats; we do not).
+
+`job.attack` gains three optional members, allowed only when the same-named stage
+is listed; each is a strict object whose members are all optional:
+
+| Member | Fields | Omitted default |
+| --- | --- | --- |
+| `reswapping` | `measure` | `sinkov_trigram` |
+| `trie` | `base_measure` | none: carry the previous score (§9.4) |
+| `measure` | `measure` | `ic` |
+
+An omitted object equals `{}`. Unknown members use `unknown_field`; a settings
+object for an unlisted stage, a nonobject, or a non-string/`null` field value is
+`invalid_request` at that member. Every explicit or defaulted measure must be an
+exact `job.measures` identifier, else `invalid_request` before work: at the
+explicit field, or at `/job/passes/<index>` for an undeclared default. A listed
+`trie` stage likewise requires `trie` (with its dictionary resource) to be declared.
+`base_measure` may name any declared measure, including `trie`. Because every
+stage measure is declared, §2's minimum-length and resource-binding preflight
+already covers them; all such failures stay seq1-only errors.
+
+```json
+"passes": ["hill_climb", "reswapping", "trie", "measure"],
+"attack": {"kind": "hill_climb", "...": "§2 fields unchanged",
+  "reswapping": {"measure": "sinkov_bigram"}, "trie": {"base_measure": "ic"}}
+```
+
+Here `measure` uses default `ic`, so `job.measures` must declare `ic`,
+`sinkov_bigram`, `trie` and both §2 objectives.
+
+### 9.2 Chaining
+
+Stages run sequentially in `job.passes` order on **one** key: the HC/PE run's
+committed best (§7), only when that run terminated `completed` with a best. Each
+stage receives the previous stage's committed key and score and hands on its own.
+There is no hold list (Task 14), checkpoint (Task 16), RNG or parallelism; the
+pipeline is fully deterministic. Every evaluation is a fresh full-message decrypt of
+`job.text` from the key's initial positions; slot choices never change, and the
+winner's `outer_index`/`start_index` and HC/PE flags are retained unchanged.
+
+### 9.3 `reswapping` — constrained steepest ascent
+
+Let K be the committed key and S its ranking under the stage measure. The first
+evaluation scores K (stage start). Each scan then visits every committed **mutable**
+pair (i,k), alphabet-index(i) < index(k), in increasing order of i. For each, remove
+it, then for every free mutable symbol x in alphabet order, including i and k
+themselves, evaluate (i,x) then (k,x), one evaluation each, restoring the board after
+every trial. A trial with x equal to its own endpoint ((i,i) or (k,k)) is the board
+with (i,k) removed; (k,i) at x = i and (i,k) at x = k restore K. Track the best strict
+ranking improvement over S; the first found wins ties, so restoring K never wins.
+After the full scan apply only that winner (remove (i,k), then add the chosen pair
+unless it is a pure removal), set S, and rescan; stop when a complete scan has no
+strict improvement (completed, even with no trials).
+
+Constrained departures: fixed pairs are never removed or reswapped; x comes from
+the §1 `symbols` universe and is unpaired; the pair count never grows, so `max_pairs`
+holds (a winning pure removal shrinks it by one); the §5 backtrack/switch thresholds
+do not apply. Like pinned bomm, the identity and pure-removal trials are evaluated
+and counted.
+
+### 9.4 `trie` and `measure`
+
+`measure` costs one evaluation: score K with its measure; K is unchanged and the
+new score replaces the carried one. `trie` costs one evaluation: decrypt K once,
+compute `TrieQ32` (scoring §5.4), and, if configured, the `base_measure` ranking on
+that same plaintext; otherwise use the carried `ranking_q32`. The stage score is
+`measure: "trie"`, `measured_q32 = TrieQ32`, `ranking_q32 = checked(base + TrieQ32)`.
+This explicit Q32 ranking sum is the **only** exception to §2's "no score sum, no
+implicit trie base score", scoped to this stage; overflow is a runtime evaluation
+error. The carried base may come from a different measure; the sum is defined but
+not comparable across measures. Otherwise scores of different measures remain
+incomparable, including across stages.
+
+### 9.5 Budget, safe stop, termination and errors
+
+Stages share the single `evaluation_budget` and §6.1 counters; each evaluation above
+is admitted, charged and completed exactly as there. HC/PE does not reserve budget
+for stages. Stage scores are always known for the committed key, so no final-rescore
+reserve exists. Before each evaluation require one unit; if absent, stop with
+`evaluation_budget`. A reswapping scan interrupted by budget or cancellation discards
+its provisional winner; earlier applied reswaps remain committed. Climb and outer
+counters never change during stages.
+
+Cancellation is polled before each stage, before each admission and after each
+evaluation before a reswap commit; once observed no further stage evaluation runs.
+Run termination: the HC/PE termination if not `completed` (stages never start);
+otherwise `completed` only when every listed stage completed, else `cancelled` or
+`evaluation_budget` with §6.1 precedence (errors > exhaustion > cancellation >
+budget). A stage error is a runtime `error` whose result best is the last committed
+key and score, with HC/PE indices and `source.kind` `evaluation`.
+
+### 9.6 Result projection
+
+`best.configuration`, `best.mutable_plugboard`, `best.plaintext` and `best.score`
+describe the final committed key and the score of the last stage that established
+it: the last completed stage, or an interrupted `reswapping` stage after its first
+evaluation. `result` gains an additive `stages` array (empty for HC/PE-only runs)
+with one entry per started stage, in order, each exactly `pass`, `measure`,
+`base_measure` (trie only, else `null`), `score` (§4.1 score object or `null`),
+`evaluations_used` (decimal string) and `completed` (boolean). Unstarted stages have
+no entry. Core mirrors this on `AttackResult`; Rust names are fixed in Task 13.2.
