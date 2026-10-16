@@ -152,16 +152,14 @@ impl crate::AttackRequest {
         let mut result = result;
         if result.termination == crate::AttackTermination::Completed && result.best.is_some() {
             for stage in self.settings().stages() {
-                let crate::space::AttackStage::Measure { measure } = *stage else {
-                    unreachable!("gate rejects unsupported stages");
-                };
+                let (_, measure, base_measure) = scoring_stage_metadata(*stage);
                 if control.poll_cancellation(cancel_requested()) {
                     result.termination = crate::AttackTermination::Cancelled;
                     break;
                 }
-                result = measure_stage(
+                result = scoring_stage(
                     result,
-                    measure,
+                    *stage,
                     &mut ObservedAccounting {
                         allowance: &mut allowance,
                         control: &mut control,
@@ -179,16 +177,28 @@ impl crate::AttackRequest {
                                 "winning slots failed to resolve",
                             )
                         })?;
-                        TrialEvaluator::new(
-                            &initial,
-                            self.domain(),
-                            self.text(),
-                            Direction::Decrypt,
-                            measure,
-                            self.bound_resource(measure),
-                        )
-                        .evaluate(&best.mutable_plugboard)
-                        .map_err(crate::attack_result::RunPayload::Evaluation)
+                        let evaluator = |measure| {
+                            TrialEvaluator::new(
+                                &initial,
+                                self.domain(),
+                                self.text(),
+                                Direction::Decrypt,
+                                measure,
+                                self.bound_resource(measure),
+                            )
+                        };
+                        let scorer = evaluator(measure);
+                        let evaluation = if matches!(stage, crate::space::AttackStage::Trie { .. })
+                        {
+                            scorer.evaluate_trie(
+                                &best.mutable_plugboard,
+                                base_measure.map(evaluator).as_ref(),
+                                best.score.ranking(),
+                            )
+                        } else {
+                            scorer.evaluate(&best.mutable_plugboard)
+                        };
+                        evaluation.map_err(crate::attack_result::RunPayload::Evaluation)
                     },
                 )?;
                 if result.termination != crate::AttackTermination::Completed {
@@ -201,16 +211,27 @@ impl crate::AttackRequest {
     }
 }
 
+fn scoring_stage_metadata(
+    stage: crate::space::AttackStage,
+) -> (&'static str, MeasureId, Option<MeasureId>) {
+    match stage {
+        crate::space::AttackStage::Measure { measure } => ("measure", measure, None),
+        crate::space::AttackStage::Trie { base_measure } => ("trie", MeasureId::Trie, base_measure),
+        _ => unreachable!("gate rejects unsupported stages"),
+    }
+}
+
 /// Admission is the start boundary; failures retain the previously committed best.
-fn measure_stage(
+fn scoring_stage(
     mut result: crate::AttackResult,
-    measure: MeasureId,
+    stage: crate::space::AttackStage,
     accounting: &mut ObservedAccounting<'_, impl CounterObserver>,
     evaluate: impl FnOnce(
         &crate::AttackBest,
     ) -> Result<(String, MeasuredScore), crate::attack_result::RunPayload>,
 ) -> Result<crate::AttackResult, crate::AttackRunError> {
     use crate::attack_result::RunPayload;
+    let (pass, measure, base_measure) = scoring_stage_metadata(stage);
     let before = accounting.allowance.used;
     let evaluation = match accounting.admit(0) {
         Ok(false) => {
@@ -234,9 +255,9 @@ fn measure_stage(
     result.evaluations_used = accounting.allowance.used;
     result.counters = crate::AttackProgress(accounting.control.snapshot());
     result.stages.push(crate::AttackStageResult {
-        pass: "measure",
+        pass,
         measure,
-        base_measure: None,
+        base_measure,
         score: evaluation.as_ref().ok().map(|(_, score)| *score),
         evaluations_used: accounting.allowance.used - before,
         completed: evaluation.is_ok(),
@@ -2882,9 +2903,11 @@ mod tests {
         };
         let mut recorder = Recorder::default();
         // Valid bound requests cannot manufacture a scoring failure; inject at evaluation.
-        let error = measure_stage(
+        let error = scoring_stage(
             result,
-            MeasureId::Entropy,
+            crate::space::AttackStage::Measure {
+                measure: MeasureId::Entropy,
+            },
             &mut ObservedAccounting {
                 allowance: &mut allowance,
                 control: &mut control,
@@ -2916,6 +2939,76 @@ mod tests {
         assert_eq!(
             (stage.score(), stage.evaluations_used(), stage.completed()),
             (None, 1, false)
+        );
+    }
+
+    #[test]
+    fn trie_composition_overflow_keeps_prior_history_best_and_charge() {
+        use crate::attack_result::RunPayload;
+        use std::error::Error;
+        let request = direct_request_with(serde_json::json!([]), true, false, |job| {
+            job["passes"] = serde_json::json!(["hill_climb", "measure"]);
+            job["attack"]["measure"] = serde_json::json!({"measure":"ic"});
+        });
+        let result = request.run(|_| {}, || false).unwrap();
+        let used = result.evaluations_used;
+        let key = result.best.as_ref().unwrap().configuration.clone();
+        let score = result.best.as_ref().unwrap().score;
+        let prior_score = result.stages[0].score;
+        let mut control = AttackControl::with_counters(result.counters.0);
+        let mut allowance = EvaluationAllowance {
+            used,
+            limit: used + 1,
+        };
+        let mut recorder = Recorder::default();
+        let error = scoring_stage(
+            result,
+            crate::space::AttackStage::Trie { base_measure: None },
+            &mut ObservedAccounting {
+                allowance: &mut allowance,
+                control: &mut control,
+                observer: &mut recorder,
+            },
+            |best| {
+                // Synthetic composition seam: real bounded dictionaries cannot reach i128::MAX.
+                MeasuredScore::higher_is_better(FixedScore::from_units(1))
+                    .with_ranking_base(FixedScore::from_units(i128::MAX))
+                    .map(|score| (best.plaintext.clone(), score))
+                    .map_err(|source| RunPayload::Evaluation(TrialEvaluationError::Measure(source)))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.best().unwrap().unwrap().configuration(), &key);
+        assert_eq!(error.best().unwrap().unwrap().score(), score);
+        assert_eq!(error.stages()[0].pass(), "measure");
+        assert_eq!(error.stages()[0].score(), prior_score);
+        assert_eq!(error.evaluations_used(), used + 1);
+        assert_eq!(error.counters().evaluations_admitted(), used + 1);
+        assert_eq!(error.counters().evaluations_completed(), used);
+        assert_eq!(recorder.0.last(), Some(&error.counters().0));
+        let stage = &error.stages()[1];
+        assert_eq!(stage.pass(), "trie");
+        assert_eq!(stage.score(), None);
+        assert_eq!(stage.evaluations_used(), 1);
+        assert!(!stage.completed());
+        assert_eq!(
+            error.run_source().category(),
+            crate::AttackRunCategory::Evaluation
+        );
+        let trial = error.run_source().source().unwrap();
+        let measure = trial.source().unwrap();
+        assert_eq!(
+            measure.downcast_ref::<crate::MeasureError>(),
+            Some(&crate::MeasureError::Arithmetic(
+                crate::ScoreError::Overflow
+            ))
+        );
+        assert_eq!(
+            measure
+                .source()
+                .unwrap()
+                .downcast_ref::<crate::ScoreError>(),
+            Some(&crate::ScoreError::Overflow)
         );
     }
 

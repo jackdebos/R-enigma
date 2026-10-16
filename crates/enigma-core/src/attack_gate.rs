@@ -225,11 +225,16 @@ impl AttackGate {
         }
         // Reject the entire pipeline if any stage is not implemented or detached.
         if passes.len() != settings.stages().len() + 1
-            || passes[1..].iter().any(|pass| pass != "measure")
-            || settings
-                .stages()
+            || passes[1..]
                 .iter()
-                .any(|stage| !matches!(stage, crate::space::AttackStage::Measure { .. }))
+                .zip(settings.stages())
+                .any(|(pass, stage)| {
+                    !matches!(
+                        (pass.as_str(), stage),
+                        ("measure", crate::space::AttackStage::Measure { .. })
+                            | ("trie", crate::space::AttackStage::Trie { .. })
+                    )
+                })
         {
             return Err(failure(
                 "unsupported_pass",
@@ -468,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn parsed_stages_still_fail_the_execution_gate() {
+    fn reswapping_rejects_the_whole_supported_pipeline() {
         let mut value = fixture(&['A', 'B', 'C', 'D']);
         value["job"]["passes"] = json!(["hill_climb", "measure", "trie"]);
         value["job"]["measures"] = json!(["ic", "entropy", "trie"]);
@@ -486,6 +491,34 @@ mod tests {
         let trie = json!({"resource_version":1,"kind":"dictionary","alphabet":["A","B","C","D"],
             "entries":[{"word":["A"],"weight":1}]})
         .to_string();
+        let mut carrier = value.clone();
+        carrier["job"].as_object_mut().unwrap().remove("attack");
+        carrier["job"]["space"]
+            .as_object_mut()
+            .unwrap()
+            .remove("plugboard");
+        let carrier = ParsedSearchRequest::parse_json(&carrier.to_string())
+            .unwrap()
+            .bind_resources(&BTreeMap::from([("trie".to_owned(), trie.as_str())]))
+            .unwrap();
+        let domain = domain(&carrier, &['A', 'B'], 1);
+        let reversed = AttackSettings::parse_json(
+            carrier.definition().alphabet(),
+            &domain,
+            &["hill_climb".into(), "trie".into(), "measure".into()],
+            carrier.measures(),
+            &value["job"]["attack"].to_string(),
+        )
+        .unwrap();
+        error(
+            &carrier,
+            &domain,
+            &reversed,
+            "unsupported_pass",
+            "/job/passes",
+        );
+        value["job"]["passes"] = json!(["hill_climb", "measure", "trie", "reswapping"]);
+        value["job"]["attack"]["reswapping"] = json!({"measure":"ic"});
         let errors = crate::ParsedAttackRequest::parse_json(&value.to_string())
             .unwrap()
             .bind_resources(&BTreeMap::from([("trie".to_owned(), trie.as_str())]))

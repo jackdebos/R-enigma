@@ -194,6 +194,181 @@ fn measure_starts_only_after_first_admission() {
     }
 }
 
+fn trie_fixture(
+    budget: u64,
+    pe: bool,
+    order: &[&str],
+    base: Option<&str>,
+    weight: i64,
+) -> enigma_core::AttackRequest {
+    let mut value = fixture_value(budget, 0, pe);
+    value["job"]["text"] = serde_json::json!("🦀éΩ🦀");
+    value["job"]["measures"] = serde_json::json!(["ic", "entropy", "trie"]);
+    value["job"]["attack"]["initial_measure"] = serde_json::json!("entropy");
+    value["job"]["attack"]["final_measure"] = serde_json::json!("entropy");
+    value["job"]["passes"]
+        .as_array_mut()
+        .unwrap()
+        .extend(order.iter().map(|stage| serde_json::json!(stage)));
+    if order.contains(&"trie") {
+        value["job"]["attack"]["trie"] = base.map_or_else(
+            || serde_json::json!({}),
+            |base| serde_json::json!({"base_measure": base}),
+        );
+    }
+    value["job"]["resources"] = serde_json::json!({"trie": {"path": "words.json"}});
+    let dictionary = serde_json::json!({"resource_version": 1, "kind": "dictionary",
+        "alphabet": ["🦀", "é", "Ω", "中"],
+        "entries": [{"word": ["🦀"], "weight": weight}]})
+    .to_string();
+    enigma_core::ParsedAttackRequest::parse_json(&value.to_string())
+        .unwrap()
+        .bind_resources(&std::collections::BTreeMap::from([(
+            "trie".to_owned(),
+            dictionary.as_str(),
+        )]))
+        .unwrap()
+}
+
+#[test]
+fn trie_composes_rankings_once_on_the_same_hc_and_pe_plaintext() {
+    use enigma_core::{index_of_coincidence, shannon_entropy, Alphabet, MeasureId, SCALE};
+    let alphabet = Alphabet::new("🦀éΩ中".chars().collect()).unwrap();
+    for pe in [false, true] {
+        let before = trie_fixture(100, pe, &[], None, 3)
+            .run(|_| {}, || false)
+            .unwrap();
+        let used = before.evaluations_used();
+        for base in [None, Some("ic"), Some("entropy"), Some("trie")] {
+            for weight in [-3, 3] {
+                let after = trie_fixture(used + 1, pe, &["trie"], base, weight)
+                    .run(|_| {}, || false)
+                    .unwrap();
+                assert_eq!(after.termination(), AttackTermination::Completed);
+                let old = before.best().unwrap();
+                let best = after.best().unwrap();
+                assert_eq!(best.configuration(), old.configuration());
+                assert_eq!(best.mutable_plugboard(), old.mutable_plugboard());
+                assert_eq!(best.plaintext(), old.plaintext());
+                assert_eq!(best.outer_index(), old.outer_index());
+                assert_eq!(best.start_index(), old.start_index());
+                assert_eq!(best.incomplete(), old.incomplete());
+                assert_eq!(best.final_objective_ascent(), old.final_objective_ascent());
+                assert_eq!(best.neighborhood_exhausted(), old.neighborhood_exhausted());
+                let trie = best.plaintext().chars().filter(|&c| c == '🦀').count() as i128
+                    * i128::from(weight)
+                    * SCALE;
+                assert_ne!(trie, 0);
+                assert_ne!(old.score().measured(), old.score().ranking());
+                let base_units = match base {
+                    Some("ic") => index_of_coincidence(&alphabet, best.plaintext())
+                        .unwrap()
+                        .ranking()
+                        .units(),
+                    Some("entropy") => shannon_entropy(&alphabet, best.plaintext())
+                        .unwrap()
+                        .ranking()
+                        .units(),
+                    Some("trie") => trie,
+                    _ => old.score().ranking().units(),
+                };
+                assert_eq!(best.measure(), MeasureId::Trie);
+                assert_eq!(best.score().measured().units(), trie);
+                assert_eq!(best.score().ranking().units(), base_units + trie);
+                let (a, c, s, f, o) = counts(before.counters());
+                assert_eq!(counts(after.counters()), (a + 1, c + 1, s, f, o));
+                let wire = serde_json::to_value(enigma_core::Event::result(&after, 0)).unwrap();
+                assert_eq!(
+                    wire["stages"][0],
+                    serde_json::json!({"pass": "trie", "measure": "trie",
+                    "base_measure": base, "score": wire["best"]["score"],
+                    "evaluations_used": "1", "completed": true})
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn supported_stage_orders_share_allowance_and_cancellation_boundaries() {
+    use std::cell::Cell;
+    for pe in [false, true] {
+        let before = trie_fixture(100, pe, &[], None, 3)
+            .run(|_| {}, || false)
+            .unwrap();
+        let used = before.evaluations_used();
+        let outers = Cell::new(0);
+        let cancelled = trie_fixture(used + 1, pe, &["trie"], None, 3)
+            .run(|p| outers.set(p.outers_completed()), || outers.get() > 0)
+            .unwrap();
+        assert_eq!(cancelled.termination(), AttackTermination::Cancelled);
+        assert!(cancelled.stages().is_empty());
+        assert_eq!(cancelled.evaluations_used(), used);
+        for order in [["measure", "trie"], ["trie", "measure"]] {
+            let completed = Cell::new(0);
+            for extra in 0..=2 {
+                for cancel in [false, true] {
+                    completed.set(0);
+                    let mut last = None;
+                    let result = trie_fixture(used + extra, pe, &order, None, 3)
+                        .run(
+                            |p| {
+                                completed.set(p.evaluations_completed());
+                                last = Some(p);
+                            },
+                            || cancel && completed.get() > used,
+                        )
+                        .unwrap();
+                    let stages = if cancel { extra.min(1) } else { extra };
+                    assert_eq!(result.stages().len() as u64, stages);
+                    assert_eq!(result.evaluations_used(), used + stages);
+                    assert_eq!(last, Some(result.counters()));
+                    assert_eq!(
+                        result.termination(),
+                        if cancel && extra > 0 {
+                            AttackTermination::Cancelled
+                        } else if extra < 2 {
+                            AttackTermination::EvaluationBudget
+                        } else {
+                            AttackTermination::Completed
+                        }
+                    );
+                    for (stage, pass) in result.stages().iter().zip(order) {
+                        assert_eq!(stage.pass(), pass);
+                        assert_eq!(stage.evaluations_used(), 1);
+                        assert!(stage.completed());
+                    }
+                    let best = result.best().unwrap();
+                    let ic = enigma_core::index_of_coincidence(
+                        &enigma_core::Alphabet::new("🦀éΩ中".chars().collect()).unwrap(),
+                        best.plaintext(),
+                    )
+                    .unwrap();
+                    if stages == 2 {
+                        if order[1] == "measure" {
+                            assert_eq!(best.score(), ic);
+                        } else {
+                            assert_eq!(
+                                best.score().ranking().units(),
+                                ic.ranking().units() + best.score().measured().units()
+                            );
+                        }
+                    }
+                }
+            }
+            // A pending cancellation after the final evaluation cannot undo completion.
+            completed.set(0);
+            let result = trie_fixture(used + 2, pe, &order, None, 3)
+                .run(
+                    |p| completed.set(p.evaluations_completed()),
+                    || completed.get() == used + 2,
+                )
+                .unwrap();
+            assert_eq!(result.termination(), AttackTermination::Completed);
+        }
+    }
+}
+
 fn fixture(budget: u64, offset: u64, pe: bool) -> enigma_core::AttackRequest {
     enigma_core::AttackRequest::parse_json(&fixture_value(budget, offset, pe).to_string()).unwrap()
 }

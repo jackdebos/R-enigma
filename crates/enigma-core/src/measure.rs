@@ -62,7 +62,7 @@ impl std::error::Error for MeasureError {
 }
 
 /// A measured Q32 value and its per-measure higher-is-better ranking orientation.
-/// This does not define a combined score across measures.
+/// Only trie stages compose rankings with a base (search-passes §9.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MeasuredScore {
     measured: FixedScore,
@@ -77,12 +77,20 @@ impl MeasuredScore {
         }
     }
 
+    /// Trie stages retain the trie measurement while adding a base ranking (§9.4).
+    pub(crate) fn with_ranking_base(self, base: FixedScore) -> Result<Self, MeasureError> {
+        Ok(Self {
+            measured: self.measured,
+            ranking: base.checked_add(self.ranking)?,
+        })
+    }
+
     /// Read the measured value (entropy is nonnegative bits, not negative bits).
     pub const fn measured(self) -> FixedScore {
         self.measured
     }
 
-    /// Read the higher-is-better ranking value for this measure alone.
+    /// Read the higher-is-better ranking, including a trie stage's base if any.
     pub const fn ranking(self) -> FixedScore {
         self.ranking
     }

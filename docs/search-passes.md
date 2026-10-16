@@ -533,8 +533,8 @@ Differential oracle remains Task17.
 
 ## 9. Chained stages — Task 13
 
-Status: **measure implemented** after HC/PE. Pipelines containing `trie` or
-`reswapping` still fail in full with `unsupported_pass`, before execution.
+Status: **measure and trie implemented** after HC/PE, in listed order.
+Pipelines containing `reswapping` still fail in full with `unsupported_pass`, before execution.
 Task 13 supersedes, for this
 branch only, the §2 sentences rejecting `reswapping`, `trie`, `measure` and mixed
 passes; §1–§8 otherwise stay normative. Pinned bomm basis:
@@ -617,7 +617,9 @@ that same plaintext; otherwise use the carried `ranking_q32`. The stage score is
 `measure: "trie"`, `measured_q32 = TrieQ32`, `ranking_q32 = checked(base + TrieQ32)`.
 This explicit Q32 ranking sum is the **only** exception to §2's "no score sum, no
 implicit trie base score", scoped to this stage; overflow is a runtime evaluation
-error. The carried base may come from a different measure; the sum is defined but
+error. Explicit `base_measure: "trie"` doubles the trie ranking, still within one
+evaluation. Signed dictionary weights retain their signs. The carried base may
+come from a different measure; the sum is defined but
 not comparable across measures. Otherwise scores of different measures remain
 incomparable, including across stages.
 

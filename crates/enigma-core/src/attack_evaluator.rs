@@ -85,6 +85,24 @@ impl<'a> TrialEvaluator<'a> {
         Ok((plaintext, score))
     }
 
+    /// One decryption; optional base scoring reuses that exact plaintext.
+    pub(super) fn evaluate_trie(
+        &self,
+        mutable: &[(char, char)],
+        base: Option<&Self>,
+        carried: crate::FixedScore,
+    ) -> Result<(String, MeasuredScore), TrialEvaluationError> {
+        let (plaintext, trie) = self.evaluate(mutable)?;
+        let ranking = match base {
+            Some(base) => base.measure(&plaintext)?.ranking(),
+            None => carried,
+        };
+        let score = trie
+            .with_ranking_base(ranking)
+            .map_err(TrialEvaluationError::Measure)?;
+        Ok((plaintext, score))
+    }
+
     fn measure(&self, plaintext: &str) -> Result<MeasuredScore, TrialEvaluationError> {
         let alphabet = self.initial.topology().alphabet();
         let incompatible = || TrialEvaluationError::IncompatibleResource(self.objective);
