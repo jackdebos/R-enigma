@@ -472,7 +472,7 @@ ordering applies only while delivery succeeds, including final result write/flus
 
 | Action | Mechanism | Result |
 | --- | --- | --- |
-| Cancel (first HC/PE release) | `--cancel-file <path>` marker (shipped); POSIX `SIGINT`/`SIGTERM` and Windows Ctrl+C integration separately pending | Cooperative safe-stop, final `result`, then `done` with `reason: "cancelled"`; no hold/checkpoint promise |
+| Cancel (first HC/PE release) | `--cancel-file <path>` marker or a platform signal (`SIGINT`/`SIGTERM`/`SIGHUP`, Windows Ctrl+C/Break); both shipped | Cooperative safe-stop, final `result`, then `done` with `reason: "cancelled"`; no hold/checkpoint promise |
 | Pause/resume live job | Not in Stage 1 | Future extension |
 | Resume dead job | `--resume <checkpoint>` | Search only; see §6 |
 | Bound HC/PE search | `space.offset`/`space.limit`, `attack.evaluation_budget` | §4.1 slice/exhaustion/budget reasons; no new `--max-keys` attack control |
@@ -487,10 +487,10 @@ Admitted evaluations are nonpreemptive; established exhaustion wins over cancell
 which wins over budget. Stops retain committed results and required reserved final
 rescoring; original errors and charged usage are preserved, not masked by cancellation.
 Core runtime, fallible JSONL projections and the timed HC/PE adapter ship in the
-production CLI (§4.1). Platform signals, hold and checkpoint cadence remain
-unimplemented. Task12.12 ships `--cancel-file` as the only external
-cancellation source, per the contract below; without it cancellation stays false.
-POSIX/Windows signals (Task12.13) remain pending; handlers may only feed a sticky
+production CLI (§4.1). Hold and checkpoint cadence remain unimplemented.
+Task12.12 ships `--cancel-file` and Task12.13 platform signals as the external
+cancellation sources, per the contracts below; they combine by OR, both sticky.
+Without either, cancellation stays false. Signal handlers only feed a sticky
 cancellation request, never perform evaluation or JSONL writes.
 
 ### `--cancel-file <path>` contract
@@ -519,8 +519,25 @@ and exit 1.
 Normal cancellation retains eligible results, emits `result` then `done` with
 `reason: "cancelled"`, and exits zero on healthy delivery. Established exhaustion
 and runtime-error precedence remain authoritative (§4.1); observing a marker does
-not override them. No signals, hold, checkpoint, cleanup or marker ownership is
-added by this contract. Core remains clock- and I/O-free.
+not override them. No hold, checkpoint, cleanup or marker ownership is added by
+this contract. Core remains clock- and I/O-free.
+
+### Signal contract
+
+`SIGINT`, `SIGTERM` and `SIGHUP` on Unix, and Ctrl+C/Break on Windows, request the
+same safe stop as an observed marker: `result` then `done` with
+`reason: "cancelled"`, exit zero on healthy delivery, with the precedence and exit
+codes above unchanged. The handler applies only to HC/PE attacks; it is installed
+after request/resource binding and initial marker inspection, before `started`.
+Earlier phases, transform and search jobs keep the default signal behavior. If
+installation fails, the CLI writes a stderr diagnostic and exits 2 with empty
+stdout, before `started`.
+
+The first signal only raises the sticky flag. A second signal exits immediately with
+code 130, without a terminal-event guarantee; a JSONL line may be cut. The handler
+replaces inherited ignored dispositions: under `nohup`, a terminal hangup requests a
+safe stop. Use `setsid`, `tmux` or `screen` to outlive the terminal. Windows and
+macOS behavior relies on the `ctrlc` crate and is not verified by tests here.
 Hold remains deferred, not removed from eventual Stage 1 goals; cancellation in the
 first release writes no hold or checkpoint. Checkpoint/resume remains Task 16 under §6.
 
