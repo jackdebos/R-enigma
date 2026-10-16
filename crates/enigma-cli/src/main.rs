@@ -515,14 +515,22 @@ mod attack_tests {
 
     #[test]
     fn structural_diagnostics_are_parser_not_handler_failures() {
-        for passes in [
-            json!(["partial_exhaustion"]),
-            json!(["hill_climb", "partial_exhaustion"]),
-            json!(["reswapping"]),
+        for (passes, code, location) in [
+            (
+                json!(["partial_exhaustion"]),
+                "invalid_request",
+                "/job/attack/kind",
+            ),
+            (
+                json!(["hill_climb", "partial_exhaustion"]),
+                "unsupported_pass",
+                "/job/passes",
+            ),
+            (json!(["reswapping"]), "unsupported_pass", "/job/passes"),
         ] {
             let mut value = request();
             value["job"]["passes"] = passes;
-            parse_error(&value, "invalid_request", "/job/attack/kind");
+            parse_error(&value, code, location);
         }
         for (pointer, replacement, code, location) in [
             (

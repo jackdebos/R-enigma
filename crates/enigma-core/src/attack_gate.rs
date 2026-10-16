@@ -32,13 +32,7 @@ impl AttackGate {
         settings: &AttackSettings,
     ) -> Result<Self, Vec<SearchDiagnostic>> {
         let passes = request.passes();
-        if passes.len() != 1 || !matches!(passes[0].as_str(), "hill_climb" | "partial_exhaustion") {
-            return Err(failure(
-                "unsupported_pass",
-                "exactly one Task 11 attack pass is required",
-                "/job/passes",
-            ));
-        }
+        crate::space::attack_passes_shape(passes)?;
         if request.space().plugboard().is_some() {
             return Err(failure(
                 "unsupported_pass",
@@ -206,6 +200,14 @@ impl AttackGate {
                 "/job/space",
             )
         })?;
+        // Chained stages parse and preflight fully, but stay unexecutable until Task 13.2.
+        if passes.len() != 1 || !settings.stages().is_empty() {
+            return Err(failure(
+                "unsupported_pass",
+                "chained stages are not executable yet",
+                "/job/passes",
+            ));
+        }
         let available = outer_total - u128::from(request.space().offset()).min(outer_total);
         let outer_selected = request
             .space()
@@ -399,6 +401,7 @@ mod tests {
             json!(["reswapping"]),
             json!(["trie"]),
             json!(["hill_climb", "partial_exhaustion"]),
+            json!(["hill_climb", "measure"]),
         ] {
             value["job"]["passes"] = passes;
             error(
@@ -432,6 +435,35 @@ mod tests {
         value["job"]["space"] = json!({});
         value["job"]["attack"] = json!({"kind":"hill_climb"});
         assert!(ParsedSearchRequest::parse_json(&value.to_string()).is_err());
+    }
+
+    #[test]
+    fn parsed_stages_still_fail_the_execution_gate() {
+        let mut value = fixture(&['A', 'B', 'C', 'D']);
+        value["job"]["passes"] = json!(["hill_climb", "measure", "trie"]);
+        value["job"]["measures"] = json!(["ic", "entropy", "trie"]);
+        value["job"]["resources"] = json!({"trie":{"path":"words.json"}});
+        value["job"]["space"]["plugboard"] =
+            json!({"kind":"attack","symbols":["A","B"],"max_pairs":1});
+        value["job"]["attack"] = json!({"kind":"hill_climb","initial_measure":"ic","final_measure":"entropy",
+            "switch_pairs":0,"backtrack_pairs":0,"evaluation_budget":1,"start":[],"trie":{"x":1}});
+        let errors = crate::ParsedAttackRequest::parse_json(&value.to_string()).unwrap_err();
+        assert_eq!(
+            (errors[0].code(), errors[0].location()),
+            ("unknown_field", "/job/attack/trie/x")
+        );
+        value["job"]["attack"]["trie"] = json!({"base_measure":"ic"});
+        let trie = json!({"resource_version":1,"kind":"dictionary","alphabet":["A","B","C","D"],
+            "entries":[{"word":["A"],"weight":1}]})
+        .to_string();
+        let errors = crate::ParsedAttackRequest::parse_json(&value.to_string())
+            .unwrap()
+            .bind_resources(&BTreeMap::from([("trie".to_owned(), trie.as_str())]))
+            .unwrap_err();
+        assert_eq!(
+            (errors[0].code(), errors[0].location()),
+            ("unsupported_pass", "/job/passes")
+        );
     }
 
     #[test]

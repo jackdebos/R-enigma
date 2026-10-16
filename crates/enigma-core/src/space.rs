@@ -345,6 +345,34 @@ pub enum AttackSeedPolicy {
     Touching(Vec<char>),
 }
 
+/// Validated chained stage after the sole HC/PE pass, with resolved measures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AttackStage {
+    Reswapping { measure: MeasureId },
+    Trie { base_measure: Option<MeasureId> },
+    Measure { measure: MeasureId },
+}
+
+/// §9.1 shape: one leading HC/PE pass, then distinct chained stages in any order.
+pub(crate) fn attack_passes_shape(passes: &[String]) -> Result<(), Vec<SearchDiagnostic>> {
+    let stages = passes.get(1..).unwrap_or_default();
+    let valid = passes
+        .first()
+        .is_some_and(|pass| matches!(pass.as_str(), "hill_climb" | "partial_exhaustion"))
+        && stages.iter().enumerate().all(|(index, stage)| {
+            matches!(stage.as_str(), "reswapping" | "trie" | "measure")
+                && !stages[..index].contains(stage)
+        });
+    if valid {
+        return Ok(());
+    }
+    Err(vec![SearchDiagnostic::new(
+        "unsupported_pass",
+        "passes must be one hill_climb or partial_exhaustion, then distinct chained stages",
+        "/job/passes",
+    )])
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum AttackInitialization {
     Start(Vec<(char, char)>),
@@ -361,6 +389,7 @@ pub struct AttackSettings {
     backtrack_pairs: usize,
     evaluation_budget: u64,
     initialization: AttackInitialization,
+    stages: Vec<AttackStage>,
 }
 
 impl AttackSettings {
@@ -426,14 +455,15 @@ impl AttackSettings {
                 "evaluation_budget",
                 "start",
                 "seeds",
+                "reswapping",
+                "trie",
+                "measure",
             ],
             PATH,
         )?;
+        attack_passes_shape(declared_passes)?;
         let kind = required_string(settings, "kind", PATH)?;
-        if declared_passes.len() != 1
-            || declared_passes[0] != kind
-            || !matches!(kind, "hill_climb" | "partial_exhaustion")
-        {
+        if declared_passes[0] != kind {
             return Err(vec![invalid(
                 "kind must match the sole selected attack pass",
                 child(PATH, "kind"),
@@ -527,6 +557,62 @@ impl AttackSettings {
             })?;
             AttackInitialization::Start(start)
         };
+        let listed = &declared_passes[1..];
+        if let Some(stage) = ["reswapping", "trie", "measure"]
+            .into_iter()
+            .find(|&stage| settings.contains_key(stage) && !listed.iter().any(|pass| pass == stage))
+        {
+            return Err(vec![invalid(
+                "stage settings require the same-named listed stage",
+                child(PATH, stage),
+            )]);
+        }
+        let declared = |id: &str| declared_measures.iter().copied().find(|m| m.id() == id);
+        let mut stages = Vec::with_capacity(listed.len());
+        for (index, stage) in listed.iter().enumerate() {
+            let path = child(PATH, stage);
+            let passes_path = format!("/job/passes/{}", index + 1);
+            let empty = Map::new();
+            let fields = settings
+                .get(stage.as_str())
+                .map_or(Ok(&empty), |value| object(value, &path))?;
+            let (key, default) = match stage.as_str() {
+                "reswapping" => ("measure", Some("sinkov_trigram")),
+                "trie" => ("base_measure", None),
+                _ => ("measure", Some("ic")),
+            };
+            allow_keys(fields, &[key], &path)?;
+            let measure = match (fields.get(key), default) {
+                (Some(value), _) => Some(value.as_str().and_then(declared).ok_or_else(|| {
+                    vec![invalid(
+                        "stage measure must be an exact declared measure identifier",
+                        child(&path, key),
+                    )]
+                })?),
+                (None, Some(id)) => Some(declared(id).ok_or_else(|| {
+                    vec![invalid(
+                        "defaulted stage measure must be declared",
+                        &passes_path,
+                    )]
+                })?),
+                (None, None) => None,
+            };
+            stages.push(match (stage.as_str(), measure) {
+                ("reswapping", Some(measure)) => AttackStage::Reswapping { measure },
+                ("measure", Some(measure)) => AttackStage::Measure { measure },
+                _ => {
+                    if declared("trie").is_none() {
+                        return Err(vec![invalid(
+                            "trie stage requires declared trie measure",
+                            passes_path,
+                        )]);
+                    }
+                    AttackStage::Trie {
+                        base_measure: measure,
+                    }
+                }
+            });
+        }
         Ok(Self {
             kind,
             initial_measure,
@@ -535,6 +621,7 @@ impl AttackSettings {
             backtrack_pairs,
             evaluation_budget,
             initialization,
+            stages,
         })
     }
 
@@ -575,6 +662,10 @@ impl AttackSettings {
             AttackInitialization::Seeds(policy) => Some(policy),
             AttackInitialization::Start(_) => None,
         }
+    }
+    /// Chained stages in `job.passes` order; empty for HC/PE-only requests.
+    pub(crate) fn stages(&self) -> &[AttackStage] {
+        &self.stages
     }
 }
 
@@ -2129,6 +2220,159 @@ mod tests {
         );
     }
 
+    // §9.1: a well-shaped passes list reaches the kind check; any other is unsupported.
+    fn passes_outcome(shaped: bool) -> (&'static str, &'static str) {
+        if shaped {
+            ("invalid_request", "/job/attack/kind")
+        } else {
+            ("unsupported_pass", "/job/passes")
+        }
+    }
+
+    // Parses `hill_climb` followed by the space-separated stages, plus extra members.
+    fn staged(
+        stages: &str,
+        all: bool,
+        members: &Value,
+    ) -> Result<Vec<AttackStage>, (String, String)> {
+        let (alphabet, domain, mut value) = settings_fixture();
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(members.as_object().unwrap().clone());
+        let passes: Vec<String> = ["hill_climb"]
+            .into_iter()
+            .chain(stages.split_whitespace())
+            .map(str::to_owned)
+            .collect();
+        let mut measures = vec![MeasureId::Ic, MeasureId::Entropy];
+        if all {
+            measures.extend([
+                MeasureId::Trie,
+                MeasureId::SinkovBigram,
+                MeasureId::SinkovTrigram,
+            ]);
+        }
+        AttackSettings::parse_json(&alphabet, &domain, &passes, &measures, &value.to_string())
+            .map(|settings| settings.stages().to_vec())
+            .map_err(|errors| (errors[0].code().to_owned(), errors[0].location().to_owned()))
+    }
+
+    #[test]
+    fn settings_chained_stages_keep_order_and_resolve_defaults() {
+        let project = |stages: Vec<AttackStage>| -> Vec<(&str, Option<&str>)> {
+            stages
+                .into_iter()
+                .map(|stage| match stage {
+                    AttackStage::Reswapping { measure } => ("reswapping", Some(measure.id())),
+                    AttackStage::Trie { base_measure } => ("trie", base_measure.map(MeasureId::id)),
+                    AttackStage::Measure { measure } => ("measure", Some(measure.id())),
+                })
+                .collect()
+        };
+        for (stages, members, expected) in [
+            ("", json!({}), vec![]),
+            (
+                "reswapping",
+                json!({}),
+                vec![("reswapping", Some("sinkov_trigram"))],
+            ),
+            ("trie", json!({}), vec![("trie", None)]),
+            (
+                "measure",
+                json!({"measure":{}}),
+                vec![("measure", Some("ic"))],
+            ),
+            (
+                "measure trie reswapping",
+                json!({"reswapping":{"measure":"sinkov_bigram"},"trie":{"base_measure":"trie"},
+                    "measure":{"measure":"entropy"}}),
+                vec![
+                    ("measure", Some("entropy")),
+                    ("trie", Some("trie")),
+                    ("reswapping", Some("sinkov_bigram")),
+                ],
+            ),
+            (
+                "trie reswapping measure",
+                json!({"trie":{"base_measure":"ic"}}),
+                vec![
+                    ("trie", Some("ic")),
+                    ("reswapping", Some("sinkov_trigram")),
+                    ("measure", Some("ic")),
+                ],
+            ),
+        ] {
+            assert_eq!(
+                project(staged(stages, true, &members).unwrap()),
+                expected,
+                "{stages}"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_chained_stage_member_errors() {
+        // Empty members on objective-only declarations exercise undeclared defaults.
+        for (stages, members, path) in [
+            ("", json!({"trie":{}}), "attack/trie"),
+            ("trie", json!({"measure":{}}), "attack/measure"),
+            ("trie", json!({"trie":[]}), "attack/trie"),
+            ("trie", json!({"trie":null}), "attack/trie"),
+            (
+                "trie",
+                json!({"trie":{"measure":"ic"}}),
+                "attack/trie/measure",
+            ),
+            (
+                "reswapping",
+                json!({"reswapping":{"measure":null}}),
+                "attack/reswapping/measure",
+            ),
+            (
+                "measure",
+                json!({"measure":{"measure":1}}),
+                "attack/measure/measure",
+            ),
+            (
+                "measure",
+                json!({"measure":{"measure":"sinkov_quadgram"}}),
+                "attack/measure/measure",
+            ),
+            (
+                "trie",
+                json!({"trie":{"base_measure":"IC"}}),
+                "attack/trie/base_measure",
+            ),
+            ("measure reswapping", json!({}), "passes/2"),
+            ("trie", json!({}), "passes/1"),
+        ] {
+            let all = members != json!({});
+            let code = if path.ends_with("trie/measure") {
+                "unknown_field"
+            } else {
+                "invalid_request"
+            };
+            let expected = (code.to_owned(), format!("/job/{path}"));
+            assert_eq!(
+                staged(stages, all, &members).unwrap_err(),
+                expected,
+                "{members}"
+            );
+        }
+        // Default `ic` for the measure stage must itself be declared.
+        let (alphabet, domain, mut value) = settings_fixture();
+        value["initial_measure"] = json!("entropy");
+        let passes = ["hill_climb".to_owned(), "measure".to_owned()];
+        let errors =
+            AttackSettings::parse_value(&alphabet, &domain, &passes, &[MeasureId::Entropy], &value)
+                .unwrap_err();
+        assert_eq!(
+            (errors[0].code(), errors[0].location()),
+            ("invalid_request", "/job/passes/1")
+        );
+    }
+
     #[test]
     fn settings_valid_objectives_thresholds_budget_and_order() {
         let (alphabet, domain, mut value) = settings_fixture();
@@ -2286,21 +2530,29 @@ mod tests {
         for passes in [
             vec![],
             vec!["partial_exhaustion"],
+            vec!["partial_exhaustion", "measure"],
             vec!["reswapping"],
+            vec!["measure", "hill_climb"],
             vec!["hill_climb", "partial_exhaustion"],
             vec!["hill_climb", "hill_climb"],
+            vec!["hill_climb", "trie", "trie"],
+            vec!["hill_climb", "unknown"],
         ] {
+            let shaped = passes.first() == Some(&"partial_exhaustion");
             let passes: Vec<String> = passes.into_iter().map(str::to_owned).collect();
             let errors = AttackSettings::parse_json(
                 &alphabet,
                 &domain,
                 &passes,
-                &[MeasureId::Ic, MeasureId::Entropy],
+                &[MeasureId::Ic, MeasureId::Entropy, MeasureId::Trie],
                 &value.to_string(),
             )
             .unwrap_err();
-            assert_eq!(errors[0].code(), "invalid_request");
-            assert_eq!(errors[0].location(), "/job/attack/kind");
+            // Kind `hill_climb` mismatches only well-shaped partial-exhaustion lists.
+            assert_eq!(
+                (errors[0].code(), errors[0].location()),
+                passes_outcome(shaped)
+            );
         }
         let mut deferred = value.clone();
         deferred["kind"] = json!("partial_exhaustion");
@@ -2587,8 +2839,10 @@ mod tests {
             vec!["partial_exhaustion".to_owned(), "hill_climb".to_owned()],
         ] {
             let errors = parse(&alphabet, &passes, &value.to_string()).unwrap_err();
-            assert_eq!(errors[0].code(), "invalid_request");
-            assert_eq!(errors[0].location(), "/job/attack/kind");
+            assert_eq!(
+                (errors[0].code(), errors[0].location()),
+                passes_outcome(passes.len() == 1)
+            );
         }
         let mut raw = value.to_string();
         raw.push_str(&" ".repeat(crate::MAX_REQUEST_BYTES - raw.len()));
@@ -3554,11 +3808,12 @@ mod tests {
             json!(["partial_exhaustion"]),
         ] {
             let mut value = attack_request();
+            let kind_only = passes == json!(["partial_exhaustion"]);
             value["job"]["passes"] = passes;
             let errors = crate::AttackRequest::parse_json(&value.to_string()).unwrap_err();
             assert_eq!(
                 (errors[0].code(), errors[0].location()),
-                ("invalid_request", "/job/attack/kind")
+                passes_outcome(kind_only)
             );
         }
         for (field, code) in [
@@ -3832,20 +4087,20 @@ mod tests {
             (
                 "/job/passes",
                 json!(["hill_climb", "partial_exhaustion"]),
-                "invalid_request",
-                "/job/attack/kind",
+                "unsupported_pass",
+                "/job/passes",
             ),
             (
                 "/job/passes",
                 json!(["reswapping"]),
-                "invalid_request",
-                "/job/attack/kind",
+                "unsupported_pass",
+                "/job/passes",
             ),
             (
                 "/job/passes",
                 json!(["unknown"]),
-                "invalid_request",
-                "/job/attack/kind",
+                "unsupported_pass",
+                "/job/passes",
             ),
         ] {
             let mut value = attack_request();
@@ -3873,7 +4128,7 @@ mod tests {
         value["job"]["space"] = attack_request()["job"]["space"].clone();
         assert_eq!(
             attack_error(&value),
-            ("invalid_request".into(), "/job/attack/kind".into())
+            ("unsupported_pass".into(), "/job/passes".into())
         );
         value["job"]["measures"] = json!(["unknown"]);
         assert_eq!(
