@@ -313,7 +313,7 @@ per-invocation control and evaluation allowances.
 Fallible JSONL projections and the shared timed HC/PE adapter ship in the CLI.
 The CLI `--cancel-file` marker (Task12.12) and platform signals (Task12.13) are
 the external cancellation sources; hold and checkpoint cadence remain deferred.
-Checkpoint/resume belongs to Task 16; Task 12 remains in progress.
+Checkpoint/resume belongs to Task 16 and the hold list to Task 14; Task 12 is done.
 
 #### Accounting and completion
 
@@ -526,5 +526,5 @@ checked Q32 scoring, no-reflector decrypt support and deterministic shared budge
 No floating-point score/trajectory parity or guaranteed key recovery is promised.
 Duet/quartet, DFS, mutable fixed facts and additional attacks remain out of scope.
 Public lifecycle/result transport is frozen above and implemented in the production
-HC/PE adapter; deferred controls remain later Task12 work. Differential oracle
-remains Task17.
+HC/PE adapter; hold and checkpoint controls remain Task14/Task16 work.
+Differential oracle remains Task17.
