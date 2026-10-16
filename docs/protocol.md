@@ -487,8 +487,8 @@ Admitted evaluations are nonpreemptive; established exhaustion wins over cancell
 which wins over budget. Stops retain committed results and required reserved final
 rescoring; original errors and charged usage are preserved, not masked by cancellation.
 Core runtime, fallible JSONL projections and the timed HC/PE adapter ship in the
-production CLI (§4.1). Platform signals/control files, hold and checkpoint cadence
-remain unimplemented. Task12.12 ships `--cancel-file` as the only external
+production CLI (§4.1). Platform signals, hold and checkpoint cadence remain
+unimplemented. Task12.12 ships `--cancel-file` as the only external
 cancellation source, per the contract below; without it cancellation stays false.
 POSIX/Windows signals (Task12.13) remain pending; handlers may only feed a sticky
 cancellation request, never perform evaluation or JSONL writes.

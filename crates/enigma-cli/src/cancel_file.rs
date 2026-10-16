@@ -55,15 +55,16 @@ impl CancelFile {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_support {
     use std::fs;
+    use std::io;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct TestDir(PathBuf);
+    pub(crate) struct TestDir(PathBuf);
 
     impl TestDir {
-        fn path(&self) -> &std::path::Path {
+        pub(crate) fn path(&self) -> &std::path::Path {
             &self.0
         }
     }
@@ -74,7 +75,7 @@ mod tests {
         }
     }
 
-    fn tempdir() -> io::Result<TestDir> {
+    pub(crate) fn tempdir() -> io::Result<TestDir> {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
             "enigma-cancel-{}-{}",
@@ -84,6 +85,13 @@ mod tests {
         fs::create_dir(&path)?;
         Ok(TestDir(path))
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::tempdir;
+    use super::*;
+    use std::fs;
 
     #[test]
     fn absent_then_created_and_removed_is_sticky() {

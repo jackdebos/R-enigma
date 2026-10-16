@@ -685,4 +685,50 @@ mod attack_tests {
             }
         }
     }
+
+    #[test]
+    fn cancel_marker_is_polled_after_started() {
+        // Mutates the marker path on the first write, i.e. right after `started`.
+        struct Writer<F: FnMut()>(Option<F>, Vec<u8>);
+        impl<F: FnMut()> Write for Writer<F> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if let Some(mut action) = self.0.take() {
+                    action();
+                }
+                self.1.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = cancel_file::test_support::tempdir().unwrap();
+        for (index, mut value) in [request(), partial("all")].into_iter().enumerate() {
+            value["job"]["attack"]["evaluation_budget"] = json!(100);
+            for (kind, exit) in [("file", ExitCode::SUCCESS), ("dir", ExitCode::FAILURE)] {
+                let path = dir.path().join(format!("{kind}-{index}"));
+                let mut out = Writer(
+                    Some(|| match kind {
+                        "file" => fs::write(&path, b"").unwrap(),
+                        _ => fs::create_dir(&path).unwrap(),
+                    }),
+                    vec![],
+                );
+                let parsed = ParsedAttackRequest::parse_json(&value.to_string()).unwrap();
+                assert_eq!(
+                    run_attack(parsed, Path::new("."), Some(&path), &mut out),
+                    exit
+                );
+                let events: Vec<Value> = String::from_utf8(out.1)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(events[0]["event"], "started");
+                assert_eq!(events[events.len() - 2]["event"], "result");
+                assert_eq!(events.last().unwrap()["event"], "done");
+                assert_eq!(events.last().unwrap()["reason"], "cancelled", "{kind}");
+            }
+        }
+    }
 }

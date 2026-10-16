@@ -311,7 +311,8 @@ share checked accounting, counter snapshots and cooperative cancellation.
 Budget-only callers retain Task 11 behavior; both controlled paths use fresh
 per-invocation control and evaluation allowances.
 Fallible JSONL projections and the shared timed HC/PE adapter ship in the CLI.
-Platform signals/control files, hold and checkpoint cadence remain deferred.
+The CLI `--cancel-file` marker (Task12.12) is the only external cancellation
+source; platform signals, hold and checkpoint cadence remain deferred.
 Checkpoint/resume belongs to Task 16; Task 12 remains in progress.
 
 #### Accounting and completion
