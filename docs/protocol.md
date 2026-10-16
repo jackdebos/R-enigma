@@ -323,7 +323,7 @@ adapter, with counter-only observation and independently polled cancellation.
 Stage 1 plans `hill_climb`, `partial_exhaustion` with backtracking, `reswapping`, `trie`,
 and `measure`; measures include index of coincidence, Sinkov n-gram statistics,
 Shannon entropy, and trie scoring. This plan does not assert parser or search support.
-The chained `reswapping`/`trie`/`measure` stages are specified (not yet implemented) in
+The chained `reswapping`/`trie`/`measure` stages are specified and implemented in
 [search-passes §9](search-passes.md#9-chained-stages--task-13).
 Representability by the definition schema does not imply algorithm support for arbitrary
 alphabet, wheel count, stepping rule, or topology.

@@ -151,42 +151,57 @@ impl crate::AttackRequest {
         }?;
         let mut result = result;
         if result.termination == crate::AttackTermination::Completed && result.best.is_some() {
+            use crate::attack_result::RunPayload;
             for stage in self.settings().stages() {
-                let (_, measure, base_measure) = scoring_stage_metadata(*stage);
                 if control.poll_cancellation(cancel_requested()) {
                     result.termination = crate::AttackTermination::Cancelled;
                     break;
                 }
-                result = scoring_stage(
-                    result,
-                    *stage,
-                    &mut ObservedAccounting {
-                        allowance: &mut allowance,
-                        control: &mut control,
-                        observer: &mut observer,
-                    },
-                    |best| {
-                        // Bind only fixed facts; mutable pairs belong solely to the trial.
-                        let initial = crate::TransformConfiguration::new(
-                            best.configuration.slots().to_vec(),
-                            self.domain().fixed_pairs().to_vec(),
-                        )
-                        .resolve(self.definition())
-                        .map_err(|_| {
-                            crate::attack_result::RunPayload::Invariant(
-                                "winning slots failed to resolve",
-                            )
-                        })?;
-                        let evaluator = |measure| {
-                            TrialEvaluator::new(
-                                &initial,
-                                self.domain(),
-                                self.text(),
-                                Direction::Decrypt,
-                                measure,
-                                self.bound_resource(measure),
-                            )
-                        };
+                // Bind only fixed facts; mutable pairs belong solely to the trial.
+                let best = result.best.as_ref().expect("completed run has best");
+                let initial = crate::TransformConfiguration::new(
+                    best.configuration.slots().to_vec(),
+                    self.domain().fixed_pairs().to_vec(),
+                )
+                .resolve(self.definition());
+                // Resolution failure surfaces only after the stage's first admission.
+                let initial = || {
+                    (initial.as_ref())
+                        .map_err(|_| RunPayload::Invariant("winning slots failed to resolve"))
+                };
+                let evaluator = |initial, measure| {
+                    TrialEvaluator::new(
+                        initial,
+                        self.domain(),
+                        self.text(),
+                        Direction::Decrypt,
+                        measure,
+                        self.bound_resource(measure),
+                    )
+                };
+                let accounting = &mut ObservedAccounting {
+                    allowance: &mut allowance,
+                    control: &mut control,
+                    observer: &mut observer,
+                };
+                result = if let crate::space::AttackStage::Reswapping { measure } = *stage {
+                    crate::attack_reswapping::reswapping_stage(
+                        result,
+                        measure,
+                        self.definition().alphabet(),
+                        self.domain(),
+                        accounting,
+                        &mut cancel_requested,
+                        |board| {
+                            let scorer = evaluator(initial()?, measure);
+                            scorer.evaluate(board).map_err(RunPayload::Evaluation)
+                        },
+                    )?
+                } else {
+                    let (_, measure, base_measure) = scoring_stage_metadata(*stage);
+                    scoring_stage(result, *stage, accounting, |best| {
+                        let initial = initial()?;
+                        let evaluator = |measure| evaluator(initial, measure);
                         let scorer = evaluator(measure);
                         let evaluation = if matches!(stage, crate::space::AttackStage::Trie { .. })
                         {
@@ -198,9 +213,9 @@ impl crate::AttackRequest {
                         } else {
                             scorer.evaluate(&best.mutable_plugboard)
                         };
-                        evaluation.map_err(crate::attack_result::RunPayload::Evaluation)
-                    },
-                )?;
+                        evaluation.map_err(RunPayload::Evaluation)
+                    })?
+                };
                 if result.termination != crate::AttackTermination::Completed {
                     break;
                 }
@@ -217,7 +232,7 @@ fn scoring_stage_metadata(
     match stage {
         crate::space::AttackStage::Measure { measure } => ("measure", measure, None),
         crate::space::AttackStage::Trie { base_measure } => ("trie", MeasureId::Trie, base_measure),
-        _ => unreachable!("gate rejects unsupported stages"),
+        _ => unreachable!("reswapping has its own stage"),
     }
 }
 
@@ -240,17 +255,11 @@ fn scoring_stage(
         }
         Ok(true) => {
             evaluate(result.best.as_ref().expect("completed run has best")).and_then(|value| {
-                accounting
-                    .transition(AttackControl::record_evaluation_completed)
-                    .map_err(|error| match error {
-                        ObservedClimbError::Counter(source) => RunPayload::Counter(source),
-                        ObservedClimbError::Evaluation(source) => RunPayload::Evaluation(source),
-                    })?;
+                accounting.transition(AttackControl::record_evaluation_completed)?;
                 Ok(value)
             })
         }
-        Err(ObservedClimbError::Counter(source)) => Err(RunPayload::Counter(source)),
-        Err(ObservedClimbError::Evaluation(source)) => Err(RunPayload::Evaluation(source)),
+        Err(error) => Err(RunPayload::from(error)),
     };
     result.evaluations_used = accounting.allowance.used;
     result.counters = crate::AttackProgress(accounting.control.snapshot());

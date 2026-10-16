@@ -220,6 +220,16 @@ pub(crate) enum RunPayload {
     Invariant(&'static str),
 }
 
+impl From<crate::attack_hill_climb::ObservedClimbError> for RunPayload {
+    fn from(error: crate::attack_hill_climb::ObservedClimbError) -> Self {
+        use crate::attack_hill_climb::ObservedClimbError;
+        match error {
+            ObservedClimbError::Counter(source) => Self::Counter(source),
+            ObservedClimbError::Evaluation(source) => Self::Evaluation(source),
+        }
+    }
+}
+
 /// Opaque owned original cause. Nested causes remain available through `Error`.
 /// Private payload construction is unavailable to external clients:
 /// ```compile_fail

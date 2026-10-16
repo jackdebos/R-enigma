@@ -533,8 +533,7 @@ Differential oracle remains Task17.
 
 ## 9. Chained stages — Task 13
 
-Status: **measure and trie implemented** after HC/PE, in listed order.
-Pipelines containing `reswapping` still fail in full with `unsupported_pass`, before execution.
+Status: **reswapping, measure and trie implemented** after HC/PE, in listed order.
 Task 13 supersedes, for this
 branch only, the §2 sentences rejecting `reswapping`, `trie`, `measure` and mixed
 passes; §1–§8 otherwise stay normative. Pinned bomm basis:
@@ -608,6 +607,11 @@ holds (a winning pure removal shrinks it by one); the §5 backtrack/switch thres
 do not apply. Like pinned bomm, the identity and pure-removal trials are evaluated
 and counted.
 
+Decision (Task 13.3b): a started reswapping stage that stops early (budget,
+cancellation or evaluation error) reports the committed S as its history `score`;
+the score is `null` only when its initial evaluation fails, and best then stays as
+before the stage.
+
 ### 9.4 `trie` and `measure`
 
 `measure` costs one evaluation: score K with its measure; K is unchanged and the
@@ -635,6 +639,8 @@ counters never change during stages.
 
 Cancellation is polled before each stage, before each admission and after each
 evaluation before a reswap commit; once observed no further stage evaluation runs.
+A cancellation pending after the final no-improvement scan therefore leaves the
+reswapping stage `completed`: no commit, hence no poll, follows that scan.
 Run termination: the HC/PE termination if not `completed` (stages never start);
 otherwise `completed` only when every listed stage completed, else `cancelled` or
 `evaluation_budget` with §6.1 precedence (errors > exhaustion > cancellation >

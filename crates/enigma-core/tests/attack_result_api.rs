@@ -369,6 +369,148 @@ fn supported_stage_orders_share_allowance_and_cancellation_boundaries() {
     }
 }
 
+fn reswapping_fixture(budget: u64, pe: bool, order: &[&str]) -> enigma_core::AttackRequest {
+    let mut value = fixture_value(budget, 0, pe);
+    let passes = value["job"]["passes"].as_array_mut().unwrap();
+    passes.extend(order.iter().map(|stage| serde_json::json!(stage)));
+    value["job"]["measures"] = serde_json::json!(["ic", "entropy"]);
+    if order.contains(&"measure") {
+        value["job"]["attack"]["measure"] = serde_json::json!({"measure": "ic"});
+    }
+    value["job"]["attack"]["reswapping"] = serde_json::json!({"measure": "entropy"});
+    enigma_core::AttackRequest::parse_json(&value.to_string()).unwrap()
+}
+
+#[test]
+fn reswapping_climbs_the_hc_and_pe_winner_under_shared_accounting() {
+    use enigma_core::MeasureId::Entropy;
+    let alphabet = enigma_core::Alphabet::new("🦀éΩ中".chars().collect()).unwrap();
+    for pe in [false, true] {
+        let before = fixture(100, 0, pe).run(|_| {}, || false).unwrap();
+        let (used, old) = (before.evaluations_used(), before.best().unwrap());
+        for order in [&["reswapping"][..], &["measure", "reswapping"]] {
+            let mut last = None;
+            let after = reswapping_fixture(used + 20, pe, order)
+                .run(|p| last = Some(p), || false)
+                .unwrap();
+            assert_eq!(after.termination(), AttackTermination::Completed);
+            assert_eq!(last, Some(after.counters()));
+            let best = after.best().unwrap();
+            let stage = after.stages().last().unwrap();
+            let spent = after.evaluations_used() - used - (order.len() as u64 - 1);
+            assert_eq!(after.stages().len(), order.len());
+            assert_eq!((stage.pass(), stage.measure()), ("reswapping", Entropy));
+            assert_eq!(stage.base_measure(), None);
+            assert_eq!(
+                (stage.score(), stage.evaluations_used(), stage.completed()),
+                (Some(best.score()), spent, true)
+            );
+            // HC keeps one pair (initial plus four trials); PE keeps the empty board.
+            assert_eq!(spent, if pe { 1 } else { 5 });
+            let (a, c, s, f, o) = counts(before.counters());
+            let extra = after.evaluations_used() - used;
+            assert_eq!(counts(after.counters()), (a + extra, c + extra, s, f, o));
+            let entropy = |text| enigma_core::shannon_entropy(&alphabet, text).unwrap();
+            assert_eq!(best.measure(), Entropy);
+            assert_eq!(best.score(), entropy(best.plaintext()));
+            assert!(best.score().ranking().units() >= entropy(old.plaintext()).ranking().units());
+            assert_eq!(best.outer_index(), old.outer_index());
+            assert_eq!(best.start_index(), old.start_index());
+            assert!(best.configuration().plugboard().contains(&('é', '中')));
+            let wire = serde_json::to_value(enigma_core::Event::result(&after, 0)).unwrap();
+            assert_eq!(
+                wire["stages"][order.len() - 1],
+                serde_json::json!({"pass": "reswapping", "measure": "entropy",
+                    "base_measure": null, "score": wire["best"]["score"],
+                    "evaluations_used": spent.to_string(), "completed": true})
+            );
+        }
+    }
+}
+
+#[test]
+fn reswapping_stops_mid_stage_or_before_start_on_budget_and_cancellation() {
+    use std::cell::Cell;
+    use AttackTermination::{Cancelled, Completed, EvaluationBudget};
+    for pe in [false, true] {
+        let before = fixture(100, 0, pe).run(|_| {}, || false).unwrap();
+        let used = before.evaluations_used();
+        let full = reswapping_fixture(used + 20, pe, &["reswapping"])
+            .run(|_| {}, || false)
+            .unwrap();
+        let spent = full.stages()[0].evaluations_used();
+        let completed = Cell::new(0);
+        for extra in 0..=spent {
+            for cancel in [false, true] {
+                completed.set(0);
+                let budget = if cancel { used + 20 } else { used + extra };
+                let result = reswapping_fixture(budget, pe, &["reswapping"])
+                    .run(
+                        |p| completed.set(p.evaluations_completed()),
+                        || cancel && completed.get() >= used + extra,
+                    )
+                    .unwrap();
+                assert_eq!(result.evaluations_used(), used + extra);
+                if extra == 0 {
+                    // Neither stop admits a first evaluation, so the stage never starts.
+                    assert!(result.stages().is_empty());
+                    let stop = [EvaluationBudget, Cancelled][usize::from(cancel)];
+                    assert_eq!(result.termination(), stop);
+                    let score = |run: &AttackResult| run.best().unwrap().score();
+                    assert_eq!(score(&result), score(&before));
+                    continue;
+                }
+                let stage = &result.stages()[0];
+                assert_eq!(stage.evaluations_used(), extra);
+                assert_eq!(stage.score(), Some(result.best().unwrap().score()));
+                // A pending cancellation after the final scan does not undo completion.
+                let termination = match (extra == spent, cancel) {
+                    (true, _) => Completed,
+                    (_, true) => Cancelled,
+                    (_, false) => EvaluationBudget,
+                };
+                assert_eq!(result.termination(), termination);
+                assert_eq!(stage.completed(), termination == Completed);
+            }
+        }
+    }
+}
+
+#[test]
+fn reswapping_commits_a_strict_trie_improvement_over_the_hc_winner() {
+    // A non-identity wheel makes plaintext board-dependent; IC ties keep the HC start.
+    let mut value = fixture_value(20, 0, false);
+    value["machine"]["definition"]["value"]["wheels"][0]["wiring"] =
+        serde_json::json!(["é", "🦀", "中", "Ω"]);
+    value["job"]["measures"] = serde_json::json!(["ic", "trie"]);
+    value["job"]["resources"] = serde_json::json!({"trie": {"path": "words.json"}});
+    let dictionary = serde_json::json!({"resource_version": 1, "kind": "dictionary",
+        "alphabet": ["🦀", "é", "Ω", "中"], "entries": [{"word": ["é"], "weight": 3}]})
+    .to_string();
+    let supplied = std::collections::BTreeMap::from([("trie".to_owned(), dictionary.as_str())]);
+    let run = |value: &serde_json::Value| {
+        let parsed = enigma_core::ParsedAttackRequest::parse_json(&value.to_string()).unwrap();
+        let request = parsed.bind_resources(&supplied).unwrap();
+        request.run(|_| {}, || false).unwrap()
+    };
+    let before = run(&value);
+    value["job"]["passes"] = serde_json::json!(["hill_climb", "reswapping"]);
+    value["job"]["attack"]["reswapping"] = serde_json::json!({"measure": "trie"});
+    let after = run(&value);
+    let (old, best) = (before.best().unwrap(), after.best().unwrap());
+    assert_eq!(old.mutable_plugboard(), [('🦀', 'Ω')]);
+    assert_eq!((old.plaintext(), best.plaintext()), ("中中", "éé"));
+    // The winning pure removal shrinks the board; the empty rescan has no trials.
+    assert!(best.mutable_plugboard().is_empty());
+    assert_eq!(best.configuration().plugboard(), [('é', '中')]);
+    assert_eq!(best.score().ranking().units(), 6 * enigma_core::SCALE);
+    assert_eq!(best.measure(), enigma_core::MeasureId::Trie);
+    let stage = &after.stages()[0];
+    let history = (stage.score(), stage.evaluations_used(), stage.completed());
+    assert_eq!(history, (Some(best.score()), 5, true));
+    assert_eq!(after.termination(), AttackTermination::Completed);
+}
+
 fn fixture(budget: u64, offset: u64, pe: bool) -> enigma_core::AttackRequest {
     enigma_core::AttackRequest::parse_json(&fixture_value(budget, offset, pe).to_string()).unwrap()
 }

@@ -1,22 +1,9 @@
 //! Private constrained steepest-ascent reswapping stage (search-passes §9.3, §9.5).
-// The runner wiring arrives in Task 13.3b; until then only unit tests reach it.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use crate::attack_control::{AttackControl, CounterObserver};
-use crate::attack_hill_climb::{
-    EvaluationAccounting, ObservedAccounting, ObservedClimbError, ScoredBoard,
-};
+use crate::attack_hill_climb::{EvaluationAccounting, ObservedAccounting, ScoredBoard};
 use crate::attack_result::{AttackRunErrorData, RunPayload};
 use crate::{Alphabet, AttackPlugboardDomain, AttackTermination, MeasureId, MeasuredScore};
-
-impl From<ObservedClimbError> for RunPayload {
-    fn from(error: ObservedClimbError) -> Self {
-        match error {
-            ObservedClimbError::Counter(source) => Self::Counter(source),
-            ObservedClimbError::Evaluation(source) => Self::Evaluation(source),
-        }
-    }
-}
 
 fn order(alphabet: &Alphabet, symbol: char) -> usize {
     alphabet.index_of(symbol).expect("validated symbol")
@@ -106,6 +93,8 @@ where
                             Ok(trial) => trial,
                             Err(stop) => return Ok(Some(stop)),
                         };
+                        // Strictly greater: a tie (e.g. restoring the pair) would
+                        // otherwise win and rescan forever.
                         if trial.score.ranking().units() > bar.ranking().units() {
                             bar = trial.score;
                             winner = Some(trial);
@@ -145,29 +134,28 @@ pub(crate) fn reswapping_stage(
         evaluate,
     }
     .run(&best.mutable_plugboard.clone(), &mut committed);
-    if accounting.allowance.used == before {
-        result.termination = outcome.ok().flatten().expect("unadmitted stage stopped");
-        return Ok(result);
+    // Admission charges the allowance first; an unchanged count means not started.
+    if accounting.allowance.used != before {
+        if let Some(key) = &committed {
+            let mut pairs = [domain.fixed_pairs(), &key.board].concat();
+            normalize(alphabet, &mut pairs);
+            let slots = best.configuration.slots().to_vec();
+            best.configuration = crate::TransformConfiguration::new(slots, pairs);
+            best.mutable_plugboard.clone_from(&key.board);
+            best.plaintext.clone_from(&key.plaintext);
+            (best.score, best.measure) = (key.score, measure);
+        }
+        result.evaluations_used = accounting.allowance.used;
+        result.counters = crate::AttackProgress(accounting.control.snapshot());
+        result.stages.push(crate::AttackStageResult {
+            pass: "reswapping",
+            measure,
+            base_measure: None,
+            score: committed.map(|key| key.score),
+            evaluations_used: accounting.allowance.used - before,
+            completed: matches!(outcome, Ok(None)),
+        });
     }
-    if let Some(key) = &committed {
-        let mut pairs = [domain.fixed_pairs(), &key.board].concat();
-        normalize(alphabet, &mut pairs);
-        let slots = best.configuration.slots().to_vec();
-        best.configuration = crate::TransformConfiguration::new(slots, pairs);
-        best.mutable_plugboard.clone_from(&key.board);
-        best.plaintext.clone_from(&key.plaintext);
-        (best.score, best.measure) = (key.score, measure);
-    }
-    result.evaluations_used = accounting.allowance.used;
-    result.counters = crate::AttackProgress(accounting.control.snapshot());
-    result.stages.push(crate::AttackStageResult {
-        pass: "reswapping",
-        measure,
-        base_measure: None,
-        score: committed.map(|key| key.score),
-        evaluations_used: accounting.allowance.used - before,
-        completed: matches!(outcome, Ok(None)),
-    });
     match outcome {
         Ok(stop) => {
             result.termination = stop.unwrap_or(result.termination);
@@ -217,6 +205,15 @@ mod tests {
     /// score -100. `stop` is [budget, cancel after, fail at]; boards are logged raw
     /// and scored by their sorted symbols (default 0).
     fn run(start: &[(char, char)], scores: &[(&str, i128)], stop: [usize; 3]) -> Run {
+        run_with(AttackControl::default(), start, scores, stop)
+    }
+
+    fn run_with(
+        mut control: AttackControl,
+        start: &[(char, char)],
+        scores: &[(&str, i128)],
+        stop: [usize; 3],
+    ) -> Run {
         let alphabet = Alphabet::new("ABCDEF".chars().collect()).unwrap();
         let json = r#"{"kind":"attack","symbols":["D","A","C","B"],"max_pairs":3}"#;
         let domain = AttackPlugboardDomain::parse_json(&alphabet, &[('F', 'E')], json).unwrap();
@@ -243,7 +240,6 @@ mod tests {
         // Capped so a non-terminating scan fails fast instead of exhausting memory.
         let limit = (stop[0] as u64).min(10_000).saturating_add(5);
         let mut allowance = EvaluationAllowance { used: 5, limit };
-        let mut control = AttackControl::default();
         let accounting = &mut ObservedAccounting {
             allowance: &mut allowance,
             control: &mut control,
@@ -367,6 +363,22 @@ mod tests {
         assert_eq!(error.counters().evaluations_admitted(), 12);
         assert_eq!(error.counters().evaluations_completed(), 11);
         assert_eq!(error.outer_index().zip(error.start_index()), Some((1, 2)));
+    }
+
+    #[test]
+    fn first_admission_counter_overflow_is_returned_with_history() {
+        let counters = CounterSnapshot {
+            evaluations_admitted: u64::MAX,
+            ..CounterSnapshot::default()
+        };
+        let control = AttackControl::with_counters(counters);
+        let error = run_with(control, AB, &[], [N, N, N]).0.unwrap_err();
+        let overflow = crate::AttackCounterOverflow::EvaluationsAdmitted;
+        assert_eq!(error.run_source().overflow(), Some(overflow));
+        let s = &error.stages()[0];
+        let history = (s.score(), s.evaluations_used(), s.completed());
+        assert_eq!(history, (None, 1, false));
+        assert_eq!(error.best().unwrap().unwrap().score, score(-100));
     }
 
     #[test]

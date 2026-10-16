@@ -233,6 +233,7 @@ impl AttackGate {
                         (pass.as_str(), stage),
                         ("measure", crate::space::AttackStage::Measure { .. })
                             | ("trie", crate::space::AttackStage::Trie { .. })
+                            | ("reswapping", crate::space::AttackStage::Reswapping { .. })
                     )
                 })
         {
@@ -435,7 +436,8 @@ mod tests {
             json!(["reswapping"]),
             json!(["trie"]),
             json!(["hill_climb", "partial_exhaustion"]),
-            json!(["hill_climb", "measure"]), // Carrier/settings mismatch remains rejected.
+            // Carrier/settings mismatches remain rejected.
+            json!(["hill_climb", "measure"]),
             json!(["hill_climb", "measure", "reswapping"]),
         ] {
             value["job"]["passes"] = passes;
@@ -473,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn reswapping_rejects_the_whole_supported_pipeline() {
+    fn reordered_stages_reject_and_reswapping_pipeline_binds() {
         let mut value = fixture(&['A', 'B', 'C', 'D']);
         value["job"]["passes"] = json!(["hill_climb", "measure", "trie"]);
         value["job"]["measures"] = json!(["ic", "entropy", "trie"]);
@@ -519,14 +521,11 @@ mod tests {
         );
         value["job"]["passes"] = json!(["hill_climb", "measure", "trie", "reswapping"]);
         value["job"]["attack"]["reswapping"] = json!({"measure":"ic"});
-        let errors = crate::ParsedAttackRequest::parse_json(&value.to_string())
+        let request = crate::ParsedAttackRequest::parse_json(&value.to_string())
             .unwrap()
             .bind_resources(&BTreeMap::from([("trie".to_owned(), trie.as_str())]))
-            .unwrap_err();
-        assert_eq!(
-            (errors[0].code(), errors[0].location()),
-            ("unsupported_pass", "/job/passes")
-        );
+            .unwrap();
+        assert_eq!(request.settings().stages().len(), 3);
     }
 
     #[test]
