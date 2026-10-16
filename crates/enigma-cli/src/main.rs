@@ -9,6 +9,7 @@
 mod attack_transport;
 mod cancel_file;
 mod resource_loader;
+mod signals;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -16,6 +17,7 @@ use std::io::{self, Read, Write};
 use std::num::NonZeroU128;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use cancel_file::CancelFile;
@@ -177,9 +179,13 @@ fn run(bytes: Vec<u8>, origin: &Path, cancel_file: Option<&Path>) -> ExitCode {
         }
         Ok(ParsedRequest::Transform(request)) => run_transform(request),
         Ok(ParsedRequest::Search(request)) => run_search(request, origin, cancel_file.is_some()),
-        Ok(ParsedRequest::Attack(request)) => {
-            run_attack(request, origin, cancel_file, &mut io::stdout().lock())
-        }
+        Ok(ParsedRequest::Attack(request)) => run_attack(
+            request,
+            origin,
+            cancel_file,
+            signals::install,
+            &mut io::stdout().lock(),
+        ),
         Err(diagnostics) => {
             // Pre-validation failure: exactly one `error` at seq 1, no `started`.
             let first = &diagnostics[0];
@@ -227,11 +233,13 @@ fn run_search(request: ParsedSearchRequest, origin: &Path, cancel_file: bool) ->
 }
 
 /// Binding finalizes eligibility, so no second gate check or resource read is needed.
-/// The cancel marker is first inspected only after load and bind succeed.
-fn run_attack(
+/// The cancel marker is first inspected only after load and bind succeed; the signal
+/// handler is installed only after that, still before `started`.
+fn run_attack<'s>(
     request: ParsedAttackRequest,
     origin: &Path,
     cancel_file: Option<&Path>,
+    install_signals: impl FnOnce() -> Result<&'s AtomicBool, String>,
     out: &mut impl Write,
 ) -> ExitCode {
     let failure = |out: &mut _, code: &str, message: &str, location: &str| {
@@ -259,6 +267,13 @@ fn run_attack(
                     return ExitCode::from(2);
                 }
             };
+            let signal = match install_signals() {
+                Ok(signal) => signal,
+                Err(error) => {
+                    eprintln!("error: failed to install signal handler: {error}");
+                    return ExitCode::from(2);
+                }
+            };
             let entry = Instant::now();
             let status = match attack_transport::run(
                 &validated,
@@ -266,7 +281,8 @@ fn run_attack(
                 || entry.elapsed(),
                 now_ts,
                 NonZeroU128::new(250).unwrap(),
-                || marker.as_mut().is_some_and(CancelFile::poll),
+                // Poll the marker first so a raised signal never masks its runtime error.
+                || marker.as_mut().is_some_and(CancelFile::poll) || signal.load(Ordering::Relaxed),
             ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
@@ -403,6 +419,9 @@ mod attack_tests {
     use super::*;
     use serde_json::{json, Value};
 
+    /// A signal flag that is never raised; no real handler is installed in tests.
+    static IDLE: AtomicBool = AtomicBool::new(false);
+
     fn request() -> Value {
         json!({"protocol_version":1,"machine":{"definition":{"kind":"custom","value":{
             "alphabet":["A","B"],"wheels":[{"name":"r","wiring":["B","A"],"turnovers":[]}],
@@ -419,7 +438,7 @@ mod attack_tests {
         let parsed = ParsedAttackRequest::parse_json(&value.to_string()).unwrap();
         let mut output = Vec::new();
         assert_eq!(
-            run_attack(parsed, origin, None, &mut output),
+            run_attack(parsed, origin, None, || Ok(&IDLE), &mut output),
             ExitCode::FAILURE
         );
         let text = String::from_utf8(output).unwrap();
@@ -470,7 +489,7 @@ mod attack_tests {
         let parsed = ParsedAttackRequest::parse_json(&value.to_string()).unwrap();
         let mut output = Vec::new();
         assert_eq!(
-            run_attack(parsed, origin, None, &mut output),
+            run_attack(parsed, origin, None, || Ok(&IDLE), &mut output),
             ExitCode::SUCCESS
         );
         let events: Vec<Value> = String::from_utf8(output)
@@ -674,7 +693,7 @@ mod attack_tests {
             // Valid structure, deterministic eligibility failure before any work events.
             let parsed = ParsedAttackRequest::parse_json(&outer(8).to_string()).unwrap();
             assert_eq!(
-                run_attack(parsed, Path::new("."), None, &mut out),
+                run_attack(parsed, Path::new("."), None, || Ok(&IDLE), &mut out),
                 ExitCode::FAILURE
             );
             assert_eq!(out.flushes, usize::from(!fail_write));
@@ -686,22 +705,35 @@ mod attack_tests {
         }
     }
 
+    /// Runs an action on the first write, i.e. right after `started`.
+    struct Writer<F: FnMut()>(Option<F>, Vec<u8>);
+    impl<F: FnMut()> Write for Writer<F> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if let Some(mut action) = self.0.take() {
+                action();
+            }
+            self.1.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn assert_cancelled(bytes: Vec<u8>) {
+        let events: Vec<Value> = String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events[0]["event"], "started");
+        assert_eq!(events[events.len() - 2]["event"], "result");
+        assert_eq!(events.last().unwrap()["event"], "done");
+        assert_eq!(events.last().unwrap()["reason"], "cancelled");
+    }
+
     #[test]
     fn cancel_marker_is_polled_after_started() {
-        // Mutates the marker path on the first write, i.e. right after `started`.
-        struct Writer<F: FnMut()>(Option<F>, Vec<u8>);
-        impl<F: FnMut()> Write for Writer<F> {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                if let Some(mut action) = self.0.take() {
-                    action();
-                }
-                self.1.extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
         let dir = cancel_file::test_support::tempdir().unwrap();
         for (index, mut value) in [request(), partial("all")].into_iter().enumerate() {
             value["job"]["attack"]["evaluation_budget"] = json!(100);
@@ -716,18 +748,44 @@ mod attack_tests {
                 );
                 let parsed = ParsedAttackRequest::parse_json(&value.to_string()).unwrap();
                 assert_eq!(
-                    run_attack(parsed, Path::new("."), Some(&path), &mut out),
+                    run_attack(parsed, Path::new("."), Some(&path), || Ok(&IDLE), &mut out),
                     exit
                 );
-                let events: Vec<Value> = String::from_utf8(out.1)
-                    .unwrap()
-                    .lines()
-                    .map(|line| serde_json::from_str(line).unwrap())
-                    .collect();
-                assert_eq!(events[0]["event"], "started");
-                assert_eq!(events[events.len() - 2]["event"], "result");
-                assert_eq!(events.last().unwrap()["event"], "done");
-                assert_eq!(events.last().unwrap()["reason"], "cancelled", "{kind}");
+                assert_cancelled(out.1);
+            }
+        }
+    }
+
+    #[test]
+    fn signal_flag_requests_the_same_safe_stop() {
+        let dir = cancel_file::test_support::tempdir().unwrap();
+        for (index, mut value) in [request(), partial("all")].into_iter().enumerate() {
+            value["job"]["attack"]["evaluation_budget"] = json!(100);
+            // (flag pre-set, marker turned into a directory on first write, exit)
+            for (preset, marker, exit) in [
+                (false, false, ExitCode::SUCCESS),
+                (true, false, ExitCode::SUCCESS),
+                (false, true, ExitCode::FAILURE),
+            ] {
+                let path = dir.path().join(format!("dir-{index}"));
+                let flag = AtomicBool::new(preset);
+                let mut out = Writer(
+                    Some(|| {
+                        flag.store(true, Ordering::Relaxed);
+                        if marker {
+                            fs::create_dir(&path).unwrap();
+                        }
+                    }),
+                    vec![],
+                );
+                let parsed = ParsedAttackRequest::parse_json(&value.to_string()).unwrap();
+                let cancel_file = marker.then_some(path.as_path());
+                assert_eq!(
+                    run_attack(parsed, Path::new("."), cancel_file, || Ok(&flag), &mut out),
+                    exit,
+                    "preset {preset}, marker {marker}"
+                );
+                assert_cancelled(out.1);
             }
         }
     }
