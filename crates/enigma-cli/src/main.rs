@@ -527,6 +527,16 @@ mod attack_tests {
                 "/job/passes",
             ),
             (json!(["reswapping"]), "unsupported_pass", "/job/passes"),
+            (
+                json!(["hill_climb", "measure", "measure"]),
+                "invalid_request",
+                "/job/passes/2",
+            ),
+            (
+                json!(["measure", "hill_climb"]),
+                "unsupported_pass",
+                "/job/passes",
+            ),
         ] {
             let mut value = request();
             value["job"]["passes"] = passes;

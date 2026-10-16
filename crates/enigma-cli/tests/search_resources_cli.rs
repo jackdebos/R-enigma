@@ -610,3 +610,201 @@ fn cancel_file_inspection_follows_request_and_resource_validation() {
         "/job/resources/trie/path",
     );
 }
+
+/// Core's chained-stage fixture: HC or PE, then `stages`; the trie dictionary is `words.json`.
+fn staged(budget: u64, pe: bool, stages: &[&str]) -> Value {
+    let alphabet = ["🦀", "é", "Ω", "中"];
+    let mut r = json!({"protocol_version":1,"machine":{"definition":{"kind":"custom","value":{
+        "alphabet":alphabet,"wheels":[{"name":"r","wiring":alphabet,"turnovers":[]}],
+        "slots":[{"id":"r","role":"rotor","movement":"fixed","wheel":"r"}],"stepping":{"rules":[]}}}},
+        "job":{"kind":"search","configuration":{"slots":[{"id":"r","position":"é","ring":"Ω"}],
+        "plugboard":[["中","é"]]},"text":"🦀éΩ🦀","measures":["ic","entropy","trie"],
+        "passes":["hill_climb"],"resources":{"trie":{"path":"words.json"}},
+        "space":{"plugboard":{"kind":"attack","symbols":["🦀","Ω"],"max_pairs":2}},
+        "attack":{"kind":"hill_climb","initial_measure":"ic","final_measure":"ic","switch_pairs":2,
+        "backtrack_pairs":2,"evaluation_budget":budget,"start":[["Ω","🦀"]]}}});
+    if pe {
+        r["job"]["passes"] = json!(["partial_exhaustion"]);
+        let attack = r["job"]["attack"].as_object_mut().unwrap();
+        attack.insert("kind".into(), json!("partial_exhaustion"));
+        attack.remove("start");
+        attack.insert(
+            "seeds".into(),
+            json!({"kind":"empty_single","selection":"all"}),
+        );
+    }
+    for &stage in stages {
+        r["job"]["passes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(stage));
+        r["job"]["attack"][stage] = match stage {
+            "trie" => json!({}),
+            _ => json!({"measure":"entropy"}),
+        };
+    }
+    r
+}
+
+fn words(word: &str) -> String {
+    json!({"resource_version":1,"kind":"dictionary","alphabet":["🦀","é","Ω","中"],
+        "entries":[{"word":[word],"weight":3}]})
+    .to_string()
+}
+
+/// Runs `request` through the CLI; best, counters, stages and reason must match Core.
+fn core_match(f: &Fixture, request: &Value) -> Vec<Value> {
+    let events = attack_events(&f.stdin(request));
+    let texts: Vec<(String, String)> = request["job"]["resources"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(id, r)| {
+            let path = f.0.join(r["path"].as_str().unwrap());
+            (id.clone(), fs::read_to_string(path).unwrap())
+        })
+        .collect();
+    let supplied = texts
+        .iter()
+        .map(|(id, t)| (id.clone(), t.as_str()))
+        .collect();
+    let parsed = enigma_core::ParsedAttackRequest::parse_json(&request.to_string()).unwrap();
+    let expected = parsed.bind_resources(&supplied).unwrap();
+    let expected = expected.run(|_| {}, || false).unwrap();
+    let projected = serde_json::to_value(enigma_core::Event::result(&expected, 0)).unwrap();
+    for field in ["best", "counters", "stages"] {
+        assert_eq!(events[events.len() - 2][field], projected[field], "{field}");
+    }
+    let reason = enigma_core::DoneReason::from(expected.termination());
+    assert_eq!(events.last().unwrap()["reason"], json!(reason));
+    events
+}
+
+#[test]
+fn public_staged_pipelines_match_core_projection() {
+    let f = Fixture::new();
+    f.write("words.json", words("🦀"));
+    for pe in [false, true] {
+        for stages in [
+            &["measure"][..],
+            &["trie"],
+            &["measure", "trie"],
+            &["reswapping"],
+        ] {
+            let events = core_match(&f, &staged(100, pe, stages));
+            let history: Vec<_> = events[events.len() - 2]["stages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|stage| (stage["pass"].clone(), stage["completed"].clone()))
+                .collect();
+            let expected: Vec<_> = stages.iter().map(|s| (json!(s), json!(true))).collect();
+            assert_eq!(history, expected, "pe={pe}");
+            assert_eq!(events.last().unwrap()["reason"], "completed");
+        }
+    }
+}
+
+#[test]
+fn public_reswapping_improves_trie_winner_on_the_wire() {
+    // Core's strict-improvement case: a non-identity wheel makes plaintext board-dependent.
+    let f = Fixture::new();
+    f.write("words.json", words("é"));
+    let mut r = staged(20, false, &["reswapping"]);
+    r["machine"]["definition"]["value"]["wheels"][0]["wiring"] = json!(["é", "🦀", "中", "Ω"]);
+    r["job"]["text"] = json!("🦀🦀");
+    r["job"]["measures"] = json!(["ic", "trie"]);
+    r["job"]["attack"]["reswapping"] = json!({"measure":"trie"});
+    let events = core_match(&f, &r);
+    let result = &events[events.len() - 2];
+    assert_eq!(result["best"]["plaintext"], "éé");
+    assert_eq!(
+        result["stages"],
+        json!([{"pass":"reswapping","measure":"trie","base_measure":null,
+            "score":result["best"]["score"],"evaluations_used":"5","completed":true}])
+    );
+    assert_eq!(events.last().unwrap()["reason"], "completed");
+}
+
+#[test]
+fn public_staged_budget_and_cancel_file_boundaries() {
+    let f = Fixture::new();
+    f.write("words.json", words("🦀"));
+    f.write("marker", "");
+    let result = |events: &[Value]| events[events.len() - 2].clone();
+    let used = |result: &Value| -> u64 {
+        let text = result["counters"]["evaluations_completed"].as_str();
+        text.unwrap().parse().unwrap()
+    };
+    let base = used(&result(&core_match(&f, &staged(100, false, &[]))));
+    let full = result(&core_match(&f, &staged(100, false, &["reswapping"])));
+    assert!(
+        used(&full) > base + 1,
+        "reswapping needs a mid-stage budget"
+    );
+    // One admitted stage evaluation stops mid-stage with an incomplete history entry.
+    let events = core_match(&f, &staged(base + 1, false, &["reswapping"]));
+    let stage = &result(&events)["stages"][0];
+    assert_eq!(
+        (&stage["evaluations_used"], &stage["completed"]),
+        (&json!("1"), &json!(false))
+    );
+    assert_eq!(events.last().unwrap()["reason"], "evaluation_budget");
+    for pe in [false, true] {
+        let base = used(&result(&core_match(&f, &staged(100, pe, &[]))));
+        // An exhausted allowance admits no stage evaluation, so no stage starts.
+        let events = core_match(&f, &staged(base, pe, &["measure", "reswapping"]));
+        assert_eq!(result(&events)["stages"], json!([]));
+        assert_eq!(events.last().unwrap()["reason"], "evaluation_budget");
+        let request = staged(100, pe, &["measure", "reswapping"]);
+        let events = attack_events(&f.stdin_with(&request, &["--cancel-file", "marker"]));
+        assert!(result(&events)["best"].is_null());
+        assert_eq!(result(&events)["stages"], json!([]));
+        assert_eq!(events.last().unwrap()["reason"], "cancelled");
+    }
+}
+
+#[test]
+fn public_staged_preflight_precedence() {
+    // Gate-ordering proof: words.json is absent, and every error beats a cancel marker.
+    let f = Fixture::new();
+    f.write("marker", "");
+    let mut undeclared = staged(100, false, &["reswapping"]);
+    undeclared["job"]["attack"]["reswapping"]["measure"] = json!("sinkov_bigram");
+    let mut defaulted = staged(100, false, &["reswapping"]);
+    defaulted["job"]["attack"]
+        .as_object_mut()
+        .unwrap()
+        .remove("reswapping");
+    let mut overflow = outer_attack(8, false);
+    overflow["job"]["passes"] = json!(["hill_climb", "measure"]);
+    let mut first = staged(100, false, &["reswapping"]);
+    first["job"]["passes"] = json!(["reswapping", "hill_climb"]);
+    // Parse-time rows fail before loading; the others fail in load or bind.
+    for (r, parse_time, code, location) in [
+        (
+            &undeclared,
+            true,
+            "invalid_request",
+            "/job/attack/reswapping/measure",
+        ),
+        (&defaulted, true, "invalid_request", "/job/passes/1"),
+        (
+            &staged(100, false, &["trie"]),
+            false,
+            "unsupported_resource",
+            "/job/resources/trie/path",
+        ),
+        (&overflow, false, "resource_limit", "/job/space"),
+        (&first, true, "unsupported_pass", "/job/passes"),
+    ] {
+        let parsed = enigma_core::ParsedAttackRequest::parse_json(&r.to_string());
+        let parsed = parsed
+            .err()
+            .map(|d| (d[0].code().to_owned(), d[0].location().to_owned()));
+        assert_eq!(parsed, parse_time.then(|| (code.into(), location.into())));
+        for extra in [&[][..], &["--cancel-file", "marker"]] {
+            error(f.stdin_with(r, extra), code, location);
+        }
+    }
+}

@@ -226,9 +226,9 @@ A search job has `kind: "search"` and exactly `configuration`, `text`, `space`,
 `passes`, `measures`, and optional `resources`. `configuration` carries the fixed
 known choices (§3.2), `space` carries the explicit variable domains and bounds,
 `passes` and `measures` select behavior, and `resources` parameterizes it. This
-section is normative for the §3.2/§3.3 structure; it does not claim that any search
-pass executes (Tasks 11–13 implement the passes; Task 13 chained stages:
-[search-passes §9](search-passes.md#9-chained-stages--task-13)).
+section is normative for the §3.2/§3.3 structure only; execution is specified by
+the pass contracts (HC/PE attacks and the Task 13 chained stages of
+[search-passes §9](search-passes.md#9-chained-stages--task-13) execute; §4.1).
 
 `space` is an object allowing exactly `slots`, `plugboard`, `offset`, and `limit`; all
 four are optional, so an empty object means the fixed choices are already complete.
@@ -380,10 +380,11 @@ optional boxed context. Malformed retained best fails with `RuntimeProjectionErr
 which retains the original runtime cause and separate best-projection cause;
 only genuine absence becomes null. These projection helpers read no clocks and
 perform no I/O or orchestration; the private adapter supplies that boundary.
-Only one attack pass, `hill_climb` or `partial_exhaustion`, is eligible; recognition
-of other passes is not support. Mixed/deferred/legacy rejection remains unchanged
-until the specified [Task 13 chained stages](search-passes.md#9-chained-stages--task-13)
-ship; they add an ordered `stages` array to `result` (§9.6 there).
+One leading attack pass, `hill_climb` or `partial_exhaustion`, is eligible, optionally
+followed by the executable [Task 13 chained stages](search-passes.md#9-chained-stages--task-13)
+`measure`, `trie` and `reswapping`; recognition of other passes is not support, and
+mixed/deferred/legacy rejection is unchanged. `result.stages` is live: it lists the
+started stages in pipeline order (§9.6 there), empty when none started.
 
 After all parsing, resource loading/binding, eligibility and count/budget validation,
 emit `started`, zero or more `progress`, one `result`, then exactly one terminal
@@ -603,9 +604,9 @@ Task 17 is the differential-oracle validation task.
 `protocol_version: 1` denotes this unpublished contract. Unknown
 versions and fields fail before work. Incompatible changes to field meaning,
 validation, traversal, or event ordering after v1 ships require a version bump. Detailed
-pass execution fields other than the [planned Task 11 contract](search-passes.md)
-(including its [Task 13 chained stages](search-passes.md#9-chained-stages--task-13))
-and checkpoint schemas remain deferred; they must be specified
+pass execution fields other than the [Task 11 contract](search-passes.md)
+(whose HC/PE attacks and [Task 13 chained stages](search-passes.md#9-chained-stages--task-13)
+execute) and checkpoint schemas remain deferred; they must be specified
 before their implementation, not presumed executable or imported from `bomm`.
 Search-space and [measure/resource schemas](scoring-resources.md) are specified as
 normative design; that does not assert implemented scoring or search execution.
