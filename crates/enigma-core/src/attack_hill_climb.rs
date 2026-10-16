@@ -112,15 +112,20 @@ impl crate::AttackRequest {
     pub fn run(
         &self,
         observe: impl FnMut(crate::AttackProgress),
-        cancel_requested: impl FnMut() -> bool,
+        mut cancel_requested: impl FnMut() -> bool,
     ) -> Result<crate::AttackResult, crate::AttackRunError> {
+        let mut allowance = EvaluationAllowance {
+            used: 0,
+            limit: self.settings().evaluation_budget(),
+        };
         let mut control = AttackControl::default();
         let mut observer = ProgressObserver(observe);
-        if self.settings().kind() == crate::AttackKind::PartialExhaustion {
-            return match self.schedule_partial_outers_controlled(
+        let result = if self.settings().kind() == crate::AttackKind::PartialExhaustion {
+            match self.schedule_partial_outers_using(
+                &mut allowance,
                 &mut control,
                 &mut observer,
-                cancel_requested,
+                &mut cancel_requested,
             ) {
                 Ok(outcome) => outcome.project_public(
                     control.snapshot(),
@@ -128,16 +133,133 @@ impl crate::AttackRequest {
                     self.settings().final_measure(),
                 ),
                 Err(error) => Err(error.project(self.domain(), self.settings().final_measure())),
-            };
+            }
+        } else {
+            match self.schedule_direct_outers_using(
+                &mut allowance,
+                &mut control,
+                &mut observer,
+                &mut cancel_requested,
+            ) {
+                Ok(outcome) => outcome.project_public(
+                    control.snapshot(),
+                    self.domain(),
+                    self.settings().final_measure(),
+                ),
+                Err(error) => Err(error.project(self.domain(), self.settings().final_measure())),
+            }
+        }?;
+        let mut result = result;
+        if result.termination == crate::AttackTermination::Completed && result.best.is_some() {
+            for stage in self.settings().stages() {
+                let crate::space::AttackStage::Measure { measure } = *stage else {
+                    unreachable!("gate rejects unsupported stages");
+                };
+                if control.poll_cancellation(cancel_requested()) {
+                    result.termination = crate::AttackTermination::Cancelled;
+                    break;
+                }
+                result = measure_stage(
+                    result,
+                    measure,
+                    &mut ObservedAccounting {
+                        allowance: &mut allowance,
+                        control: &mut control,
+                        observer: &mut observer,
+                    },
+                    |best| {
+                        // Bind only fixed facts; mutable pairs belong solely to the trial.
+                        let initial = crate::TransformConfiguration::new(
+                            best.configuration.slots().to_vec(),
+                            self.domain().fixed_pairs().to_vec(),
+                        )
+                        .resolve(self.definition())
+                        .map_err(|_| {
+                            crate::attack_result::RunPayload::Invariant(
+                                "winning slots failed to resolve",
+                            )
+                        })?;
+                        TrialEvaluator::new(
+                            &initial,
+                            self.domain(),
+                            self.text(),
+                            Direction::Decrypt,
+                            measure,
+                            self.bound_resource(measure),
+                        )
+                        .evaluate(&best.mutable_plugboard)
+                        .map_err(crate::attack_result::RunPayload::Evaluation)
+                    },
+                )?;
+                if result.termination != crate::AttackTermination::Completed {
+                    break;
+                }
+            }
         }
-        match self.schedule_direct_outers_controlled(&mut control, &mut observer, cancel_requested)
-        {
-            Ok(outcome) => outcome.project_public(
-                control.snapshot(),
-                self.domain(),
-                self.settings().final_measure(),
-            ),
-            Err(error) => Err(error.project(self.domain(), self.settings().final_measure())),
+        control.notify(&mut observer);
+        Ok(result)
+    }
+}
+
+/// Admission is the start boundary; failures retain the previously committed best.
+fn measure_stage(
+    mut result: crate::AttackResult,
+    measure: MeasureId,
+    accounting: &mut ObservedAccounting<'_, impl CounterObserver>,
+    evaluate: impl FnOnce(
+        &crate::AttackBest,
+    ) -> Result<(String, MeasuredScore), crate::attack_result::RunPayload>,
+) -> Result<crate::AttackResult, crate::AttackRunError> {
+    use crate::attack_result::RunPayload;
+    let before = accounting.allowance.used;
+    let evaluation = match accounting.admit(0) {
+        Ok(false) => {
+            result.termination = crate::AttackTermination::EvaluationBudget;
+            return Ok(result);
+        }
+        Ok(true) => {
+            evaluate(result.best.as_ref().expect("completed run has best")).and_then(|value| {
+                accounting
+                    .transition(AttackControl::record_evaluation_completed)
+                    .map_err(|error| match error {
+                        ObservedClimbError::Counter(source) => RunPayload::Counter(source),
+                        ObservedClimbError::Evaluation(source) => RunPayload::Evaluation(source),
+                    })?;
+                Ok(value)
+            })
+        }
+        Err(ObservedClimbError::Counter(source)) => Err(RunPayload::Counter(source)),
+        Err(ObservedClimbError::Evaluation(source)) => Err(RunPayload::Evaluation(source)),
+    };
+    result.evaluations_used = accounting.allowance.used;
+    result.counters = crate::AttackProgress(accounting.control.snapshot());
+    result.stages.push(crate::AttackStageResult {
+        pass: "measure",
+        measure,
+        base_measure: None,
+        score: evaluation.as_ref().ok().map(|(_, score)| *score),
+        evaluations_used: accounting.allowance.used - before,
+        completed: evaluation.is_ok(),
+    });
+    match evaluation {
+        Ok((plaintext, score)) => {
+            let best = result.best.as_mut().expect("completed run has best");
+            best.plaintext = plaintext;
+            best.score = score;
+            best.measure = measure;
+            Ok(result)
+        }
+        Err(source) => {
+            accounting.control.notify(accounting.observer);
+            Err(crate::AttackRunError::new(AttackRunErrorData {
+                outer_index: result.best.as_ref().map(|best| best.outer_index),
+                start_index: result.best.as_ref().map(|best| best.start_index),
+                source: crate::AttackRunSource(source),
+                stages: result.stages,
+                evaluations_used: result.evaluations_used,
+                counters: result.counters,
+                best: Ok(result.best),
+            }))
         }
     }
 }
@@ -506,17 +628,32 @@ impl ControlledPartialRunError {
 }
 
 impl crate::AttackRequest {
+    #[cfg(test)]
     fn schedule_partial_outers_controlled(
         &self,
+        control: &mut AttackControl,
+        observer: &mut impl CounterObserver,
+        requested: impl FnMut() -> bool,
+    ) -> Result<ControlledPartialRun, Box<ControlledPartialRunError>> {
+        self.schedule_partial_outers_using(
+            &mut EvaluationAllowance {
+                used: 0,
+                limit: self.settings().evaluation_budget(),
+            },
+            control,
+            observer,
+            requested,
+        )
+    }
+
+    fn schedule_partial_outers_using(
+        &self,
+        allowance: &mut EvaluationAllowance,
         control: &mut AttackControl,
         observer: &mut impl CounterObserver,
         mut requested: impl FnMut() -> bool,
     ) -> Result<ControlledPartialRun, Box<ControlledPartialRunError>> {
         control.notify(observer);
-        let mut allowance = EvaluationAllowance {
-            used: 0,
-            limit: self.settings().evaluation_budget(),
-        };
         let result = if self.settings().kind() != crate::AttackKind::PartialExhaustion {
             Err(Box::new(ControlledPartialRunError {
                 outer_index: None,
@@ -532,7 +669,7 @@ impl crate::AttackRequest {
                 self.gate().outer_selected(),
                 self.outer_candidates(),
                 &mut ObservedAccounting {
-                    allowance: &mut allowance,
+                    allowance,
                     control,
                     observer,
                 },
@@ -725,17 +862,32 @@ impl crate::AttackRequest {
     }
 
     /// Same-owner lazy projection closes the adapter's key/index provenance precondition.
+    #[cfg(test)]
     fn schedule_direct_outers_controlled(
         &self,
+        control: &mut AttackControl,
+        observer: &mut impl CounterObserver,
+        requested: impl FnMut() -> bool,
+    ) -> Result<DirectRunOutcome, Box<ControlledDirectError>> {
+        self.schedule_direct_outers_using(
+            &mut EvaluationAllowance {
+                used: 0,
+                limit: self.settings().evaluation_budget(),
+            },
+            control,
+            observer,
+            requested,
+        )
+    }
+
+    fn schedule_direct_outers_using(
+        &self,
+        allowance: &mut EvaluationAllowance,
         control: &mut AttackControl,
         observer: &mut impl CounterObserver,
         mut requested: impl FnMut() -> bool,
     ) -> Result<DirectRunOutcome, Box<ControlledDirectError>> {
         control.notify(observer);
-        let mut allowance = EvaluationAllowance {
-            used: 0,
-            limit: self.settings().evaluation_budget(),
-        };
         let result = if self.settings().kind() != crate::AttackKind::HillClimb {
             Err(Box::new(ControlledDirectError {
                 outer_index: None,
@@ -749,7 +901,7 @@ impl crate::AttackRequest {
                 self.gate().outer_selected(),
                 self.outer_candidates(),
                 &mut ObservedAccounting {
-                    allowance: &mut allowance,
+                    allowance,
                     control,
                     observer,
                 },
@@ -2712,6 +2864,59 @@ mod tests {
             job["space"]["slots"] = serde_json::json!([{"id":"r","positions":["A","B","C"]}]);
             customize(job);
         })
+    }
+
+    #[test]
+    fn measure_failure_retains_committed_best_and_original_source() {
+        use crate::attack_result::RunPayload;
+        let result = scheduler_request(100, false, false, 0)
+            .run(|_| {}, || false)
+            .unwrap();
+        let used = result.evaluations_used;
+        let score = result.best.as_ref().unwrap().score;
+        let key = result.best.as_ref().unwrap().configuration.clone();
+        let mut control = AttackControl::with_counters(result.counters.0);
+        let mut allowance = EvaluationAllowance {
+            used,
+            limit: used + 1,
+        };
+        let mut recorder = Recorder::default();
+        // Valid bound requests cannot manufacture a scoring failure; inject at evaluation.
+        let error = measure_stage(
+            result,
+            MeasureId::Entropy,
+            &mut ObservedAccounting {
+                allowance: &mut allowance,
+                control: &mut control,
+                observer: &mut recorder,
+            },
+            |_| {
+                Err(RunPayload::Evaluation(
+                    TrialEvaluationError::MissingResource(MeasureId::Trie),
+                ))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.run_source().category(),
+            crate::AttackRunCategory::Evaluation
+        );
+        assert!(matches!(
+            error.run_source().0,
+            RunPayload::Evaluation(TrialEvaluationError::MissingResource(MeasureId::Trie))
+        ));
+        assert_eq!(error.evaluations_used(), used + 1);
+        assert_eq!(error.counters().evaluations_admitted(), used + 1);
+        assert_eq!(error.counters().evaluations_completed(), used);
+        assert_eq!(recorder.0.last(), Some(&error.counters().0));
+        let best = error.best().unwrap().unwrap();
+        assert_eq!(best.configuration(), &key);
+        assert_eq!(best.score(), score);
+        let stage = &error.stages()[0];
+        assert_eq!(
+            (stage.score(), stage.evaluations_used(), stage.completed()),
+            (None, 1, false)
+        );
     }
 
     #[test]

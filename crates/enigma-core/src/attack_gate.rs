@@ -223,11 +223,17 @@ impl AttackGate {
                 ));
             }
         }
-        // All stage execution remains unsupported until later Task 13 units.
-        if passes.len() != 1 || !settings.stages().is_empty() {
+        // Reject the entire pipeline if any stage is not implemented or detached.
+        if passes.len() != settings.stages().len() + 1
+            || passes[1..].iter().any(|pass| pass != "measure")
+            || settings
+                .stages()
+                .iter()
+                .any(|stage| !matches!(stage, crate::space::AttackStage::Measure { .. }))
+        {
             return Err(failure(
                 "unsupported_pass",
-                "chained stages are not executable yet",
+                "pipeline contains an unsupported or detached stage",
                 "/job/passes",
             ));
         }
@@ -424,7 +430,8 @@ mod tests {
             json!(["reswapping"]),
             json!(["trie"]),
             json!(["hill_climb", "partial_exhaustion"]),
-            json!(["hill_climb", "measure"]),
+            json!(["hill_climb", "measure"]), // Carrier/settings mismatch remains rejected.
+            json!(["hill_climb", "measure", "reswapping"]),
         ] {
             value["job"]["passes"] = passes;
             error(

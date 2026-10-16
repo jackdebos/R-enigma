@@ -533,8 +533,9 @@ Differential oracle remains Task17.
 
 ## 9. Chained stages — Task 13
 
-Status: **specified, not implemented.** Until Task 13.2/13.3 land, requests listing
-these stages keep failing with `unsupported_pass`. Task 13 supersedes, for this
+Status: **measure implemented** after HC/PE. Pipelines containing `trie` or
+`reswapping` still fail in full with `unsupported_pass`, before execution.
+Task 13 supersedes, for this
 branch only, the §2 sentences rejecting `reswapping`, `trie`, `measure` and mixed
 passes; §1–§8 otherwise stay normative. Pinned bomm basis:
 [attack.c, lines 81–91](https://github.com/ffraenz/bomm/blob/aeb2f2bf00dfdee68e972f90ae7e83b387b188e9/src/attack.c#L81-L91),
@@ -647,4 +648,5 @@ evaluation. `result` gains an additive `stages` array (empty for HC/PE-only runs
 with one entry per started stage, in order, each exactly `pass`, `measure`,
 `base_measure` (trie only, else `null`), `score` (§4.1 score object or `null`),
 `evaluations_used` (decimal string) and `completed` (boolean). Unstarted stages have
-no entry. Core mirrors this on `AttackResult`; Rust names are fixed in Task 13.2.
+no entry: a stage starts at its first evaluation admission, so budget or cancellation
+preventing that admission leaves no history entry. Core mirrors this on `AttackResult`.

@@ -85,6 +85,115 @@ fn fixture_value(budget: u64, offset: u64, pe: bool) -> serde_json::Value {
     value
 }
 
+fn measure_fixture(budget: u64, offset: u64, pe: bool) -> enigma_core::AttackRequest {
+    let mut value = fixture_value(budget, offset, pe);
+    value["job"]["passes"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!("measure"));
+    value["job"]["measures"] = serde_json::json!(["ic", "entropy"]);
+    value["job"]["attack"]["measure"] = serde_json::json!({"measure": "entropy"});
+    enigma_core::AttackRequest::parse_json(&value.to_string()).unwrap()
+}
+
+#[test]
+fn measure_rescores_the_same_hc_and_pe_winner_once() {
+    for pe in [false, true] {
+        let before = fixture(100, 0, pe).run(|_| {}, || false).unwrap();
+        let mut last = None;
+        let after = measure_fixture(before.evaluations_used() + 1, 0, pe)
+            .run(|p| last = Some(p), || false)
+            .unwrap();
+        assert_eq!(after.termination(), AttackTermination::Completed);
+        assert_eq!(last, Some(after.counters()));
+        let (a, c, started, finished, outers) = counts(before.counters());
+        assert_eq!(
+            counts(after.counters()),
+            (a + 1, c + 1, started, finished, outers)
+        );
+        assert_eq!(after.evaluations_used(), before.evaluations_used() + 1);
+        let old = before.best().unwrap();
+        let best = after.best().unwrap();
+        assert_eq!(best.configuration(), old.configuration());
+        assert_eq!(best.mutable_plugboard(), old.mutable_plugboard());
+        assert_eq!(best.plaintext(), old.plaintext());
+        assert_eq!(best.outer_index(), old.outer_index());
+        assert_eq!(best.start_index(), old.start_index());
+        assert_eq!(best.incomplete(), old.incomplete());
+        assert_eq!(best.final_objective_ascent(), old.final_objective_ascent());
+        assert_eq!(best.neighborhood_exhausted(), old.neighborhood_exhausted());
+        let expected = enigma_core::shannon_entropy(
+            &enigma_core::Alphabet::new("🦀éΩ中".chars().collect()).unwrap(),
+            best.plaintext(),
+        )
+        .unwrap();
+        assert_eq!(best.score(), expected);
+        assert_eq!(best.measure(), enigma_core::MeasureId::Entropy);
+        let stage = &after.stages()[0];
+        assert_eq!(after.stages().len(), 1);
+        assert_eq!(
+            (stage.pass(), stage.measure(), stage.base_measure()),
+            ("measure", enigma_core::MeasureId::Entropy, None)
+        );
+        assert_eq!(
+            (stage.score(), stage.evaluations_used(), stage.completed()),
+            (Some(expected), 1, true)
+        );
+        let wire = serde_json::to_value(enigma_core::Event::result(&after, 0)).unwrap();
+        assert_eq!(wire["stages"][0]["evaluations_used"], "1");
+    }
+}
+
+#[test]
+fn measure_starts_only_after_first_admission() {
+    use std::cell::Cell;
+    for pe in [false, true] {
+        let complete = fixture(100, 0, pe).run(|_| {}, || false).unwrap();
+        let used = complete.evaluations_used();
+        for (budget, offset, cancel, termination) in [
+            (1, 0, false, AttackTermination::EvaluationBudget),
+            (used, 0, false, AttackTermination::EvaluationBudget),
+            (used, 0, true, AttackTermination::Cancelled),
+            (used + 1, 0, true, AttackTermination::Cancelled),
+            (used + 1, 1, true, AttackTermination::OuterSliceEnd),
+        ] {
+            let completed = Cell::new(0);
+            let mut last = None;
+            let result = measure_fixture(budget, offset, pe)
+                .run(
+                    |p| {
+                        completed.set(p.outers_completed());
+                        last = Some(p);
+                    },
+                    || cancel && completed.get() == 1,
+                )
+                .unwrap();
+            assert_eq!(result.termination(), termination);
+            assert!(result.stages().is_empty());
+            assert_eq!(last, Some(result.counters()));
+            assert!(result.evaluations_used() <= used);
+            if offset == 1 {
+                assert!(result.best().is_none());
+            }
+            if budget >= used && offset == 0 {
+                assert_eq!(
+                    result.best().unwrap().score(),
+                    complete.best().unwrap().score()
+                );
+            }
+        }
+        // Completion must not add a speculative cancellation poll after the final score.
+        let completed = Cell::new(0);
+        let result = measure_fixture(used + 1, 0, pe)
+            .run(
+                |p| completed.set(p.evaluations_completed()),
+                || completed.get() > used,
+            )
+            .unwrap();
+        assert_eq!(result.termination(), AttackTermination::Completed);
+    }
+}
+
 fn fixture(budget: u64, offset: u64, pe: bool) -> enigma_core::AttackRequest {
     enigma_core::AttackRequest::parse_json(&fixture_value(budget, offset, pe).to_string()).unwrap()
 }
