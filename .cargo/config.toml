@@ -1,0 +1,11 @@
+# Repository-wide Cargo settings; they apply to every cargo command run in this
+# workspace, by people and agents alike.
+
+[build]
+# Leave headroom on 12-core developer machines so the desktop stays usable while
+# the workspace compiles.
+jobs = 8
+
+[alias]
+# Strict lint gate used by every work unit.
+lint = "clippy --workspace --all-targets -- -D warnings"
