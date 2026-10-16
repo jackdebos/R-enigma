@@ -131,6 +131,34 @@ struct WinningScore {
     ranking_q32: String,
 }
 
+/// Wire-only history entry for one admitted chained stage.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct StageResult {
+    pass: &'static str,
+    measure: &'static str,
+    base_measure: Option<&'static str>,
+    score: Option<WinningScore>,
+    evaluations_used: String,
+    completed: bool,
+}
+
+impl From<&crate::AttackStageResult> for StageResult {
+    fn from(stage: &crate::AttackStageResult) -> Self {
+        Self {
+            pass: stage.pass(),
+            measure: stage.measure().id(),
+            base_measure: stage.base_measure().map(crate::MeasureId::id),
+            score: stage.score().map(|score| WinningScore {
+                measure: stage.measure().id().to_owned(),
+                measured_q32: score.measured().units().to_string(),
+                ranking_q32: score.ranking().units().to_string(),
+            }),
+            evaluations_used: stage.evaluations_used().to_string(),
+            completed: stage.completed(),
+        }
+    }
+}
+
 impl From<&AttackBest> for BestResult {
     fn from(best: &AttackBest) -> Self {
         let configuration = best.configuration();
@@ -184,6 +212,8 @@ pub enum Event {
     },
     /// Final committed search winner and factual whole-run snapshot.
     Result {
+        /// Started stages in pipeline order, including on runtime failure.
+        stages: Vec<StageResult>,
         /// Null only when the runtime result genuinely has no winner.
         best: Option<Box<BestResult>>,
         /// All five factual counters, not charged allowance usage.
@@ -244,15 +274,22 @@ impl From<AttackTermination> for DoneReason {
 impl Event {
     /// Projects an owned runtime result without clocks, I/O or execution orchestration.
     pub fn result(result: &AttackResult, elapsed_ms: u128) -> Self {
-        Self::result_snapshot(result.best(), result.counters(), elapsed_ms)
+        Self::result_snapshot(
+            result.best(),
+            result.counters(),
+            result.stages(),
+            elapsed_ms,
+        )
     }
 
     fn result_snapshot(
         best: Option<&AttackBest>,
         counters: AttackProgress,
+        stages: &[crate::AttackStageResult],
         elapsed_ms: u128,
     ) -> Self {
         Self::Result {
+            stages: stages.iter().map(StageResult::from).collect(),
             best: best.map(|best| Box::new(BestResult::from(best))),
             counters: counters.into(),
             elapsed_ms: elapsed_ms.to_string(),
@@ -308,7 +345,7 @@ impl Event {
             },
         };
         Ok((
-            Self::result_snapshot(best, error.counters(), elapsed_ms),
+            Self::result_snapshot(best, error.counters(), error.stages(), elapsed_ms),
             Self::Error {
                 code: "internal_error".to_owned(),
                 message,
@@ -441,6 +478,7 @@ mod tests {
         use crate::attack_result::{AttackRunErrorData, AttackRunSource, RunPayload};
         let expected = encoded(&Event::result(&result, u128::MAX));
         let error = crate::AttackRunError::new(AttackRunErrorData {
+            stages: Vec::new(),
             source: AttackRunSource(RunPayload::Invariant("injected after accepted winner")),
             outer_index: Some(u128::MAX),
             start_index: None,
@@ -555,7 +593,7 @@ mod tests {
             assert_eq!(
                 encoded(&Event::result(&result, 23)),
                 json!({
-                    "event": "result", "best": {
+                    "event": "result", "stages": [], "best": {
                         "configuration": {"slots": slots, "plugboard": best.configuration().plugboard()},
                         "mutable_plugboard": best.mutable_plugboard(), "plaintext": best.plaintext(),
                         "score": {"measure": best.measure().id(),
@@ -595,8 +633,54 @@ mod tests {
                 value["counters"],
                 encoded(&Event::progress(result.counters(), 0))["counters"]
             );
-            assert_eq!(value.as_object().unwrap().len(), 7);
+            assert_eq!(value["stages"], json!([]));
+            assert_eq!(value.as_object().unwrap().len(), 8);
         }
+    }
+
+    #[test]
+    fn stage_history_projects_exact_fields_on_success_and_runtime_error() {
+        // Synthetic history proves the future carrier, not stage execution support.
+        use crate::attack_result::{AttackRunErrorData, AttackRunSource, RunPayload};
+        let mut result = result_fixture(false, 0);
+        result.stages.push(crate::AttackStageResult {
+            pass: "trie",
+            measure: crate::MeasureId::Trie,
+            base_measure: Some(crate::MeasureId::Entropy),
+            score: Some(result.best().unwrap().score()),
+            evaluations_used: u64::MAX,
+            completed: true,
+        });
+        result.stages.push(crate::AttackStageResult {
+            pass: "measure",
+            measure: crate::MeasureId::Ic,
+            base_measure: None,
+            score: None,
+            evaluations_used: 1,
+            completed: false,
+        });
+        let score = result.best().unwrap().score();
+        let expected = json!([
+            {"pass":"trie","measure":"trie","base_measure":"entropy",
+             "score":{"measure":"trie","measured_q32":score.measured().units().to_string(),
+                      "ranking_q32":score.ranking().units().to_string()},
+             "evaluations_used":u64::MAX.to_string(),"completed":true},
+            {"pass":"measure","measure":"ic","base_measure":null,"score":null,
+             "evaluations_used":"1","completed":false}
+        ]);
+        assert_eq!(encoded(&Event::result(&result, 0))["stages"], expected);
+        let error = crate::AttackRunError::new(AttackRunErrorData {
+            stages: result.stages,
+            source: AttackRunSource(RunPayload::Invariant("injected")),
+            outer_index: None,
+            start_index: None,
+            evaluations_used: 1,
+            counters: result.counters,
+            best: Ok(result.best),
+        });
+        assert_eq!(error.stages().len(), 2);
+        let (projected, _) = Event::runtime_error(&error, 0).unwrap();
+        assert_eq!(encoded(&projected)["stages"], expected);
     }
 
     #[test]
@@ -887,6 +971,7 @@ mod tests {
                     RunPayload::Invariant(_) => ("invariant", "/job"),
                 };
                 let error = crate::AttackRunError::new(AttackRunErrorData {
+                    stages: Vec::new(),
                     source: AttackRunSource(payload),
                     outer_index: None,
                     start_index: None,
@@ -925,7 +1010,7 @@ mod tests {
                     assert_eq!(
                         encoded(&result),
                         json!({
-                            "event": "result", "best": null, "counters": super::ProgressCounters::from(error.counters()),
+                            "event": "result", "stages": [], "best": null, "counters": super::ProgressCounters::from(error.counters()),
                             "elapsed_ms": "0", "protocol_version": 1, "seq": 7, "ts": TS
                         })
                     );
@@ -1005,6 +1090,7 @@ mod tests {
         for outer_index in [None, Some(0), Some(u128::MAX)] {
             for start_index in [None, Some(0), Some(u128::MAX)] {
                 let error = crate::AttackRunError::new(AttackRunErrorData {
+                    stages: Vec::new(),
                     source: AttackRunSource(RunPayload::Invariant("full width")),
                     outer_index,
                     start_index,

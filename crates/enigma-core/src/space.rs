@@ -390,6 +390,7 @@ pub struct AttackSettings {
     evaluation_budget: u64,
     initialization: AttackInitialization,
     stages: Vec<AttackStage>,
+    stage_measure_explicit: Vec<bool>,
 }
 
 impl AttackSettings {
@@ -569,6 +570,7 @@ impl AttackSettings {
         }
         let declared = |id: &str| declared_measures.iter().copied().find(|m| m.id() == id);
         let mut stages = Vec::with_capacity(listed.len());
+        let mut stage_measure_explicit = Vec::with_capacity(listed.len());
         for (index, stage) in listed.iter().enumerate() {
             let path = child(PATH, stage);
             let passes_path = format!("/job/passes/{}", index + 1);
@@ -597,6 +599,7 @@ impl AttackSettings {
                 })?),
                 (None, None) => None,
             };
+            stage_measure_explicit.push(fields.contains_key(key));
             stages.push(match (stage.as_str(), measure) {
                 ("reswapping", Some(measure)) => AttackStage::Reswapping { measure },
                 ("measure", Some(measure)) => AttackStage::Measure { measure },
@@ -622,6 +625,7 @@ impl AttackSettings {
             evaluation_budget,
             initialization,
             stages,
+            stage_measure_explicit,
         })
     }
 
@@ -663,6 +667,15 @@ impl AttackSettings {
             AttackInitialization::Start(_) => None,
         }
     }
+    // Preserve explicit/default diagnostic locations when checking detached settings.
+    pub(crate) fn stage_measure_path(&self, index: usize, stage: &str, key: &str) -> String {
+        if self.stage_measure_explicit[index] {
+            format!("/job/attack/{stage}/{key}")
+        } else {
+            format!("/job/passes/{}", index + 1)
+        }
+    }
+
     /// Chained stages in `job.passes` order; empty for HC/PE-only requests.
     pub(crate) fn stages(&self) -> &[AttackStage] {
         &self.stages

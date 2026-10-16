@@ -101,6 +101,44 @@ impl AttackBest {
     }
 }
 
+/// Committed history for one stage whose first evaluation was admitted.
+#[derive(Clone, Debug)]
+pub struct AttackStageResult {
+    pub(crate) pass: &'static str,
+    pub(crate) measure: MeasureId,
+    pub(crate) base_measure: Option<MeasureId>,
+    pub(crate) score: Option<MeasuredScore>,
+    pub(crate) evaluations_used: u64,
+    pub(crate) completed: bool,
+}
+
+impl AttackStageResult {
+    /// Stage identifier in pipeline order.
+    pub fn pass(&self) -> &'static str {
+        self.pass
+    }
+    /// Resolved stage objective.
+    pub fn measure(&self) -> MeasureId {
+        self.measure
+    }
+    /// Configured trie base objective, otherwise absent.
+    pub fn base_measure(&self) -> Option<MeasureId> {
+        self.base_measure
+    }
+    /// Last committed stage score, absent if its first evaluation failed.
+    pub fn score(&self) -> Option<MeasuredScore> {
+        self.score
+    }
+    /// Charged allowance used by this stage alone.
+    pub fn evaluations_used(&self) -> u64 {
+        self.evaluations_used
+    }
+    /// Whether the stage finished all requested work.
+    pub fn completed(&self) -> bool {
+        self.completed
+    }
+}
+
 /// Owned run projection with optional winner and independent factual accounting.
 ///
 /// Raw scheduler modules and methods remain inaccessible:
@@ -118,9 +156,14 @@ pub struct AttackResult {
     pub(crate) counters: AttackProgress,
     pub(crate) evaluations_used: u64,
     pub(crate) best: Option<AttackBest>,
+    pub(crate) stages: Vec<AttackStageResult>,
 }
 
 impl AttackResult {
+    /// Started stages in pipeline order; empty for HC/PE-only runs.
+    pub fn stages(&self) -> &[AttackStageResult] {
+        &self.stages
+    }
     /// Whole-run stop reason.
     pub fn termination(&self) -> AttackTermination {
         self.termination
@@ -256,6 +299,7 @@ pub struct AttackRunError(Box<AttackRunErrorData>);
 /// Private complete envelope; boxing preserves the public result signature.
 #[derive(Debug)]
 pub(crate) struct AttackRunErrorData {
+    pub(crate) stages: Vec<AttackStageResult>,
     pub(crate) source: AttackRunSource,
     pub(crate) outer_index: Option<u128>,
     pub(crate) start_index: Option<u128>,
@@ -265,6 +309,10 @@ pub(crate) struct AttackRunErrorData {
 }
 
 impl AttackRunError {
+    /// Started stage history retained independently of best projection.
+    pub fn stages(&self) -> &[AttackStageResult] {
+        &self.0.stages
+    }
     pub(crate) fn new(data: AttackRunErrorData) -> Self {
         Self(Box::new(data))
     }
@@ -331,6 +379,7 @@ mod tests {
             TrialEvaluationError::IncompatibleResource(MeasureId::Trie),
         ] {
             let error = AttackRunError::new(AttackRunErrorData {
+                stages: Vec::new(),
                 source: AttackRunSource(RunPayload::Evaluation(payload)),
                 outer_index: None,
                 start_index: None,
@@ -418,6 +467,7 @@ mod tests {
         ] {
             let result = AttackResult {
                 termination,
+                stages: Vec::new(),
                 counters: AttackProgress(CounterSnapshot {
                     evaluations_admitted: u64::MAX - 1,
                     evaluations_completed: u64::MAX - 2,

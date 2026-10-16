@@ -4,6 +4,35 @@ use enigma_core::{
 };
 
 #[test]
+fn hc_pe_runs_have_empty_public_and_wire_stage_histories() {
+    for pe in [false, true] {
+        for (budget, offset, cancelled) in [
+            (100, 0, false),
+            (1, 0, false),
+            (1, 1, false),
+            (100, 0, true),
+        ] {
+            let result = fixture(budget, offset, pe)
+                .run(|_| {}, || cancelled)
+                .unwrap();
+            assert!(result.stages().is_empty());
+            let wire = serde_json::to_value(enigma_core::Event::result(&result, 0)).unwrap();
+            assert_eq!(wire["stages"], serde_json::json!([]));
+            assert_eq!(wire.as_object().unwrap().len(), 5);
+        }
+    }
+    use enigma_core::{AttackStageResult, MeasureId, MeasuredScore};
+    let _: fn(&AttackResult) -> &[AttackStageResult] = AttackResult::stages;
+    let _: fn(&AttackRunError) -> &[AttackStageResult] = AttackRunError::stages;
+    let _: fn(&AttackStageResult) -> &str = AttackStageResult::pass;
+    let _: fn(&AttackStageResult) -> MeasureId = AttackStageResult::measure;
+    let _: fn(&AttackStageResult) -> Option<MeasureId> = AttackStageResult::base_measure;
+    let _: fn(&AttackStageResult) -> Option<MeasuredScore> = AttackStageResult::score;
+    let _: fn(&AttackStageResult) -> u64 = AttackStageResult::evaluations_used;
+    let _: fn(&AttackStageResult) -> bool = AttackStageResult::completed;
+}
+
+#[test]
 fn public_run_error_is_pointer_sized() {
     assert_eq!(
         std::mem::size_of::<AttackRunError>(),

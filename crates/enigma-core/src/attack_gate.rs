@@ -200,7 +200,30 @@ impl AttackGate {
                 "/job/space",
             )
         })?;
-        // Chained stages parse and preflight fully, but stay unexecutable until Task 13.2.
+        // Detached stage declarations are checked after resource/text/count preflight.
+        for (index, stage) in settings.stages().iter().enumerate() {
+            use crate::space::AttackStage;
+            let (name, key, measure) = match *stage {
+                AttackStage::Reswapping { measure } => ("reswapping", "measure", Some(measure)),
+                AttackStage::Measure { measure } => ("measure", "measure", Some(measure)),
+                AttackStage::Trie { base_measure } => ("trie", "base_measure", base_measure),
+            };
+            if measure.is_some_and(|measure| !request.measures().contains(&measure)) {
+                return Err(failure(
+                    "invalid_request",
+                    "stage measure must be declared by the carrier",
+                    &settings.stage_measure_path(index, name, key),
+                ));
+            }
+            if name == "trie" && !request.measures().contains(&crate::MeasureId::Trie) {
+                return Err(failure(
+                    "invalid_request",
+                    "trie stage requires declared trie measure",
+                    &format!("/job/passes/{}", index + 1),
+                ));
+            }
+        }
+        // All stage execution remains unsupported until later Task 13 units.
         if passes.len() != 1 || !settings.stages().is_empty() {
             return Err(failure(
                 "unsupported_pass",
@@ -492,6 +515,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn detached_stage_declarations_keep_explicit_and_default_locations() {
+        let request = bound(&fixture(&['A', 'B']));
+        let domain = domain(&request, &['A', 'B'], 1);
+        for (stage, fields, missing, path) in [
+            ("measure", Value::Null, MeasureId::Ic, "/job/passes/1"),
+            ("measure", json!({}), MeasureId::Ic, "/job/passes/1"),
+            (
+                "measure",
+                json!({"measure":"trie"}),
+                MeasureId::Trie,
+                "/job/attack/measure/measure",
+            ),
+            (
+                "reswapping",
+                json!({}),
+                MeasureId::SinkovTrigram,
+                "/job/passes/1",
+            ),
+            (
+                "reswapping",
+                json!({"measure":"trie"}),
+                MeasureId::Trie,
+                "/job/attack/reswapping/measure",
+            ),
+            ("trie", json!({}), MeasureId::Trie, "/job/passes/1"),
+            (
+                "trie",
+                json!({"base_measure":"entropy"}),
+                MeasureId::Trie,
+                "/job/passes/1",
+            ),
+            (
+                "trie",
+                json!({"base_measure":"trie"}),
+                MeasureId::Trie,
+                "/job/attack/trie/base_measure",
+            ),
+        ] {
+            let mut fragment = json!({"kind":"hill_climb","initial_measure":"entropy",
+                "final_measure":"entropy","switch_pairs":0,"backtrack_pairs":0,
+                "evaluation_budget":1,"start":[]});
+            if !fields.is_null() {
+                fragment[stage] = fields;
+            }
+            let settings = AttackSettings::parse_json(
+                request.definition().alphabet(),
+                &domain,
+                &["hill_climb".into(), stage.into()],
+                &[MeasureId::Entropy, missing],
+                &fragment.to_string(),
+            )
+            .unwrap();
+            let mut current = fixture(&['A', 'B']);
+            current["job"]["measures"] = json!(["entropy"]);
+            current["job"]["passes"] = json!(["hill_climb", stage]);
+            error(
+                &bound(&current),
+                &domain,
+                &settings,
+                "invalid_request",
+                path,
+            );
+        }
+    }
+
     // Independent tiny unordered-pair oracle, used only to check algebraic counts.
     fn oracle(symbols: &[char], mask: Option<&[char]>) -> u128 {
         let mut count = 1;
@@ -627,6 +716,18 @@ mod tests {
             if slots == 8 {
                 assert_eq!(request.candidate_count(), None);
                 error(&request, &domain, &settings, "resource_limit", "/job/space");
+                let staged = AttackSettings::parse_json(
+                    request.definition().alphabet(),
+                    &domain,
+                    &["hill_climb".into(), "measure".into()],
+                    &[MeasureId::Ic, MeasureId::Entropy, MeasureId::Trie],
+                    &json!({"kind":"hill_climb","initial_measure":"ic",
+                        "final_measure":"entropy","switch_pairs":0,"backtrack_pairs":0,
+                        "evaluation_budget":1,"start":[],"measure":{"measure":"trie"}})
+                    .to_string(),
+                )
+                .unwrap();
+                error(&request, &domain, &staged, "resource_limit", "/job/space");
             } else {
                 let gate = AttackGate::check(&request, &domain, &settings).unwrap();
                 assert_eq!(

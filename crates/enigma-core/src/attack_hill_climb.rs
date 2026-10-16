@@ -157,6 +157,7 @@ impl DirectRunOutcome {
             .map(|best| (best.outer_index, best.start_index));
         self.project(counters, domain, measure).map_err(|error| {
             crate::AttackRunError::new(AttackRunErrorData {
+                stages: Vec::new(),
                 source: crate::AttackRunSource(crate::attack_result::RunPayload::Invariant(
                     "accepted best projection failed",
                 )),
@@ -183,6 +184,7 @@ impl DirectRunOutcome {
             DirectRunTermination::Cancelled => AttackTermination::Cancelled,
         };
         Ok(crate::AttackResult {
+            stages: Vec::new(),
             termination,
             counters: crate::AttackProgress(counters),
             evaluations_used: self.evaluations_used,
@@ -435,6 +437,7 @@ impl ControlledPartialRun {
         if let Some(best) = &self.best {
             if best.seeds.seeds.best.is_none() {
                 return Err(crate::AttackRunError::new(AttackRunErrorData {
+                    stages: Vec::new(),
                     source: crate::AttackRunSource(crate::attack_result::RunPayload::Invariant(
                         "accepted best projection failed",
                     )),
@@ -487,6 +490,7 @@ impl ControlledPartialRunError {
             }
         };
         crate::AttackRunError::new(AttackRunErrorData {
+            stages: Vec::new(),
             source: crate::AttackRunSource(source),
             outer_index: self.outer_index,
             start_index: self.seed_index,
@@ -1117,6 +1121,7 @@ impl ControlledDirectError {
             }
         };
         crate::AttackRunError::new(AttackRunErrorData {
+            stages: Vec::new(),
             source: crate::AttackRunSource(source),
             outer_index: self.outer_index,
             start_index,
