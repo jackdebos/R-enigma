@@ -337,7 +337,9 @@ then exactly one terminal `done`; runtime failure emits terminal `error`. Search
 emit `progress`, `candidate`, `checkpoint`, and `hold` according to job lifecycle.
 The first HC/PE release instead uses only `progress` and final `result` (§4.1);
 `candidate`, `checkpoint` and `hold` remain eventual Stage 1 requirements, not part
-of that release. Transform emits no candidate, hold, or checkpoint event. A validated `transform` job
+of that release. Task 14 specifies (not yet implemented) the hold delivered once, as the
+final `result.hold` array ([search-passes §10](search-passes.md#10-hold-list--task-14));
+no live `hold` event. Transform emits no candidate, hold, or checkpoint event. A validated `transform` job
 emits `started`, then exactly one `output` whose `output` member is the transformed
 text, then exactly one terminal `done` with `reason: "completed"`. `done` remains
 solely a lifecycle/reason event shared by transform and future search; it never carries
@@ -394,14 +396,15 @@ The lifecycle below is implemented by the shared production HC/PE adapter;
 legacy search remains unsupported.
 On runtime error, `result` contains only the earlier successfully committed aggregate
 best, or null; do not invent a result for the failing climb. No `done` follows error.
-`result` is final, not a stream of provisional trials or a hold list.
+`result` is final, not a stream of provisional trials; its planned `hold` array is the
+final Task 14 hold ([search-passes §10.7](search-passes.md#107-result-and-wire-projection)).
 
 Payloads below supplement the existing event envelope; `done` stays reason-only:
 
 | Event | Required payload |
 | --- | --- |
 | `progress` | `counters`, `elapsed_ms` |
-| `result` | `best` (object or null), `counters`, `elapsed_ms` |
+| `result` | `stages`, `best` (object or null), `hold` (Task 14, planned), `counters`, `elapsed_ms` |
 | `done` | `reason`: `completed`, `outer_slice_end`, `evaluation_budget`, or `cancelled` |
 | Runtime `error` | Existing `code`, `message`, `location`; additionally `context` |
 
@@ -478,7 +481,7 @@ ordering applies only while delivery succeeds, including final result write/flus
 
 | Action | Mechanism | Result |
 | --- | --- | --- |
-| Cancel (first HC/PE release) | `--cancel-file <path>` marker or a platform signal (`SIGINT`/`SIGTERM`/`SIGHUP`, Windows Ctrl+C/Break); both shipped | Cooperative safe-stop, final `result`, then `done` with `reason: "cancelled"`; no hold/checkpoint promise |
+| Cancel (first HC/PE release) | `--cancel-file <path>` marker or a platform signal (`SIGINT`/`SIGTERM`/`SIGHUP`, Windows Ctrl+C/Break); both shipped | Cooperative safe-stop, final `result`, then `done` with `reason: "cancelled"`; hold per planned Task 14; no checkpoint promise |
 | Pause/resume live job | Not in Stage 1 | Future extension |
 | Resume dead job | `--resume <checkpoint>` | Search only; see §6 |
 | Bound HC/PE search | `space.offset`/`space.limit`, `attack.evaluation_budget` | §4.1 slice/exhaustion/budget reasons; no new `--max-keys` attack control |
@@ -544,8 +547,9 @@ code 130, without a terminal-event guarantee; a JSONL line may be cut. The handl
 replaces inherited ignored dispositions: under `nohup`, a terminal hangup requests a
 safe stop. Use `setsid`, `tmux` or `screen` to outlive the terminal. Windows and
 macOS behavior relies on the `ctrlc` crate and is not verified by tests here.
-Hold remains deferred, not removed from eventual Stage 1 goals; cancellation in the
-first release writes no hold or checkpoint. Checkpoint/resume remains Task 16 under §6.
+Live hold events remain deferred, not removed from eventual Stage 1 goals; cancellation
+will retain the final `result.hold` (planned, search-passes §10.6); it writes no
+checkpoint. Checkpoint/resume remains Task 16 under §6.
 
 ## 6. Checkpoint and resume (record schema deferred)
 
@@ -573,12 +577,15 @@ then the plugboard remainder change fastest. A dimension that is structurally fi
 has a single-value domain contributes one value and does not vary. The plugboard
 remainder enumerates the `size`-element combinations of `candidates` in increasing
 candidate-index order, lexicographically. `offset` skips that many candidates and
-`limit` caps how many are produced, both counted in this one flat order. Task 14 may
-nest deterministic variant selection outside this base order; it does not change the
-order within a variant. Scoring uses integer/fixed-point arithmetic where floating point
+`limit` caps how many are produced, both counted in this one flat order. Variant
+selection, formerly reserved for Task 14, is deferred to a later unassigned task; it
+may nest outside this base order but must not change the order within a variant.
+Scoring uses integer/fixed-point arithmetic where floating point
 could vary, otherwise results are bit-identical. Unordered reductions do not affect
 scores; each candidate is scored independently. Stochastic passes record seed and RNG
-state. Holds order by `(score desc, enumeration index asc)`. These obligations apply
+state. Holds order by `(score desc, enumeration index asc)`; for attacks the index is
+(outer, start) and stages re-rank per
+[search-passes §10](search-passes.md#10-hold-list--task-14). These obligations apply
 only to implemented search jobs. The planned Task 11 attack branch retains the
 per-slot order but slices outer scramblers only; seed/action indices and evaluation
 budgets are separate, as specified in [attack order](search-passes.md#3-pre-execution-gates-and-outer-order).

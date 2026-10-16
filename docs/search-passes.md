@@ -77,7 +77,8 @@ This document specifies `hill_climb` and `partial_exhaustion`, plus the implemen
 control contract in §6.1 and public Core HC/PE facade in §6.2;
 [protocol §4.1](protocol.md#41-planned-hcpe-search-events--task-127) defines first-release
 lifecycle/results/progress, now delivered by the CLI for HC/PE. Chained stages are
-specified in [§9](#9-chained-stages--task-13); checkpoints and variants remain separate work.
+specified in [§9](#9-chained-stages--task-13) and the hold list in [§10](#10-hold-list--task-14);
+checkpoints and variants remain separate work.
 
 ## 1. Two domain branches, no implicit unknown key
 
@@ -156,7 +157,8 @@ path; unknown keys use `unknown_field`. Missing/mismatched attack settings are
 `invalid_request`. Recognized but deferred `reswapping`, `trie`, and `measure`
 remain structurally recognized, but are `unsupported_pass` for Task 11 execution.
 Mixed passes likewise fail before work; no cross-pass hold/objective state exists.
-(Task 13 supersedes this for chained stages after the sole HC/PE pass: §9.)
+(Task 13 supersedes this for chained stages after the sole HC/PE pass: §9; Task 14
+hold: §10.)
 Legacy structural requests without `attack` keep their existing parsing meaning.
 
 Both objectives use already declared and retained Task 10 scorers. All selected
@@ -314,8 +316,8 @@ Budget-only callers retain Task 11 behavior; both controlled paths use fresh
 per-invocation control and evaluation allowances.
 Fallible JSONL projections and the shared timed HC/PE adapter ship in the CLI.
 The CLI `--cancel-file` marker (Task12.12) and platform signals (Task12.13) are
-the external cancellation sources; hold and checkpoint cadence remain deferred.
-Checkpoint/resume belongs to Task 16 and the hold list to Task 14; Task 12 is done.
+the external cancellation sources; checkpoint cadence remains deferred.
+Checkpoint/resume belongs to Task 16 and the hold list to Task 14 (§10); Task 12 is done.
 
 #### Accounting and completion
 
@@ -378,7 +380,7 @@ and at terminal success, cancellation or error. Duplicate snapshots are allowed.
 No callback runs mid-evaluation; cancellation polling is independent of observer
 cadence. Error snapshots retain admitted usage and only successful completions.
 
-This boundary decides no clock, rate, I/O, hold capacity or candidate payload.
+This boundary decides no clock, rate, I/O, hold capacity (§10) or candidate payload.
 The production adapter coalesces at safe callbacks using monotonic elapsed time,
 UTC event timestamps and an internal positive 250 ms interval. It flushes each line,
 emits terminal snapshots without waiting and latches delivery failures with
@@ -458,8 +460,8 @@ u64/u128/i128 values and Q32 units. Transport failures latch cancellation withou
 turning the infallible observer into a fallible evaluator or hiding a runtime error.
 
 First-release JSONL is `started`, optional `progress`, final `result`, then `done`
-or runtime `error`; validation errors remain seq1-only. Holds remain an eventual
-Stage 1 requirement, deferred from this release; no candidate/hold/checkpoint event
+or runtime `error`; validation errors remain seq1-only. Task 14 specifies the hold,
+delivered once as the final `result.hold` array (§10); no candidate/hold/checkpoint event
 is promised. Task16 owns checkpoint/resume. File and POSIX/Windows adapters are
 separately unstarted under [protocol control](protocol.md#5-control); none is shipped.
 
@@ -473,7 +475,7 @@ key, plaintext, final measured/ranking score, absolute outer index and seed/star
 index. A climb interrupted by budget is not completed. An outer candidate is
 completed only after all its climbs finish. Eligible final-scored committed boards
 include the interrupted climb's board, marked incomplete; ties select lowest
-(outer index, seed/start index). No hold capacity is defined; the implemented public
+(outer index, seed/start index). §10 generalizes this best to a top-N hold; the public
 Core projection is §6.2 and wire projection is protocol §4.1.
 Per-climb outcome records whether final-objective ascent occurred and whether its
 legal neighborhood was fully exhausted; final rescoring alone is not optimization.
@@ -528,7 +530,7 @@ checked Q32 scoring, no-reflector decrypt support and deterministic shared budge
 No floating-point score/trajectory parity or guaranteed key recovery is promised.
 Duet/quartet, DFS, mutable fixed facts and additional attacks remain out of scope.
 Public lifecycle/result transport is frozen above and implemented in the production
-HC/PE adapter; hold and checkpoint controls remain Task14/Task16 work.
+HC/PE adapter; the hold is §10 (Task 14) and checkpoint controls remain Task16 work.
 Differential oracle remains Task17.
 
 ## 9. Chained stages — Task 13
@@ -582,8 +584,8 @@ Here `measure` uses default `ic`, so `job.measures` must declare `ic`,
 Stages run sequentially in `job.passes` order on **one** key: the HC/PE run's
 committed best (§7), only when that run terminated `completed` with a best. Each
 stage receives the previous stage's committed key and score and hands on its own.
-There is no hold list (Task 14), checkpoint (Task 16), RNG or parallelism; the
-pipeline is fully deterministic. Every evaluation is a fresh full-message decrypt of
+Task 14 repeats this pipeline per hold entry (§10.5); there is no checkpoint
+(Task 16), RNG or parallelism; the pipeline is fully deterministic. Every evaluation is a fresh full-message decrypt of
 `job.text` from the key's initial positions; slot choices never change, and the
 winner's `outer_index`/`start_index` and HC/PE flags are retained unchanged.
 
@@ -658,3 +660,143 @@ with one entry per started stage, in order, each exactly `pass`, `measure`,
 `evaluations_used` (decimal string) and `completed` (boolean). Unstarted stages have
 no entry: a stage starts at its first evaluation admission, so budget or cancellation
 preventing that admission leaves no history entry. Core mirrors this on `AttackResult`.
+
+## 10. Hold list — Task 14
+
+Status: **specified (14.0), not implemented.** A run keeps the top-N committed
+candidates instead of one best, polishes them with the §9 stages and delivers them
+once, in the final `result`. §1–§9 stay normative except where this section extends
+them. Scope is the hold list only: multi-variant search is deferred to a later,
+unassigned task; live `hold` events and parallelism are out of scope (§10.8).
+Pinned bomm basis: `src/hold.c` (`bomm_hold_add`), `src/attack.c` and `src/query.c`
+(`--num-hold`, default 100) at commit `aeb2f2bf`.
+
+### 10.1 Request field and admission
+
+`job.attack` gains one optional common member, valid for both `hill_climb` and
+`partial_exhaustion`:
+
+| Member | Type and meaning | Omitted default |
+| --- | --- | --- |
+| `hold` | Integer in [1, 1000]: hold capacity N | 100 |
+
+A present value that is not an integer, is fractional, or lies outside [1, 1000]
+is `invalid_request` at `/job/attack/hold`, like `evaluation_budget`; `null` is not
+omission. `hold` is parsed in the §2 settings fragment at its exact-field/type step
+(after raw validation, unknown-member and alphabet checks), so it fails before the
+§3 gate counts and budget, resource binding and `started`, as a seq1-only `error`.
+The upper bound caps retained memory and the final `result` line: each entry owns a
+full plaintext of `job.text`, so output grows as N × text length. 1000 is ten times
+the bomm default. A capacity above the number of climbs is valid; the hold is then
+simply shorter. The hold never changes enumeration, budget or counters.
+
+### 10.2 Entry rule
+
+The HC/PE schedulers offer the hold exactly the candidates they compare against the
+single best today (§7, §6.2): once per climb (direct start or PE seed), at its end,
+the climb's committed board with its required final score, in enumeration order.
+This includes budget- or cancellation-interrupted climbs (flag `incomplete`), whose
+reserved final rescore succeeded. Provisional scan winners, failed climbs, failed
+final rescores and climbs that never obtained an initial score offer nothing; a
+§6.1 safe stop offers no further climb. On a runtime error the hold keeps exactly
+the earlier offers that the Task 12.9a/b retention rules keep for the single best
+(earlier outers and eligible earlier seeds of a failing outer); when outer-completion
+accounting overflows, offers of that outer are discarded with it. Stages (§10.5) do
+not offer new entries; they replace existing ones.
+
+### 10.3 Order, ties, duplicates and capacity
+
+Entries are ordered by `(ranking_q32 desc, enumeration index asc)`, the protocol
+[determinism](protocol.md#7-determinism) hold order. The enumeration index of an
+attack candidate is the pair (absolute unsliced `outer_index`, `start_index`) of §3
+and §4, compared lexicographically; it is unique per climb. Before stages, every
+entry carries its HC/PE `final_measure` score, so all are comparable.
+
+A duplicate is an offer whose complete key equals a held entry's: every resolved
+slot (wheel, position, ring) and the complete plugboard (fixed plus mutable pairs).
+Deterministic scoring gives duplicates equal scores, so the held entry has the
+smaller index; the offer is rejected without evicting anything. Otherwise, while
+fewer than N entries are held, the offer is inserted at its ordered position (after
+equal scores, since it is later). When full, it is inserted only if it orders before
+the last entry, which is then evicted; else it is rejected. Rejected and evicted
+candidates are never reconsidered. The flags and indices of a kept entry are its own.
+
+### 10.4 Compatibility invariant
+
+With N = 1 the run reproduces Task 13 exactly: the same `best`, `stages`,
+termination, counters, usage and runtime-error context. Without listed stages,
+`best` is the first entry for every N and equals today's strict-`>` earliest best.
+
+### 10.5 Stages over the hold
+
+Stages run only when the HC/PE run terminated `completed` with a nonempty hold (§9.2).
+Finalists are processed one at a time, best-first by their pre-stage order; each runs
+the complete §9 pipeline in `job.passes` order from its own committed key and score,
+exactly as §9.2–§9.4 define for one key, keeping its own indices and HC/PE flags.
+All finalists share the one `evaluation_budget`, §6.1 counters and cancellation
+(§9.5); no budget is reserved per finalist. Cancellation is also polled before each
+finalist. After a stop no further stage evaluation runs for any finalist.
+
+Each entry ends in one state:
+
+| State | Meaning | Score |
+| --- | --- | --- |
+| polished | every listed stage completed | last stage's score |
+| partial | some stage started, not all completed (at most one entry, the finalist at stop or error) | §9.6 rule |
+| unpolished | no stage started | HC/PE final score |
+
+Final order: polished entries by `(ranking_q32 desc, enumeration index asc)`, then the
+partial entry, then unpolished entries in pre-stage order. Scores of different
+measures are not comparable (§2, §9.4), so ranking never compares across states;
+polished entries share one final measure and are comparable. Because best-first
+processing reaches the strongest pre-stage candidates first, a stop leaves them
+polished and ahead. After re-ranking, an entry whose complete key equals an earlier
+entry's is removed (polished duplicates have equal scores, so the smaller index
+stays); removed slots are not refilled. With no listed stages every entry is
+trivially polished and the pre-stage order stands.
+
+Termination: the HC/PE termination if not `completed`; otherwise `completed` only
+when every finalist is polished, else `cancelled` or `evaluation_budget` with §9.5
+precedence. A stage error is a runtime `error` (§9.5): its finalist keeps its last
+committed key and score as the partial entry; the hold is retained.
+
+### 10.6 Budget, cancellation and errors
+
+A stop or error never discards held entries: budget and cancellation return the
+retained hold (§10.2 during HC/PE, §10.5 states during stages) in the final
+`result`; a runtime error returns it in the error's `result`. Errors dominate
+cancellation, which dominates budget (§6.1). Stage cost grows with N: with listed
+stages a request that completed under Task 13 may now stop with
+`evaluation_budget`; `hold: 1` keeps the Task 13 cost.
+
+### 10.7 Result and wire projection
+
+`result` gains an additive `hold` array, in final order (§10.5); it is empty exactly
+when `best` is null. Each entry has exactly the nine `best` fields of
+[protocol §4.1](protocol.md#41-planned-hcpe-search-events--task-127) plus `stages`,
+the entry's own stage history in the §9.6 shape (empty when unpolished or without
+stages). The array position is the rank; no separate rank field exists. `best`
+equals the first entry without `stages`, and top-level `result.stages` equals the
+first entry's `stages`, so both keep their Task 13 meaning for N = 1. Entries may
+carry different `score.measure` values; clients must not compare scores across
+measures. Runtime `error` context keeps the §4.1 shape; for a stage error its
+`outer_index`/`start_index` are the failing finalist's. Core mirrors this on
+`AttackResult` with an ordered entry list. Task 16 decides how a checkpoint records
+the hold ([protocol §6](protocol.md#6-checkpoint-and-resume-record-schema-deferred)).
+
+### 10.8 Non-goals and departures from bomm
+
+Not in Task 14: multi-variant search (deferred, unassigned), live or periodic `hold`
+events, threads or a shared concurrent hold, and checkpointing (Task 16).
+
+Deliberate departures from pinned bomm:
+
+- Offers: one final-scored committed board per climb, not every pass result of
+  every key; stages replace an entry in place rather than adding offers, because
+  stage measures differ and §9 polishes one key per pipeline.
+- Stages run on the hold after HC/PE, best-first, not inline per key.
+- Ties order by enumeration index, not thread arrival; duplicates are any equal
+  complete key, not only an equal-score neighbour (equivalent under deterministic
+  scoring), and are re-checked after stages.
+- Capacity is bounded by 1000; re-ranking is tiered by polish state because scores
+  from different measures are not comparable.
