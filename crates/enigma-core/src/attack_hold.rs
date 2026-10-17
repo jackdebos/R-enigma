@@ -50,13 +50,19 @@ impl AttackHold {
         &self.entries
     }
 
+    /// Move the ranked head and unpolished tail into the run envelope.
+    pub(crate) fn into_head_tail(self) -> (Option<AttackBest>, Vec<AttackBest>) {
+        let mut entries = self.into_entries().into_iter();
+        (entries.next(), entries.collect())
+    }
+
     pub(crate) fn into_entries(self) -> Vec<AttackBest> {
         self.entries
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{FixedScore, MeasureId, MeasuredScore, SlotConfiguration, TransformConfiguration};
 
@@ -75,6 +81,38 @@ mod tests {
             incomplete: false,
             final_objective_ascent: true,
             neighborhood_exhausted: true,
+        }
+    }
+
+    /// Compare every payload field and the plaintext allocation without cloning it.
+    pub(crate) fn snapshot(entries: &[AttackBest]) -> Vec<(String, usize)> {
+        entries
+            .iter()
+            .map(|entry| (format!("{entry:?}"), entry.plaintext.as_ptr() as usize))
+            .collect()
+    }
+
+    pub(crate) fn tail_fixture() -> Vec<AttackBest> {
+        let mut last = candidate("tail-last", -9, 7, 8);
+        last.incomplete = true;
+        last.final_objective_ascent = false;
+        last.neighborhood_exhausted = false;
+        vec![candidate("tail-first", -2, 4, 5), last]
+    }
+
+    #[test]
+    fn hold_ownership_consumption_preserves_rank_payload_and_allocations() {
+        for size in 0..=3 {
+            let mut hold = AttackHold::new(3);
+            for index in 0..size {
+                hold.offer(candidate(&format!("key-{index}"), index, index as u128, 2));
+            }
+            let expected = snapshot(hold.entries());
+            let (head, tail) = hold.into_head_tail();
+            assert_eq!(head.is_some(), size > 0);
+            assert_eq!(tail.len(), (size as usize).saturating_sub(1));
+            let actual: Vec<_> = head.into_iter().chain(tail).collect();
+            assert_eq!(snapshot(&actual), expected);
         }
     }
 

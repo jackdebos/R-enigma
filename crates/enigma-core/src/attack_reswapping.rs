@@ -167,6 +167,7 @@ pub(crate) fn reswapping_stage(
                 outer_index: result.best.as_ref().map(|best| best.outer_index),
                 start_index: result.best.as_ref().map(|best| best.start_index),
                 source: crate::AttackRunSource(source),
+                held_tail: result.held_tail,
                 stages: result.stages,
                 evaluations_used: result.evaluations_used,
                 counters: result.counters,
@@ -219,6 +220,7 @@ mod tests {
         let domain = AttackPlugboardDomain::parse_json(&alphabet, &[('F', 'E')], json).unwrap();
         let pairs = [start, &[('E', 'F')]].concat();
         let result = AttackResult {
+            held_tail: crate::attack_hold::tests::tail_fixture(),
             termination: Completed,
             counters: crate::AttackProgress(CounterSnapshot::default()),
             evaluations_used: 5,
@@ -236,6 +238,7 @@ mod tests {
             }),
             stages: Vec::new(),
         };
+        let tail = crate::attack_hold::tests::snapshot(&result.held_tail);
         let (count, log) = (Cell::new(0), RefCell::new(Vec::new()));
         // Capped so a non-terminating scan fails fast instead of exhausting memory.
         let limit = (stop[0] as u64).min(10_000).saturating_add(5);
@@ -263,6 +266,11 @@ mod tests {
         let outcome = reswapping_stage(
             result, measure, &alphabet, &domain, accounting, cancel, evaluate,
         );
+        let retained = match &outcome {
+            Ok(result) => &result.held_tail[..],
+            Err(error) => crate::attack_result::tests::held_tail(error),
+        };
+        assert_eq!(crate::attack_hold::tests::snapshot(retained), tail);
         (outcome, log.into_inner())
     }
 
@@ -352,10 +360,17 @@ mod tests {
     }
 
     #[test]
-    fn mid_scan_error_reports_committed_best_and_score() {
+    fn hold_ownership_reswapping_error_retains_tail_and_committed_best() {
         let error = run(AB_CD, &[("CD", 3)], [N, N, 12]).0.unwrap_err();
         let expected = (CD, 3, "pCD", &[('C', 'D'), ('E', 'F')][..]);
         assert_eq!(best(error.best().unwrap().unwrap()), expected);
+        assert!(matches!(
+            error.run_source().0,
+            RunPayload::Invariant("synthetic trial failure")
+        ));
+        assert_eq!(error.counters().climbs_started(), 0);
+        assert_eq!(error.counters().climbs_completed(), 0);
+        assert_eq!(error.counters().outers_completed(), 0);
         let s = &error.stages()[0];
         let history = (s.score(), s.evaluations_used(), s.completed());
         assert_eq!(history, (Some(score(3)), 12, false));

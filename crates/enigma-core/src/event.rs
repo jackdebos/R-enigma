@@ -478,6 +478,7 @@ mod tests {
         use crate::attack_result::{AttackRunErrorData, AttackRunSource, RunPayload};
         let expected = encoded(&Event::result(&result, u128::MAX));
         let error = crate::AttackRunError::new(AttackRunErrorData {
+            held_tail: Vec::new(),
             stages: Vec::new(),
             source: AttackRunSource(RunPayload::Invariant("injected after accepted winner")),
             outer_index: Some(u128::MAX),
@@ -670,6 +671,7 @@ mod tests {
         ]);
         assert_eq!(encoded(&Event::result(&result, 0))["stages"], expected);
         let error = crate::AttackRunError::new(AttackRunErrorData {
+            held_tail: Vec::new(),
             stages: result.stages,
             source: AttackRunSource(RunPayload::Invariant("injected")),
             outer_index: None,
@@ -971,6 +973,7 @@ mod tests {
                     RunPayload::Invariant(_) => ("invariant", "/job"),
                 };
                 let error = crate::AttackRunError::new(AttackRunErrorData {
+                    held_tail: Vec::new(),
                     stages: Vec::new(),
                     source: AttackRunSource(payload),
                     outer_index: None,
@@ -1090,6 +1093,7 @@ mod tests {
         for outer_index in [None, Some(0), Some(u128::MAX)] {
             for start_index in [None, Some(0), Some(u128::MAX)] {
                 let error = crate::AttackRunError::new(AttackRunErrorData {
+                    held_tail: Vec::new(),
                     stages: Vec::new(),
                     source: AttackRunSource(RunPayload::Invariant("full width")),
                     outer_index,

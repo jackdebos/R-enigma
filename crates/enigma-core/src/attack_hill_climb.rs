@@ -285,6 +285,7 @@ fn scoring_stage(
                 outer_index: result.best.as_ref().map(|best| best.outer_index),
                 start_index: result.best.as_ref().map(|best| best.start_index),
                 source: crate::AttackRunSource(source),
+                held_tail: result.held_tail,
                 stages: result.stages,
                 evaluations_used: result.evaluations_used,
                 counters: result.counters,
@@ -309,6 +310,7 @@ impl DirectRunOutcome {
             .map(|best| (best.outer_index, best.start_index));
         self.project(counters, domain, measure).map_err(|error| {
             crate::AttackRunError::new(AttackRunErrorData {
+                held_tail: Vec::new(),
                 stages: Vec::new(),
                 source: crate::AttackRunSource(crate::attack_result::RunPayload::Invariant(
                     "accepted best projection failed",
@@ -336,6 +338,7 @@ impl DirectRunOutcome {
             DirectRunTermination::Cancelled => AttackTermination::Cancelled,
         };
         Ok(crate::AttackResult {
+            held_tail: Vec::new(),
             stages: Vec::new(),
             termination,
             counters: crate::AttackProgress(counters),
@@ -589,6 +592,7 @@ impl ControlledPartialRun {
         if let Some(best) = &self.best {
             if best.seeds.seeds.best.is_none() {
                 return Err(crate::AttackRunError::new(AttackRunErrorData {
+                    held_tail: Vec::new(),
                     stages: Vec::new(),
                     source: crate::AttackRunSource(crate::attack_result::RunPayload::Invariant(
                         "accepted best projection failed",
@@ -642,6 +646,7 @@ impl ControlledPartialRunError {
             }
         };
         crate::AttackRunError::new(AttackRunErrorData {
+            held_tail: Vec::new(),
             stages: Vec::new(),
             source: crate::AttackRunSource(source),
             outer_index: self.outer_index,
@@ -1303,6 +1308,7 @@ impl ControlledDirectError {
             }
         };
         crate::AttackRunError::new(AttackRunErrorData {
+            held_tail: Vec::new(),
             stages: Vec::new(),
             source: crate::AttackRunSource(source),
             outer_index: self.outer_index,
@@ -2952,14 +2958,18 @@ mod tests {
     }
 
     #[test]
-    fn trie_composition_overflow_keeps_prior_history_best_and_charge() {
+    fn hold_ownership_scoring_failure_keeps_tail_history_best_and_charge() {
         use crate::attack_result::RunPayload;
         use std::error::Error;
         let request = direct_request_with(serde_json::json!([]), true, false, |job| {
             job["passes"] = serde_json::json!(["hill_climb", "measure"]);
             job["attack"]["measure"] = serde_json::json!({"measure":"ic"});
         });
-        let result = request.run(|_| {}, || false).unwrap();
+        let mut result = request.run(|_| {}, || false).unwrap();
+        result.held_tail = crate::attack_hold::tests::tail_fixture();
+        let tail = crate::attack_hold::tests::snapshot(&result.held_tail);
+        let indices = result.best.as_ref().map(|b| (b.outer_index, b.start_index));
+        let prior_counters = result.counters;
         let used = result.evaluations_used;
         let key = result.best.as_ref().unwrap().configuration.clone();
         let score = result.best.as_ref().unwrap().score;
@@ -2989,6 +2999,23 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.best().unwrap().unwrap().configuration(), &key);
         assert_eq!(error.best().unwrap().unwrap().score(), score);
+        assert_eq!(
+            crate::attack_hold::tests::snapshot(crate::attack_result::tests::held_tail(&error)),
+            tail
+        );
+        assert_eq!(error.outer_index().zip(error.start_index()), indices);
+        assert_eq!(
+            error.counters().climbs_started(),
+            prior_counters.climbs_started()
+        );
+        assert_eq!(
+            error.counters().climbs_completed(),
+            prior_counters.climbs_completed()
+        );
+        assert_eq!(
+            error.counters().outers_completed(),
+            prior_counters.outers_completed()
+        );
         assert_eq!(error.stages()[0].pass(), "measure");
         assert_eq!(error.stages()[0].score(), prior_score);
         assert_eq!(error.evaluations_used(), used + 1);

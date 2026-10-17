@@ -156,6 +156,8 @@ pub struct AttackResult {
     pub(crate) counters: AttackProgress,
     pub(crate) evaluations_used: u64,
     pub(crate) best: Option<AttackBest>,
+    // Unpolished finalists; only the head runs stages until Task 14.3.
+    pub(crate) held_tail: Vec<AttackBest>,
     pub(crate) stages: Vec<AttackStageResult>,
 }
 
@@ -309,6 +311,9 @@ pub struct AttackRunError(Box<AttackRunErrorData>);
 /// Private complete envelope; boxing preserves the public result signature.
 #[derive(Debug)]
 pub(crate) struct AttackRunErrorData {
+    // Retained privately until Task 14 result projection consumes this field.
+    #[allow(dead_code)]
+    pub(crate) held_tail: Vec<AttackBest>,
     pub(crate) stages: Vec<AttackStageResult>,
     pub(crate) source: AttackRunSource,
     pub(crate) outer_index: Option<u128>,
@@ -372,8 +377,12 @@ impl std::error::Error for AttackRunError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn held_tail(error: &AttackRunError) -> &[AttackBest] {
+        &error.0.held_tail
+    }
 
     #[test]
     fn injected_private_causes_preserve_public_downcast_chain() {
@@ -389,6 +398,7 @@ mod tests {
             TrialEvaluationError::IncompatibleResource(MeasureId::Trie),
         ] {
             let error = AttackRunError::new(AttackRunErrorData {
+                held_tail: Vec::new(),
                 stages: Vec::new(),
                 source: AttackRunSource(RunPayload::Evaluation(payload)),
                 outer_index: None,
@@ -476,6 +486,7 @@ mod tests {
             AttackTermination::Cancelled,
         ] {
             let result = AttackResult {
+                held_tail: Vec::new(),
                 termination,
                 stages: Vec::new(),
                 counters: AttackProgress(CounterSnapshot {
