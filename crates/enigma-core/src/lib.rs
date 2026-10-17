@@ -49,8 +49,6 @@ mod attack_control;
 mod attack_evaluator;
 mod attack_gate;
 mod attack_hill_climb;
-// TODO(14.2): remove this allowance when the schedulers use the hold.
-#[allow(dead_code)]
 mod attack_hold;
 mod attack_neighborhood;
 mod attack_result;

@@ -332,6 +332,19 @@ impl AttackRunError {
         Self(Box::new(data))
     }
 
+    pub(crate) fn with_held(mut self, head: Option<AttackBest>, tail: Vec<AttackBest>) -> Self {
+        if head.is_some() {
+            self.0.best = Ok(head);
+        }
+        self.0.held_tail = tail;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn held_tail(&self) -> &[AttackBest] {
+        &self.0.held_tail
+    }
+
     /// Original owned runtime cause, independent of best projection failure.
     pub fn run_source(&self) -> &AttackRunSource {
         &self.0.source

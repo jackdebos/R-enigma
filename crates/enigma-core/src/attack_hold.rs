@@ -1,4 +1,4 @@
-//! Private bounded finalists; scheduler integration belongs to Task 14.2.
+//! Private bounded canonical finalists shared by attack schedulers.
 
 use crate::AttackBest;
 
@@ -46,6 +46,7 @@ impl AttackHold {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn entries(&self) -> &[AttackBest] {
         &self.entries
     }

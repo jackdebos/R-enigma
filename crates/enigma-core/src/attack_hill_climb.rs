@@ -21,7 +21,7 @@ pub(crate) struct DirectOuterOutcome {
 }
 
 #[derive(Debug)]
-enum ProjectionError {
+pub(crate) enum ProjectionError {
     MissingCommittedBoard,
     Board(crate::attack_evaluator::TrialBoardError),
 }
@@ -95,6 +95,54 @@ impl DirectOuterOutcome {
     }
 }
 
+/// Capacity one deliberately keeps raw selection and terminal projection timing.
+struct DirectAcceptance(Option<crate::attack_hold::AttackHold>);
+
+impl DirectAcceptance {
+    fn new(capacity: usize) -> Self {
+        Self((capacity > 1).then(|| crate::attack_hold::AttackHold::new(capacity)))
+    }
+
+    fn accept(
+        &mut self,
+        outcome: DirectOuterOutcome,
+        domain: &AttackPlugboardDomain,
+        measure: MeasureId,
+    ) -> Result<Option<DirectOuterOutcome>, ProjectionError> {
+        match &mut self.0 {
+            None => Ok(Some(outcome)),
+            Some(hold) => {
+                // N > 1 validates every eligible offer, including eventual losers.
+                hold.offer(outcome.project(domain, measure)?);
+                Ok(None)
+            }
+        }
+    }
+
+    fn finish(
+        self,
+        run: Result<DirectRunOutcome, Box<ControlledDirectError>>,
+        counters: crate::attack_control::CounterSnapshot,
+        domain: &AttackPlugboardDomain,
+        measure: MeasureId,
+    ) -> Result<crate::AttackResult, crate::AttackRunError> {
+        let result = match run {
+            Ok(outcome) => outcome.project_public(counters, domain, measure),
+            Err(error) => Err(error.project(domain, measure)),
+        };
+        let Some(hold) = self.0 else { return result };
+        let (head, tail) = hold.into_head_tail();
+        match result {
+            Ok(mut result) => {
+                result.best = head;
+                result.held_tail = tail;
+                Ok(result)
+            }
+            Err(error) => Err(error.with_held(head, tail)),
+        }
+    }
+}
+
 struct ProgressObserver<F>(F);
 
 impl<F: FnMut(crate::AttackProgress)> CounterObserver for ProgressObserver<F> {
@@ -135,19 +183,22 @@ impl crate::AttackRequest {
                 Err(error) => Err(error.project(self.domain(), self.settings().final_measure())),
             }
         } else {
-            match self.schedule_direct_outers_using(
+            let mut acceptance = DirectAcceptance::new(self.settings().hold_capacity());
+            let run = self.schedule_direct_outers_using(
                 &mut allowance,
                 &mut control,
                 &mut observer,
                 &mut cancel_requested,
-            ) {
-                Ok(outcome) => outcome.project_public(
-                    control.snapshot(),
-                    self.domain(),
-                    self.settings().final_measure(),
-                ),
-                Err(error) => Err(error.project(self.domain(), self.settings().final_measure())),
-            }
+                |outcome| {
+                    acceptance.accept(outcome, self.domain(), self.settings().final_measure())
+                },
+            );
+            acceptance.finish(
+                run,
+                control.snapshot(),
+                self.domain(),
+                self.settings().final_measure(),
+            )
         }?;
         let mut result = result;
         if result.termination == crate::AttackTermination::Completed && result.best.is_some() {
@@ -392,6 +443,7 @@ pub(crate) enum DirectRunError {
     Climb(DirectClimbError),
     Counter(CounterOverflow),
     MissingOuter,
+    Projection(ProjectionError),
 }
 
 impl From<ObservedClimbError> for DirectRunError {
@@ -912,6 +964,7 @@ impl crate::AttackRequest {
             control,
             observer,
             requested,
+            |outcome| Ok(Some(outcome)),
         )
     }
 
@@ -921,6 +974,7 @@ impl crate::AttackRequest {
         control: &mut AttackControl,
         observer: &mut impl CounterObserver,
         mut requested: impl FnMut() -> bool,
+        accept: impl FnMut(DirectOuterOutcome) -> Result<Option<DirectOuterOutcome>, ProjectionError>,
     ) -> Result<DirectRunOutcome, Box<ControlledDirectError>> {
         control.notify(observer);
         let result = if self.settings().kind() != crate::AttackKind::HillClimb {
@@ -960,6 +1014,7 @@ impl crate::AttackRequest {
                         climb,
                     })
                 },
+                accept,
             )
         };
         control.notify(observer);
@@ -1293,7 +1348,12 @@ impl ControlledDirectError {
             DirectRunError::Resolution(_) | DirectRunError::MissingOuter => None,
             _ => self.outer_index.map(|_| 0),
         };
+        let mut projection_error = None;
         let source = match self.source {
+            DirectRunError::Projection(error) => {
+                projection_error = Some(error);
+                RunPayload::Invariant("accepted best projection failed")
+            }
             DirectRunError::Resolution(diagnostics) => RunPayload::Resolution(diagnostics),
             DirectRunError::Climb(DirectClimbError::Evaluation(source)) => {
                 RunPayload::Evaluation(source)
@@ -1315,11 +1375,14 @@ impl ControlledDirectError {
             start_index,
             evaluations_used: self.evaluations_used,
             counters: crate::AttackProgress(self.counters),
-            best: self
-                .best
-                .map(|best| best.project(domain, measure))
-                .transpose()
-                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>),
+            best: if let Some(error) = projection_error {
+                Err(Box::new(error))
+            } else {
+                self.best
+                    .map(|best| best.project(domain, measure))
+                    .transpose()
+                    .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
+            },
         })
     }
 }
@@ -1340,6 +1403,7 @@ fn schedule_controlled_direct<O: CounterObserver, F: FnMut() -> bool>(
         &mut ObservedAccounting<'_, O>,
         &mut F,
     ) -> Result<DirectOuterOutcome, DirectRunError>,
+    mut accept: impl FnMut(DirectOuterOutcome) -> Result<Option<DirectOuterOutcome>, ProjectionError>,
 ) -> Result<DirectRunOutcome, Box<ControlledDirectError>> {
     accounting.control.notify(accounting.observer);
     let before = accounting.control.snapshot();
@@ -1385,7 +1449,17 @@ fn schedule_controlled_direct<O: CounterObserver, F: FnMut() -> bool>(
             result.climbs_completed = now.climbs_completed - before.climbs_completed;
             result.outer_completed = now.outers_completed - before.outers_completed;
             result.evaluations_used = accounting.allowance.used;
-            if let Some(current) = &outcome.climb.current {
+            let outcome = if outcome.climb.current.is_some() {
+                accept(outcome).map_err(|source| IndexedDirectRunError {
+                    outer_index: Some(index),
+                    evaluations_used: accounting.allowance.used,
+                    source: DirectRunError::Projection(source),
+                })?
+            } else {
+                None
+            };
+            if let Some(outcome) = outcome {
+                let current = outcome.climb.current.as_ref().expect("accepted board");
                 if result.best.as_ref().is_none_or(|best| {
                     current.score.ranking().units()
                         > best
@@ -4866,6 +4940,10 @@ mod tests {
     }
 
     fn projection_fixture() -> (crate::AttackRequest, DirectOuterOutcome) {
+        projection_fixture_at("é")
+    }
+
+    fn projection_fixture_at(position: &str) -> (crate::AttackRequest, DirectOuterOutcome) {
         let alphabet = ["🦀", "é", "Ω", "中"];
         let json = serde_json::json!({
             "protocol_version": 1, "machine": {"definition": {"kind": "custom", "value": {
@@ -4873,7 +4951,7 @@ mod tests {
                 "slots": [{"id": "r", "role": "rotor", "movement": "fixed", "wheel": "r"}],
                 "stepping": {"rules": []}
             }}}, "job": {
-                "kind": "search", "configuration": {"slots": [{"id": "r", "position": "é", "ring": "Ω"}],
+                "kind": "search", "configuration": {"slots": [{"id": "r", "position": position, "ring": "Ω"}],
                     "plugboard": [["中", "é"]]}, "text": "🦀🦀", "measures": ["ic"], "passes": ["hill_climb"],
                 "space": {"plugboard": {"kind": "attack", "symbols": ["🦀", "Ω"], "max_pairs": 2}},
                 "attack": {"kind": "hill_climb", "initial_measure": "ic", "final_measure": "ic",
@@ -4893,6 +4971,257 @@ mod tests {
             )
             .unwrap();
         (request, outcome)
+    }
+
+    #[test]
+    fn hc_hold_canonical_rank_ties_and_eviction() {
+        let (request, _) = projection_fixture();
+        let mut acceptance = DirectAcceptance::new(2);
+        for (index, rank, empty, reverse) in [
+            (0, -9, false, false),
+            (1, -9, false, true),
+            (2, 4, true, false),
+            (3, 4, false, false),
+        ] {
+            let (_, mut outcome) = projection_fixture();
+            outcome.outer_index = index;
+            let current = outcome.climb.current.as_mut().unwrap();
+            current.score = MeasuredScore::higher_is_better(FixedScore::from_units(rank));
+            if empty {
+                current.board.clear();
+            } else if reverse {
+                for pair in &mut current.board {
+                    *pair = (pair.1, pair.0);
+                }
+            }
+            // A distinct slot key permits capacity eviction; the equal rank keeps index 2 first.
+            if index == 3 {
+                outcome.initial = projection_fixture_at("Ω").1.initial;
+            }
+            acceptance
+                .accept(outcome, request.domain(), MeasureId::Ic)
+                .unwrap();
+            if index == 1 {
+                let entries = acceptance.0.as_ref().unwrap().entries();
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].outer_index(), 0);
+            }
+        }
+        let entries = acceptance.0.unwrap().into_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries.iter().map(|e| e.outer_index).collect::<Vec<_>>(),
+            [2, 3]
+        );
+        assert_eq!(entries[1].mutable_plugboard, [('🦀', 'Ω')]);
+    }
+
+    // Synthetic internal faults are unreachable through validated external requests.
+    fn hc_hold_fault_run(
+        capacity: usize,
+        fault: u8,
+    ) -> Result<crate::AttackResult, crate::AttackRunError> {
+        let (request, _) = projection_fixture();
+        let mut acceptance = DirectAcceptance::new(capacity);
+        let mut control = AttackControl::default();
+        let mut observer = Recorder::default();
+        let mut allowance = EvaluationAllowance {
+            used: 0,
+            limit: 100,
+        };
+        let outers = ["é", "Ω", "中"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| (i as u128, Ok(projection_fixture_at(p).1.initial)));
+        let run = schedule_controlled_direct(
+            3,
+            outers,
+            &mut ObservedAccounting {
+                allowance: &mut allowance,
+                control: &mut control,
+                observer: &mut observer,
+            },
+            &mut || false,
+            |initial, index, accounting, requested| {
+                if (fault == 4 && index == 1) || (fault == 8 && index == 2) {
+                    return Err(DirectRunError::Climb(DirectClimbError::Evaluation(
+                        TrialEvaluationError::Model(crate::ModelError::UnknownSymbol('Z')),
+                    )));
+                }
+                let (scoring, start) = request.direct_scoring(&initial).unwrap();
+                let climb = scoring
+                    .climb_cancellable(start, 2, accounting, requested)
+                    .map_err(DirectRunError::from)?;
+                let mut outcome = DirectOuterOutcome {
+                    initial,
+                    outer_index: index,
+                    start_index: 0,
+                    climb,
+                };
+                let current = outcome.climb.current.as_mut().unwrap();
+                current.score =
+                    MeasuredScore::higher_is_better(FixedScore::from_units(index as i128));
+                if (fault == 2 && index == 2) || ((fault == 3 || fault == 4) && index == 0) {
+                    current.board.push(('Z', '🦀'));
+                }
+                if index == 2 {
+                    if fault == 1 {
+                        let mut counters = accounting.control.snapshot();
+                        counters.outers_completed = u128::MAX;
+                        *accounting.control = AttackControl::with_counters(counters);
+                    } else if fault >= 5 {
+                        outcome.climb.neighborhood_exhausted = false;
+                        outcome.climb.cancelled = fault == 6;
+                        outcome.climb.budget_stopped = fault != 6;
+                        if fault == 7 {
+                            outcome.climb.current = None;
+                        }
+                    }
+                }
+                Ok(outcome)
+            },
+            |outcome| acceptance.accept(outcome, request.domain(), MeasureId::Ic),
+        );
+        assert_eq!(observer.0.last(), Some(&control.snapshot()));
+        let result = acceptance.finish(run, control.snapshot(), request.domain(), MeasureId::Ic);
+        let (used, counters) = match &result {
+            Ok(r) => (r.evaluations_used, r.counters),
+            Err(e) => (e.evaluations_used(), e.counters()),
+        };
+        assert_eq!(used, allowance.used);
+        assert_eq!(counters, crate::AttackProgress(control.snapshot()));
+        result
+    }
+
+    #[test]
+    fn hc_hold_transactional_overflow_and_projection_faults() {
+        use crate::AttackRunCategory::{Counter, Evaluation, Invariant};
+        for (fault, category, outers) in [
+            (1, Counter, u128::MAX),
+            (2, Invariant, 3),
+            (8, Evaluation, 2),
+        ] {
+            let error = hc_hold_fault_run(2, fault).unwrap_err();
+            assert_eq!(error.outer_index(), Some(2));
+            assert_eq!(error.start_index(), Some(0));
+            assert_eq!(error.best().unwrap().unwrap().outer_index(), 1);
+            assert_eq!(error.held_tail()[0].outer_index(), 0);
+            assert_eq!(error.held_tail().len(), 1);
+            assert_eq!(error.counters().outers_completed(), outers);
+            assert_eq!(error.run_source().category(), category);
+            if fault == 1 {
+                assert_eq!(
+                    error.run_source().overflow(),
+                    Some(crate::AttackCounterOverflow::OutersCompleted)
+                );
+            } else if fault == 2 {
+                assert!(error.to_string().contains("projection failed"));
+            } else {
+                assert!(matches!(
+                    error.run_source().0,
+                    crate::attack_result::RunPayload::Evaluation(TrialEvaluationError::Model(
+                        crate::ModelError::UnknownSymbol('Z')
+                    ))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn hc_hold_capacity_one_keeps_lazy_projection_and_original_fault() {
+        assert_eq!(
+            hc_hold_fault_run(1, 3).unwrap().best.unwrap().outer_index(),
+            2
+        );
+        let eager = hc_hold_fault_run(3, 3).unwrap_err();
+        assert_eq!(eager.outer_index(), Some(0));
+        assert_eq!(
+            eager.run_source().category(),
+            crate::AttackRunCategory::Invariant
+        );
+        assert!(eager.best().is_err());
+        let lazy = hc_hold_fault_run(1, 4).unwrap_err();
+        assert_eq!(lazy.outer_index(), Some(1));
+        assert_eq!(
+            lazy.run_source().category(),
+            crate::AttackRunCategory::Evaluation
+        );
+        assert!(lazy
+            .best()
+            .unwrap_err()
+            .downcast_ref::<ProjectionError>()
+            .is_some());
+        assert!(matches!(
+            lazy.run_source().0,
+            crate::attack_result::RunPayload::Evaluation(TrialEvaluationError::Model(
+                crate::ModelError::UnknownSymbol('Z')
+            ))
+        ));
+    }
+
+    #[test]
+    fn hc_hold_interrupted_scored_and_unstarted_offers() {
+        let actual = scheduler_request(100, false, false, 0)
+            .run(|_| {}, || false)
+            .unwrap();
+        assert_eq!(actual.held_tail.len(), 2);
+        for fault in [5, 6, 7] {
+            let result = hc_hold_fault_run(3, fault).unwrap();
+            assert_eq!(
+                result.termination,
+                if fault == 6 {
+                    crate::AttackTermination::Cancelled
+                } else {
+                    crate::AttackTermination::EvaluationBudget
+                }
+            );
+            let head = result.best.unwrap();
+            assert_eq!(head.outer_index(), if fault == 7 { 1 } else { 2 });
+            assert_eq!(head.incomplete(), fault != 7);
+            assert_eq!(result.held_tail.len(), if fault == 7 { 1 } else { 2 });
+        }
+    }
+
+    #[test]
+    fn hc_hold_capacity_one_matches_raw_observation_and_polling() {
+        for (budget, stop) in [(100, usize::MAX), (1, usize::MAX), (100, 3), (100, 10)] {
+            let request = direct_request_with(serde_json::json!([]), false, false, |job| {
+                job["attack"]["hold"] = serde_json::json!(1);
+                job["attack"]["evaluation_budget"] = serde_json::json!(budget);
+            });
+            let mut control = AttackControl::default();
+            let mut observer = Recorder::default();
+            let mut expected_polls = 0;
+            let raw = request
+                .schedule_direct_outers_controlled(&mut control, &mut observer, || {
+                    expected_polls += 1;
+                    expected_polls == stop
+                })
+                .unwrap();
+            let expected = raw
+                .project_public(
+                    control.snapshot(),
+                    request.domain(),
+                    request.settings().final_measure(),
+                )
+                .unwrap();
+            let mut snapshots = Vec::new();
+            let mut polls = 0;
+            let actual = request
+                .run(
+                    |p| snapshots.push(p.0),
+                    || {
+                        polls += 1;
+                        polls == stop
+                    },
+                )
+                .unwrap();
+            assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+            // The public facade adds its existing terminal notification after stages.
+            observer.0.push(control.snapshot());
+            assert_eq!(snapshots, observer.0);
+            assert_eq!(polls, expected_polls);
+        }
     }
 
     #[test]
@@ -5115,6 +5444,7 @@ mod tests {
                     climb,
                 })
             },
+            |outcome| Ok(Some(outcome)),
         )
         .unwrap_err();
         assert!(matches!(error.source, DirectRunError::MissingOuter));
@@ -5396,6 +5726,7 @@ mod tests {
                         climb,
                     })
                 },
+                |outcome| Ok(Some(outcome)),
             )
             .unwrap_err();
             assert_eq!(error.outer_index, Some(1));
@@ -5529,6 +5860,7 @@ mod tests {
                         climb,
                     })
                 },
+                |outcome| Ok(Some(outcome)),
             )
             .unwrap_err();
             assert_eq!(error.outer_index, Some(index));
