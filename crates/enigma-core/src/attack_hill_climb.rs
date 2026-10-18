@@ -560,6 +560,8 @@ struct ControlledPartialError {
     seed_index: Option<u128>,
     source: ControlledPartialSource,
     best: Option<Box<(ResolvedConfiguration, SeedBest)>>,
+    /// Earlier eligible seeds of the failing outer; capacities above one only.
+    held: Option<Box<crate::attack_hold::AttackHold>>,
 }
 
 impl ControlledPartialError {
@@ -573,7 +575,24 @@ impl ControlledPartialError {
             seed_index: error.seed_index,
             source: ControlledPartialSource::Climb(error.source),
             best: error.best.map(|best| Box::new((initial, *best))),
+            held: None,
         }
+    }
+}
+
+/// Offers outer-local entries in enumeration order; `offer` keeps earlier duplicates.
+fn merge_held(
+    global: &mut Option<crate::attack_hold::AttackHold>,
+    local: Option<crate::attack_hold::AttackHold>,
+) {
+    match (global.as_mut(), local) {
+        (Some(global), Some(local)) => {
+            local
+                .into_entries()
+                .into_iter()
+                .for_each(|e| global.offer(e));
+        }
+        (_, local) => *global = global.take().or(local),
     }
 }
 
@@ -843,6 +862,7 @@ impl crate::AttackRequest {
                     seed_index: None,
                     source: ControlledPartialSource::UnsupportedPass,
                     best: None,
+                    held: None,
                 });
             }
             let first = settings.initial_measure();
@@ -886,8 +906,9 @@ impl crate::AttackRequest {
                         ControlFlow::Continue(None)
                     },
                 )
-                .map_err(|error| {
-                    ControlledPartialError::from_seed(outer_index, initial.clone(), error)
+                .map_err(|error| ControlledPartialError {
+                    held: held.take().map(Box::new),
+                    ..ControlledPartialError::from_seed(outer_index, initial.clone(), error)
                 })?;
             if let Some((seed_index, source)) = fault {
                 return Err(ControlledPartialError {
@@ -895,6 +916,7 @@ impl crate::AttackRequest {
                     seed_index: Some(seed_index),
                     source: ControlledPartialSource::Projection(source),
                     best: None,
+                    held: held.map(Box::new),
                 });
             }
             Ok(ControlledPartialOutcome {
@@ -1370,6 +1392,7 @@ fn schedule_controlled_partial_with_climb<O: CounterObserver, F: FnMut() -> bool
                         best = Some(candidate);
                     }
                 }
+                merge_held(&mut result.held, error.held.map(|held| *held));
                 ControlledPartialRunError {
                     outer_index: Some(error.outer_index),
                     seed_index: error.seed_index,
@@ -1407,15 +1430,7 @@ fn schedule_controlled_partial_with_climb<O: CounterObserver, F: FnMut() -> bool
             result.climbs_completed = now.climbs_completed - before.climbs_completed;
             result.evaluations_used = accounting.allowance.used;
             // Accepted outers merge in order; equal-capacity local holds lose nothing.
-            match (&mut result.held, outcome.held.take()) {
-                (Some(global), Some(local)) => {
-                    local
-                        .into_entries()
-                        .into_iter()
-                        .for_each(|e| global.offer(e));
-                }
-                (global, local) => *global = global.take().or(local),
-            }
+            merge_held(&mut result.held, outcome.held.take());
             if let Some(seed) = &outcome.seeds.seeds.best {
                 if result.best.as_ref().is_none_or(|best| {
                     seed.current.score.ranking().units()
@@ -3390,6 +3405,7 @@ mod tests {
                             CounterOverflow::ClimbsStarted,
                         )),
                         best: retained.take().map(Box::new),
+                        held: None,
                     })
                 },
             )
@@ -5372,9 +5388,16 @@ mod tests {
             outers_completed: if fault == 1 { u128::MAX - 1 } else { 0 },
             ..Default::default()
         });
+        // Fault 4 drops the third outer; fault 5 makes it unresolvable.
+        let outers = request
+            .outer_candidates()
+            .take(if fault == 4 { 2 } else { 3 });
         let run = schedule_controlled_partial_with_climb(
             3,
-            request.outer_candidates(),
+            outers.map(|(i, outer)| match (fault, i) {
+                (5, 2) => (i, Err(Vec::new())),
+                _ => (i, outer),
+            }),
             &mut ObservedAccounting {
                 allowance: &mut EvaluationAllowance {
                     used: 0,
@@ -5473,11 +5496,24 @@ mod tests {
                 fault == 2,
                 error.to_string().contains("seed projection failed")
             );
-            // Only the earlier accepted outer survives; for the evaluation fault,
-            // dropping outer 1's seed 0 is the accepted 14.2c2 transitional gap.
+            // Overflow discards outer 1; seed faults keep its earlier seeds
+            // (seed 1 duplicates seed 0) but never the failing seed.
+            let kept: &[_] = match fault {
+                1 => &[(0, 0), (0, 3)],
+                _ => &[(0, 0), (1, 0), (0, 3)],
+            };
             assert_eq!(
                 pe_hold_indices(error.best().unwrap(), error.held_tail()),
-                [(0, 0), (0, 3)]
+                kept
+            );
+        }
+        // Missing-outer and resolution errors keep every earlier accepted offer.
+        for (fault, outer) in [(4, None), (5, Some(2))] {
+            let error = pe_hold_fault_run(4, fault).unwrap_err();
+            assert_eq!(error.outer_index(), outer);
+            assert_eq!(
+                pe_hold_indices(error.best().unwrap(), error.held_tail()),
+                [(0, 0), (1, 2), (1, 0), (0, 3)]
             );
         }
         // Capacity one keeps lazy projection and the raw 12.9a/b retained best.
