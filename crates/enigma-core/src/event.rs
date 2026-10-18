@@ -229,9 +229,8 @@ pub enum Event {
     },
     /// Final committed search winner and factual whole-run snapshot.
     Result {
-        /// Final ordered success finalists; omitted on runtime errors until error projection.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        hold: Option<Vec<HoldResult>>,
+        /// Final ordered finalists; empty only when no winner is retained.
+        hold: Vec<HoldResult>,
         /// Started stages in pipeline order, including on runtime failure.
         stages: Vec<StageResult>,
         /// Null only when the runtime result genuinely has no winner.
@@ -298,7 +297,7 @@ impl Event {
             result.best(),
             result.counters(),
             result.stages(),
-            Some(result.hold().map(HoldResult::from).collect()),
+            result.hold().map(HoldResult::from).collect(),
             elapsed_ms,
         )
     }
@@ -307,7 +306,7 @@ impl Event {
         best: Option<&AttackBest>,
         counters: AttackProgress,
         stages: &[crate::AttackStageResult],
-        hold: Option<Vec<HoldResult>>,
+        hold: Vec<HoldResult>,
         elapsed_ms: u128,
     ) -> Self {
         Self::Result {
@@ -327,12 +326,15 @@ impl Event {
         error: &AttackRunError,
         elapsed_ms: u128,
     ) -> Result<(Self, Self), RuntimeProjectionError<'_>> {
-        let best = error
-            .best()
+        let hold: Vec<_> = error
+            .hold()
             .map_err(|best_projection| RuntimeProjectionError {
                 original: error,
                 best_projection,
-            })?;
+            })?
+            .map(HoldResult::from)
+            .collect();
+        let best = error.best().expect("hold validated best projection");
         let source = error.run_source();
         let diagnostics: Vec<_> = source
             .diagnostics()
@@ -368,8 +370,7 @@ impl Event {
             },
         };
         Ok((
-            // Preserve the legacy error shape; do not claim a full hold from best alone.
-            Self::result_snapshot(best, error.counters(), error.stages(), None, elapsed_ms),
+            Self::result_snapshot(best, error.counters(), error.stages(), hold, elapsed_ms),
             Self::Error {
                 code: "internal_error".to_owned(),
                 message,
@@ -500,21 +501,88 @@ mod tests {
     // not evidence that validated public requests naturally fail.
     fn assert_runtime_winner_projection(result: crate::AttackResult) {
         use crate::attack_result::{AttackRunErrorData, AttackRunSource, RunPayload};
-        let mut expected = encoded(&Event::result(&result, u128::MAX));
-        expected.as_object_mut().unwrap().remove("hold");
+        let expected = encoded(&Event::result(&result, u128::MAX));
         let error = crate::AttackRunError::new(AttackRunErrorData {
-            held_tail: Vec::new(),
-            stages: Vec::new(),
+            held_tail: result.held_tail,
+            stages: result.stages,
             source: AttackRunSource(RunPayload::Invariant("injected after accepted winner")),
             outer_index: Some(u128::MAX),
             start_index: None,
-            evaluations_used: result.evaluations_used(),
-            counters: result.counters(),
+            evaluations_used: result.evaluations_used,
+            counters: result.counters,
             best: Ok(result.best),
         });
         let (projected, terminal) = Event::runtime_error(&error, u128::MAX).unwrap();
         assert_eq!(encoded(&projected), expected);
         assert_eq!(encoded(&terminal)["context"]["source"]["kind"], "invariant");
+    }
+
+    #[test]
+    fn error_hold_borrows_and_projects_all_retained_histories() {
+        use crate::attack_result::{AttackRunErrorData, AttackRunSource, RunPayload};
+        // Inject a post-rerank error envelope; this is not a naturally failing request.
+        let mut result = result_fixture(false, 0);
+        for (index, completed) in [(7, true), (3, false)] {
+            let mut entry = result_fixture(false, 0).best.take().unwrap();
+            entry.outer_index = index;
+            entry.start_index = index + 1;
+            entry.stages.push(crate::AttackStageResult {
+                pass: "measure",
+                measure: crate::MeasureId::Ic,
+                base_measure: None,
+                score: Some(entry.score()),
+                evaluations_used: index as u64,
+                completed,
+            });
+            result.held_tail.push(entry);
+        }
+        result.stages = result.held_tail[0].stages.clone();
+        result.stages[0].evaluations_used = 1;
+        let expected = encoded(&Event::result(&result, 29));
+        let error = crate::AttackRunError::new(AttackRunErrorData {
+            held_tail: result.held_tail,
+            stages: result.stages,
+            source: AttackRunSource(RunPayload::Invariant("injected stage failure")),
+            outer_index: Some(3),
+            start_index: Some(4),
+            evaluations_used: 11,
+            counters: result.counters,
+            best: Ok(result.best),
+        });
+        let entries: Vec<_> = error.hold().unwrap().collect();
+        assert_eq!(entries.len(), 3);
+        assert!(std::ptr::eq(
+            entries[0].best(),
+            error.best().unwrap().unwrap()
+        ));
+        assert!(std::ptr::eq(entries[0].stages(), error.stages()));
+        for (view, owned) in entries[1..].iter().zip(error.held_tail()) {
+            assert!(std::ptr::eq(view.best(), owned));
+            assert!(std::ptr::eq(
+                view.best().plaintext().as_ptr(),
+                owned.plaintext().as_ptr()
+            ));
+            assert!(std::ptr::eq(view.stages(), owned.stages.as_slice()));
+        }
+        let (projected, terminal) = Event::runtime_error(&error, 29).unwrap();
+        let wire = encoded(&projected);
+        assert_eq!(wire, expected);
+        assert_eq!(wire["hold"][0]["stages"], wire["stages"]);
+        assert_ne!(wire["hold"][0]["stages"], wire["hold"][1]["stages"]);
+        assert_ne!(wire["hold"][1]["stages"], wire["hold"][2]["stages"]);
+        for entry in wire["hold"].as_array().unwrap() {
+            assert_eq!(entry.as_object().unwrap().len(), 10);
+        }
+        let mut head = wire["hold"][0].clone();
+        head.as_object_mut().unwrap().remove("stages");
+        assert_eq!(head, wire["best"]);
+        let context = encoded(&terminal)["context"].clone();
+        assert_eq!(context["outer_index"], "3");
+        assert_eq!(context["start_index"], "4");
+        assert_ne!(context["outer_index"], wire["best"]["outer_index"]);
+        assert_eq!(context["evaluations_used"], "11");
+        assert_eq!(context["counters"], wire["counters"]);
+        assert_eq!(context["source"]["message"], "injected stage failure");
     }
 
     #[test]
@@ -749,10 +817,7 @@ mod tests {
         assert_eq!(error.stages().len(), 2);
         let (projected, _) = Event::runtime_error(&error, 0).unwrap();
         assert_eq!(encoded(&projected)["stages"], expected);
-        assert!(!encoded(&projected)
-            .as_object()
-            .unwrap()
-            .contains_key("hold"));
+        assert_eq!(encoded(&projected)["hold"][0]["stages"], expected);
     }
 
     #[test]
@@ -1020,7 +1085,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_projection_preserves_original_and_best_errors() {
+    fn error_hold_projection_preserves_original_and_best_errors() {
         use crate::attack_control::CounterOverflow as PrivateCounter;
         use crate::attack_evaluator::{TrialBoardError, TrialEvaluationError};
         use crate::attack_result::{AttackRunErrorData, AttackRunSource, RunPayload};
@@ -1057,6 +1122,7 @@ mod tests {
                     },
                 });
                 if !malformed {
+                    assert_eq!(error.hold().unwrap().count(), 0);
                     let (result, terminal) = Event::runtime_error(&error, 0).unwrap();
                     let diagnostics: Vec<_> = error
                         .run_source()
@@ -1083,12 +1149,17 @@ mod tests {
                     assert_eq!(
                         encoded(&result),
                         json!({
-                            "event": "result", "stages": [], "best": null, "counters": super::ProgressCounters::from(error.counters()),
+                            "event": "result", "stages": [], "hold": [], "best": null, "counters": super::ProgressCounters::from(error.counters()),
                             "elapsed_ms": "0", "protocol_version": 1, "seq": 7, "ts": TS
                         })
                     );
                     continue;
                 }
+                let hold_failure = error
+                    .hold()
+                    .err()
+                    .expect("projection must not become empty");
+                assert!(std::ptr::eq(hold_failure, error.best().unwrap_err()));
                 let failure = Event::runtime_error(&error, 0).unwrap_err();
                 assert!(std::ptr::eq(failure.original(), &error));
                 assert!(std::ptr::eq(

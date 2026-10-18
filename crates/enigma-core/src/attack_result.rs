@@ -344,8 +344,6 @@ pub struct AttackRunError(Box<AttackRunErrorData>);
 /// Private complete envelope; boxing preserves the public result signature.
 #[derive(Debug)]
 pub(crate) struct AttackRunErrorData {
-    // Retained privately until Task 14 result projection consumes this field.
-    #[allow(dead_code)]
     pub(crate) held_tail: Vec<AttackBest>,
     pub(crate) stages: Vec<AttackStageResult>,
     pub(crate) source: AttackRunSource,
@@ -357,6 +355,26 @@ pub(crate) struct AttackRunErrorData {
 }
 
 impl AttackRunError {
+    /// Finalists in final order; projection failure is distinct from genuine absence.
+    pub fn hold(
+        &self,
+    ) -> Result<
+        impl Iterator<Item = AttackHoldEntry<'_>>,
+        &(dyn std::error::Error + Send + Sync + 'static),
+    > {
+        let best = self.best()?;
+        Ok(best.into_iter().flat_map(move |best| {
+            std::iter::once(AttackHoldEntry {
+                best,
+                stages: &self.0.stages,
+            })
+            .chain(self.0.held_tail.iter().map(|best| AttackHoldEntry {
+                best,
+                stages: &best.stages,
+            }))
+        }))
+    }
+
     /// Started stage history retained independently of best projection.
     pub fn stages(&self) -> &[AttackStageResult] {
         &self.0.stages

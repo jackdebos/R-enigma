@@ -84,6 +84,26 @@ fn success_hold_is_borrowed_ordered_and_keeps_entry_histories() {
 }
 
 #[test]
+fn error_hold_public_signature_supports_borrowed_iteration_and_propagation() {
+    // Compile an external client: valid requests do not deterministically fail here.
+    fn client<'a>(
+        error: &'a AttackRunError,
+    ) -> Result<
+        Vec<enigma_core::AttackHoldEntry<'a>>,
+        &'a (dyn std::error::Error + Send + Sync + 'static),
+    > {
+        let entries: Vec<_> = error.hold()?.collect();
+        if let Some(head) = entries.first() {
+            let _: &'a AttackBest = head.best();
+            let _: &'a [enigma_core::AttackStageResult] = head.stages();
+            assert!(std::ptr::eq(head.best(), error.best()?.unwrap()));
+        }
+        Ok(entries)
+    }
+    let _ = client;
+}
+
+#[test]
 fn public_run_error_is_pointer_sized() {
     assert_eq!(
         std::mem::size_of::<AttackRunError>(),
@@ -96,7 +116,7 @@ fn public_run_error_is_pointer_sized() {
 fn borrowed_projection_error_supports_client_downcast() {
     // Qualify this synthetic downcast separately from public runtime coverage.
     fn client(error: &AttackRunError) -> Option<&enigma_core::ModelError> {
-        let projection = error.best().err()?;
+        let projection = error.hold().err()?;
         projection.downcast_ref::<enigma_core::ModelError>()
     }
     let _: fn(&AttackRunError) -> Option<&enigma_core::ModelError> = client;
