@@ -663,7 +663,7 @@ preventing that admission leaves no history entry. Core mirrors this on `AttackR
 
 ## 10. Hold list — Task 14
 
-Status: **specified (14.0), not implemented.** A run keeps the top-N committed
+Status: **implemented in Core and the CLI.** A run keeps the top-N committed
 candidates instead of one best, polishes them with the §9 stages and delivers them
 once, in the final `result`. §1–§9 stay normative except where this section extends
 them. Scope is the hold list only: multi-variant search is deferred to a later,

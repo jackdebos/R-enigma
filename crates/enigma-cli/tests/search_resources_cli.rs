@@ -652,7 +652,7 @@ fn words(word: &str) -> String {
     .to_string()
 }
 
-/// Runs `request` through the CLI; best, counters, stages and reason must match Core.
+/// Runs `request` through the CLI; best, ordered hold, counters, stages and reason match Core.
 fn core_match(f: &Fixture, request: &Value) -> Vec<Value> {
     let events = attack_events(&f.stdin(request));
     let texts: Vec<(String, String)> = request["job"]["resources"]
@@ -672,7 +672,7 @@ fn core_match(f: &Fixture, request: &Value) -> Vec<Value> {
     let expected = parsed.bind_resources(&supplied).unwrap();
     let expected = expected.run(|_| {}, || false).unwrap();
     let projected = serde_json::to_value(enigma_core::Event::result(&expected, 0)).unwrap();
-    for field in ["best", "counters", "stages"] {
+    for field in ["best", "hold", "counters", "stages"] {
         assert_eq!(events[events.len() - 2][field], projected[field], "{field}");
     }
     let reason = enigma_core::DoneReason::from(expected.termination());
@@ -706,6 +706,117 @@ fn public_staged_pipelines_match_core_projection() {
 }
 
 #[test]
+fn public_hold_staged_capacities_and_default_match_core() {
+    let f = Fixture::new();
+    f.write("words.json", words("🦀"));
+    for pe in [false, true] {
+        let mut default_result = None;
+        for capacity in [Some(1), Some(3), None, Some(100)] {
+            let mut request = staged(100, pe, &["measure", "trie"]);
+            request["job"]["configuration"]["slots"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("position");
+            request["job"]["space"]["slots"] = json!([{"id":"r","positions":["🦀","é","Ω","中"]}]);
+            if let Some(capacity) = capacity {
+                request["job"]["attack"]["hold"] = json!(capacity);
+            }
+            assert_eq!(
+                request["job"]["attack"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("hold"),
+                capacity.is_some(),
+                "omission must not be represented by null"
+            );
+            let events = core_match(&f, &request);
+            let mut result = events[events.len() - 2].clone();
+            let hold = result["hold"].as_array().unwrap();
+            let expected_count = match capacity {
+                Some(1) => 1,
+                Some(3) => 3,
+                _ if pe => 8,
+                _ => 4,
+            };
+            assert_eq!(hold.len(), expected_count, "pe={pe}, cap={capacity:?}");
+            assert!(hold.len() <= capacity.unwrap_or(100));
+            assert_eq!(result["best"].is_null(), hold.is_empty());
+            let mut head = hold[0].clone();
+            let head_stages = head.as_object_mut().unwrap().remove("stages").unwrap();
+            assert_eq!(head, result["best"]);
+            assert_eq!(head_stages, result["stages"]);
+            let mut keys = std::collections::HashSet::new();
+            let mut indices = Vec::new();
+            for entry in hold {
+                let mut fields: Vec<_> = entry
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
+                fields.sort_unstable();
+                assert_eq!(
+                    fields,
+                    [
+                        "configuration",
+                        "final_objective_ascent",
+                        "incomplete",
+                        "mutable_plugboard",
+                        "neighborhood_exhausted",
+                        "outer_index",
+                        "plaintext",
+                        "score",
+                        "stages",
+                        "start_index",
+                    ]
+                );
+                assert!(
+                    keys.insert(entry["configuration"].to_string()),
+                    "complete-key duplicate"
+                );
+                let history = entry["stages"].as_array().unwrap();
+                assert_eq!(history.len(), 2);
+                for (stage, pass) in history.iter().zip(["measure", "trie"]) {
+                    assert_eq!(stage["pass"], pass);
+                    assert_eq!(stage["completed"], true);
+                }
+                assert_eq!(history.last().unwrap()["score"], entry["score"]);
+                assert_eq!(entry["score"], hold[0]["score"], "fixture ties");
+                indices.push((
+                    entry["outer_index"]
+                        .as_str()
+                        .unwrap()
+                        .parse::<u128>()
+                        .unwrap(),
+                    entry["start_index"]
+                        .as_str()
+                        .unwrap()
+                        .parse::<u128>()
+                        .unwrap(),
+                ));
+            }
+            let expected_indices: Vec<_> = (0..4)
+                .flat_map(|outer| (0..if pe { 2 } else { 1 }).map(move |start| (outer, start)))
+                .take(expected_count)
+                .collect();
+            assert_eq!(
+                indices, expected_indices,
+                "absolute lexicographic tie order"
+            );
+            assert_eq!(events.last().unwrap()["reason"], "completed");
+            // Compare only equal capacities: stage costs legitimately vary with N.
+            result.as_object_mut().unwrap().remove("ts");
+            result.as_object_mut().unwrap().remove("elapsed_ms");
+            if capacity.is_none() {
+                default_result = Some(result);
+            } else if capacity == Some(100) {
+                assert_eq!(Some(result), default_result, "omitted/100 payload parity");
+            }
+        }
+    }
+}
+
+#[test]
 fn public_reswapping_improves_trie_winner_on_the_wire() {
     // Core's strict-improvement case: a non-identity wheel makes plaintext board-dependent.
     let f = Fixture::new();
@@ -727,7 +838,7 @@ fn public_reswapping_improves_trie_winner_on_the_wire() {
 }
 
 #[test]
-fn public_staged_budget_and_cancel_file_boundaries() {
+fn public_hold_staged_budget_and_cancel_file_boundaries() {
     let f = Fixture::new();
     f.write("words.json", words("🦀"));
     f.write("marker", "");
@@ -758,8 +869,13 @@ fn public_staged_budget_and_cancel_file_boundaries() {
         assert_eq!(events.last().unwrap()["reason"], "evaluation_budget");
         let request = staged(100, pe, &["measure", "reswapping"]);
         let events = attack_events(&f.stdin_with(&request, &["--cancel-file", "marker"]));
-        assert!(result(&events)["best"].is_null());
-        assert_eq!(result(&events)["stages"], json!([]));
+        let cancelled = result(&events);
+        assert_eq!(cancelled["hold"], json!([]));
+        assert_eq!(
+            cancelled["best"].is_null(),
+            cancelled["hold"].as_array().unwrap().is_empty()
+        );
+        assert_eq!(cancelled["stages"], json!([]));
         assert_eq!(events.last().unwrap()["reason"], "cancelled");
     }
 }

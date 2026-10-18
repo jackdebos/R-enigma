@@ -337,7 +337,7 @@ then exactly one terminal `done`; runtime failure emits terminal `error`. Search
 emit `progress`, `candidate`, `checkpoint`, and `hold` according to job lifecycle.
 The first HC/PE release instead uses only `progress` and final `result` (§4.1);
 `candidate`, `checkpoint` and `hold` remain eventual Stage 1 requirements, not part
-of that release. Task 14 specifies (not yet implemented) the hold delivered once, as the
+of that release. Task 14 implements the hold delivered once, as the
 final `result.hold` array ([search-passes §10](search-passes.md#10-hold-list--task-14));
 no live `hold` event. Transform emits no candidate, hold, or checkpoint event. A validated `transform` job
 emits `started`, then exactly one `output` whose `output` member is the transformed
@@ -371,6 +371,9 @@ Syntax errors point to the closest available containing path.
 in the production CLI. HC/PE share the synchronous JSONL adapter and fallible Core
 projections. Legacy search still returns seq1 `unsupported_job` after preflight,
 without work events. All preflight failures remain seq1-only errors.
+`AttackResult::hold()` exposes ordered borrowed entry views; `AttackRunError::hold()`
+is independently fallible, preserving projection errors rather than returning an
+empty hold. Each view borrows its best payload and entry-specific stage history.
 
 Core provides pure progress and result
 wire projections from `AttackProgress`/`AttackResult` and caller-supplied elapsed
@@ -394,17 +397,19 @@ emit `started`, zero or more `progress`, one `result`, then exactly one terminal
 Task12.8 exposes Core HC; Task12.9c adds Core PE through the same synchronous API.
 The lifecycle below is implemented by the shared production HC/PE adapter;
 legacy search remains unsupported.
-On runtime error, `result` contains only the earlier successfully committed aggregate
-best, or null; do not invent a result for the failing climb. No `done` follows error.
-`result` is final, not a stream of provisional trials; its planned `hold` array is the
-final Task 14 hold ([search-passes §10.7](search-passes.md#107-result-and-wire-projection)).
+On runtime error, `result` retains the earlier eligible committed finalists in
+`hold`, with their aggregate `best` or null; do not invent a result for the failing
+climb. Stage errors retain the failing finalist's last committed key per
+[search-passes §10.5](search-passes.md#105-stages-over-the-hold).
+No `done` follows error. `result` is final, not a stream of provisional trials;
+its `hold` array is the implemented Task 14 hold ([search-passes §10.7](search-passes.md#107-result-and-wire-projection)).
 
 Payloads below supplement the existing event envelope; `done` stays reason-only:
 
 | Event | Required payload |
 | --- | --- |
 | `progress` | `counters`, `elapsed_ms` |
-| `result` | `stages`, `best` (object or null), `hold` (Task 14, planned), `counters`, `elapsed_ms` |
+| `result` | `stages`, `best` (object or null), `hold` (Task 14 array), `counters`, `elapsed_ms` |
 | `done` | `reason`: `completed`, `outer_slice_end`, `evaluation_budget`, or `cancelled` |
 | Runtime `error` | Existing `code`, `message`, `location`; additionally `context` |
 
@@ -481,7 +486,7 @@ ordering applies only while delivery succeeds, including final result write/flus
 
 | Action | Mechanism | Result |
 | --- | --- | --- |
-| Cancel (first HC/PE release) | `--cancel-file <path>` marker or a platform signal (`SIGINT`/`SIGTERM`/`SIGHUP`, Windows Ctrl+C/Break); both shipped | Cooperative safe-stop, final `result`, then `done` with `reason: "cancelled"`; hold per planned Task 14; no checkpoint promise |
+| Cancel (first HC/PE release) | `--cancel-file <path>` marker or a platform signal (`SIGINT`/`SIGTERM`/`SIGHUP`, Windows Ctrl+C/Break); both shipped | Cooperative safe-stop, final `result`, then `done` with `reason: "cancelled"`; retained `result.hold` per Task 14; no checkpoint promise |
 | Pause/resume live job | Not in Stage 1 | Future extension |
 | Resume dead job | `--resume <checkpoint>` | Search only; see §6 |
 | Bound HC/PE search | `space.offset`/`space.limit`, `attack.evaluation_budget` | §4.1 slice/exhaustion/budget reasons; no new `--max-keys` attack control |
@@ -496,7 +501,8 @@ Admitted evaluations are nonpreemptive; established exhaustion wins over cancell
 which wins over budget. Stops retain committed results and required reserved final
 rescoring; original errors and charged usage are preserved, not masked by cancellation.
 Core runtime, fallible JSONL projections and the timed HC/PE adapter ship in the
-production CLI (§4.1). Hold and checkpoint cadence remain unimplemented.
+production CLI (§4.1), including the final retained hold. Live hold events and
+checkpoint cadence remain unimplemented.
 Task12.12 ships `--cancel-file` and Task12.13 platform signals as the external
 cancellation sources, per the contracts below; they combine by OR, both sticky.
 Without either, cancellation stays false. Signal handlers only feed a sticky
@@ -548,7 +554,7 @@ replaces inherited ignored dispositions: under `nohup`, a terminal hangup reques
 safe stop. Use `setsid`, `tmux` or `screen` to outlive the terminal. Windows and
 macOS behavior relies on the `ctrlc` crate and is not verified by tests here.
 Live hold events remain deferred, not removed from eventual Stage 1 goals; cancellation
-will retain the final `result.hold` (planned, search-passes §10.6); it writes no
+retains the final `result.hold` (search-passes §10.6); it writes no
 checkpoint. Checkpoint/resume remains Task 16 under §6.
 
 ## 6. Checkpoint and resume (record schema deferred)
