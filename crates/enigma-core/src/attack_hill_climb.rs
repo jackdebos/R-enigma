@@ -5434,11 +5434,29 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct PeHoldTrace {
+        entered: Vec<(u128, u128)>,
+        post_climb: Vec<(u64, crate::attack_control::CounterSnapshot)>,
+    }
+
     // Synthetic board-keyed scores and faults drive the production seed loop.
     fn pe_hold_fault_run(
         capacity: usize,
         fault: u8,
     ) -> Result<crate::AttackResult, crate::AttackRunError> {
+        pe_hold_fault_run_at(capacity, fault, (1, 2)).0
+    }
+
+    fn pe_hold_fault_run_at(
+        capacity: usize,
+        fault: u8,
+        coordinates: (u128, u128),
+    ) -> (
+        Result<crate::AttackResult, crate::AttackRunError>,
+        PeHoldTrace,
+    ) {
+        let mut trace = PeHoldTrace::default();
         let request = partial_scheduler_request(100, false, |_| {});
         let mut control = AttackControl::with_counters(crate::attack_control::CounterSnapshot {
             outers_completed: if fault == 1 { u128::MAX - 1 } else { 0 },
@@ -5471,15 +5489,19 @@ mod tests {
                     requested,
                     capacity,
                     |scoring, seed, board, accounting, requested| {
-                        let target = index == 1 && seed == 2;
+                        trace.entered.push((index, seed));
+                        let target = (index, seed) == coordinates;
                         if fault == 3 && target {
                             return Err(TrialEvaluationError::Model(
                                 crate::ModelError::UnknownSymbol('Z'),
                             )
                             .into());
                         }
-                        let mut climb =
-                            scoring.climb_cancellable(board, 0, accounting, requested)?;
+                        let climb = scoring.climb_cancellable(board, 0, accounting, requested);
+                        trace
+                            .post_climb
+                            .push((accounting.allowance.used, accounting.control.snapshot()));
+                        let mut climb = climb?;
                         let current = climb.current.as_mut().unwrap();
                         let rank = match current.board.as_slice() {
                             [('A', 'C') | ('C', 'A')] => 30,
@@ -5496,10 +5518,11 @@ mod tests {
                 )
             },
         );
-        match run {
+        let result = match run {
             Ok(run) => run.project_public(control.snapshot(), request.domain(), MeasureId::Trie),
             Err(error) => Err(error.project(request.domain(), MeasureId::Trie)),
-        }
+        };
+        (result, trace)
     }
 
     fn pe_hold_indices(
@@ -5581,6 +5604,82 @@ mod tests {
             pe_hold_indices(raw.best().unwrap(), raw.held_tail()),
             [(0, 0)]
         );
+    }
+
+    fn assert_pe_projection_fault(
+        error: &crate::AttackRunError,
+        trace: &PeHoldTrace,
+        coordinates: (u128, u128),
+    ) {
+        assert_eq!(
+            error.run_source().category(),
+            crate::AttackRunCategory::Invariant
+        );
+        assert!(error.to_string().contains("seed projection failed"));
+        assert_eq!(
+            (error.outer_index(), error.start_index()),
+            (Some(coordinates.0), Some(coordinates.1))
+        );
+        assert_eq!(trace.post_climb.len(), trace.entered.len());
+        let &(used, counters) = trace.post_climb.last().unwrap();
+        assert_eq!(error.evaluations_used(), used);
+        assert_eq!(error.counters(), crate::AttackProgress(counters));
+        assert_eq!(error.counters().outers_completed(), coordinates.0);
+    }
+
+    #[test]
+    fn pe_hold_projection_fault_stops_later_seed_execution() {
+        let (result, trace) = pe_hold_fault_run_at(4, 2, (1, 2));
+        let error = result.unwrap_err();
+        assert_eq!(
+            trace.entered,
+            [(0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (1, 1), (1, 2)]
+        );
+        assert_pe_projection_fault(&error, &trace, (1, 2));
+        let hold: Vec<_> = error.hold().unwrap().collect();
+        assert_eq!(
+            hold.iter()
+                .map(|entry| (entry.best().outer_index(), entry.best().start_index()))
+                .collect::<Vec<_>>(),
+            [(0, 0), (1, 0), (0, 3)]
+        );
+    }
+
+    #[test]
+    fn pe_hold_first_outer_projection_fault_retains_only_prior_seeds() {
+        let reference = pe_hold_fault_run(4, 0).unwrap();
+        for seed in [0, 2] {
+            let (result, trace) = pe_hold_fault_run_at(4, 2, (0, seed));
+            let error = result.unwrap_err();
+            let expected: Vec<_> = (0..=seed).map(|start| (0, start)).collect();
+            assert_eq!(trace.entered, expected);
+            assert_pe_projection_fault(&error, &trace, (0, seed));
+            if seed == 0 {
+                // Without a retained head, independent projection errors stay errors.
+                let best_error = error.best().unwrap_err();
+                let hold_error = error
+                    .hold()
+                    .err()
+                    .expect("independent hold projection error");
+                assert!(best_error.downcast_ref::<ProjectionError>().is_some());
+                assert!(hold_error.downcast_ref::<ProjectionError>().is_some());
+                assert!(std::ptr::eq(best_error, hold_error));
+                assert!(error.held_tail().is_empty());
+            } else {
+                let hold: Vec<_> = error.hold().unwrap().collect();
+                assert_eq!(hold.len(), 1); // Seed 1 duplicates seed 0.
+                assert_eq!(
+                    pe_hold_indices(error.best().unwrap(), error.held_tail()),
+                    [(0, 0)]
+                );
+                // Debug includes every owned payload field, but not allocation addresses.
+                assert_eq!(
+                    format!("{:?}", hold[0].best()),
+                    format!("{:?}", reference.best.as_ref().unwrap())
+                );
+                assert!(hold[0].stages().is_empty());
+            }
+        }
     }
 
     #[test]
@@ -9150,6 +9249,59 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn hold_strict_best_capacity_parity_without_stages() {
+        for pe in [false, true] {
+            let observe = |capacity| {
+                let request = hold_stages_request(pe, &[], 1000, capacity);
+                let (mut snapshots, mut polls) = (Vec::new(), 0);
+                let result = request
+                    .run(
+                        |p| snapshots.push(p.0),
+                        || {
+                            polls += 1;
+                            false
+                        },
+                    )
+                    .unwrap();
+                (result, snapshots, polls)
+            };
+            let (one, one_snapshots, one_polls) = observe(1);
+            let (many, many_snapshots, many_polls) = observe(100);
+            let best = one.best.as_ref().unwrap();
+            let head = many.hold().next().unwrap();
+            // Full Debug payload covers configuration, mutable board, plaintext,
+            // measure/score, absolute indices, flags and entry history.
+            assert_eq!(format!("{best:?}"), format!("{:?}", head.best()));
+            assert_eq!(one.termination, crate::AttackTermination::Completed);
+            assert_eq!(many.termination, one.termination);
+            assert_eq!(many.evaluations_used, one.evaluations_used);
+            assert_eq!(many.counters, one.counters);
+            assert_eq!((many_snapshots, many_polls), (one_snapshots, one_polls));
+            assert!(one.stages.is_empty());
+            assert!(many.stages.is_empty());
+            assert_eq!(one.hold().count(), 1);
+            assert!(many.hold().all(|entry| entry.stages().is_empty()));
+            let tied: Vec<_> = many
+                .hold()
+                .filter(|entry| entry.best().score == best.score)
+                .collect();
+            assert!(tied.len() > 1);
+            let indices: Vec<_> = tied
+                .iter()
+                .map(|entry| (entry.best().outer_index(), entry.best().start_index()))
+                .collect();
+            assert_eq!(indices[0], (0, 0));
+            assert!(indices.windows(2).all(|pair| pair[0] < pair[1]));
+            for (i, entry) in tied.iter().enumerate() {
+                for later in &tied[i + 1..] {
+                    assert_ne!(entry.best().configuration, later.best().configuration);
+                }
+            }
+            assert_eq!((best.outer_index(), best.start_index()), indices[0]);
+        }
     }
 
     #[test]
