@@ -5,6 +5,7 @@
 //! observed preview and score (see `e2e/bomm/README.md`). These tests never run bomm:
 //! they decrypt through the real `enigma` binary, compare the first 64 letters exactly,
 //! and compare full-message IC or Sinkov scores within justified numeric bounds.
+//! The opt-in release attack case compares recovered board/plaintext outcomes only.
 
 mod support;
 
@@ -24,6 +25,7 @@ const CASES: &[&str] = &[
     "enigma-i-double-step",
     "enigma-m3-two-notch",
     "enigma-m4-thin-c-gamma",
+    "m4-u264-attack-board",
     "m4-u264-first-break",
     "m4-u264-sinkov-bigram-correct",
     "m4-u264-sinkov-bigram-wrong",
@@ -103,7 +105,7 @@ fn ic(text: &str) -> f64 {
 }
 
 /// Strict test-only txt -> JSON v1 adapter. No production parser or model bypass.
-fn convert_table(text: &str, order: usize, source: &str) -> (NgramModel, usize) {
+fn converted_resource(text: &str, order: usize, source: &str) -> (Value, usize) {
     let fields: Vec<_> = text.split_whitespace().collect();
     assert_eq!(
         fields.len() % 2,
@@ -144,6 +146,11 @@ fn convert_table(text: &str, order: usize, source: &str) -> (NgramModel, usize) 
         "resource_version": 1, "kind": "ngram", "alphabet": alphabet,
         "order": order, "entries": entries
     });
+    (resource, count)
+}
+
+fn convert_table(text: &str, order: usize, source: &str) -> (NgramModel, usize) {
+    let (resource, count) = converted_resource(text, order, source);
     let model = parse_ngram_json(&resource.to_string()).unwrap_or_else(|errors| {
         panic!("{source}: public resource parser rejected table: {errors:?}")
     });
@@ -269,6 +276,98 @@ fn check(case: &str, kind: Kind) -> (f64, f64) {
         assert_eq!(plaintext, expected, "{case}: full {label} plaintext");
     }
     (ours, score)
+}
+
+const HISTORICAL_PAIRS: &[&str] = &["AT", "BL", "DF", "GJ", "HM", "NW", "OP", "QY", "RZ", "VX"];
+
+fn attack_fixture() -> (Value, Value) {
+    let query = load("m4-u264-attack-board", "query.json");
+    let record = load("m4-u264-attack-board", "case.json");
+    let historical = load("m4-u264-sinkov-trigram-correct", "case.json");
+    assert_eq!(record["kind"], json!("historical-attack"));
+    assert_eq!(record["historical_pairs"], json!(HISTORICAL_PAIRS));
+    assert_eq!(record["observed"]["plugboard"], json!(HISTORICAL_PAIRS));
+    assert_eq!(historical["engine"]["plugboard"], json!(HISTORICAL_PAIRS));
+    assert_eq!(record["plaintext"], historical["plaintext"]);
+    assert_eq!(record["plaintext"].as_str().unwrap().len(), 232);
+    assert_eq!(record["capture"]["bomm_commit"], json!(BOMM_COMMIT));
+    assert_eq!(record["capture"]["exit_code"], json!(0));
+    assert_eq!(
+        record["engine"]["job"]["configuration"]["plugboard"],
+        json!([])
+    );
+    assert_eq!(record["engine"]["job"]["attack"]["start"], json!([]));
+    assert_eq!(query["space"]["plugboard"], json!(""));
+    assert_eq!(
+        query["ciphertext"],
+        load("m4-u264-sinkov-trigram-correct", "query.json")["ciphertext"]
+    );
+    assert_eq!(
+        record["resource"]["source"],
+        json!("frequencies/enigma1941-trigram.txt")
+    );
+    assert_eq!(record["resource"]["order"], json!(3));
+    assert_eq!(record["resource"]["measure"], json!("sinkov_trigram"));
+    (query, record)
+}
+
+#[test]
+fn historical_attack_fixture_is_consistent() {
+    attack_fixture();
+}
+
+#[test]
+#[ignore = "~15 s release attack; run with cargo test --release -p enigma-cli --test bomm_parity -- --ignored"]
+fn historical_m4_u264_attack_board() {
+    let (query, record) = attack_fixture();
+    let source = record["resource"]["source"].as_str().unwrap();
+    let text = std::fs::read_to_string(bomm_dir().join(source)).unwrap();
+    let (resource, _) = converted_resource(&text, 3, source);
+    parse_ngram_json(&resource.to_string()).expect("converted table passes the public parser");
+
+    // Generated inputs live in a per-process temporary directory (no converted JSON in Git).
+    let directory = std::env::temp_dir().join(format!("enigma-bomm-attack-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("trigram.json"), resource.to_string()).unwrap();
+    let mut request = record["engine"].clone();
+    request["job"]["text"] = json!(query["ciphertext"].as_str().unwrap().to_ascii_uppercase());
+    request["job"]["resources"] = json!({"sinkov_trigram": {"path": "trigram.json"}});
+    std::fs::write(directory.join("request.json"), request.to_string()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_enigma"))
+        .current_dir(&directory)
+        .arg("request.json")
+        .output()
+        .expect("failed to run the attack through the real CLI");
+    std::fs::remove_dir_all(&directory).unwrap();
+    let events = successful_events(&output);
+    let results: Vec<_> = events
+        .iter()
+        .filter(|event| event["event"] == "result")
+        .collect();
+    assert_eq!(results.len(), 1, "events: {events:?}");
+    let best = &results[0]["best"];
+    let mut pairs: Vec<String> = best["configuration"]["plugboard"]
+        .as_array()
+        .expect("result board is an array")
+        .iter()
+        .map(|pair| {
+            let mut letters: Vec<_> = pair
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|letter| letter.as_str().unwrap())
+                .collect();
+            assert_eq!(letters.len(), 2);
+            letters.sort_unstable();
+            letters.concat()
+        })
+        .collect();
+    pairs.sort_unstable();
+    assert_eq!(pairs, HISTORICAL_PAIRS);
+    assert_eq!(
+        best["plaintext"], record["plaintext"],
+        "full sourced plaintext"
+    );
 }
 
 #[test]

@@ -1,0 +1,76 @@
+{
+  "kind": "historical-attack",
+  "provenance": {
+    "source": "Stefan Krah, M4 Project, 'First break of the M4 Project'",
+    "url": "https://www.bytereef.org/m4-project-first-break.html",
+    "retrieved": "2026-10-18",
+    "source_values": "UKW: B; W/0: B241; Stecker: ATBLDFGJHMNWOPQYRZVX; Rings: AAAV; Message key: VJNA; ciphertext stripped of indicator groups; plaintext as seen in the server logs",
+    "confirmation": "Same page: plaintext confirmed against the U-264 war diary (NARA T1022, Roll 2886), FT 1132/19 from Kptlt. Hartwig Looks",
+    "normalization": "Ciphertext and plaintext copied with line breaks removed; ciphertext lowercased for bomm, both uppercased for this engine",
+    "design": "A: fixed historical wheels, rings and positions; unknown plugboard starting empty. IC hill climb switches to Sinkov trigram at 7 pairs, backtracks at 5, then trigram reswapping and measure. Our max_pairs 13 matches bomm's unrestricted board; budget 100000000, hold 5."
+  },
+  "engine": {
+    "protocol_version": 1,
+    "machine": {"definition": {"kind": "bundled", "id": "enigma-m4"}},
+    "job": {
+      "kind": "search",
+      "configuration": {
+        "slots": [
+          {"id": "reflector", "wheel": "Thin-B", "position": "A", "ring": "A"},
+          {"id": "greek", "wheel": "Beta", "position": "V", "ring": "A"},
+          {"id": "left", "wheel": "II", "position": "J", "ring": "A"},
+          {"id": "middle", "wheel": "IV", "position": "N", "ring": "A"},
+          {"id": "right", "wheel": "I", "position": "A", "ring": "V"}
+        ],
+        "plugboard": []
+      },
+      "space": {
+        "plugboard": {
+          "kind": "attack",
+          "symbols": ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"],
+          "max_pairs": 13
+        }
+      },
+      "passes": ["hill_climb", "reswapping", "measure"],
+      "measures": ["ic", "sinkov_trigram"],
+      "attack": {
+        "kind": "hill_climb",
+        "initial_measure": "ic",
+        "final_measure": "sinkov_trigram",
+        "switch_pairs": 7,
+        "backtrack_pairs": 5,
+        "evaluation_budget": 100000000,
+        "start": [],
+        "hold": 5,
+        "reswapping": {"measure": "sinkov_trigram"},
+        "measure": {"measure": "sinkov_trigram"}
+      }
+    }
+  },
+  "resource": {
+    "source": "frequencies/enigma1941-trigram.txt",
+    "order": 3,
+    "measure": "sinkov_trigram",
+    "note": "The test supplies uppercase query ciphertext and JSON v1 resources converted from the in-repo table; converted JSON is not versioned."
+  },
+  "historical_pairs": ["AT", "BL", "DF", "GJ", "HM", "NW", "OP", "QY", "RZ", "VX"],
+  "plaintext": "VONVONJLOOKSJHFFTTTEINSEINSDREIZWOYYQNNSNEUNINHALTXXBEIANGRIFFUNTERWASSERGEDRUECKTYWABOSXLETZTERGEGNERSTANDNULACHTDREINULUHRMARQUANTONJOTANEUNACHTSEYHSDREIYZWOZWONULGRADYACHTSMYSTOSSENACHXEKNSVIERMBFAELLTYNNNNNNOOOVIERYSICHTEINSNULL",
+  "capture": {
+    "bomm_commit": "aeb2f2bf00dfdee68e972f90ae7e83b387b188e9",
+    "bomm_sha256": "58f236fc648638a21d7c1be7e4a355c0a9aeca7edcbbfc2743ebd8cdb81895b5",
+    "date": "2026-10-18",
+    "command": "timeout 120 $R/build/bomm -q -t 1 -n 5 e2e/bomm/m4-u264-attack-board/query.json",
+    "cwd": "repository root (criptografia-enigma)",
+    "reference_directory": "../bomm-reference",
+    "exit_code": 0,
+    "units": 1,
+    "decrypts": 8456
+  },
+  "observed": {
+    "plugboard": ["AT", "BL", "DF", "GJ", "HM", "NW", "OP", "QY", "RZ", "VX"],
+    "preview": "vonvonjlooksjhffttteinseinsdreizwoyyqnnsneuninhaltxxbeiangriffun",
+    "score": "-8.333018",
+    "key": "UKW-B-thin,beta,II,IV,I aaaav avjna at bl df gj hm nw op qy rz vx"
+  },
+  "comparison": "Outcome only: recovered board must equal the 10 historical pairs and our full decryption must equal the sourced 232-letter plaintext. bomm prints only a preview. No trajectory, score or evaluation-count equality is asserted."
+}

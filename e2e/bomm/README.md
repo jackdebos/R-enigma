@@ -1,8 +1,8 @@
 # bomm differential cases
 
-Known-key decrypt/IC/Sinkov cases observed once from the unmodified bomm CLI
+Known-key decrypt/IC/Sinkov and opt-in plugboard-attack cases observed from the unmodified bomm CLI
 ([ffraenz/bomm](https://github.com/ffraenz/bomm) at `aeb2f2bf00dfdee68e972f90ae7e83b387b188e9`)
-and compared with this engine on every test run by
+and compared with this engine (attack opt-in, other cases on every test run) by
 `crates/enigma-cli/tests/bomm_parity.rs`. This is not JSON compatibility. Each engine is
 driven in its own schema. The tests need neither network nor the bomm binary.
 
@@ -11,7 +11,7 @@ driven in its own schema. The tests need neither network nor the bomm binary.
 One directory per case:
 
 - `query.json`: the exact bomm input that was run. The ciphertext here is the single source used by both engines.
-- `case.json`: `kind` (`historical`, `historical-wrong-key` or `constructed`), `provenance` (constructed cases carry their full source `plaintext` here), `engine` (the same key in this engine's schema), `plaintext` (correct-key historical cases only, as sourced), `capture` (commit, binary SHA-256, date, command, exit code, units and decrypts) and `observed` (bomm's preview, score and key line, verbatim).
+- `case.json`: `kind` (`historical`, `historical-wrong-key`, `historical-attack` or `constructed`), `provenance` (constructed cases carry their full source `plaintext` here), `engine` (the same key in this engine's schema), `plaintext` (correct-key historical cases only, as sourced), `capture` (commit, binary SHA-256, date, command, exit code, units and decrypts) and `observed` (bomm's preview, score and key line, verbatim).
 - `frequencies/`: the two verbatim source tables described below; not a case directory.
 
 The historical case is `m4-u264-first-break`: the first M4 Project break (U-264 message), whose plaintext is confirmed by the war diary. Its source URL and the copied values are listed in its `provenance`. The constructed ciphertexts were produced by this engine's CLI (`transform`, `encrypt`) from the plaintext given in `provenance`. bomm decrypts them independently.
@@ -23,6 +23,41 @@ wheels, rings and plugboard unchanged. This one-step offset produces non-German
 output as a negative control. Wrong-key cases have no sourced plaintext: only
 the preview is compared exactly. Both engines must score the correct key more
 than 1 natural-log unit above the wrong key for each order.
+
+## Opt-in design A plugboard attack
+
+`m4-u264-attack-board` fixes the U-264 wheels, rings and positions but starts
+with an empty, unknown plugboard. Both engines run IC hill climb → Sinkov trigram
+(switch at 7 pairs, backtrack at 5), trigram reswapping, then trigram measure,
+with hold 5. Our config uses `max_pairs: 13` and budget 100,000,000. Its
+`historical-attack` case stores the search request under `engine`; the test
+supplies ciphertext from the query and resources via the existing strict table
+converter, writing JSON v1 and the request into a per-process directory under
+the system temporary directory, removed after the CLI run.
+
+Run the real CLI attack explicitly in release:
+
+```sh
+cargo test --release -p enigma-cli --test bomm_parity -- --ignored
+```
+
+The default suite checks fixture consistency and accounts for this directory,
+but never runs the attack. Debug builds are too slow; revisit the opt-in choice
+after the planned engine-optimization work. The successful measurement probe
+was **0.028 s bomm (`-t 1`) versus 14.7 s ours (release)**, sequential single
+runs, not a benchmark or stable performance guarantee. Both reported 8,456
+evaluations/decrypts; that agreement is observational, not asserted.
+
+The permanent query was separately captured exactly once from the repository
+root using `timeout 120 $R/build/bomm -q -t 1 -n 5
+e2e/bomm/m4-u264-attack-board/query.json`. It recovered
+`AT BL DF GJ HM NW OP QY RZ VX`, preview
+`vonvonjlooksjhffttteinseinsdreizwoyyqnnsneuninhaltxxbeiangriffun`, score
+`-8.333018`, one unit and 8,456 decrypts (exit 0). Provenance, binary hash and
+command are in `case.json`. This case compares **outcomes only**: stored bomm
+pairs and our top board equal the ten historical pairs, and our full plaintext
+equals the sourced 232 letters. bomm itself prints only a 64-letter preview.
+There is no trajectory, score or evaluation-count assertion for the attack.
 
 ## Frequency tables
 
@@ -54,7 +89,7 @@ run from the repository root:
 
     $R/build/bomm -q -t 1 -n 1 e2e/bomm/<case>/query.json
 
-Use short options only (the long options are declared without arguments). Each query fixes one wheel per slot, single-letter `rings`/`positions` masks and a fixed `plugboard`, and has one `measure` pass (`ic`, `sinkov_bigram` or `sinkov_trigram`). That means no search. Every capture printed `Number of units: 1` and `Number of decrypts: 1`. bomm silently drops non-lowercase letters, so query text is lowercase. The preview is the first 64 letters of the hold entry, and the score is `%+10.10f` cut to nine characters. Both are stored verbatim. Raw terminal output, logs and binaries are per-run artifacts and are not versioned.
+Use short options only (the long options are declared without arguments). Each known-key query fixes one wheel per slot, single-letter `rings`/`positions` masks and a fixed `plugboard`, and has one `measure` pass (`ic`, `sinkov_bigram` or `sinkov_trigram`). That means no search. Every known-key capture printed `Number of units: 1` and `Number of decrypts: 1`. bomm silently drops non-lowercase letters, so query text is lowercase. The preview is the first 64 letters of the hold entry, and the score is `%+10.10f` cut to nine characters. Both are stored verbatim. Raw terminal output, logs and binaries are per-run artifacts and are not versioned.
 
 N-gram queries supply `frequencies.bigram` or `frequencies.trigram` as
 `e2e/bomm/frequencies/enigma1941-<order>.txt`. bomm opens these relative to the
@@ -96,4 +131,4 @@ Measured before setting the Sinkov tolerance (Q32 units divided by `2^32`):
 
 ## Coverage and remaining work
 
-Covered: known-key decryption and resource-free IC on Enigma I, M3 (two-notch VI–VIII) and M4 (thin reflectors, Beta/Gamma), with nonzero rings, plugboards and middle-wheel double steps inside the preview, plus one historical message and German Enigma1941 bigram/trigram Sinkov scoring on its correct and wrong keys. Not covered: text beyond 64 letters against bomm itself, scores beyond display precision, other n-gram orders/tables, and every search (hill climbing, plugboard exploration, stages, hold list, outer ordering). Those are separate Task17 slices; attack comparisons must use real German text with a known plaintext. A source-linked helper calling bomm's functions directly would lift the 64-letter and six-decimal limits if needed.
+Covered: known-key decryption and resource-free IC on Enigma I, M3 (two-notch VI–VIII) and M4 (thin reflectors, Beta/Gamma), with nonzero rings, plugboards and middle-wheel double steps inside the preview, plus one historical message and German Enigma1941 bigram/trigram Sinkov scoring on its correct and wrong keys. The opt-in design A case adds unknown-plugboard hill-climb/reswapping outcome coverage with fixed outer settings. Not covered: text beyond 64 letters against bomm itself, scores beyond display precision, other n-gram orders/tables, general search/plugboard exploration, stage trajectories, hold-list ordering and outer ordering. Those are separate Task17 slices; attack comparisons must use real German text with a known plaintext. A source-linked helper calling bomm's functions directly would lift the 64-letter and six-decimal limits if needed.
