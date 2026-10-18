@@ -1,5 +1,7 @@
 //! Private fresh-state trial evaluation with retained, caller-borrowed scoring models.
 
+use std::cell::OnceCell;
+
 use crate::{
     index_of_coincidence, shannon_entropy, AttackPlugboardDomain, BoundResource, Direction, Engine,
     MeasureError, MeasureId, MeasuredScore, ModelError, Plugboard, ResolvedConfiguration,
@@ -44,6 +46,10 @@ pub(super) struct TrialEvaluator<'a> {
     direction: Direction,
     objective: MeasureId,
     resource: Option<&'a BoundResource>,
+    // None in the cell remembers an allocation-policy fallback, not an unbuilt cache.
+    prepared: OnceCell<Option<Vec<char>>>,
+    #[cfg(test)]
+    deny_reservation: bool,
 }
 
 impl<'a> TrialEvaluator<'a> {
@@ -62,6 +68,9 @@ impl<'a> TrialEvaluator<'a> {
             direction,
             objective,
             resource,
+            prepared: OnceCell::new(),
+            #[cfg(test)]
+            deny_reservation: false,
         }
     }
 
@@ -71,18 +80,75 @@ impl<'a> TrialEvaluator<'a> {
     ) -> Result<(String, MeasuredScore), TrialEvaluationError> {
         let board = validated_trial_board(self.initial, self.domain, mutable)
             .map_err(TrialEvaluationError::Board)?;
-        // Engine::clone preserves positions. Build and discard a local engine instead.
-        let mut engine = Engine::new(
+        let mut engine = None;
+        if self.prepared.get().is_none() {
+            // Preserve constructor-before-full-input validation, even on fallback.
+            let mut fresh = self.fresh_engine(board.clone())?;
+            let alphabet = self.initial.topology().alphabet();
+            if let Some(symbol) = self.input.chars().find(|c| alphabet.index_of(*c).is_none()) {
+                return Err(TrialEvaluationError::Model(ModelError::UnknownSymbol(
+                    symbol,
+                )));
+            }
+            let length = self.input.chars().count();
+            let mut rows = reserved_rows(length, alphabet.symbols.len(), self.reserve_denied());
+            if let Some(rows) = &mut rows {
+                fresh
+                    .scrambler_rows(length, self.direction, rows)
+                    .map_err(TrialEvaluationError::Model)?;
+            } else {
+                engine = Some(fresh);
+            }
+            // Failed model/input validation never initializes the cell.
+            self.prepared
+                .set(rows)
+                .expect("single-threaded lazy preparation");
+        }
+        let plaintext = match self.prepared.get().expect("prepared above") {
+            Some(rows) => {
+                let alphabet = self.initial.topology().alphabet();
+                let width = alphabet.symbols.len();
+                let mut output = String::with_capacity(self.input.len());
+                for (offset, symbol) in self.input.chars().enumerate() {
+                    let input = board.map(symbol).expect("validated input and board");
+                    let index = alphabet.index_of(input).expect("validated board alphabet");
+                    let output_symbol = rows[offset * width + index];
+                    output.push(board.map(output_symbol).expect("scrambler alphabet"));
+                }
+                output
+            }
+            None => {
+                let mut engine = match engine {
+                    Some(engine) => engine,
+                    None => self.fresh_engine(board)?,
+                };
+                engine
+                    .transform(self.input, self.direction)
+                    .map_err(TrialEvaluationError::Model)?
+            }
+        };
+        let score = self.measure(&plaintext)?;
+        Ok((plaintext, score))
+    }
+
+    fn fresh_engine(&self, board: Plugboard) -> Result<Engine, TrialEvaluationError> {
+        Engine::new(
             self.initial.topology().clone(),
             self.initial.stepping().clone(),
             board,
         )
-        .map_err(TrialEvaluationError::Model)?;
-        let plaintext = engine
-            .transform(self.input, self.direction)
-            .map_err(TrialEvaluationError::Model)?;
-        let score = self.measure(&plaintext)?;
-        Ok((plaintext, score))
+        .map_err(TrialEvaluationError::Model)
+    }
+
+    fn reserve_denied(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.deny_reservation
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
     }
 
     /// One decryption; optional base scoring reuses that exact plaintext.
@@ -124,6 +190,22 @@ impl<'a> TrialEvaluator<'a> {
         };
         score.map_err(TrialEvaluationError::Measure)
     }
+}
+
+const TABLE_DATA_LIMIT: usize = 1024 * 1024;
+
+fn table_entries(length: usize, width: usize) -> Option<usize> {
+    let entries = length.checked_mul(width)?;
+    (entries.checked_mul(std::mem::size_of::<char>())? <= TABLE_DATA_LIMIT).then_some(entries)
+}
+
+fn reserved_rows(length: usize, width: usize, deny: bool) -> Option<Vec<char>> {
+    let entries = table_entries(length, width)?;
+    let mut rows = Vec::new();
+    if deny || rows.try_reserve_exact(entries).is_err() {
+        return None;
+    }
+    Some(rows)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -193,6 +275,196 @@ pub(crate) fn validated_trial_board(
 mod tests {
     use super::*;
     use crate::{Alphabet, DefinitionSource, SlotConfiguration, TransformConfiguration};
+
+    #[test]
+    fn lazy_rows_are_built_once_across_boards_and_rejected_trials() {
+        crate::engine::ROW_BUILDS.with(|count| count.set(0));
+        let initial = machine("ABC", "BAC", "A", true);
+        let domain = domain(initial.topology().alphabet(), &[], "ABC", 1);
+        let trial = evaluator(&initial, &domain, "AA");
+        crate::engine::ROW_BUILDS.with(|count| assert_eq!(count.get(), 0));
+        assert!(trial.evaluate(&[('A', 'A')]).is_err());
+        crate::engine::ROW_BUILDS.with(|count| assert_eq!(count.get(), 0));
+        let a = trial.evaluate(&[]).unwrap();
+        trial.evaluate(&[('A', 'B')]).unwrap();
+        assert!(trial.evaluate(&[('A', 'A')]).is_err());
+        assert_eq!(trial.evaluate(&[]).unwrap(), a);
+        crate::engine::ROW_BUILDS.with(|count| assert_eq!(count.get(), 1));
+    }
+
+    fn turnover_machine(symbols: &str, reflector: bool) -> ResolvedConfiguration {
+        let s: Vec<_> = symbols.chars().collect();
+        let mut slots = Vec::new();
+        if reflector {
+            slots.push(
+                serde_json::json!({"id":"ukw","role":"reflector","movement":"fixed","wheel":"ukw"}),
+            );
+        }
+        for id in ["slow", "middle", "fast"] {
+            slots
+                .push(serde_json::json!({"id":id,"role":"rotor","movement":"movable","wheel":"r"}));
+        }
+        let source = serde_json::json!({"kind":"custom","value":{
+        "alphabet":s,
+        "wheels":[{"name":"r","wiring":[s[1],s[3],s[2],s[0]],"turnovers":[s[3]]},
+                  {"name":"ukw","wiring":[s[1],s[0],s[3],s[2]],"turnovers":[]}],
+        "slots":slots,"stepping":{"rules":[
+            {"when":{"always":true},"advance":["fast"]},
+            {"when":{"at_turnover":"fast"},"advance":["middle","fast"]},
+            {"when":{"at_turnover":"middle"},"advance":["slow","middle"]},
+            {"when":{"at_turnover":"middle"},"advance":["middle"]}
+        ]}}});
+        let definition = DefinitionSource::parse_json(&source.to_string())
+            .unwrap()
+            .resolve()
+            .unwrap();
+        let mut config = Vec::new();
+        if reflector {
+            config.push(SlotConfiguration::new("ukw", "ukw", s[2], s[1]));
+        }
+        config.extend([
+            SlotConfiguration::new("slow", "r", s[1], s[2]),
+            SlotConfiguration::new("middle", "r", s[2], s[1]),
+            SlotConfiguration::new("fast", "r", s[3], s[2]),
+        ]);
+        TransformConfiguration::new(config, vec![(s[0], s[1])])
+            .resolve(&definition)
+            .unwrap()
+    }
+
+    #[test]
+    fn cached_and_denied_tables_match_fresh_engine_across_contexts() {
+        for symbols in ["ABCD", "界Aéλ"] {
+            let s: Vec<_> = symbols.chars().collect();
+            for reflector in [false, true] {
+                let initial = turnover_machine(symbols, reflector);
+                let domain = domain(
+                    initial.topology().alphabet(),
+                    &[(s[0], s[1])],
+                    &symbols.chars().skip(2).collect::<String>(),
+                    2,
+                );
+                // Fast turnover advances middle onto its own notch, then middle
+                // advances again on the next keypress (the real double-step).
+                let mut probe = initial.clone().into_engine().unwrap();
+                probe
+                    .transform(&s[0].to_string(), Direction::Encrypt)
+                    .unwrap();
+                let start = usize::from(reflector);
+                assert_eq!(&probe.positions()[start..], &[s[1], s[3], s[0]]);
+                probe
+                    .transform(&s[0].to_string(), Direction::Encrypt)
+                    .unwrap();
+                assert_eq!(&probe.positions()[start..], &[s[2], s[0], s[1]]);
+                for direction in [Direction::Encrypt, Direction::Decrypt] {
+                    for input in [symbols.to_owned(), symbols.repeat(9)] {
+                        for deny in [false, true] {
+                            let mut trial = TrialEvaluator::new(
+                                &initial,
+                                &domain,
+                                &input,
+                                direction,
+                                MeasureId::Ic,
+                                None,
+                            );
+                            trial.deny_reservation = deny;
+                            for pairs in [vec![], vec![(s[2], s[3])], vec![]] {
+                                let board =
+                                    validated_trial_board(&initial, &domain, &pairs).unwrap();
+                                let mut fresh = Engine::new(
+                                    initial.topology().clone(),
+                                    initial.stepping().clone(),
+                                    board,
+                                )
+                                .unwrap();
+                                let plaintext = fresh.transform(&input, direction).unwrap();
+                                let score =
+                                    index_of_coincidence(initial.topology().alphabet(), &plaintext)
+                                        .unwrap();
+                                assert_eq!(trial.evaluate(&pairs).unwrap(), (plaintext, score));
+                                assert_eq!(trial.prepared.get().unwrap().is_none(), deny);
+                                assert!(matches!(
+                                    trial.evaluate(&[(s[2], s[2])]),
+                                    Err(TrialEvaluationError::Board(_))
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn table_allocation_policy_checks_overflow_boundary_and_denial() {
+        let entries = TABLE_DATA_LIMIT / std::mem::size_of::<char>();
+        assert_eq!(table_entries(entries, 1), Some(entries));
+        assert_eq!(table_entries(entries + 1, 1), None);
+        assert_eq!(table_entries(usize::MAX, 2), None);
+        assert_eq!(table_entries(usize::MAX / 2, 1), None);
+        assert!(reserved_rows(2, 4, true).is_none());
+        assert_eq!(reserved_rows(0, 4, false), Some(Vec::new()));
+        let initial = machine("ABC", "BAC", "A", true);
+        let domain = domain(initial.topology().alphabet(), &[], "ABC", 1);
+        let input = "ABC".repeat(entries / 9 + 1);
+        let trial = evaluator(&initial, &domain, &input);
+        assert_eq!(table_entries(input.chars().count(), 3), None);
+        let expected = initial
+            .clone()
+            .into_engine()
+            .unwrap()
+            .transform(&input, Direction::Decrypt)
+            .unwrap();
+        assert_eq!(trial.evaluate(&[]).unwrap().0, expected);
+        assert!(matches!(trial.prepared.get(), Some(None)));
+        assert_eq!(trial.evaluate(&[]).unwrap().0, expected);
+    }
+
+    #[test]
+    fn validation_precedence_and_failed_first_trials_do_not_prepare() {
+        let initial = machine("ABC", "BAC", "A", true);
+        let alphabet = initial.topology().alphabet();
+        let domain = domain(alphabet, &[], "ABC", 1);
+        for deny in [false, true] {
+            let mut invalid = evaluator(&initial, &domain, "AZ");
+            invalid.deny_reservation = deny;
+            assert!(matches!(
+                invalid.evaluate(&[('A', 'A')]),
+                Err(TrialEvaluationError::Board(_))
+            ));
+            assert_eq!(
+                invalid.evaluate(&[]),
+                Err(TrialEvaluationError::Model(ModelError::UnknownSymbol('Z')))
+            );
+            assert!(invalid.prepared.get().is_none());
+            let wrong_fixed = super::tests::domain(alphabet, &[('A', 'B')], "C", 1);
+            let invalid = evaluator(&initial, &wrong_fixed, "AZ");
+            assert_eq!(
+                invalid.evaluate(&[]),
+                Err(TrialEvaluationError::Board(
+                    TrialBoardError::FixedFactsBinding
+                ))
+            );
+            assert!(invalid.prepared.get().is_none());
+            for input in ["", "A"] {
+                let mut trial = evaluator(&initial, &domain, input);
+                trial.deny_reservation = deny;
+                assert!(matches!(
+                    trial.evaluate(&[]),
+                    Err(TrialEvaluationError::Measure(
+                        MeasureError::InsufficientSamples { .. }
+                    ))
+                ));
+                assert!(trial.prepared.get().is_some());
+                assert!(matches!(
+                    trial.evaluate(&[]),
+                    Err(TrialEvaluationError::Measure(
+                        MeasureError::InsufficientSamples { .. }
+                    ))
+                ));
+            }
+        }
+    }
 
     #[test]
     fn owned_trial_errors_preserve_causal_sources() {
@@ -314,14 +586,14 @@ mod tests {
         domain: &'a AttackPlugboardDomain,
         input: &'a str,
     ) -> TrialEvaluator<'a> {
-        TrialEvaluator {
+        TrialEvaluator::new(
             initial,
             domain,
             input,
-            direction: Direction::Decrypt,
-            objective: MeasureId::Ic,
-            resource: None,
-        }
+            Direction::Decrypt,
+            MeasureId::Ic,
+            None,
+        )
     }
 
     const SINKOV: [MeasureId; 6] = [
@@ -359,9 +631,16 @@ mod tests {
         let initial = machine("ABCD", "ABDC", "CB", false);
         let alphabet = initial.topology().alphabet();
         let domain = domain(alphabet, &[], "ABCD", 2);
-        let mut trial = evaluator(&initial, &domain, "ABCD");
+        let trial = evaluator(&initial, &domain, "ABCD");
         assert_eq!(trial.evaluate(&[]).unwrap().0, "CABD");
-        trial.direction = Direction::Encrypt;
+        let trial = TrialEvaluator::new(
+            &initial,
+            &domain,
+            "ABCD",
+            Direction::Encrypt,
+            MeasureId::Ic,
+            None,
+        );
         assert_eq!(trial.evaluate(&[]).unwrap().0, "BCAD");
         for (stepped, expected) in [(true, "CA"), (false, "BB")] {
             let initial = machine("ABC", "BAC", "A", stepped);
@@ -392,10 +671,7 @@ mod tests {
             ))),
         );
         assert_eq!(trial.evaluate(&[]).unwrap(), a);
-        let foreign = TrialEvaluator {
-            input: "AZ",
-            ..trial
-        };
+        let foreign = evaluator(&initial, &domain, "AZ");
         assert_eq!(
             foreign.evaluate(&[]),
             Err(TrialEvaluationError::Model(ModelError::UnknownSymbol('Z')))
@@ -417,7 +693,8 @@ mod tests {
         let score = trial.evaluate(&[]).unwrap().1;
         assert_eq!(score.measured().units(), crate::SCALE);
         assert_eq!(score.ranking().units(), -crate::SCALE);
-        trial.input = "AAAA";
+        let mut trial = evaluator(&initial, &domain, "AAAA");
+        trial.objective = MeasureId::Entropy;
         assert!(trial.evaluate(&[]).unwrap().1.ranking().units() > score.ranking().units());
         trial.objective = MeasureId::Ic;
         assert!(trial.evaluate(&[]).unwrap().1.ranking().units() > 2 * crate::SCALE / 3);
@@ -437,11 +714,25 @@ mod tests {
             // ln(3/4) and ln(1/4), independently quantized downward to Q32.
             assert_eq!(a.1.measured().units(), -1_235_585_093);
             assert_eq!(a.1.ranking(), a.1.measured());
-            trial.input = "BBBBBBB";
+            let trial = TrialEvaluator::new(
+                &initial,
+                &domain,
+                "BBBBBBB",
+                Direction::Decrypt,
+                objective,
+                Some(&resource),
+            );
             let b = trial.evaluate(&[]).unwrap();
             assert_eq!(b.1.measured().units(), -5_954_088_944);
             assert!(a.1.ranking().units() > b.1.ranking().units());
-            trial.input = "AAAAAAA";
+            let trial = TrialEvaluator::new(
+                &initial,
+                &domain,
+                "AAAAAAA",
+                Direction::Decrypt,
+                objective,
+                Some(&resource),
+            );
             assert_eq!(trial.evaluate(&[]).unwrap(), a);
         }
         let resource = trie(&alphabet);
@@ -451,12 +742,26 @@ mod tests {
         let a = trial.evaluate(&[]).unwrap();
         assert_eq!(a.1.measured().units(), 4 * crate::SCALE);
         assert_eq!(a.1.ranking(), a.1.measured());
-        trial.input = "BBB";
+        let trial = TrialEvaluator::new(
+            &initial,
+            &domain,
+            "BBB",
+            Direction::Decrypt,
+            MeasureId::Trie,
+            Some(&resource),
+        );
         assert_eq!(
             trial.evaluate(&[]).unwrap().1.measured().units(),
             3 * crate::SCALE
         );
-        trial.input = "AAB";
+        let trial = TrialEvaluator::new(
+            &initial,
+            &domain,
+            "AAB",
+            Direction::Decrypt,
+            MeasureId::Trie,
+            Some(&resource),
+        );
         assert_eq!(trial.evaluate(&[]).unwrap(), a);
     }
 

@@ -38,6 +38,11 @@ pub struct Engine {
     positions: Vec<char>,
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ROW_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl Engine {
     /// Builds an engine over an already validated machine.
     ///
@@ -99,15 +104,44 @@ impl Engine {
 
     /// Applies one electrical traversal to a single alphabet symbol.
     fn traverse(&self, symbol: char, direction: Direction) -> Result<char, ModelError> {
+        let signal = self
+            .plugboard
+            .map(symbol)
+            .ok_or(ModelError::UnknownSymbol(symbol))?;
+        let signal = self.traverse_scrambler(signal, direction)?;
+        self.plugboard
+            .map(signal)
+            .ok_or(ModelError::UnknownSymbol(signal))
+    }
+
+    /// Builds board-independent rows, stepping exactly once before each row.
+    pub(crate) fn scrambler_rows(
+        &mut self,
+        length: usize,
+        direction: Direction,
+        rows: &mut Vec<char>,
+    ) -> Result<(), ModelError> {
+        #[cfg(test)]
+        ROW_BUILDS.with(|count| count.set(count.get() + 1));
+        for _ in 0..length {
+            self.stepping
+                .advance_prevalidated(&self.topology, &mut self.positions)?;
+            for &symbol in &self.topology.alphabet().symbols {
+                rows.push(self.traverse_scrambler(symbol, direction)?);
+            }
+        }
+        Ok(())
+    }
+
+    fn traverse_scrambler(
+        &self,
+        mut signal: char,
+        direction: Direction,
+    ) -> Result<char, ModelError> {
         let slots = self.topology.slots();
         let has_reflector = slots
             .first()
             .is_some_and(|slot| slot.role() == SlotRole::Reflector);
-
-        let mut signal = self
-            .plugboard
-            .map(symbol)
-            .ok_or(ModelError::UnknownSymbol(symbol))?;
 
         if has_reflector {
             // Forward from the rightmost rotor up to (but excluding) the reflector.
@@ -135,10 +169,7 @@ impl Engine {
             }
         }
 
-        // The output plugboard is applied at the other end of the traversal.
-        self.plugboard
-            .map(signal)
-            .ok_or(ModelError::UnknownSymbol(signal))
+        Ok(signal)
     }
 
     /// Maps `symbol` through one slot's wheel in the requested electrical direction.

@@ -266,6 +266,9 @@ impl crate::AttackRequest {
                 )
             };
             result = if let crate::space::AttackStage::Reswapping { measure } = *stage {
+                // Retain one lazy scorer for this resolved stage/finalist. Construction
+                // does no traversal; resolution errors still surface after admission.
+                let scorer = initial().ok().map(|initial| evaluator(initial, measure));
                 crate::attack_reswapping::reswapping_stage(
                     result,
                     measure,
@@ -274,8 +277,12 @@ impl crate::AttackRequest {
                     accounting,
                     &mut cancel_requested,
                     |board| {
-                        let scorer = evaluator(initial()?, measure);
-                        scorer.evaluate(board).map_err(RunPayload::Evaluation)
+                        initial()?;
+                        scorer
+                            .as_ref()
+                            .expect("resolved stage scorer")
+                            .evaluate(board)
+                            .map_err(RunPayload::Evaluation)
                     },
                 )?
             } else {
@@ -2744,6 +2751,7 @@ mod tests {
             (1, true, 5, 5, false, true, false),
             (2, true, 100, 10, true, true, false),
         ] {
+            crate::engine::ROW_BUILDS.with(|count| count.set(0));
             let last = resource(&initial);
             let context = BoundClimbScoring::new(
                 &initial,
@@ -2778,6 +2786,9 @@ mod tests {
                 ),
                 (used, used)
             );
+            crate::engine::ROW_BUILDS.with(|count| {
+                assert_eq!(count.get() == 0, used == 0);
+            });
             assert_eq!(allowance.used, 7 + used);
             assert_eq!(snapshot.climbs_started, u128::from(used > 0));
             assert_eq!(snapshot.climbs_completed, u128::from(exhausted));
@@ -9249,6 +9260,47 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn reswapping_retains_one_lazy_evaluator_and_stops_before_preparation() {
+        let builds = || crate::engine::ROW_BUILDS.with(|count| count.get());
+        let reset = || crate::engine::ROW_BUILDS.with(|count| count.set(0));
+        reset();
+        let request = hold_stages_request(false, &["reswapping"], 1000, 1);
+        let result = request.run(|_| {}, || true).unwrap();
+        assert_eq!(builds(), 0);
+        assert_eq!(result.evaluations_used, 0);
+        let request = |staged: bool| {
+            let mut value = serde_json::json!({"protocol_version":1,"machine":{"definition":{
+                "kind":"custom","value":{"alphabet":["A","B","C","D"],
+                "wheels":[{"name":"r","wiring":["B","C","A","D"],"turnovers":[]}],
+                "slots":[{"id":"r","role":"rotor","movement":"movable","wheel":"r"}],
+                "stepping":{"rules":[]}}}},
+                "job":{"kind":"search","configuration":{"slots":[{"id":"r","position":"A","ring":"A"}],"plugboard":[]},
+                "space":{"plugboard":{"kind":"attack","symbols":["A","B","C","D"],"max_pairs":2}},
+                "text":"AABBCD","passes":if staged {vec!["hill_climb","reswapping"]} else {vec!["hill_climb"]},
+                "measures":["ic"],"attack":{"kind":"hill_climb","initial_measure":"ic","final_measure":"ic",
+                "switch_pairs":2,"backtrack_pairs":0,"evaluation_budget":1000,
+                "start":[["A","B"],["C","D"]],"reswapping":{"measure":"ic"}}}});
+            if !staged {
+                value["job"]["attack"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("reswapping");
+            }
+            crate::ParsedAttackRequest::parse_json(&value.to_string())
+                .unwrap()
+                .bind_resources(&std::collections::BTreeMap::new())
+                .unwrap()
+        };
+        reset();
+        request(false).run(|_| {}, || false).unwrap();
+        let direct = builds();
+        reset();
+        let result = request(true).run(|_| {}, || false).unwrap();
+        assert!(result.stages[0].evaluations_used > 1);
+        assert_eq!(builds(), direct + 1);
     }
 
     #[test]
