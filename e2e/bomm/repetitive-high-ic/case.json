@@ -2,7 +2,7 @@
   "kind": "constructed",
   "provenance": {
     "construction": "Ciphertext produced by this repository's engine (enigma CLI transform, direction encrypt) from the plaintext below; bomm decrypts it independently from query.json.",
-    "plaintext": "EINS repeated 20 times",
+    "plaintext": "EINSEINSEINSEINSEINSEINSEINSEINSEINSEINSEINSEINSEINSEINSEINSEINSEINSEINSEINSEINS",
     "covers": "low-entropy plaintext with a high IC (about 6.25)"
   },
   "engine": {

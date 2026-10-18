@@ -97,9 +97,25 @@ fn ic(text: &str) -> f64 {
     units as f64 / SCALE as f64
 }
 
-fn check(case: &str) {
+/// Whether a case's full plaintext comes from a historical source or from its construction.
+enum Kind {
+    Historical,
+    Constructed,
+}
+
+fn check(case: &str, kind: Kind) {
     let query = load(case, "query.json");
     let record = load(case, "case.json");
+
+    // The test, not the fixture, decides which full-plaintext check applies.
+    let (label, expected) = match kind {
+        Kind::Historical => ("historical", &record["plaintext"]),
+        Kind::Constructed => ("constructed", &record["provenance"]["plaintext"]),
+    };
+    assert_eq!(record["kind"], json!(label), "{case}: kind");
+    let expected = expected
+        .as_str()
+        .unwrap_or_else(|| panic!("{case}: {label} plaintext is a string"));
 
     let capture = &record["capture"];
     assert_eq!(capture["bomm_commit"], json!(BOMM_COMMIT), "{case}");
@@ -132,15 +148,8 @@ fn check(case: &str) {
         "{case}: IC {ours:.10} vs bomm {score_text}"
     );
 
-    if record["kind"] == json!("historical") {
-        assert_eq!(
-            plaintext,
-            record["plaintext"]
-                .as_str()
-                .expect("historical plaintext is a string"),
-            "{case}: sourced plaintext"
-        );
-    }
+    // bomm only shows 64 letters; the rest is checked against the known plaintext.
+    assert_eq!(plaintext, expected, "{case}: full {label} plaintext");
 }
 
 #[test]
@@ -157,25 +166,25 @@ fn every_case_directory_is_checked() {
 
 #[test]
 fn historical_m4_u264_first_break() {
-    check("m4-u264-first-break");
+    check("m4-u264-first-break", Kind::Historical);
 }
 
 #[test]
 fn enigma_i_double_step() {
-    check("enigma-i-double-step");
+    check("enigma-i-double-step", Kind::Constructed);
 }
 
 #[test]
 fn enigma_m3_two_notch() {
-    check("enigma-m3-two-notch");
+    check("enigma-m3-two-notch", Kind::Constructed);
 }
 
 #[test]
 fn enigma_m4_thin_c_gamma() {
-    check("enigma-m4-thin-c-gamma");
+    check("enigma-m4-thin-c-gamma", Kind::Constructed);
 }
 
 #[test]
 fn repetitive_high_ic() {
-    check("repetitive-high-ic");
+    check("repetitive-high-ic", Kind::Constructed);
 }

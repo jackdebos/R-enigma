@@ -11,7 +11,7 @@ driven in its own schema. The tests need neither network nor the bomm binary.
 One directory per case:
 
 - `query.json`: the exact bomm input that was run. The ciphertext here is the single source used by both engines.
-- `case.json`: `kind` (`historical` or `constructed`), `provenance`, `engine` (the same key in this engine's schema), `plaintext` (historical cases only, as sourced), `capture` (commit, binary SHA-256, date, command, exit code, keys evaluated) and `observed` (bomm's preview, score and key line, verbatim).
+- `case.json`: `kind` (`historical` or `constructed`), `provenance` (constructed cases carry their full source `plaintext` here), `engine` (the same key in this engine's schema), `plaintext` (historical cases only, as sourced), `capture` (commit, binary SHA-256, date, command, exit code, keys evaluated) and `observed` (bomm's preview, score and key line, verbatim).
 
 The historical case is `m4-u264-first-break`: the first M4 Project break (U-264 message), whose plaintext is confirmed by the war diary. Its source URL and the copied values are listed in its `provenance`. The constructed ciphertexts were produced by this engine's CLI (`transform`, `encrypt`) from the plaintext given in `provenance`. bomm decrypts them independently.
 
@@ -42,6 +42,10 @@ No ETW slot is given to bomm: without one it maps letters identically, as our ma
 
 ## Comparison policy
 
-- Text: our full decryption's first 64 letters must equal the uppercased preview exactly. Historical cases must also reproduce the sourced plaintext exactly.
+- Text: our full decryption's first 64 letters must equal the uppercased preview exactly. Letters beyond the preview are not observed from bomm, so the full decryption must also equal the known plaintext: the sourced one for historical cases, the construction input for constructed ones. Each test declares its case's kind; a mismatching `kind` field fails instead of skipping a check.
 - IC: bomm's measure pass scores `26 * sum f(f-1) / (n(n-1))` over the whole decrypted message (`src/measure.h` `bomm_measure_frequency_ic` via `bomm_measure_scrambler`), the same text and formula as `enigma_core::index_of_coincidence`. Our Q32 units are divided by `2^32`, and `|ours - printed| <= 1.1e-6` must hold. The printed value has six decimals, truncated, and our Q32 floor adds at most `2^-32`.
 - A mismatch is reported as a discrepancy. Observed values are never edited to match.
+
+## Coverage and remaining work
+
+Covered: known-key decryption and resource-free IC on Enigma I, M3 (two-notch VI–VIII) and M4 (thin reflectors, Beta/Gamma), with nonzero rings, plugboards and middle-wheel double steps inside the preview, plus one historical message. Not covered: text beyond 64 letters against bomm itself, IC beyond six decimals, n-gram scoring, and every search (hill climbing, plugboard exploration, stages, hold list, outer ordering). Those are separate Task17 slices; attack comparisons must use real German text with a known plaintext. A source-linked helper calling bomm's functions directly would lift the 64-letter and six-decimal limits if needed.
