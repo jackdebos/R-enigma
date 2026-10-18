@@ -26,6 +26,10 @@ pub enum Direction {
 ///
 /// The displayed positions are held in physical left-to-right order, one symbol per
 /// slot. Stepping mutates these positions; ring settings never do.
+///
+/// Construction checks the stepping/topology binding. Both are owned, private, and
+/// remain immutable afterward, so per-symbol stepping can skip that binding comparison
+/// while retaining all other planning and advancement checks.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Engine {
     topology: MachineTopology,
@@ -86,7 +90,8 @@ impl Engine {
         }
         let mut output = String::with_capacity(text.len());
         for symbol in text.chars() {
-            self.stepping.advance(&self.topology, &mut self.positions)?;
+            self.stepping
+                .advance_prevalidated(&self.topology, &mut self.positions)?;
             output.push(self.traverse(symbol, direction)?);
         }
         Ok(output)
@@ -433,10 +438,67 @@ mod tests {
         )
         .unwrap();
 
+        let wrong_alphabet = Alphabet::new(vec!['B', 'A', 'C', 'D']).unwrap();
+        assert_eq!(
+            Engine::new(
+                other.clone(),
+                stepping.clone(),
+                identity_plugboard(&wrong_alphabet),
+            )
+            .err(),
+            Some(ModelError::PlugboardAlphabetMismatch)
+        );
         assert_eq!(
             Engine::new(other, stepping, identity_plugboard(&alphabet)).err(),
             Some(ModelError::SteppingTopologyMismatch)
         );
+    }
+
+    #[test]
+    fn split_transforms_match_concatenation_across_turnover_and_wrap() {
+        let alphabet = four_symbol_alphabet();
+        let topology = MachineTopology::new(
+            alphabet.clone(),
+            vec![
+                Wiring::new("slow", &alphabet, &['B', 'A', 'D', 'C'], &[]).unwrap(),
+                Wiring::new("fast", &alphabet, &['A', 'C', 'D', 'B'], &['D']).unwrap(),
+            ],
+            vec![
+                Slot::new("slow", "slow", SlotRole::Rotor, Movement::Movable, 'C', 'B'),
+                Slot::new("fast", "fast", SlotRole::Rotor, Movement::Movable, 'C', 'A'),
+            ],
+        )
+        .unwrap();
+        let stepping = Stepping::new(
+            &topology,
+            vec![
+                StepRule::new(StepCondition::Always, vec!["fast".into()]),
+                StepRule::new(
+                    StepCondition::AtTurnover("fast".into()),
+                    vec!["slow".into(), "fast".into()],
+                ),
+            ],
+        )
+        .unwrap();
+        for direction in [Direction::Encrypt, Direction::Decrypt] {
+            let mut whole = Engine::new(
+                topology.clone(),
+                stepping.clone(),
+                identity_plugboard(&alphabet),
+            )
+            .unwrap();
+            let mut split = whole.clone();
+            let expected = whole.transform("ABCDAB", direction).unwrap();
+            let mut actual = split.transform("A", direction).unwrap();
+            assert_eq!(split.positions(), ['C', 'D']);
+            actual.push_str(&split.transform("B", direction).unwrap());
+            assert_eq!(split.positions(), ['D', 'A']);
+            actual.push_str(&split.transform("", direction).unwrap());
+            actual.push_str(&split.transform("CDAB", direction).unwrap());
+            assert_eq!(actual, expected);
+            assert_eq!(split.positions(), whole.positions());
+            assert_eq!(split.positions(), ['A', 'A']);
+        }
     }
 
     #[test]

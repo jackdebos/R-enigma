@@ -669,11 +669,26 @@ impl Stepping {
         topology: &MachineTopology,
         positions: &[char],
     ) -> Result<Vec<usize>, ModelError> {
+        self.validate_binding(topology)?;
+        self.plan_prevalidated(topology, positions)
+    }
+
+    fn validate_binding(&self, topology: &MachineTopology) -> Result<(), ModelError> {
         if let Some(bound) = &self.bound_topology {
             if bound != topology {
                 return Err(ModelError::SteppingTopologyMismatch);
             }
         }
+        Ok(())
+    }
+
+    // The caller must have validated the binding and kept topology and rules unchanged.
+    // All other planning checks and target resolution remain on this path.
+    fn plan_prevalidated(
+        &self,
+        topology: &MachineTopology,
+        positions: &[char],
+    ) -> Result<Vec<usize>, ModelError> {
         let expected = topology.slots().len();
         if positions.len() != expected {
             return Err(ModelError::PositionCountMismatch {
@@ -706,7 +721,17 @@ impl Stepping {
         topology: &MachineTopology,
         positions: &mut [char],
     ) -> Result<(), ModelError> {
-        let plan = self.plan(topology, positions)?;
+        self.validate_binding(topology)?;
+        self.advance_prevalidated(topology, positions)
+    }
+
+    // Same binding invariant as plan_prevalidated; this skips only structural equality.
+    fn advance_prevalidated(
+        &self,
+        topology: &MachineTopology,
+        positions: &mut [char],
+    ) -> Result<(), ModelError> {
+        let plan = self.plan_prevalidated(topology, positions)?;
         let size = topology.alphabet().len();
         for index in plan {
             let symbol = positions[index];
@@ -1553,6 +1578,51 @@ mod tests {
             stepping.plan(&renamed, &positions),
             Err(ModelError::SteppingTopologyMismatch)
         );
+    }
+
+    #[test]
+    fn stepping_binding_checks_precede_position_errors_even_for_bound_empty_rules() {
+        let topology = stepping_topology();
+        let other = MachineTopology::new(
+            topology.alphabet().clone(),
+            topology.wheels().to_vec(),
+            vec![
+                Slot::new("slow", "slow", SlotRole::Rotor, Movement::Movable, 'B', 'A'),
+                Slot::new("fast", "fast", SlotRole::Rotor, Movement::Movable, 'A', 'A'),
+            ],
+        )
+        .unwrap();
+        for rules in [
+            vec![],
+            vec![StepRule::new(StepCondition::Always, vec!["fast".into()])],
+        ] {
+            let stepping = Stepping::new(&topology, rules).unwrap();
+            for initial in [vec!['A', 'A'], vec!['A'], vec![]] {
+                let mut positions = initial.clone();
+                assert_eq!(
+                    stepping.plan(&other, &positions),
+                    Err(ModelError::SteppingTopologyMismatch)
+                );
+                assert_eq!(
+                    stepping.advance(&other, &mut positions),
+                    Err(ModelError::SteppingTopologyMismatch)
+                );
+                assert_eq!(positions, initial);
+            }
+        }
+        for stepping in [Stepping::none(), Stepping::new(&topology, vec![]).unwrap()] {
+            let mut positions = ['A', 'D'];
+            assert!(stepping.plan(&topology, &positions).unwrap().is_empty());
+            stepping.advance(&topology, &mut positions).unwrap();
+            assert_eq!(positions, ['A', 'D']);
+        }
+        let mut positions = ['B', 'D'];
+        assert!(Stepping::none()
+            .plan(&other, &positions)
+            .unwrap()
+            .is_empty());
+        Stepping::none().advance(&other, &mut positions).unwrap();
+        assert_eq!(positions, ['B', 'D']);
     }
 
     #[test]
