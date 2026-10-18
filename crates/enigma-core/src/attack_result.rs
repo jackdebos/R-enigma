@@ -56,7 +56,7 @@ pub struct AttackBest {
     pub(crate) incomplete: bool,
     pub(crate) final_objective_ascent: bool,
     pub(crate) neighborhood_exhausted: bool,
-    /// This entry's own stage history; no accessor until the hold is projected.
+    /// This entry's own stage history; the head uses its result's history.
     pub(crate) stages: Vec<AttackStageResult>,
 }
 
@@ -163,7 +163,38 @@ pub struct AttackResult {
     pub(crate) stages: Vec<AttackStageResult>,
 }
 
+/// Borrowed finalist and its own committed stage history.
+#[derive(Clone, Copy, Debug)]
+pub struct AttackHoldEntry<'a> {
+    best: &'a AttackBest,
+    stages: &'a [AttackStageResult],
+}
+
+impl<'a> AttackHoldEntry<'a> {
+    /// Final-scored committed candidate, without copying its plaintext.
+    pub fn best(&self) -> &'a AttackBest {
+        self.best
+    }
+    /// This finalist's admitted stages in pipeline order.
+    pub fn stages(&self) -> &'a [AttackStageResult] {
+        self.stages
+    }
+}
+
 impl AttackResult {
+    /// Finalists in final order, with the winner first; empty without a winner.
+    pub fn hold(&self) -> impl Iterator<Item = AttackHoldEntry<'_>> {
+        self.best.iter().flat_map(move |best| {
+            std::iter::once(AttackHoldEntry {
+                best,
+                stages: &self.stages,
+            })
+            .chain(self.held_tail.iter().map(|best| AttackHoldEntry {
+                best,
+                stages: &best.stages,
+            }))
+        })
+    }
     /// Started stages in pipeline order; empty for HC/PE-only runs.
     pub fn stages(&self) -> &[AttackStageResult] {
         &self.stages

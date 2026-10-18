@@ -110,6 +110,23 @@ pub struct BestResult {
     neighborhood_exhausted: bool,
 }
 
+/// Wire-only finalist with the same nine winner fields and its own history.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct HoldResult {
+    #[serde(flatten)]
+    best: BestResult,
+    stages: Vec<StageResult>,
+}
+
+impl From<crate::AttackHoldEntry<'_>> for HoldResult {
+    fn from(entry: crate::AttackHoldEntry<'_>) -> Self {
+        Self {
+            best: BestResult::from(entry.best()),
+            stages: entry.stages().iter().map(StageResult::from).collect(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct WinningConfiguration {
     slots: Vec<WinningSlot>,
@@ -212,6 +229,9 @@ pub enum Event {
     },
     /// Final committed search winner and factual whole-run snapshot.
     Result {
+        /// Final ordered success finalists; omitted on runtime errors until error projection.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hold: Option<Vec<HoldResult>>,
         /// Started stages in pipeline order, including on runtime failure.
         stages: Vec<StageResult>,
         /// Null only when the runtime result genuinely has no winner.
@@ -278,6 +298,7 @@ impl Event {
             result.best(),
             result.counters(),
             result.stages(),
+            Some(result.hold().map(HoldResult::from).collect()),
             elapsed_ms,
         )
     }
@@ -286,9 +307,11 @@ impl Event {
         best: Option<&AttackBest>,
         counters: AttackProgress,
         stages: &[crate::AttackStageResult],
+        hold: Option<Vec<HoldResult>>,
         elapsed_ms: u128,
     ) -> Self {
         Self::Result {
+            hold,
             stages: stages.iter().map(StageResult::from).collect(),
             best: best.map(|best| Box::new(BestResult::from(best))),
             counters: counters.into(),
@@ -345,7 +368,8 @@ impl Event {
             },
         };
         Ok((
-            Self::result_snapshot(best, error.counters(), error.stages(), elapsed_ms),
+            // Preserve the legacy error shape; do not claim a full hold from best alone.
+            Self::result_snapshot(best, error.counters(), error.stages(), None, elapsed_ms),
             Self::Error {
                 code: "internal_error".to_owned(),
                 message,
@@ -476,7 +500,8 @@ mod tests {
     // not evidence that validated public requests naturally fail.
     fn assert_runtime_winner_projection(result: crate::AttackResult) {
         use crate::attack_result::{AttackRunErrorData, AttackRunSource, RunPayload};
-        let expected = encoded(&Event::result(&result, u128::MAX));
+        let mut expected = encoded(&Event::result(&result, u128::MAX));
+        expected.as_object_mut().unwrap().remove("hold");
         let error = crate::AttackRunError::new(AttackRunErrorData {
             held_tail: Vec::new(),
             stages: Vec::new(),
@@ -490,6 +515,44 @@ mod tests {
         let (projected, terminal) = Event::runtime_error(&error, u128::MAX).unwrap();
         assert_eq!(encoded(&projected), expected);
         assert_eq!(encoded(&terminal)["context"]["source"]["kind"], "invariant");
+    }
+
+    #[test]
+    fn success_hold_projects_every_entry_and_its_own_history() {
+        let mut result = result_fixture(false, 0);
+        let mut tail = result_fixture(false, 0).best.take().unwrap();
+        tail.outer_index = 7;
+        tail.stages.push(crate::AttackStageResult {
+            pass: "measure",
+            measure: crate::MeasureId::Ic,
+            base_measure: None,
+            score: Some(tail.score()),
+            evaluations_used: 3,
+            completed: false,
+        });
+        result.held_tail.push(tail);
+        let wire = encoded(&Event::result(&result, 0));
+        let hold = wire["hold"].as_array().expect("success hold array");
+        assert_eq!(hold.len(), 2);
+        for (entry, best) in hold
+            .iter()
+            .zip(result.best.iter().chain(result.held_tail.iter()))
+        {
+            let mut expected = serde_json::to_value(super::BestResult::from(best)).unwrap();
+            expected["stages"] = if best.outer_index() == 7 {
+                json!([super::StageResult::from(&best.stages[0])])
+            } else {
+                wire["stages"].clone()
+            };
+            assert_eq!(entry, &expected);
+            assert_eq!(entry.as_object().unwrap().len(), 10);
+        }
+        assert_eq!(hold[0]["stages"], json!([]));
+        assert_eq!(hold[1]["stages"][0]["evaluations_used"], "3");
+        assert_eq!(hold[1]["stages"][0]["completed"], false);
+        let mut head = hold[0].clone();
+        head.as_object_mut().unwrap().remove("stages");
+        assert_eq!(head, wire["best"]);
     }
 
     #[test]
@@ -594,7 +657,9 @@ mod tests {
             assert_eq!(
                 encoded(&Event::result(&result, 23)),
                 json!({
-                    "event": "result", "stages": [], "best": {
+                    "event": "result", "stages": [],
+                    "hold": result.hold().map(super::HoldResult::from).collect::<Vec<_>>(),
+                    "best": {
                         "configuration": {"slots": slots, "plugboard": best.configuration().plugboard()},
                         "mutable_plugboard": best.mutable_plugboard(), "plaintext": best.plaintext(),
                         "score": {"measure": best.measure().id(),
@@ -635,7 +700,8 @@ mod tests {
                 encoded(&Event::progress(result.counters(), 0))["counters"]
             );
             assert_eq!(value["stages"], json!([]));
-            assert_eq!(value.as_object().unwrap().len(), 8);
+            assert_eq!(value["hold"], json!([]));
+            assert_eq!(value.as_object().unwrap().len(), 9);
         }
     }
 
@@ -683,6 +749,10 @@ mod tests {
         assert_eq!(error.stages().len(), 2);
         let (projected, _) = Event::runtime_error(&error, 0).unwrap();
         assert_eq!(encoded(&projected)["stages"], expected);
+        assert!(!encoded(&projected)
+            .as_object()
+            .unwrap()
+            .contains_key("hold"));
     }
 
     #[test]

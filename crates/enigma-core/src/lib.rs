@@ -55,8 +55,8 @@ mod attack_result;
 mod attack_reswapping;
 pub use attack_gate::AttackGate;
 pub use attack_result::{
-    AttackBest, AttackCounterOverflow, AttackProgress, AttackResult, AttackRunCategory,
-    AttackRunError, AttackRunSource, AttackStageResult, AttackTermination,
+    AttackBest, AttackCounterOverflow, AttackHoldEntry, AttackProgress, AttackResult,
+    AttackRunCategory, AttackRunError, AttackRunSource, AttackStageResult, AttackTermination,
 };
 mod binding;
 mod candidate;

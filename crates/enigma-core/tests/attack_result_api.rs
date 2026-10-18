@@ -18,7 +18,12 @@ fn hc_pe_runs_have_empty_public_and_wire_stage_histories() {
             assert!(result.stages().is_empty());
             let wire = serde_json::to_value(enigma_core::Event::result(&result, 0)).unwrap();
             assert_eq!(wire["stages"], serde_json::json!([]));
-            assert_eq!(wire.as_object().unwrap().len(), 5);
+            assert_eq!(wire.as_object().unwrap().len(), 6);
+            assert_eq!(
+                wire["hold"].as_array().unwrap().len(),
+                result.hold().count()
+            );
+            assert_eq!(result.hold().next().is_none(), result.best().is_none());
         }
     }
     use enigma_core::{AttackStageResult, MeasureId, MeasuredScore};
@@ -30,6 +35,52 @@ fn hc_pe_runs_have_empty_public_and_wire_stage_histories() {
     let _: fn(&AttackStageResult) -> Option<MeasuredScore> = AttackStageResult::score;
     let _: fn(&AttackStageResult) -> u64 = AttackStageResult::evaluations_used;
     let _: fn(&AttackStageResult) -> bool = AttackStageResult::completed;
+}
+
+#[test]
+fn success_hold_is_borrowed_ordered_and_keeps_entry_histories() {
+    fn client<'a>(entry: enigma_core::AttackHoldEntry<'a>) -> &'a AttackBest {
+        entry.best()
+    }
+    for capacity in [1, 100] {
+        let mut value = fixture_value(100, 0, true);
+        value["job"]["attack"]["hold"] = serde_json::json!(capacity);
+        let before = enigma_core::AttackRequest::parse_json(&value.to_string())
+            .unwrap()
+            .run(|_| {}, || false)
+            .unwrap();
+        value["job"]["passes"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!("measure"));
+        value["job"]["attack"]["measure"] = serde_json::json!({"measure": "ic"});
+        value["job"]["attack"]["evaluation_budget"] =
+            serde_json::json!(before.evaluations_used() + 1);
+        let result = enigma_core::AttackRequest::parse_json(&value.to_string())
+            .unwrap()
+            .run(|_| {}, || false)
+            .unwrap();
+        let entries: Vec<_> = result.hold().collect();
+        assert_eq!(entries.len(), if capacity == 1 { 1 } else { 2 });
+        assert!(std::ptr::eq(client(entries[0]), result.best().unwrap()));
+        assert!(std::ptr::eq(entries[0].stages(), result.stages()));
+        assert_eq!(entries[0].stages().len(), 1);
+        if capacity > 1 {
+            assert!(entries[1].stages().is_empty());
+        }
+        let wire = serde_json::to_value(enigma_core::Event::result(&result, 0)).unwrap();
+        for (entry, projected) in entries.iter().zip(wire["hold"].as_array().unwrap()) {
+            assert_eq!(
+                projected["start_index"],
+                entry.best().start_index().to_string()
+            );
+            assert_eq!(
+                projected["stages"].as_array().unwrap().len(),
+                entry.stages().len()
+            );
+        }
+        assert_eq!(wire["hold"][0]["stages"], wire["stages"]);
+    }
 }
 
 #[test]
