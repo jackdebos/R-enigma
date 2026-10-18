@@ -1,0 +1,32 @@
+{
+  "kind": "constructed",
+  "provenance": {
+    "construction": "Ciphertext produced by this repository's engine (enigma CLI transform, direction encrypt) from the plaintext below; bomm decrypts it independently from query.json.",
+    "plaintext": "DERFEINDGREIFTBEIMORGENGRAUENANXVERSTAERKUNGENSINDUNTERWEGSXMELDUNGFOLGT",
+    "covers": "nonzero rings, 8 plugboard pairs, middle-wheel double step at letter 5"
+  },
+  "engine": {
+    "machine": "enigma-i",
+    "slots": [
+      {"id": "reflector", "wheel": "B", "position": "A", "ring": "A"},
+      {"id": "left", "wheel": "II", "position": "K", "ring": "F"},
+      {"id": "middle", "wheel": "I", "position": "P", "ring": "M"},
+      {"id": "right", "wheel": "III", "position": "S", "ring": "T"}
+    ],
+    "plugboard": ["AQ", "BJ", "CY", "DM", "FN", "GU", "HL", "KZ"]
+  },
+  "capture": {
+    "bomm_commit": "aeb2f2bf00dfdee68e972f90ae7e83b387b188e9",
+    "bomm_sha256": "58f236fc648638a21d7c1be7e4a355c0a9aeca7edcbbfc2743ebd8cdb81895b5",
+    "date": "2026-10-18",
+    "command": "$R/build/bomm -q -t 1 -n 1 e2e/bomm/enigma-i-double-step/query.json",
+    "exit_code": 0,
+    "units": 1,
+    "decrypts": 1
+  },
+  "observed": {
+    "preview": "derfeindgreiftbeimorgengrauenanxverstaerkungensindunterwegsxmeld",
+    "score": "+1.841158",
+    "key": "UKW-B,II,I,III afmt akps aq bj cy dm fn gu hl kz"
+  }
+}

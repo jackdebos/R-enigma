@@ -1,0 +1,33 @@
+{
+  "kind": "constructed",
+  "provenance": {
+    "construction": "Ciphertext produced by this repository's engine (enigma CLI transform, direction encrypt) from the plaintext below; bomm decrypts it independently from query.json.",
+    "plaintext": "WETTERBERICHTFUERDIENORDSEEXWINDAUSWESTSTAERKESECHSXSEEGANGHOCHXSICHTSCHLECHT",
+    "covers": "thin reflector C, greek wheel Gamma at position R ring E, double step at letter 4"
+  },
+  "engine": {
+    "machine": "enigma-m4",
+    "slots": [
+      {"id": "reflector", "wheel": "Thin-C", "position": "A", "ring": "A"},
+      {"id": "greek", "wheel": "Gamma", "position": "R", "ring": "E"},
+      {"id": "left", "wheel": "V", "position": "D", "ring": "K"},
+      {"id": "middle", "wheel": "IV", "position": "I", "ring": "P"},
+      {"id": "right", "wheel": "VI", "position": "K", "ring": "Z"}
+    ],
+    "plugboard": ["AE", "BX", "CM", "FQ", "JU", "LS"]
+  },
+  "capture": {
+    "bomm_commit": "aeb2f2bf00dfdee68e972f90ae7e83b387b188e9",
+    "bomm_sha256": "58f236fc648638a21d7c1be7e4a355c0a9aeca7edcbbfc2743ebd8cdb81895b5",
+    "date": "2026-10-18",
+    "command": "$R/build/bomm -q -t 1 -n 1 e2e/bomm/enigma-m4-thin-c-gamma/query.json",
+    "exit_code": 0,
+    "units": 1,
+    "decrypts": 1
+  },
+  "observed": {
+    "preview": "wetterberichtfuerdienordseexwindausweststaerkesechsxseeganghochx",
+    "score": "+1.937115",
+    "key": "UKW-C-thin,gamma,V,IV,VI aekpz ardik ae bx cm fq ju ls"
+  }
+}

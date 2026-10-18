@@ -1,0 +1,32 @@
+{
+  "kind": "constructed",
+  "provenance": {
+    "construction": "Ciphertext produced by this repository's engine (enigma CLI transform, direction encrypt) from the plaintext below; bomm decrypts it independently from query.json.",
+    "plaintext": "KONVOIINQUADRATBRAVOSICHTETXKURSNORDOSTXGESCHWINDIGKEITZEHNKNOTENXANGRIFFBEFOHLEN",
+    "covers": "two-notch wheels VI-VIII, UKW C, 7 plugboard pairs, double step at letter 5 via notch M"
+  },
+  "engine": {
+    "machine": "enigma-m3",
+    "slots": [
+      {"id": "reflector", "wheel": "C", "position": "A", "ring": "A"},
+      {"id": "left", "wheel": "VI", "position": "A", "ring": "C"},
+      {"id": "middle", "wheel": "VII", "position": "L", "ring": "Q"},
+      {"id": "right", "wheel": "VIII", "position": "J", "ring": "H"}
+    ],
+    "plugboard": ["AR", "BT", "CW", "DZ", "EH", "GO", "IL"]
+  },
+  "capture": {
+    "bomm_commit": "aeb2f2bf00dfdee68e972f90ae7e83b387b188e9",
+    "bomm_sha256": "58f236fc648638a21d7c1be7e4a355c0a9aeca7edcbbfc2743ebd8cdb81895b5",
+    "date": "2026-10-18",
+    "command": "$R/build/bomm -q -t 1 -n 1 e2e/bomm/enigma-m3-two-notch/query.json",
+    "exit_code": 0,
+    "units": 1,
+    "decrypts": 1
+  },
+  "observed": {
+    "preview": "konvoiinquadratbravosichtetxkursnordostxgeschwindigkeitzehnknote",
+    "score": "+1.316049",
+    "key": "UKW-C,VI,VII,VIII acqh aalj ar bt cw dz eh go il"
+  }
+}

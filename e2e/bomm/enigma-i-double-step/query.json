@@ -1,0 +1,16 @@
+{
+  "alphabet": "abcdefghijklmnopqrstuvwxyz",
+  "ciphertext": "jpvtntmhbdtmkuavsllufjkjbhebunyvaivoeubqidiuvzqhgfqermuvmkesjofybhpltuen",
+  "space": {
+    "slots": [
+      {"wheels": ["UKW-B"], "rings": "a", "positions": "a"},
+      {"rotating": true, "wheels": ["II"], "rings": "f", "positions": "k"},
+      {"rotating": true, "wheels": ["I"], "rings": "m", "positions": "p"},
+      {"rotating": true, "wheels": ["III"], "rings": "t", "positions": "s"}
+    ],
+    "plugboard": "aq bj cy dm fn gu hl kz"
+  },
+  "passes": [
+    {"type": "measure", "measure": "ic"}
+  ]
+}
