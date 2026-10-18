@@ -93,6 +93,7 @@ fn measure_fixture(budget: u64, offset: u64, pe: bool) -> enigma_core::AttackReq
         .push(serde_json::json!("measure"));
     value["job"]["measures"] = serde_json::json!(["ic", "entropy"]);
     value["job"]["attack"]["measure"] = serde_json::json!({"measure": "entropy"});
+    value["job"]["attack"]["hold"] = serde_json::json!(1); // Task 13 single winner.
     enigma_core::AttackRequest::parse_json(&value.to_string()).unwrap()
 }
 
@@ -206,6 +207,7 @@ fn trie_fixture(
     value["job"]["measures"] = serde_json::json!(["ic", "entropy", "trie"]);
     value["job"]["attack"]["initial_measure"] = serde_json::json!("entropy");
     value["job"]["attack"]["final_measure"] = serde_json::json!("entropy");
+    value["job"]["attack"]["hold"] = serde_json::json!(1); // Task 13 single winner.
     value["job"]["passes"]
         .as_array_mut()
         .unwrap()
@@ -378,6 +380,7 @@ fn reswapping_fixture(budget: u64, pe: bool, order: &[&str]) -> enigma_core::Att
         value["job"]["attack"]["measure"] = serde_json::json!({"measure": "ic"});
     }
     value["job"]["attack"]["reswapping"] = serde_json::json!({"measure": "entropy"});
+    value["job"]["attack"]["hold"] = serde_json::json!(1); // Task 13 single winner.
     enigma_core::AttackRequest::parse_json(&value.to_string()).unwrap()
 }
 

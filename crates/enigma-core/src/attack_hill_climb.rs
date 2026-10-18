@@ -213,78 +213,118 @@ impl crate::AttackRequest {
             )
         }?;
         let mut result = result;
-        if result.termination == crate::AttackTermination::Completed && result.best.is_some() {
-            use crate::attack_result::RunPayload;
-            for stage in self.settings().stages() {
-                if control.poll_cancellation(cancel_requested()) {
-                    result.termination = crate::AttackTermination::Cancelled;
+        let completed = crate::AttackTermination::Completed;
+        let staged = !self.settings().stages().is_empty();
+        if staged && result.termination == completed && result.best.is_some() {
+            let accounting = &mut ObservedAccounting {
+                allowance: &mut allowance,
+                control: &mut control,
+                observer: &mut observer,
+            };
+            // Best-first finalists share one allowance; a stop ends every later one.
+            let (mut polished, mut partial, mut unpolished) = (Vec::new(), None, Vec::new());
+            loop {
+                result = self.finalist_stages(result, accounting, &mut cancel_requested)?;
+                let mut finalist = result.best.take().expect("staged finalist");
+                finalist.stages = std::mem::take(&mut result.stages);
+                if result.termination != completed {
+                    // Any history means a stage started, even if it then stopped.
+                    if finalist.stages.is_empty() {
+                        unpolished.push(finalist);
+                    } else {
+                        partial = Some(finalist);
+                    }
                     break;
                 }
-                // Bind only fixed facts; mutable pairs belong solely to the trial.
-                let best = result.best.as_ref().expect("completed run has best");
-                let initial = crate::TransformConfiguration::new(
-                    best.configuration.slots().to_vec(),
-                    self.domain().fixed_pairs().to_vec(),
-                )
-                .resolve(self.definition());
-                // Resolution failure surfaces only after the stage's first admission.
-                let initial = || {
-                    (initial.as_ref())
-                        .map_err(|_| RunPayload::Invariant("winning slots failed to resolve"))
-                };
-                let evaluator = |initial, measure| {
-                    TrialEvaluator::new(
-                        initial,
-                        self.domain(),
-                        self.text(),
-                        Direction::Decrypt,
-                        measure,
-                        self.bound_resource(measure),
-                    )
-                };
-                let accounting = &mut ObservedAccounting {
-                    allowance: &mut allowance,
-                    control: &mut control,
-                    observer: &mut observer,
-                };
-                result = if let crate::space::AttackStage::Reswapping { measure } = *stage {
-                    crate::attack_reswapping::reswapping_stage(
-                        result,
-                        measure,
-                        self.definition().alphabet(),
-                        self.domain(),
-                        accounting,
-                        &mut cancel_requested,
-                        |board| {
-                            let scorer = evaluator(initial()?, measure);
-                            scorer.evaluate(board).map_err(RunPayload::Evaluation)
-                        },
-                    )?
-                } else {
-                    let (_, measure, base_measure) = scoring_stage_metadata(*stage);
-                    scoring_stage(result, *stage, accounting, |best| {
-                        let initial = initial()?;
-                        let evaluator = |measure| evaluator(initial, measure);
-                        let scorer = evaluator(measure);
-                        let evaluation = if matches!(stage, crate::space::AttackStage::Trie { .. })
-                        {
-                            scorer.evaluate_trie(
-                                &best.mutable_plugboard,
-                                base_measure.map(evaluator).as_ref(),
-                                best.score.ranking(),
-                            )
-                        } else {
-                            scorer.evaluate(&best.mutable_plugboard)
-                        };
-                        evaluation.map_err(RunPayload::Evaluation)
-                    })?
-                };
-                if result.termination != crate::AttackTermination::Completed {
+                polished.push(finalist);
+                if result.held_tail.is_empty() {
                     break;
                 }
+                result.best = Some(result.held_tail.remove(0));
             }
+            unpolished.append(&mut result.held_tail);
+            let ranked = crate::attack_hold::rerank_after_stages(polished, partial, unpolished);
+            let mut ranked = ranked.into_iter();
+            let mut head = ranked.next().expect("rerank keeps the first finalist");
+            result.stages = std::mem::take(&mut head.stages);
+            result.best = Some(head);
+            result.held_tail = ranked.collect();
         }
         control.notify(&mut observer);
+        Ok(result)
+    }
+
+    /// Runs every listed stage on `result.best` alone; unprocessed finalists ride
+    /// in `held_tail` only so a stage error still returns them.
+    fn finalist_stages(
+        &self,
+        mut result: crate::AttackResult,
+        accounting: &mut ObservedAccounting<'_, impl CounterObserver>,
+        mut cancel_requested: impl FnMut() -> bool,
+    ) -> Result<crate::AttackResult, crate::AttackRunError> {
+        use crate::attack_result::RunPayload;
+        for stage in self.settings().stages() {
+            if (accounting.control).poll_cancellation(cancel_requested()) {
+                result.termination = crate::AttackTermination::Cancelled;
+                break;
+            }
+            // Bind only fixed facts; mutable pairs belong solely to the trial.
+            let best = result.best.as_ref().expect("completed run has best");
+            let initial = crate::TransformConfiguration::new(
+                best.configuration.slots().to_vec(),
+                self.domain().fixed_pairs().to_vec(),
+            )
+            .resolve(self.definition());
+            // Resolution failure surfaces only after the stage's first admission.
+            let initial = || {
+                (initial.as_ref())
+                    .map_err(|_| RunPayload::Invariant("winning slots failed to resolve"))
+            };
+            let evaluator = |initial, measure| {
+                TrialEvaluator::new(
+                    initial,
+                    self.domain(),
+                    self.text(),
+                    Direction::Decrypt,
+                    measure,
+                    self.bound_resource(measure),
+                )
+            };
+            result = if let crate::space::AttackStage::Reswapping { measure } = *stage {
+                crate::attack_reswapping::reswapping_stage(
+                    result,
+                    measure,
+                    self.definition().alphabet(),
+                    self.domain(),
+                    accounting,
+                    &mut cancel_requested,
+                    |board| {
+                        let scorer = evaluator(initial()?, measure);
+                        scorer.evaluate(board).map_err(RunPayload::Evaluation)
+                    },
+                )?
+            } else {
+                let (_, measure, base_measure) = scoring_stage_metadata(*stage);
+                scoring_stage(result, *stage, accounting, |best| {
+                    let initial = initial()?;
+                    let evaluator = |measure| evaluator(initial, measure);
+                    let scorer = evaluator(measure);
+                    let evaluation = if matches!(stage, crate::space::AttackStage::Trie { .. }) {
+                        scorer.evaluate_trie(
+                            &best.mutable_plugboard,
+                            base_measure.map(evaluator).as_ref(),
+                            best.score.ranking(),
+                        )
+                    } else {
+                        scorer.evaluate(&best.mutable_plugboard)
+                    };
+                    evaluation.map_err(RunPayload::Evaluation)
+                })?
+            };
+            if result.termination != crate::AttackTermination::Completed {
+                break;
+            }
+        }
         Ok(result)
     }
 }
@@ -9048,5 +9088,215 @@ mod tests {
             Err(TrialEvaluationError::Board(_))
         ));
         assert_eq!(allowance.used, 1);
+    }
+
+    /// Outers B, A, C decrypt "ABA" to AAC, CCB and BBA, tied on IC; the
+    /// dictionary (AC 1, CB 2, BA 2) then separates them in trie stages.
+    fn hold_stages_request(
+        pe: bool,
+        passes: &[&str],
+        budget: u64,
+        hold: u64,
+    ) -> crate::AttackRequest {
+        direct_request_with(serde_json::json!([]), false, pe, |job| {
+            job["configuration"]["slots"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("position");
+            job["space"]["slots"] = serde_json::json!([{"id":"r","positions":["B","A","C"]}]);
+            job["text"] = serde_json::json!("ABA");
+            job["measures"] = serde_json::json!(["ic", "trie"]);
+            job["attack"]["initial_measure"] = serde_json::json!("ic");
+            job["attack"]["final_measure"] = serde_json::json!("ic");
+            job["attack"]["evaluation_budget"] = serde_json::json!(budget);
+            job["attack"]["hold"] = serde_json::json!(hold);
+            for &pass in passes {
+                job["passes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!(pass));
+                job["attack"][pass] = match pass {
+                    "trie" => serde_json::json!({}),
+                    _ => serde_json::json!({"measure": "trie"}),
+                };
+            }
+        })
+    }
+
+    /// Final entries as (outer, start, whole ranking units, own history length).
+    fn hold_stages_entries(result: &crate::AttackResult) -> Vec<(u128, u128, i128, usize)> {
+        (result.best.iter().chain(&result.held_tail))
+            .map(|e| {
+                (
+                    e.outer_index,
+                    e.start_index,
+                    e.score.ranking().units() >> 32,
+                    e.stages.len(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hold_stages_capacity_one_matches_task13_pipeline() {
+        for pe in [false, true] {
+            for (budget, stop) in [
+                (1000, usize::MAX),
+                (13, 99),
+                (68, 99),
+                (1000, 14),
+                (1000, 70),
+            ] {
+                let request = hold_stages_request(pe, &["trie", "reswapping"], budget, 1);
+                let (mut control, mut observer, mut polls) =
+                    (AttackControl::default(), Recorder::default(), 0);
+                let mut requested = || {
+                    polls += 1;
+                    polls == stop
+                };
+                let (domain, measure) = (request.domain(), request.settings().final_measure());
+                let mut expected = if pe {
+                    let run = request.schedule_partial_outers_controlled(
+                        &mut control,
+                        &mut observer,
+                        &mut requested,
+                    );
+                    run.unwrap()
+                        .project_public(control.snapshot(), domain, measure)
+                } else {
+                    let run = request.schedule_direct_outers_controlled(
+                        &mut control,
+                        &mut observer,
+                        &mut requested,
+                    );
+                    run.unwrap()
+                        .project_public(control.snapshot(), domain, measure)
+                }
+                .unwrap();
+                // Task 13: the single winner runs the stage loop, then one terminal notification.
+                if expected.termination == crate::AttackTermination::Completed
+                    && expected.best.is_some()
+                {
+                    let allowance = &mut EvaluationAllowance {
+                        used: expected.evaluations_used,
+                        limit: budget,
+                    };
+                    let accounting = &mut ObservedAccounting {
+                        allowance,
+                        control: &mut control,
+                        observer: &mut observer,
+                    };
+                    expected = request
+                        .finalist_stages(expected, accounting, &mut requested)
+                        .unwrap();
+                }
+                control.notify(&mut observer);
+                let (mut snapshots, mut actual_polls) = (Vec::new(), 0);
+                let actual = request
+                    .run(
+                        |p| snapshots.push(p.0),
+                        || {
+                            actual_polls += 1;
+                            actual_polls == stop
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+                assert_eq!((snapshots, actual_polls), (observer.0, polls));
+            }
+        }
+    }
+
+    #[test]
+    fn hold_stages_polish_every_finalist_then_rerank_and_dedup() {
+        for (pe, passes, expected) in [
+            (
+                false,
+                &["trie"][..],
+                [(1, 0, 3, 0), (2, 0, 3, 1), (0, 0, 2, 1)],
+            ),
+            (
+                false,
+                &["trie", "reswapping"],
+                [(1, 0, 2, 0), (2, 0, 2, 2), (0, 0, 1, 2)],
+            ),
+            // Every PE seed reswaps onto its outer's empty board; the smaller index stays.
+            (
+                true,
+                &["reswapping"],
+                [(1, 0, 2, 0), (2, 0, 2, 1), (0, 0, 1, 1)],
+            ),
+        ] {
+            let before = hold_stages_request(pe, &[], 1000, 100)
+                .run(|_| {}, || false)
+                .unwrap();
+            assert_eq!(hold_stages_entries(&before).len(), if pe { 12 } else { 3 });
+            let mut last = None;
+            let result = hold_stages_request(pe, passes, 1000, 100)
+                .run(|p| last = Some(p), || false)
+                .unwrap();
+            assert_eq!(result.termination, crate::AttackTermination::Completed);
+            assert_eq!(last, Some(result.counters));
+            // Outer 0 led before stages and now trails; the new head's history is the run's.
+            assert_eq!(hold_stages_entries(&result), expected);
+            let histories: Vec<_> = std::iter::once(&result.stages)
+                .chain(result.held_tail.iter().map(|e| &e.stages))
+                .collect();
+            for (entry, history) in result.best.iter().chain(&result.held_tail).zip(&histories) {
+                assert_eq!(history.len(), passes.len());
+                assert!(history.iter().all(|stage| stage.completed));
+                assert_eq!(history.last().unwrap().score, Some(entry.score));
+            }
+            // One shared allowance: every finalist's stage cost, deduplicated ones included
+            // (PE: three empty boards cost 1 each, nine single pairs cost 7 each).
+            let spent = if pe {
+                66
+            } else {
+                histories
+                    .iter()
+                    .flat_map(|h| h.iter())
+                    .map(|s| s.evaluations_used)
+                    .sum()
+            };
+            assert_eq!(result.evaluations_used, before.evaluations_used + spent);
+            let admitted = before.counters.evaluations_admitted() + spent;
+            assert_eq!(result.counters.evaluations_admitted(), admitted);
+        }
+    }
+
+    #[test]
+    fn hold_stages_stop_mid_finalist_before_start_and_between_finalists() {
+        use crate::AttackTermination::{Cancelled, EvaluationBudget};
+        let used = (hold_stages_request(false, &[], 1000, 3).run(|_| {}, || false))
+            .unwrap()
+            .evaluations_used;
+        let completed = std::cell::Cell::new(0);
+        for (budget, cancel_at, termination, partial) in [
+            (used + 3, u64::MAX, EvaluationBudget, true),
+            (used + 2, u64::MAX, EvaluationBudget, false),
+            (1000, used + 2, Cancelled, false),
+        ] {
+            completed.set(0);
+            let result = hold_stages_request(false, &["trie", "reswapping"], budget, 3)
+                .run(
+                    |p| completed.set(p.evaluations_completed()),
+                    || completed.get() >= cancel_at,
+                )
+                .unwrap();
+            assert_eq!(result.termination, termination);
+            assert_eq!(result.evaluations_used, used + 2 + u64::from(partial));
+            // Polished first, then the partial entry despite its higher score, then the
+            // unpolished entries in pre-stage order with their HC scores.
+            let middle = if partial { (1, 0, 3, 1) } else { (1, 0, 1, 0) };
+            assert_eq!(
+                hold_stages_entries(&result),
+                [(0, 0, 1, 0), middle, (2, 0, 1, 0)]
+            );
+            assert_eq!(result.stages.len(), 2);
+            assert_eq!(
+                result.held_tail[0].stages.first().map(|s| s.completed),
+                partial.then_some(true)
+            );
+        }
     }
 }

@@ -57,7 +57,6 @@ pub struct AttackBest {
     pub(crate) final_objective_ascent: bool,
     pub(crate) neighborhood_exhausted: bool,
     /// This entry's own stage history; no accessor until the hold is projected.
-    #[allow(dead_code)] // Read once 14.3b runs stages over the hold.
     pub(crate) stages: Vec<AttackStageResult>,
 }
 

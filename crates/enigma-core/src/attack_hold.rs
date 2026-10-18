@@ -74,7 +74,6 @@ fn rank_order(left: &AttackBest, right: &AttackBest) -> Ordering {
 /// Final post-stage order: ranked polished entries, the partial entry, then
 /// unpolished entries as given. Later duplicate complete keys are dropped
 /// without refilling, so polished duplicates keep the smaller index.
-#[allow(dead_code)] // Wired when 14.3b runs stages over the hold.
 pub(crate) fn rerank_after_stages(
     mut polished: Vec<AttackBest>,
     partial: Option<AttackBest>,
