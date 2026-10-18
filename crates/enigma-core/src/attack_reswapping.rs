@@ -235,6 +235,7 @@ mod tests {
                 incomplete: false,
                 final_objective_ascent: false,
                 neighborhood_exhausted: false,
+                stages: Vec::new(),
             }),
             stages: Vec::new(),
         };

@@ -1,5 +1,7 @@
 //! Private bounded canonical finalists shared by attack schedulers.
 
+use std::cmp::Ordering;
+
 use crate::AttackBest;
 
 /// Owns final-scored candidates from one owner and one comparable objective.
@@ -33,13 +35,10 @@ impl AttackHold {
         {
             return;
         }
-        let ranking = candidate.score.ranking().units();
-        let index = (candidate.outer_index, candidate.start_index);
-        let position = self.entries.iter().position(|entry| {
-            ranking > entry.score.ranking().units()
-                || (ranking == entry.score.ranking().units()
-                    && index < (entry.outer_index, entry.start_index))
-        });
+        let position = self
+            .entries
+            .iter()
+            .position(|entry| rank_order(&candidate, entry) == Ordering::Less);
         let position = position.unwrap_or(self.entries.len());
         if position < self.capacity {
             self.entries.insert(position, candidate);
@@ -63,6 +62,37 @@ impl AttackHold {
     }
 }
 
+/// Hold order: ranking descending, then absolute `(outer, start)` ascending.
+fn rank_order(left: &AttackBest, right: &AttackBest) -> Ordering {
+    let ranking = |entry: &AttackBest| entry.score.ranking().units();
+    let index = |entry: &AttackBest| (entry.outer_index, entry.start_index);
+    ranking(right)
+        .cmp(&ranking(left))
+        .then_with(|| index(left).cmp(&index(right)))
+}
+
+/// Final post-stage order: ranked polished entries, the partial entry, then
+/// unpolished entries as given. Later duplicate complete keys are dropped
+/// without refilling, so polished duplicates keep the smaller index.
+#[allow(dead_code)] // Wired when 14.3b runs stages over the hold.
+pub(crate) fn rerank_after_stages(
+    mut polished: Vec<AttackBest>,
+    partial: Option<AttackBest>,
+    unpolished: Vec<AttackBest>,
+) -> Vec<AttackBest> {
+    polished.sort_by(rank_order);
+    let mut ranked: Vec<AttackBest> = Vec::with_capacity(polished.len() + unpolished.len() + 1);
+    for entry in polished.into_iter().chain(partial).chain(unpolished) {
+        if !ranked
+            .iter()
+            .any(|kept| kept.configuration == entry.configuration)
+        {
+            ranked.push(entry);
+        }
+    }
+    ranked
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -83,6 +113,7 @@ pub(crate) mod tests {
             incomplete: false,
             final_objective_ascent: true,
             neighborhood_exhausted: true,
+            stages: Vec::new(),
         }
     }
 
@@ -263,5 +294,105 @@ pub(crate) mod tests {
     #[should_panic(expected = "attack hold capacity must be positive")]
     fn zero_capacity_violates_internal_precondition() {
         AttackHold::new(0);
+    }
+
+    fn rerank_keys(entries: &[AttackBest]) -> Vec<&str> {
+        entries.iter().map(AttackBest::plaintext).collect()
+    }
+
+    #[test]
+    fn hold_rerank_tiers_precede_numeric_score_and_measure() {
+        let polished = candidate("polished", -50, 9, 9);
+        let mut partial = candidate("partial", 40, 0, 0);
+        partial.measure = MeasureId::Entropy;
+        let unpolished = candidate("unpolished", 90, 0, 1);
+        let ranked = rerank_after_stages(vec![polished], Some(partial), vec![unpolished]);
+        assert_eq!(rerank_keys(&ranked), ["polished", "partial", "unpolished"]);
+    }
+
+    #[test]
+    fn hold_rerank_polished_by_ranking_then_indices_unpolished_kept() {
+        let polished = vec![
+            candidate("low", 1, 0, 0),
+            candidate("tie_late", 5, 2, 0),
+            candidate("tie_early", 5, 1, 7),
+            candidate("high", 8, 3, 0),
+        ];
+        let unpolished = vec![candidate("u_low", 1, 4, 0), candidate("u_high", 9, 5, 0)];
+        let ranked = rerank_after_stages(polished, None, unpolished);
+        assert_eq!(
+            rerank_keys(&ranked),
+            ["high", "tie_early", "tie_late", "low", "u_low", "u_high"]
+        );
+    }
+
+    #[test]
+    fn hold_rerank_without_stages_keeps_pre_stage_order() {
+        let mut hold = AttackHold::new(4);
+        for (index, ranking) in [3, 7, 7, 1].into_iter().enumerate() {
+            hold.offer(candidate(
+                &format!("key-{index}"),
+                ranking,
+                index as u128,
+                0,
+            ));
+        }
+        let expected = snapshot(hold.entries());
+        let ranked = rerank_after_stages(hold.into_entries(), None, Vec::new());
+        assert_eq!(snapshot(&ranked), expected);
+    }
+
+    #[test]
+    fn hold_rerank_drops_later_duplicates_without_refill() {
+        let polished = vec![candidate("dup", 4, 3, 0), candidate("dup", 4, 1, 0)];
+        let mut partial = candidate("partial_dup", 0, 0, 0);
+        partial.configuration = polished[0].configuration.clone();
+        let unpolished = vec![
+            candidate("other", 2, 5, 0),
+            candidate("dup", 9, 0, 0),
+            candidate("other", 1, 6, 0),
+        ];
+        let ranked = rerank_after_stages(polished, Some(partial), unpolished);
+        assert_eq!(rerank_keys(&ranked), ["dup", "other"]);
+        assert_eq!((ranked[0].outer_index, ranked[1].outer_index), (1, 5));
+    }
+
+    #[test]
+    fn hold_rerank_empty_inputs() {
+        assert!(rerank_after_stages(Vec::new(), None, Vec::new()).is_empty());
+        let only_partial =
+            rerank_after_stages(Vec::new(), Some(candidate("p", 0, 0, 0)), Vec::new());
+        assert_eq!(rerank_keys(&only_partial), ["p"]);
+    }
+
+    #[test]
+    fn hold_rerank_preserves_entry_stage_history() {
+        let stage = |pass| crate::AttackStageResult {
+            pass,
+            measure: MeasureId::Ic,
+            base_measure: None,
+            score: None,
+            evaluations_used: 3,
+            completed: pass == "done",
+        };
+        let mut low = candidate("low", 1, 0, 0);
+        low.stages = vec![stage("done")];
+        let mut high = candidate("high", 2, 1, 0);
+        high.stages = vec![stage("done"), stage("done")];
+        let mut partial = candidate("partial", 0, 2, 0);
+        partial.stages = vec![stage("cut")];
+        let ranked = rerank_after_stages(vec![low, high], Some(partial), Vec::new());
+        let history: Vec<Vec<_>> = ranked
+            .iter()
+            .map(|entry| entry.stages.iter().map(|s| (s.pass, s.completed)).collect())
+            .collect();
+        assert_eq!(
+            history,
+            [
+                vec![("done", true), ("done", true)],
+                vec![("done", true)],
+                vec![("cut", false)],
+            ]
+        );
     }
 }

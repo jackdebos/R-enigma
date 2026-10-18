@@ -92,6 +92,7 @@ impl DirectOuterOutcome {
             incomplete: self.climb.cancelled || self.climb.budget_stopped,
             final_objective_ascent: self.climb.final_objective_ascent,
             neighborhood_exhausted: self.climb.neighborhood_exhausted,
+            stages: Vec::new(),
         })
     }
 }
