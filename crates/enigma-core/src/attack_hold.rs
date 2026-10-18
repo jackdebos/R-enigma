@@ -7,6 +7,7 @@ use crate::AttackBest;
 /// Inputs must have canonical complete configurations: definition-ordered slots,
 /// alphabet-ordered pair endpoints and pairs, including fixed plus mutable pairs.
 /// Configuration equality is structural; this type does not normalize raw keys.
+#[derive(Debug)]
 pub(crate) struct AttackHold {
     capacity: usize,
     entries: Vec<AttackBest>,
