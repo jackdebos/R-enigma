@@ -2,21 +2,22 @@
 //!
 //! Each case directory under `e2e/bomm/` holds the bomm `query.json` that was run once at
 //! capture time and a `case.json` with the same key in this engine's schema plus bomm's
-//! observed preview and IC score (see `e2e/bomm/README.md`). These tests never run bomm:
-//! they decrypt the query's ciphertext through the real `enigma` binary and compare the
-//! first 64 letters exactly and the full-message IC within bomm's printed precision.
+//! observed preview and score (see `e2e/bomm/README.md`). These tests never run bomm:
+//! they decrypt through the real `enigma` binary, compare the first 64 letters exactly,
+//! and compare full-message IC or Sinkov scores within justified numeric bounds.
 
 mod support;
 
 use support::successful_events;
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use serde_json::{json, Value};
 
-use enigma_core::{index_of_coincidence, Alphabet, SCALE};
+use enigma_core::{index_of_coincidence, parse_ngram_json, Alphabet, NgramModel, SCALE};
 
 const BOMM_COMMIT: &str = "aeb2f2bf00dfdee68e972f90ae7e83b387b188e9";
 const CASES: &[&str] = &[
@@ -24,6 +25,10 @@ const CASES: &[&str] = &[
     "enigma-m3-two-notch",
     "enigma-m4-thin-c-gamma",
     "m4-u264-first-break",
+    "m4-u264-sinkov-bigram-correct",
+    "m4-u264-sinkov-bigram-wrong",
+    "m4-u264-sinkov-trigram-correct",
+    "m4-u264-sinkov-trigram-wrong",
     "repetitive-high-ic",
 ];
 /// bomm prints the score as `%+10.10f` cut to nine characters: six decimals, truncated.
@@ -97,13 +102,83 @@ fn ic(text: &str) -> f64 {
     units as f64 / SCALE as f64
 }
 
-/// Whether a case's full plaintext comes from a historical source or from its construction.
+/// Strict test-only txt -> JSON v1 adapter. No production parser or model bypass.
+fn convert_table(text: &str, order: usize, source: &str) -> (NgramModel, usize) {
+    let fields: Vec<_> = text.split_whitespace().collect();
+    assert_eq!(
+        fields.len() % 2,
+        0,
+        "{source}: incomplete gram/count record"
+    );
+    let mut seen = HashSet::new();
+    let entries: Vec<_> = fields
+        .chunks_exact(2)
+        .enumerate()
+        .map(|(index, fields)| {
+            let context = format!("{source}: record {} ({:?})", index + 1, fields);
+            let gram = fields[0];
+            assert!(
+                gram.len() == order && gram.bytes().all(|b| b.is_ascii_lowercase()),
+                "{context}: expected exactly {order} lowercase ASCII letters"
+            );
+            assert!(seen.insert(gram), "{context}: duplicate gram");
+            assert!(
+                fields[1].bytes().all(|b| b.is_ascii_digit()),
+                "{context}: count must contain decimal digits only"
+            );
+            let count: u64 = fields[1]
+                .parse()
+                .unwrap_or_else(|error| panic!("{context}: invalid count: {error}"));
+            assert!(count > 0, "{context}: count must be positive");
+            let symbols: Vec<_> = gram
+                .to_ascii_uppercase()
+                .chars()
+                .map(|c| c.to_string())
+                .collect();
+            json!({"gram": symbols, "count": count})
+        })
+        .collect();
+    let count = entries.len();
+    let alphabet: Vec<_> = ('A'..='Z').map(|c| c.to_string()).collect();
+    let resource = json!({
+        "resource_version": 1, "kind": "ngram", "alphabet": alphabet,
+        "order": order, "entries": entries
+    });
+    let model = parse_ngram_json(&resource.to_string()).unwrap_or_else(|errors| {
+        panic!("{source}: public resource parser rejected table: {errors:?}")
+    });
+    (model, count)
+}
+
+fn table(order: usize) -> (NgramModel, usize) {
+    let name = match order {
+        2 => "enigma1941-bigram.txt",
+        3 => "enigma1941-trigram.txt",
+        _ => panic!("unsupported fixture order {order}"),
+    };
+    let path = bomm_dir().join("frequencies").join(name);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+    convert_table(&text, order, name)
+}
+
+/// Printed truncation plus half an f32 ULP below |weight|=16 and a conservative
+/// 1e-9 for Q32 log/mean floors, Q48 approximation and binary64 log/accumulation.
+/// The table test below guards the count and weight bounds behind this allowance.
+fn sinkov_tolerance(printed: &str) -> f64 {
+    let (_, fraction) = printed.split_once('.').expect("printed decimal score");
+    assert!(!fraction.is_empty() && fraction.bytes().all(|b| b.is_ascii_digit()));
+    10_f64.powi(-(fraction.len() as i32)) + 2_f64.powi(-21) + 1e-9
+}
+
+/// Whether full plaintext is sourced, constructed, or intentionally unavailable.
 enum Kind {
     Historical,
     Constructed,
+    HistoricalWrongKey,
 }
 
-fn check(case: &str, kind: Kind) {
+fn check(case: &str, kind: Kind) -> (f64, f64) {
     let query = load(case, "query.json");
     let record = load(case, "case.json");
 
@@ -111,16 +186,32 @@ fn check(case: &str, kind: Kind) {
     let (label, expected) = match kind {
         Kind::Historical => ("historical", &record["plaintext"]),
         Kind::Constructed => ("constructed", &record["provenance"]["plaintext"]),
+        Kind::HistoricalWrongKey => ("historical-wrong-key", &Value::Null),
     };
     assert_eq!(record["kind"], json!(label), "{case}: kind");
-    let expected = expected
-        .as_str()
-        .unwrap_or_else(|| panic!("{case}: {label} plaintext is a string"));
+    let expected = if matches!(kind, Kind::HistoricalWrongKey) {
+        assert!(
+            record.get("plaintext").is_none(),
+            "{case}: no sourced wrong-key plaintext"
+        );
+        None
+    } else {
+        Some(
+            expected
+                .as_str()
+                .unwrap_or_else(|| panic!("{case}: {label} plaintext is a string")),
+        )
+    };
 
     let capture = &record["capture"];
     assert_eq!(capture["bomm_commit"], json!(BOMM_COMMIT), "{case}");
     assert_eq!(capture["exit_code"], json!(0), "{case}");
     assert_eq!(capture["units"], json!(1), "{case}: exactly one key");
+    assert_eq!(
+        capture["decrypts"],
+        json!(1),
+        "{case}: exactly one decryption"
+    );
 
     // bomm reads lowercase only; this engine's alphabet is uppercase.
     let ciphertext = query["ciphertext"]
@@ -142,14 +233,42 @@ fn check(case: &str, kind: Kind) {
         .as_str()
         .expect("observed score is a string");
     let score: f64 = score_text.parse().expect("observed score is a decimal");
-    let ours = ic(&plaintext);
-    assert!(
-        (ours - score).abs() <= SCORE_TOLERANCE,
-        "{case}: IC {ours:.10} vs bomm {score_text}"
-    );
+    let measure = query["passes"][0]["measure"]
+        .as_str()
+        .expect("measure name");
+    let ours = match measure {
+        "ic" => {
+            let ours = ic(&plaintext);
+            assert!(
+                (ours - score).abs() <= SCORE_TOLERANCE,
+                "{case}: IC {ours:.10} vs bomm {score_text}"
+            );
+            ours
+        }
+        "sinkov_bigram" | "sinkov_trigram" => {
+            let order = if measure == "sinkov_bigram" { 2 } else { 3 };
+            let (model, _) = table(order);
+            let ours = model
+                .score(&plaintext)
+                .expect("measurable plaintext")
+                .measured()
+                .units() as f64
+                / SCALE as f64;
+            let difference = (ours - score).abs();
+            let tolerance = sinkov_tolerance(score_text);
+            eprintln!("{case}: ours={ours:.12}, bomm={score_text}, difference={difference:.12}, tolerance={tolerance:.12}");
+            assert!(difference <= tolerance,
+                "{case}: Sinkov {ours:.12} vs bomm {score_text}; difference {difference} exceeds {tolerance}");
+            ours
+        }
+        other => panic!("{case}: unexpected measure {other}"),
+    };
 
-    // bomm only shows 64 letters; the rest is checked against the known plaintext.
-    assert_eq!(plaintext, expected, "{case}: full {label} plaintext");
+    // bomm only shows 64 letters; check the rest when known plaintext exists.
+    if let Some(expected) = expected {
+        assert_eq!(plaintext, expected, "{case}: full {label} plaintext");
+    }
+    (ours, score)
 }
 
 #[test]
@@ -157,11 +276,114 @@ fn every_case_directory_is_checked() {
     let mut found: Vec<String> = std::fs::read_dir(bomm_dir())
         .expect("e2e/bomm is readable")
         .map(|entry| entry.expect("directory entry"))
-        .filter(|entry| entry.path().is_dir())
+        .filter(|entry| entry.path().is_dir() && entry.file_name() != "frequencies")
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .collect();
     found.sort();
     assert_eq!(found, CASES);
+}
+
+#[test]
+fn frequency_tables_parse_without_losing_records() {
+    // No SHA dependency is available: byte hashes are recorded/verified at capture time.
+    for order in [2, 3] {
+        let (model, records) = table(order);
+        assert!(records > 0);
+        assert_eq!(model.entry_count(), records);
+        assert_eq!(model.order(), order);
+        assert_eq!(
+            model.alphabet(),
+            &Alphabet::new(('A'..='Z').collect()).unwrap()
+        );
+        // Every source count is then exactly representable in bomm's f32 map;
+        // total is exact in f64. The unseen floor bounds all log magnitudes.
+        assert!(model.total_count() <= (1 << 24));
+        let max_weight = (2.0 * model.total_count() as f64 / model.minimum_count() as f64).ln();
+        assert!(max_weight < 16.0);
+        // Exercise the deterministic Q32 approximation against binary64 ln on
+        // every listed gram and an unseen gram (the tables are sparse).
+        let name = if order == 2 { "bigram" } else { "trigram" };
+        let text =
+            std::fs::read_to_string(bomm_dir().join(format!("frequencies/enigma1941-{name}.txt")))
+                .unwrap();
+        let fields: Vec<_> = text.split_whitespace().collect();
+        let mut listed = HashSet::new();
+        for fields in fields.chunks_exact(2) {
+            let gram = fields[0].to_ascii_uppercase();
+            listed.insert(gram.clone());
+            let count: f64 = fields[1].parse().unwrap();
+            let expected = (count / model.total_count() as f64).ln();
+            let actual = model.score(&gram).unwrap().measured().units() as f64 / SCALE as f64;
+            assert!((actual - expected).abs() < 1e-9, "{name}: {gram}");
+        }
+        let unseen = ('A'..='Z')
+            .flat_map(|a| {
+                ('A'..='Z').flat_map(move |b| {
+                    ('A'..='Z').map(move |c| {
+                        if order == 2 {
+                            format!("{a}{b}")
+                        } else {
+                            format!("{a}{b}{c}")
+                        }
+                    })
+                })
+            })
+            .find(|gram| !listed.contains(gram))
+            .expect("sparse fixture has an unseen gram");
+        let actual = model.score(&unseen).unwrap().measured().units() as f64 / SCALE as f64;
+        assert!((actual + max_weight).abs() < 1e-9);
+    }
+}
+
+#[test]
+fn sinkov_display_precision_is_derived_per_value() {
+    let arithmetic = 2_f64.powi(-21) + 1e-9;
+    assert!((sinkov_tolerance("-6.038888") - (1e-6 + arithmetic)).abs() < 1e-15);
+    assert!((sinkov_tolerance("-10.19315") - (1e-5 + arithmetic)).abs() < 1e-15);
+}
+
+#[test]
+fn converter_rejects_malformed_records_without_repair() {
+    for text in [
+        "ab",
+        "ab 0",
+        "ab -1",
+        "ab 1.5",
+        "ab 18446744073709551616",
+        "AB 1",
+        "aé 1",
+        "a 1",
+        "abc 1",
+        "ab 1 ab 2",
+        "",
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| convert_table(text, 2, "negative control")).is_err(),
+            "accepted malformed table: {text:?}"
+        );
+    }
+}
+
+#[test]
+fn historical_m4_u264_sinkov_bigram() {
+    let (correct, bomm_correct) = check("m4-u264-sinkov-bigram-correct", Kind::Historical);
+    let (wrong, bomm_wrong) = check("m4-u264-sinkov-bigram-wrong", Kind::HistoricalWrongKey);
+    assert!(
+        correct - wrong > 1.0,
+        "correct key must clearly outrank wrong key"
+    );
+    assert!(bomm_correct - bomm_wrong > 1.0);
+}
+
+#[test]
+fn historical_m4_u264_sinkov_trigram() {
+    let (correct, bomm_correct) = check("m4-u264-sinkov-trigram-correct", Kind::Historical);
+    let (wrong, bomm_wrong) = check("m4-u264-sinkov-trigram-wrong", Kind::HistoricalWrongKey);
+    assert!(
+        correct - wrong > 1.0,
+        "correct key must clearly outrank wrong key"
+    );
+    assert!(bomm_correct - bomm_wrong > 1.0);
 }
 
 #[test]

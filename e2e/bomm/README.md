@@ -1,6 +1,6 @@
 # bomm differential cases
 
-Known-key decrypt/IC cases observed once from the unmodified bomm CLI
+Known-key decrypt/IC/Sinkov cases observed once from the unmodified bomm CLI
 ([ffraenz/bomm](https://github.com/ffraenz/bomm) at `aeb2f2bf00dfdee68e972f90ae7e83b387b188e9`)
 and compared with this engine on every test run by
 `crates/enigma-cli/tests/bomm_parity.rs`. This is not JSON compatibility. Each engine is
@@ -11,9 +11,40 @@ driven in its own schema. The tests need neither network nor the bomm binary.
 One directory per case:
 
 - `query.json`: the exact bomm input that was run. The ciphertext here is the single source used by both engines.
-- `case.json`: `kind` (`historical` or `constructed`), `provenance` (constructed cases carry their full source `plaintext` here), `engine` (the same key in this engine's schema), `plaintext` (historical cases only, as sourced), `capture` (commit, binary SHA-256, date, command, exit code, keys evaluated) and `observed` (bomm's preview, score and key line, verbatim).
+- `case.json`: `kind` (`historical`, `historical-wrong-key` or `constructed`), `provenance` (constructed cases carry their full source `plaintext` here), `engine` (the same key in this engine's schema), `plaintext` (correct-key historical cases only, as sourced), `capture` (commit, binary SHA-256, date, command, exit code, units and decrypts) and `observed` (bomm's preview, score and key line, verbatim).
+- `frequencies/`: the two verbatim source tables described below; not a case directory.
 
 The historical case is `m4-u264-first-break`: the first M4 Project break (U-264 message), whose plaintext is confirmed by the war diary. Its source URL and the copied values are listed in its `provenance`. The constructed ciphertexts were produced by this engine's CLI (`transform`, `encrypt`) from the plaintext given in `provenance`. bomm decrypts them independently.
+
+The four `m4-u264-sinkov-{bigram,trigram}-{correct,wrong}` cases reuse that
+historical ciphertext, with one fixed key per query. Correct cases reuse VJNA;
+wrong cases change only the rightmost message-key position A to B (VJNB), keeping
+wheels, rings and plugboard unchanged. This one-step offset produces non-German
+output as a negative control. Wrong-key cases have no sourced plaintext: only
+the preview is compared exactly. Both engines must score the correct key more
+than 1 natural-log unit above the wrong key for each order.
+
+## Frequency tables
+
+`frequencies/enigma1941-bigram.txt` and `enigma1941-trigram.txt` are byte-for-byte
+copies of `data/frequencies/` in the pinned bomm commit above. Its README credits
+raw 1941 Enigma message decrypt tables published by Frode Weierud,
+[CryptoCellar](https://cryptocellar.org/bgac/keyofE.html). No separate data licence
+is stated. No English tables are included.
+
+| File | Records | SHA-256 |
+| --- | ---: | --- |
+| `enigma1941-bigram.txt` | 568 | `749fd92249944326fa6ae1b29ebcebc197ac2a745cfc88e2b2bc496fc74e5e08` |
+| `enigma1941-trigram.txt` | 3514 | `e5e6e2ec7522e1e921393177fdc6acd86fe669984c4ffb9de3d7440ecc49f345` |
+
+Both totals are 17694, with minimum count 1 (maxima 453 and 194). Hashes were
+verified against the reference copies at capture time. No hash crate is an
+available CLI dev-dependency, so tests do not assert SHA-256 and add no dependency.
+The test-only adapter strictly validates lowercase ASCII grams and positive
+integer counts, rejects duplicates/malformed records, uppercases grams and emits
+JSON resource v1 in memory with ordered A–Z. The real public
+`enigma_core::parse_ngram_json` parser loads it; no converted JSON is versioned.
+Tests verify entry counts and rejection of malformed input.
 
 ## Capture
 
@@ -23,7 +54,14 @@ run from the repository root:
 
     $R/build/bomm -q -t 1 -n 1 e2e/bomm/<case>/query.json
 
-Use short options only (the long options are declared without arguments). Each query fixes one wheel per slot, single-letter `rings`/`positions` masks and a fixed `plugboard`, and has one `{"type": "measure", "measure": "ic"}` pass. That means no search. Every capture printed `Number of units: 1` and `Number of decrypts: 1`. bomm silently drops non-lowercase letters, so query text is lowercase. The preview is the first 64 letters of the hold entry, and the score is `%+10.10f` cut to nine characters. Both are stored verbatim. Raw terminal output, logs and binaries are per-run artifacts and are not versioned.
+Use short options only (the long options are declared without arguments). Each query fixes one wheel per slot, single-letter `rings`/`positions` masks and a fixed `plugboard`, and has one `measure` pass (`ic`, `sinkov_bigram` or `sinkov_trigram`). That means no search. Every capture printed `Number of units: 1` and `Number of decrypts: 1`. bomm silently drops non-lowercase letters, so query text is lowercase. The preview is the first 64 letters of the hold entry, and the score is `%+10.10f` cut to nine characters. Both are stored verbatim. Raw terminal output, logs and binaries are per-run artifacts and are not versioned.
+
+N-gram queries supply `frequencies.bigram` or `frequencies.trigram` as
+`e2e/bomm/frequencies/enigma1941-<order>.txt`. bomm opens these relative to the
+**process working directory**, not the query directory: capture from this
+repository root. Each of the four n-gram queries was run once on 2026-10-18,
+exit 0, one unit and one decrypt. Reference HEAD, clean status and binary hash
+were checked before and after capture and were unchanged.
 
 ## Schema mapping
 
@@ -42,10 +80,20 @@ No ETW slot is given to bomm: without one it maps letters identically, as our ma
 
 ## Comparison policy
 
-- Text: our full decryption's first 64 letters must equal the uppercased preview exactly. Letters beyond the preview are not observed from bomm, so the full decryption must also equal the known plaintext: the sourced one for historical cases, the construction input for constructed ones. Each test declares its case's kind; a mismatching `kind` field fails instead of skipping a check.
+- Text: our full decryption's first 64 letters must equal the uppercased preview exactly. Letters beyond the preview are not observed from bomm, so correct-key full decryptions must also equal the known plaintext: the sourced one for historical cases, the construction input for constructed ones. `historical-wrong-key` explicitly checks only the preview; its remaining output has no independent plaintext oracle. Each test declares its case's kind; a mismatching `kind` field fails instead of skipping a check.
 - IC: bomm's measure pass scores `26 * sum f(f-1) / (n(n-1))` over the whole decrypted message (`src/measure.h` `bomm_measure_frequency_ic` via `bomm_measure_scrambler`), the same text and formula as `enigma_core::index_of_coincidence`. Our Q32 units are divided by `2^32`, and `|ours - printed| <= 1.1e-6` must hold. The printed value has six decimals, truncated, and our Q32 floor adds at most `2^-32`.
+- Sinkov: both engines take the mean natural-log probability over every overlapping window of the full decryption: listed `ln(count/F)`, unseen `ln(m/(2F))`. bomm stores weights as binary32 and accumulates in binary64 (`src/measure.c:107–130`, `src/measure.h`); ours uses deterministic Q32 weights and a floored Q32 mean (see `docs/scoring-resources.md` §4–5). For **each printed score**, derive decimal count `d` from its string and use `10^-d + 2^-21 + 1e-9`. The first term covers display truncation (including the final decimal rounding before cutting); the second is half a binary32 ULP for weights with magnitude below 16. Both tables' largest magnitude is the unseen weight, `ln(35388) ≈ 10.474128`; all counts are exactly representable in binary32 and their totals in binary64. Tests guard these bounds. The conservative `1e-9` covers two Q32 floors (less than `2/2^32`), the Q48 log approximation and binary64 log/accumulation on 230–231 windows. Tests additionally compare every listed Q32 weight and an unseen weight with binary64 ln within `1e-9`. The tolerance is about `1.477837e-6` for six decimals or `1.047784e-5` for five, not fitted to the observed differences below.
 - A mismatch is reported as a discrepancy. Observed values are never edited to match.
+
+Measured before setting the Sinkov tolerance (Q32 units divided by `2^32`):
+
+| Order/key | bomm printed | Ours | Absolute difference |
+| --- | ---: | ---: | ---: |
+| bigram/correct | -6.038888 | -6.038888248848 | 2.48848e-7 |
+| bigram/wrong | -7.848161 | -7.848161784234 | 7.84234e-7 |
+| trigram/correct | -8.333018 | -8.333018734353 | 7.34353e-7 |
+| trigram/wrong | -10.19315 | -10.193157256581 | 7.256581e-6 |
 
 ## Coverage and remaining work
 
-Covered: known-key decryption and resource-free IC on Enigma I, M3 (two-notch VI–VIII) and M4 (thin reflectors, Beta/Gamma), with nonzero rings, plugboards and middle-wheel double steps inside the preview, plus one historical message. Not covered: text beyond 64 letters against bomm itself, IC beyond six decimals, n-gram scoring, and every search (hill climbing, plugboard exploration, stages, hold list, outer ordering). Those are separate Task17 slices; attack comparisons must use real German text with a known plaintext. A source-linked helper calling bomm's functions directly would lift the 64-letter and six-decimal limits if needed.
+Covered: known-key decryption and resource-free IC on Enigma I, M3 (two-notch VI–VIII) and M4 (thin reflectors, Beta/Gamma), with nonzero rings, plugboards and middle-wheel double steps inside the preview, plus one historical message and German Enigma1941 bigram/trigram Sinkov scoring on its correct and wrong keys. Not covered: text beyond 64 letters against bomm itself, scores beyond display precision, other n-gram orders/tables, and every search (hill climbing, plugboard exploration, stages, hold list, outer ordering). Those are separate Task17 slices; attack comparisons must use real German text with a known plaintext. A source-linked helper calling bomm's functions directly would lift the 64-letter and six-decimal limits if needed.
