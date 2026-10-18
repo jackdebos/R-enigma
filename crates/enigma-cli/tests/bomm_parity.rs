@@ -12,9 +12,11 @@ mod support;
 use support::successful_events;
 
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -311,6 +313,72 @@ fn attack_fixture() -> (Value, Value) {
     (query, record)
 }
 
+fn case_a_runs(option: Option<&OsStr>) -> Result<usize, &'static str> {
+    match option {
+        None => Ok(1),
+        Some(value) if value == "1" => Ok(3),
+        Some(_) => Err("ENIGMA_CASE_A_TIMING must be absent or exactly 1"),
+    }
+}
+
+fn case_a_timing_summary(samples: [Duration; 3]) -> Value {
+    let mut sorted = samples;
+    sorted.sort_unstable();
+    json!({
+        "case": "m4-u264-attack-board",
+        "unit": "seconds",
+        "samples": samples.map(|sample| sample.as_secs_f64()),
+        "min": sorted[0].as_secs_f64(),
+        "median": sorted[1].as_secs_f64(),
+        "max": sorted[2].as_secs_f64(),
+        "verified_pairs": 10,
+        "verified_plaintext_letters": 232
+    })
+}
+
+// Best-effort cleanup also covers subprocess errors and assertion panics.
+struct AttackInputs(PathBuf);
+
+impl Drop for AttackInputs {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.0) {
+            eprintln!("cannot remove {}: {error}", self.0.display());
+        }
+    }
+}
+
+#[test]
+fn case_a_timing_option_is_explicit() {
+    assert_eq!(case_a_runs(None), Ok(1));
+    assert_eq!(case_a_runs(Some(OsStr::new("1"))), Ok(3));
+    for value in ["", "0", "2", "true", " 1"] {
+        assert_eq!(
+            case_a_runs(Some(OsStr::new(value))),
+            Err("ENIGMA_CASE_A_TIMING must be absent or exactly 1")
+        );
+    }
+}
+
+#[test]
+fn case_a_timing_summary_preserves_order_and_sorts_statistics() {
+    let samples = [30, 10, 20].map(Duration::from_secs);
+    assert_eq!(
+        case_a_timing_summary(samples),
+        json!({
+            "case": "m4-u264-attack-board",
+            "unit": "seconds",
+            "samples": [30.0, 10.0, 20.0],
+            "min": 10.0, "median": 20.0, "max": 30.0,
+            "verified_pairs": 10, "verified_plaintext_letters": 232
+        })
+    );
+    let equal = case_a_timing_summary([Duration::from_millis(250); 3]);
+    assert_eq!(equal["samples"], json!([0.25, 0.25, 0.25]));
+    for field in ["min", "median", "max"] {
+        assert_eq!(equal[field], json!(0.25));
+    }
+}
+
 #[test]
 fn historical_attack_fixture_is_consistent() {
     attack_fixture();
@@ -319,6 +387,8 @@ fn historical_attack_fixture_is_consistent() {
 #[test]
 #[ignore = "~15 s release attack; run with cargo test --release -p enigma-cli --test bomm_parity -- --ignored"]
 fn historical_m4_u264_attack_board() {
+    let runs = case_a_runs(std::env::var_os("ENIGMA_CASE_A_TIMING").as_deref())
+        .unwrap_or_else(|error| panic!("{error}"));
     let (query, record) = attack_fixture();
     let source = record["resource"]["source"].as_str().unwrap();
     let text = std::fs::read_to_string(bomm_dir().join(source)).unwrap();
@@ -328,18 +398,30 @@ fn historical_m4_u264_attack_board() {
     // Generated inputs live in a per-process temporary directory (no converted JSON in Git).
     let directory = std::env::temp_dir().join(format!("enigma-bomm-attack-{}", std::process::id()));
     std::fs::create_dir_all(&directory).unwrap();
+    let inputs = AttackInputs(directory.clone());
     std::fs::write(directory.join("trigram.json"), resource.to_string()).unwrap();
     let mut request = record["engine"].clone();
     request["job"]["text"] = json!(query["ciphertext"].as_str().unwrap().to_ascii_uppercase());
     request["job"]["resources"] = json!({"sinkov_trigram": {"path": "trigram.json"}});
     std::fs::write(directory.join("request.json"), request.to_string()).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_enigma"))
-        .current_dir(&directory)
-        .arg("request.json")
-        .output()
-        .expect("failed to run the attack through the real CLI");
-    std::fs::remove_dir_all(&directory).unwrap();
-    let events = successful_events(&output);
+    let mut samples = [Duration::ZERO; 3];
+    for sample in samples.iter_mut().take(runs) {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_enigma"));
+        command.current_dir(&directory).arg("request.json");
+        let start = Instant::now();
+        let output = command.output();
+        *sample = start.elapsed();
+        let output = output.expect("failed to run the attack through the real CLI");
+        verify_attack_output(&output, &record);
+    }
+    drop(inputs);
+    if runs == 3 {
+        println!("ENIGMA_CASE_A_TIMING {}", case_a_timing_summary(samples));
+    }
+}
+
+fn verify_attack_output(output: &std::process::Output, record: &Value) {
+    let events = successful_events(output);
     let results: Vec<_> = events
         .iter()
         .filter(|event| event["event"] == "result")

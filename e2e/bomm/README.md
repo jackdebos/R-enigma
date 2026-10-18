@@ -59,6 +59,30 @@ pairs and our top board equal the ten historical pairs, and our full plaintext
 equals the sourced 232 letters. bomm itself prints only a 64-letter preview.
 There is no trajectory, score or evaluation-count assertion for the attack.
 
+### Verify and time case A
+
+From the repository root:
+
+```sh
+./scripts/verify_and_time_case_a.sh
+```
+
+The launcher runs the release test with `ENIGMA_CASE_A_TIMING=1`: three sequential
+CLI executions, each checked against all ten historical pairs and the full
+232-letter plaintext. It also resolves the repository root when invoked by path
+from another working directory. Without that environment option, the ignored
+test above still runs the CLI once and prints no timing summary; other option
+values are rejected.
+
+After all three results pass, one `ENIGMA_CASE_A_TIMING `-prefixed JSON line
+reports `case`, `unit` (seconds), execution-order `samples`, `min`, `median`,
+`max`, `verified_pairs` and `verified_plaintext_letters`. These are CLI subprocess
+wall times: startup, resource parsing and output transport are included, not just
+internal compute. Compilation, Cargo/test-harness overhead, input conversion,
+assertions and temporary-input cleanup are excluded. Inputs are prepared once
+from the versioned fixtures; no bomm rerun or extra measurement tools are needed.
+There are no timing thresholds or guaranteed benchmark results.
+
 ## Frequency tables
 
 `frequencies/enigma1941-bigram.txt` and `enigma1941-trigram.txt` are byte-for-byte
