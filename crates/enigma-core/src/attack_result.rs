@@ -158,7 +158,7 @@ pub struct AttackResult {
     pub(crate) counters: AttackProgress,
     pub(crate) evaluations_used: u64,
     pub(crate) best: Option<AttackBest>,
-    // Unpolished finalists; only the head runs stages until Task 14.3.
+    // Finalists after `best` in final order, each with its own stage history.
     pub(crate) held_tail: Vec<AttackBest>,
     pub(crate) stages: Vec<AttackStageResult>,
 }
@@ -342,6 +342,28 @@ impl AttackRunError {
         self
     }
 
+    /// Reranks a stage error's hold (§10.5): `polished` finalists, the failing one as
+    /// partial with the error's history, then its unprocessed tail. `best` and `stages`
+    /// become the first entry's; source, indices and accounting stay the failure's.
+    pub(crate) fn with_staged_hold(mut self, polished: Vec<AttackBest>) -> Self {
+        let data = &mut *self.0;
+        let tail = std::mem::take(&mut data.held_tail);
+        if let Some(mut failing) = data.best.as_mut().ok().and_then(Option::take) {
+            failing.stages = std::mem::take(&mut data.stages);
+            let ranked = crate::attack_hold::rerank_after_stages(polished, Some(failing), tail);
+            let mut ranked = ranked.into_iter();
+            let mut head = ranked.next().expect("rerank keeps the first finalist");
+            data.stages = std::mem::take(&mut head.stages);
+            data.best = Ok(Some(head));
+            data.held_tail = ranked.collect();
+        } else {
+            // No projected failing finalist: keep its best and history as reported and
+            // retain every other entry, reranked, behind it.
+            data.held_tail = crate::attack_hold::rerank_after_stages(polished, None, tail);
+        }
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn held_tail(&self) -> &[AttackBest] {
         &self.0.held_tail
@@ -397,6 +419,38 @@ pub(crate) mod tests {
 
     pub(crate) fn held_tail(error: &AttackRunError) -> &[AttackBest] {
         &error.0.held_tail
+    }
+
+    #[test]
+    fn hold_stage_error_unprojected_best_keeps_history_and_every_entry() {
+        let mut entries = crate::attack_hold::tests::tail_fixture();
+        let expected = crate::attack_hold::tests::snapshot(&entries);
+        let stage = AttackStageResult {
+            pass: "measure",
+            measure: MeasureId::Ic,
+            base_measure: None,
+            score: None,
+            evaluations_used: 1,
+            completed: false,
+        };
+        let error = AttackRunError::new(AttackRunErrorData {
+            held_tail: entries.split_off(1),
+            stages: vec![stage],
+            source: AttackRunSource(RunPayload::Invariant("stage")),
+            outer_index: Some(3),
+            start_index: Some(0),
+            evaluations_used: 1,
+            counters: AttackProgress(CounterSnapshot::default()),
+            best: Err("unprojectable".into()),
+        })
+        .with_staged_hold(entries);
+        assert_eq!(error.best().unwrap_err().to_string(), "unprojectable");
+        assert_eq!(error.stages().len(), 1);
+        assert_eq!(error.outer_index().zip(error.start_index()), Some((3, 0)));
+        assert_eq!(
+            crate::attack_hold::tests::snapshot(held_tail(&error)),
+            expected
+        );
     }
 
     #[test]

@@ -221,34 +221,9 @@ impl crate::AttackRequest {
                 control: &mut control,
                 observer: &mut observer,
             };
-            // Best-first finalists share one allowance; a stop ends every later one.
-            let (mut polished, mut partial, mut unpolished) = (Vec::new(), None, Vec::new());
-            loop {
-                result = self.finalist_stages(result, accounting, &mut cancel_requested)?;
-                let mut finalist = result.best.take().expect("staged finalist");
-                finalist.stages = std::mem::take(&mut result.stages);
-                if result.termination != completed {
-                    // Any history means a stage started, even if it then stopped.
-                    if finalist.stages.is_empty() {
-                        unpolished.push(finalist);
-                    } else {
-                        partial = Some(finalist);
-                    }
-                    break;
-                }
-                polished.push(finalist);
-                if result.held_tail.is_empty() {
-                    break;
-                }
-                result.best = Some(result.held_tail.remove(0));
-            }
-            unpolished.append(&mut result.held_tail);
-            let ranked = crate::attack_hold::rerank_after_stages(polished, partial, unpolished);
-            let mut ranked = ranked.into_iter();
-            let mut head = ranked.next().expect("rerank keeps the first finalist");
-            result.stages = std::mem::take(&mut head.stages);
-            result.best = Some(head);
-            result.held_tail = ranked.collect();
+            result = stages_over_hold(result, |result| {
+                self.finalist_stages(result, accounting, &mut cancel_requested)
+            })?;
         }
         control.notify(&mut observer);
         Ok(result)
@@ -327,6 +302,46 @@ impl crate::AttackRequest {
         }
         Ok(result)
     }
+}
+
+/// Stages finalists best-first on one shared allowance; a stop ends every later
+/// one. Polished, partial and unpolished entries are then reranked (§10.5).
+fn stages_over_hold(
+    mut result: crate::AttackResult,
+    mut stage: impl FnMut(crate::AttackResult) -> Result<crate::AttackResult, crate::AttackRunError>,
+) -> Result<crate::AttackResult, crate::AttackRunError> {
+    let completed = crate::AttackTermination::Completed;
+    let (mut polished, mut partial, mut unpolished) = (Vec::new(), None, Vec::new());
+    loop {
+        result = match stage(result) {
+            Ok(result) => result,
+            Err(error) => return Err(error.with_staged_hold(polished)),
+        };
+        let mut finalist = result.best.take().expect("staged finalist");
+        finalist.stages = std::mem::take(&mut result.stages);
+        if result.termination != completed {
+            // Any history means a stage started, even if it then stopped.
+            if finalist.stages.is_empty() {
+                unpolished.push(finalist);
+            } else {
+                partial = Some(finalist);
+            }
+            break;
+        }
+        polished.push(finalist);
+        if result.held_tail.is_empty() {
+            break;
+        }
+        result.best = Some(result.held_tail.remove(0));
+    }
+    unpolished.append(&mut result.held_tail);
+    let ranked = crate::attack_hold::rerank_after_stages(polished, partial, unpolished);
+    let mut ranked = ranked.into_iter();
+    let mut head = ranked.next().expect("rerank keeps the first finalist");
+    result.stages = std::mem::take(&mut head.stages);
+    result.best = Some(head);
+    result.held_tail = ranked.collect();
+    Ok(result)
 }
 
 fn scoring_stage_metadata(
@@ -9297,6 +9312,89 @@ mod tests {
                 result.held_tail[0].stages.first().map(|s| s.completed),
                 partial.then_some(true)
             );
+        }
+    }
+
+    #[test]
+    fn hold_stage_error_reranks_polished_partial_and_unprocessed_finalists() {
+        use crate::attack_result::RunPayload;
+        // Pre-stage hold: outers 0, 1, 2 tied on IC; finalist k fails its measure stage.
+        for (fail_at, duplicate, expected) in [
+            (1, false, vec![(0, vec![false]), (1, vec![]), (2, vec![])]),
+            (
+                2,
+                false,
+                vec![(0, vec![true]), (1, vec![false]), (2, vec![])],
+            ),
+            (
+                3,
+                false,
+                vec![(1, vec![true]), (0, vec![true]), (2, vec![false])],
+            ),
+            // The unprocessed outer 2 repeats outer 0's key and is dropped after rerank.
+            (2, true, vec![(0, vec![true]), (1, vec![false])]),
+        ] {
+            let mut result =
+                (hold_stages_request(false, &[], 1000, 3).run(|_| {}, || false)).unwrap();
+            if duplicate {
+                result.held_tail[1].configuration =
+                    result.best.as_ref().unwrap().configuration.clone();
+            }
+            let used = result.evaluations_used;
+            let mut control = AttackControl::with_counters(result.counters.0);
+            let mut allowance = EvaluationAllowance { used, limit: 1000 };
+            let mut recorder = Recorder::default();
+            let accounting = &mut ObservedAccounting {
+                allowance: &mut allowance,
+                control: &mut control,
+                observer: &mut recorder,
+            };
+            let mut calls = 0;
+            let error = stages_over_hold(result, |result| {
+                calls += 1;
+                let stage = crate::space::AttackStage::Measure {
+                    measure: MeasureId::Ic,
+                };
+                scoring_stage(result, stage, accounting, |best| {
+                    if calls == fail_at {
+                        let missing = TrialEvaluationError::MissingResource(MeasureId::Trie);
+                        return Err(RunPayload::Evaluation(missing));
+                    }
+                    // Later finalists score higher, so polished entries reverse order.
+                    let units = (best.outer_index as i128 + 1) << 32;
+                    let score = MeasuredScore::higher_is_better(FixedScore::from_units(units));
+                    Ok((best.plaintext.clone(), score))
+                })
+            })
+            .unwrap_err();
+            let best = error.best().unwrap().unwrap();
+            let held = crate::attack_result::tests::held_tail(&error);
+            let history = |stages: &[crate::AttackStageResult]| -> Vec<bool> {
+                stages.iter().map(|stage| stage.completed).collect()
+            };
+            let entries: Vec<_> = std::iter::once((best.outer_index, history(error.stages())))
+                .chain(held.iter().map(|e| (e.outer_index, history(&e.stages))))
+                .collect();
+            assert_eq!(entries, expected);
+            assert!(best.stages.is_empty());
+            if expected[0].1 == [true] {
+                let units = (best.outer_index as i128 + 1) << 32;
+                assert_eq!(best.score().ranking().units(), units);
+            }
+            // The failing finalist keeps the error indices, cause and accounting.
+            let failing = (fail_at - 1) as u128;
+            assert_eq!(
+                error.outer_index().zip(error.start_index()),
+                Some((failing, 0))
+            );
+            assert!(matches!(
+                error.run_source().0,
+                RunPayload::Evaluation(TrialEvaluationError::MissingResource(MeasureId::Trie))
+            ));
+            assert_eq!(error.evaluations_used(), used + fail_at);
+            assert_eq!(error.counters().evaluations_admitted(), used + fail_at);
+            assert_eq!(error.counters().evaluations_completed(), used + fail_at - 1);
+            assert_eq!(recorder.0.last(), Some(&error.counters().0));
         }
     }
 }
