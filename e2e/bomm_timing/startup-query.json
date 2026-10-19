@@ -1,0 +1,20 @@
+{
+  "alphabet": "abcdefghijklmnopqrstuvwxyz",
+  "ciphertext": "nczwvusxpnyminhzxmqxsfwxwlkjahshnmcoccakuqpmkcsmhkseinjusblkiosxckubhmllxcsjusrrdvkohulxwccbgvliyxeoahxrhkkfvdrewezlxobafgyujqukgrtvukameurbveksuhhvoyhabcjwmaklfklmyfvnrizrvvrtkofdanjmolbgffleoprgtflvrhowopbekvwmuqfmpwparmfhagkxiibg",
+  "space": {
+    "slots": [
+      {"wheels": ["UKW-B-thin"], "rings": "a", "positions": "a"},
+      {"wheels": ["beta"], "rings": "a", "positions": "v"},
+      {"rotating": true, "wheels": ["II"], "rings": "a", "positions": "j"},
+      {"rotating": true, "wheels": ["IV"], "rings": "a", "positions": "n"},
+      {"rotating": true, "wheels": ["I"], "rings": "v", "positions": "a"}
+    ],
+    "plugboard": ""
+  },
+  "passes": [
+    {"type": "measure", "measure": "sinkov_trigram"}
+  ],
+  "frequencies": {
+    "trigram": "e2e/bomm/frequencies/enigma1941-trigram.txt"
+  }
+}

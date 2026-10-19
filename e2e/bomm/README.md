@@ -61,27 +61,18 @@ There is no trajectory, score or evaluation-count assertion for the attack.
 
 ### Verify and time case A
 
-From the repository root:
+The ignored test above runs the CLI exactly once and prints no timing. Timing
+lives in two symmetric harnesses that read this directory's design-A inputs:
 
-```sh
-./scripts/verify_and_time_case_a.sh
-```
+| Harness | Program | Guide |
+| --- | --- | --- |
+| `e2e/enigma_rust_timing/run.sh` | our release CLI | `e2e/enigma_rust_timing/README.md` |
+| `e2e/bomm_timing/run.sh` | pinned bomm (`BOMM_BIN`) | `e2e/bomm_timing/README.md` |
 
-The launcher runs the release test with `ENIGMA_CASE_A_TIMING=1`: three sequential
-CLI executions, each checked against all ten historical pairs and the full
-232-letter plaintext. It also resolves the repository root when invoked by path
-from another working directory. Without that environment option, the ignored
-test above still runs the CLI once and prints no timing summary; other option
-values are rejected.
-
-After all three results pass, one `ENIGMA_CASE_A_TIMING `-prefixed JSON line
-reports `case`, `unit` (seconds), execution-order `samples`, `min`, `median`,
-`max`, `verified_pairs` and `verified_plaintext_letters`. These are CLI subprocess
-wall times: startup, resource parsing and output transport are included, not just
-internal compute. Compilation, Cargo/test-harness overhead, input conversion,
-assertions and temporary-input cleanup are excluded. Inputs are prepared once
-from the versioned fixtures; no bomm rerun or extra measurement tools are needed.
-There are no timing thresholds or guaranteed benchmark results.
+Each runs `ENIGMA_TIMING_RUNS` (default 100) sequential pairs of a startup probe
+and the full attack, checks every output, and writes a new untracked JSON file
+under its `results/`. Per-evaluation search time is
+`(median full - median startup) / 8456`. There are no timing thresholds.
 
 ## Frequency tables
 

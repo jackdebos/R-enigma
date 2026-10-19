@@ -5,3 +5,7 @@
 # Rust
 /target/
 **/*.rs.bk
+
+# Untracked timing results (see e2e/*_timing/README.md)
+/e2e/bomm_timing/results/
+/e2e/enigma_rust_timing/results/
