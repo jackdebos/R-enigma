@@ -47,6 +47,8 @@ pub(super) struct TrialEvaluator<'a> {
     direction: Direction,
     objective: MeasureId,
     resource: Option<&'a BoundResource>,
+    // Only successful checks of the immutable, borrowed binding are retained.
+    binding: OnceCell<()>,
     // None in the cell remembers an allocation-policy fallback, not an unbuilt cache.
     prepared: OnceCell<Option<Prepared>>,
     #[cfg(test)]
@@ -76,6 +78,7 @@ impl<'a> TrialEvaluator<'a> {
             direction,
             objective,
             resource,
+            binding: OnceCell::new(),
             prepared: OnceCell::new(),
             #[cfg(test)]
             deny_reservation: false,
@@ -86,7 +89,12 @@ impl<'a> TrialEvaluator<'a> {
         &self,
         mutable: &[(char, char)],
     ) -> Result<(String, MeasuredScore), TrialEvaluationError> {
-        let board = validated_trial_board(self.initial, self.domain, mutable)
+        if self.binding.get().is_none() {
+            validate_binding(self.initial, self.domain).map_err(TrialEvaluationError::Board)?;
+            // Retain success even if mutable, input or scoring validation below fails.
+            self.binding.set(()).expect("single-threaded binding check");
+        }
+        let board = checked_mutable_board(self.initial, self.domain, mutable)
             .map_err(TrialEvaluationError::Board)?;
         let mut engine = None;
         if self.prepared.get().is_none() {
@@ -275,6 +283,11 @@ impl std::error::Error for TrialBoardError {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static BINDING_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Accept only mutable guesses, bound to the selected initial scrambler.
 /// Fixed facts are compared by mapping; their stored order and orientation stay untouched.
 pub(crate) fn validated_trial_board(
@@ -282,6 +295,16 @@ pub(crate) fn validated_trial_board(
     domain: &AttackPlugboardDomain,
     mutable: &[(char, char)],
 ) -> Result<Plugboard, TrialBoardError> {
+    validate_binding(initial, domain)?;
+    checked_mutable_board(initial, domain, mutable)
+}
+
+fn validate_binding(
+    initial: &ResolvedConfiguration,
+    domain: &AttackPlugboardDomain,
+) -> Result<(), TrialBoardError> {
+    #[cfg(test)]
+    BINDING_CHECKS.with(|count| count.set(count.get() + 1));
     let alphabet = initial.topology().alphabet();
     if !domain.matches_alphabet(alphabet) {
         return Err(TrialBoardError::AlphabetBinding);
@@ -291,6 +314,15 @@ pub(crate) fn validated_trial_board(
     if &fixed != initial.plugboard() {
         return Err(TrialBoardError::FixedFactsBinding);
     }
+    Ok(())
+}
+
+fn checked_mutable_board(
+    initial: &ResolvedConfiguration,
+    domain: &AttackPlugboardDomain,
+    mutable: &[(char, char)],
+) -> Result<Plugboard, TrialBoardError> {
+    let alphabet = initial.topology().alphabet();
     let mut pairs = domain.fixed_pairs().to_vec();
     pairs.extend_from_slice(mutable);
     // Existing model validation reports self-pairs, foreign and reused endpoints.
@@ -312,6 +344,127 @@ pub(crate) fn validated_trial_board(
 mod tests {
     use super::*;
     use crate::{Alphabet, DefinitionSource, SlotConfiguration, TransformConfiguration};
+
+    #[test]
+    fn warm_trials_build_only_the_mutable_board() {
+        let initial = machine("ABC", "BAC", "A", true);
+        let domain = domain(initial.topology().alphabet(), &[], "ABC", 1);
+        let trial = evaluator(&initial, &domain, "AA");
+        let expected = trial.evaluate(&[]).unwrap();
+        crate::PLUGBOARD_BUILDS.with(|c| c.set(0));
+        BINDING_CHECKS.with(|c| c.set(0));
+        assert_eq!(trial.evaluate(&[]).unwrap(), expected);
+        assert_eq!(crate::PLUGBOARD_BUILDS.with(|c| c.get()), 1);
+        assert_eq!(BINDING_CHECKS.with(|c| c.get()), 0);
+    }
+
+    #[test]
+    fn successful_binding_survives_later_failures_but_failed_binding_retries() {
+        let alphabet = alphabet();
+        let initial = initial(&alphabet, &[('A', 'B')]);
+        let valid = domain(&alphabet, &[('B', 'A')], "CDEF", 2);
+        for (input, objective) in [
+            ("AACD", MeasureId::Ic),
+            ("AAZ", MeasureId::Ic),
+            ("A", MeasureId::Ic),
+            ("AACD", MeasureId::SinkovBigram),
+        ] {
+            BINDING_CHECKS.with(|c| c.set(0));
+            let trial =
+                TrialEvaluator::new(&initial, &valid, input, Direction::Decrypt, objective, None);
+            assert_eq!(BINDING_CHECKS.with(|c| c.get()), 0);
+            assert!(matches!(
+                trial.evaluate(&[('C', 'C')]),
+                Err(TrialEvaluationError::Board(TrialBoardError::Model(
+                    ModelError::PlugboardSelfPair('C')
+                )))
+            ));
+            assert_eq!(BINDING_CHECKS.with(|c| c.get()), 1);
+            BINDING_CHECKS.with(|c| c.set(0));
+            let first = trial.evaluate(&[]);
+            assert!(trial.evaluate(&[('C', 'C')]).is_err());
+            assert_eq!(trial.evaluate(&[]), first);
+            assert_eq!(BINDING_CHECKS.with(|c| c.get()), 0, "{input}");
+        }
+        let reversed = Alphabet::new("HGFEDCBA".chars().collect()).unwrap();
+        for (invalid, error, builds) in [
+            (
+                domain(&reversed, &[], "CD", 1),
+                TrialBoardError::AlphabetBinding,
+                0,
+            ),
+            (
+                domain(&alphabet, &[], "CD", 1),
+                TrialBoardError::FixedFactsBinding,
+                1,
+            ),
+        ] {
+            let trial = evaluator(&initial, &invalid, "Z");
+            BINDING_CHECKS.with(|c| c.set(0));
+            crate::PLUGBOARD_BUILDS.with(|c| c.set(0));
+            let expected = TrialEvaluationError::Board(error);
+            for count in 1..=2 {
+                assert_eq!(trial.evaluate(&[('C', 'C')]).unwrap_err(), expected);
+                assert_eq!(BINDING_CHECKS.with(|c| c.get()), count);
+                assert_eq!(crate::PLUGBOARD_BUILDS.with(|c| c.get()), builds * count);
+            }
+        }
+    }
+
+    #[test]
+    fn validation_precedence_matrix_cold_and_warm() {
+        let alphabet = alphabet();
+        let initial = initial(&alphabet, &[('A', 'B')]);
+        let domain = domain(&alphabet, &[('A', 'B')], "CDEF", 2);
+        let cases = [
+            (
+                vec![('G', 'H'), ('C', 'C')],
+                TrialBoardError::Model(ModelError::PlugboardSelfPair('C')),
+            ),
+            (
+                vec![('C', 'D'), ('E', 'Z')],
+                TrialBoardError::Model(ModelError::UnknownSymbol('Z')),
+            ),
+            (
+                vec![('C', 'D'), ('E', 'G')],
+                TrialBoardError::OutsideMutable('G'),
+            ),
+            (vec![('H', 'G')], TrialBoardError::OutsideMutable('H')),
+            (vec![('C', 'D'), ('E', 'F')], TrialBoardError::TotalCapacity),
+        ];
+        for warm in [false, true] {
+            for input in ["AACD", "Z"] {
+                let trial = TrialEvaluator::new(
+                    &initial,
+                    &domain,
+                    input,
+                    Direction::Decrypt,
+                    MeasureId::SinkovBigram,
+                    None,
+                );
+                if warm {
+                    let expected = if input == "Z" {
+                        TrialEvaluationError::Model(ModelError::UnknownSymbol('Z'))
+                    } else {
+                        TrialEvaluationError::MissingResource(MeasureId::SinkovBigram)
+                    };
+                    assert_eq!(trial.evaluate(&[]).unwrap_err(), expected);
+                }
+                for (board, expected) in &cases {
+                    assert_eq!(
+                        validated_trial_board(&initial, &domain, board).unwrap_err(),
+                        *expected
+                    );
+                    assert_eq!(
+                        trial.evaluate(board).unwrap_err(),
+                        TrialEvaluationError::Board(
+                            validated_trial_board(&initial, &domain, board).unwrap_err()
+                        )
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn lazy_rows_are_built_once_across_boards_and_rejected_trials() {

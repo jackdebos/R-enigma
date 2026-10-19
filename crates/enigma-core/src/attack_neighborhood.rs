@@ -155,7 +155,12 @@ impl<'a> TrialContext<'a> {
         }) {
             return Ok(Vec::new());
         }
-        let original = validated_trial_board(self.initial, self.domain, self.current)?;
+        // The validated snapshot is a disjoint involution. Fixed endpoints were
+        // rejected above. Severing a/b frees their partners; every action reconnects
+        // distinct available endpoints (four distinct symbols in the last case).
+        // Add/remove, moving a link to a free endpoint, and reconnecting two links
+        // all change the mapping. Thus only mask and capacity can reject a trial;
+        // neither model construction nor an electrical no-op comparison is needed.
         let mut trials = Vec::with_capacity(4);
         for added in additions {
             let mut trial: MutableBoard = self
@@ -165,19 +170,21 @@ impl<'a> TrialContext<'a> {
                 .filter(|&(x, y)| x != a && y != a && x != b && y != b)
                 .collect();
             trial.extend(added);
-            if let Ok(board) = validated_trial_board(self.initial, self.domain, &trial) {
-                if board != original {
-                    // Canonicalize by alphabet indices, not Unicode character order.
-                    let index = |s| alphabet.iter().position(|c| *c == s).unwrap();
-                    for pair in &mut trial {
-                        if index(pair.0) > index(pair.1) {
-                            *pair = (pair.1, pair.0);
-                        }
-                    }
-                    trial.sort_by_key(|&(x, y)| (index(x), index(y)));
-                    trials.push(trial);
+            if trial.iter().any(|&(x, y)| {
+                !self.domain.symbols().contains(&x) || !self.domain.symbols().contains(&y)
+            }) || self.domain.fixed_pairs().len() + trial.len() > self.domain.max_pairs()
+            {
+                continue;
+            }
+            // Canonicalize by alphabet indices, not Unicode character order.
+            let index = |s| alphabet.iter().position(|c| *c == s).unwrap();
+            for pair in &mut trial {
+                if index(pair.0) > index(pair.1) {
+                    *pair = (pair.1, pair.0);
                 }
             }
+            trial.sort_by_key(|&(x, y)| (index(x), index(y)));
+            trials.push(trial);
         }
         Ok(trials)
     }
@@ -382,11 +389,17 @@ mod tests {
                                 .filter(|&(x, _)| !fixed.iter().any(|&(f, g)| x == f || x == g))
                                 .collect();
                             for board in [&current, &canonical] {
-                                assert_eq!(
+                                let cursor =
                                     NeighborhoodCursor::new(&initial, &domain, board, threshold)
-                                        .unwrap()
-                                        .collect::<Vec<_>>(),
-                                    flattened,
+                                        .unwrap();
+                                crate::PLUGBOARD_BUILDS.with(|c| c.set(0));
+                                crate::attack_evaluator::BINDING_CHECKS.with(|c| c.set(0));
+                                // Full sequence equality includes action order and duplicates.
+                                assert_eq!(cursor.collect::<Vec<_>>(), flattened);
+                                assert_eq!(crate::PLUGBOARD_BUILDS.with(|c| c.get()), 0);
+                                assert_eq!(
+                                    crate::attack_evaluator::BINDING_CHECKS.with(|c| c.get()),
+                                    0
                                 );
                                 neighborhoods += 1;
                             }
@@ -518,10 +531,19 @@ mod tests {
             vec![('A', 'D')],
             vec![('A', 'B'), ('C', 'D')],
         ];
-        let actual: Vec<_> = NeighborhoodCursor::new(&initial, &domain, &[('A', 'B')], 0)
-            .unwrap()
-            .collect();
+        // Positive control: standalone validation still performs both constructions.
+        crate::PLUGBOARD_BUILDS.with(|c| c.set(0));
+        crate::attack_evaluator::BINDING_CHECKS.with(|c| c.set(0));
+        validated_trial_board(&initial, &domain, &[('A', 'B')]).unwrap();
+        assert_eq!(crate::PLUGBOARD_BUILDS.with(|c| c.get()), 2);
+        assert_eq!(crate::attack_evaluator::BINDING_CHECKS.with(|c| c.get()), 1);
+        let cursor = NeighborhoodCursor::new(&initial, &domain, &[('A', 'B')], 0).unwrap();
+        crate::PLUGBOARD_BUILDS.with(|c| c.set(0));
+        crate::attack_evaluator::BINDING_CHECKS.with(|c| c.set(0));
+        let actual: Vec<_> = cursor.collect();
         assert_eq!(actual, expected);
+        assert_eq!(crate::PLUGBOARD_BUILDS.with(|c| c.get()), 0);
+        assert_eq!(crate::attack_evaluator::BINDING_CHECKS.with(|c| c.get()), 0);
         for board in [
             vec![('A', 'C')],
             vec![('A', 'D')],

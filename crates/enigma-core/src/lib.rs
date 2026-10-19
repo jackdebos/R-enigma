@@ -302,13 +302,28 @@ impl std::error::Error for ModelError {}
 /// Ordered alphabet of distinct Unicode scalar values.
 ///
 /// Symbols are preserved exactly: this type does not normalize or rewrite them.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Alphabet {
     symbols: Vec<char>,
     indices: HashMap<char, usize>,
 }
 
+impl PartialEq for Alphabet {
+    fn eq(&self, other: &Self) -> bool {
+        // Construction derives immutable indices solely from this ordered symbol sequence.
+        self.symbols == other.symbols
+    }
+}
+
+impl Eq for Alphabet {}
+
 impl Alphabet {
+    #[cfg(test)]
+    fn indices_equal(&self, other: &Self) -> bool {
+        ALPHABET_MAP_COMPARISONS.with(|count| count.set(count.get() + 1));
+        self.indices == other.indices
+    }
+
     /// Creates a non-empty alphabet, rejecting repeated scalar values.
     pub fn new(symbols: Vec<char>) -> Result<Self, ModelError> {
         if symbols.is_empty() {
@@ -349,6 +364,7 @@ impl Alphabet {
 #[cfg(test)]
 thread_local! {
     pub(crate) static INDEX_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ALPHABET_MAP_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether a slot may change position under a stepping rule.
@@ -840,6 +856,11 @@ pub struct Plugboard {
     mapping: Vec<usize>,
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PLUGBOARD_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl Plugboard {
     /// Builds a plugboard over `alphabet` from unordered pairs of distinct symbols.
     ///
@@ -847,6 +868,8 @@ impl Plugboard {
     /// involution, and unpaired symbols map to themselves. A symbol paired with itself,
     /// a repeated endpoint, or a symbol outside `alphabet` is rejected.
     pub fn new(alphabet: &Alphabet, pairs: &[(char, char)]) -> Result<Self, ModelError> {
+        #[cfg(test)]
+        PLUGBOARD_BUILDS.with(|count| count.set(count.get() + 1));
         let mut mapping: Vec<usize> = (0..alphabet.len()).collect();
         for &(left, right) in pairs {
             let left_index = alphabet
@@ -1305,6 +1328,46 @@ mod tests {
         assert_eq!(alphabet.index_of('é'), Some(2));
         assert_eq!(alphabet.index_of('e'), None);
         assert_eq!(Alphabet::new(vec!['e', '\u{301}']).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn alphabet_equality_avoids_derived_map_comparison() {
+        let left = Alphabet::new(vec!['λ', '中', 'é', 'e', '\u{301}']).unwrap();
+        let right = Alphabet::new(vec!['λ', '中', 'é', 'e', '\u{301}']).unwrap();
+        super::ALPHABET_MAP_COMPARISONS.with(|count| count.set(0));
+
+        // Positive control: the same instrumented helper performs actual map equality.
+        assert!(left.indices_equal(&right));
+        super::ALPHABET_MAP_COMPARISONS.with(|count| assert_eq!(count.get(), 1));
+        super::ALPHABET_MAP_COMPARISONS.with(|count| count.set(0));
+
+        assert_eq!(left, right);
+        super::ALPHABET_MAP_COMPARISONS.with(|count| assert_eq!(count.get(), 0));
+    }
+
+    #[test]
+    fn alphabet_equality_preserves_order_and_exact_unicode_scalars() {
+        let symbols = vec!['λ', '中', 'é', 'e', '\u{301}'];
+        let alphabet = Alphabet::new(symbols.clone()).unwrap();
+        assert_eq!(alphabet, alphabet.clone());
+        assert_eq!(alphabet, Alphabet::new(symbols).unwrap());
+        assert_ne!(
+            alphabet,
+            Alphabet::new(vec!['中', 'λ', 'é', 'e', '\u{301}']).unwrap()
+        );
+        assert_ne!(
+            alphabet,
+            Alphabet::new(vec!['λ', '中', 'é', 'e', '\u{300}']).unwrap()
+        );
+        assert_ne!(alphabet, Alphabet::new(vec!['λ', '中', 'é']).unwrap());
+        assert_ne!(
+            Alphabet::new(vec!['é']).unwrap(),
+            Alphabet::new(vec!['e', '\u{301}']).unwrap()
+        );
+        assert_ne!(
+            Alphabet::new(vec!['e', '\u{301}']).unwrap(),
+            Alphabet::new(vec!['\u{301}', 'e']).unwrap()
+        );
     }
 
     #[test]
