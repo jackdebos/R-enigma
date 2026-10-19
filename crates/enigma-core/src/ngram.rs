@@ -167,6 +167,16 @@ impl NgramModel {
             }
             length = length.checked_add(1).ok_or(ScoreError::Overflow)?;
         }
+        self.score_windows(text, length)
+    }
+
+    /// [`Self::score`] for text already known to lie in this model's alphabet.
+    pub(crate) fn score_valid(&self, text: &str) -> Result<MeasuredScore, MeasureError> {
+        let length = u128::try_from(text.chars().count()).map_err(|_| ScoreError::Overflow)?;
+        self.score_windows(text, length)
+    }
+
+    fn score_windows(&self, text: &str, length: u128) -> Result<MeasuredScore, MeasureError> {
         let required = u128::try_from(self.order).map_err(|_| ScoreError::Overflow)?;
         if length < required {
             return Err(MeasureError::InsufficientSamples {
@@ -347,6 +357,19 @@ mod tests {
             sparse.score("B").unwrap().measured().units(),
             -2_977_044_472
         );
+    }
+
+    #[test]
+    fn prevalidated_scores_match_validated_scores_and_sample_errors() {
+        let model = NgramModel::new(
+            Alphabet::new(vec!['λ', 'β', 'A']).unwrap(),
+            3,
+            vec![(vec!['λ', 'β', 'A'], 4), (vec!['A', 'A', 'A'], 1)],
+        )
+        .unwrap();
+        for text in ["", "λ", "λβ", "λβA", "AAAλβAλβ", "βββ"] {
+            assert_eq!(model.score_valid(text), model.score(text), "{text}");
+        }
     }
 
     #[test]

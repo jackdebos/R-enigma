@@ -2,6 +2,7 @@
 
 use std::cell::OnceCell;
 
+use crate::measure::{index_coincidence, index_entropy};
 use crate::{
     index_of_coincidence, shannon_entropy, AttackPlugboardDomain, BoundResource, Direction, Engine,
     MeasureError, MeasureId, MeasuredScore, ModelError, Plugboard, ResolvedConfiguration,
@@ -47,9 +48,16 @@ pub(super) struct TrialEvaluator<'a> {
     objective: MeasureId,
     resource: Option<&'a BoundResource>,
     // None in the cell remembers an allocation-policy fallback, not an unbuilt cache.
-    prepared: OnceCell<Option<Vec<char>>>,
+    prepared: OnceCell<Option<Prepared>>,
     #[cfg(test)]
     deny_reservation: bool,
+}
+
+/// Board-independent alphabet indices: the input, then one scrambler row per offset.
+#[derive(Debug)]
+struct Prepared {
+    input: Vec<u32>,
+    rows: Vec<u32>,
 }
 
 impl<'a> TrialEvaluator<'a> {
@@ -85,12 +93,17 @@ impl<'a> TrialEvaluator<'a> {
             // Preserve constructor-before-full-input validation, even on fallback.
             let mut fresh = self.fresh_engine(board.clone())?;
             let alphabet = self.initial.topology().alphabet();
-            if let Some(symbol) = self.input.chars().find(|c| alphabet.index_of(*c).is_none()) {
-                return Err(TrialEvaluationError::Model(ModelError::UnknownSymbol(
-                    symbol,
-                )));
+            let mut input = Vec::with_capacity(self.input.len());
+            for symbol in self.input.chars() {
+                let index = alphabet
+                    .index_of(symbol)
+                    .and_then(|index| u32::try_from(index).ok())
+                    .ok_or(TrialEvaluationError::Model(ModelError::UnknownSymbol(
+                        symbol,
+                    )))?;
+                input.push(index);
             }
-            let length = self.input.chars().count();
+            let length = input.len();
             let mut rows = reserved_rows(length, alphabet.symbols.len(), self.reserve_denied());
             if let Some(rows) = &mut rows {
                 fresh
@@ -101,34 +114,38 @@ impl<'a> TrialEvaluator<'a> {
             }
             // Failed model/input validation never initializes the cell.
             self.prepared
-                .set(rows)
+                .set(rows.map(|rows| Prepared { input, rows }))
                 .expect("single-threaded lazy preparation");
         }
-        let plaintext = match self.prepared.get().expect("prepared above") {
-            Some(rows) => {
-                let alphabet = self.initial.topology().alphabet();
-                let width = alphabet.symbols.len();
-                let mut output = String::with_capacity(self.input.len());
-                for (offset, symbol) in self.input.chars().enumerate() {
-                    let input = board.map(symbol).expect("validated input and board");
-                    let index = alphabet.index_of(input).expect("validated board alphabet");
-                    let output_symbol = rows[offset * width + index];
-                    output.push(board.map(output_symbol).expect("scrambler alphabet"));
+        match self.prepared.get().expect("prepared above") {
+            Some(prepared) => {
+                let symbols = &self.initial.topology().alphabet().symbols;
+                let width = symbols.len();
+                let mut plaintext = String::with_capacity(self.input.len());
+                let mut indices = Vec::with_capacity(prepared.input.len());
+                // The trial board is bound to this alphabet, so its mapping is
+                // indexed by the same alphabet indices as the rows.
+                for (offset, &symbol) in prepared.input.iter().enumerate() {
+                    let signal = board.mapping[symbol as usize];
+                    let output = board.mapping[prepared.rows[offset * width + signal] as usize];
+                    plaintext.push(symbols[output]);
+                    indices.push(output as u32);
                 }
-                output
+                let score = self.measure_with(&plaintext, Some(&indices))?;
+                Ok((plaintext, score))
             }
             None => {
                 let mut engine = match engine {
                     Some(engine) => engine,
                     None => self.fresh_engine(board)?,
                 };
-                engine
+                let plaintext = engine
                     .transform(self.input, self.direction)
-                    .map_err(TrialEvaluationError::Model)?
+                    .map_err(TrialEvaluationError::Model)?;
+                let score = self.measure(&plaintext)?;
+                Ok((plaintext, score))
             }
-        };
-        let score = self.measure(&plaintext)?;
-        Ok((plaintext, score))
+        }
     }
 
     fn fresh_engine(&self, board: Plugboard) -> Result<Engine, TrialEvaluationError> {
@@ -170,18 +187,38 @@ impl<'a> TrialEvaluator<'a> {
     }
 
     fn measure(&self, plaintext: &str) -> Result<MeasuredScore, TrialEvaluationError> {
+        self.measure_with(plaintext, None)
+    }
+
+    /// Prepared trials pass the plaintext's alphabet indices, already known valid, so
+    /// IC, entropy and n-gram scoring skip per-symbol membership lookups. The resource
+    /// guards and their order are shared with the character path.
+    fn measure_with(
+        &self,
+        plaintext: &str,
+        indices: Option<&[u32]>,
+    ) -> Result<MeasuredScore, TrialEvaluationError> {
         let alphabet = self.initial.topology().alphabet();
         let incompatible = || TrialEvaluationError::IncompatibleResource(self.objective);
         let score = match (self.objective, self.resource) {
-            (MeasureId::Ic, None) => index_of_coincidence(alphabet, plaintext),
-            (MeasureId::Entropy, None) => shannon_entropy(alphabet, plaintext),
+            (MeasureId::Ic, None) => match indices {
+                Some(indices) => index_coincidence(alphabet.len(), indices),
+                None => index_of_coincidence(alphabet, plaintext),
+            },
+            (MeasureId::Entropy, None) => match indices {
+                Some(indices) => index_entropy(alphabet.len(), indices),
+                None => shannon_entropy(alphabet, plaintext),
+            },
             (objective, None) if objective.requires_resource() => {
                 return Err(TrialEvaluationError::MissingResource(objective));
             }
             (objective, Some(BoundResource::Ngram(model)))
                 if objective.order() == Some(model.order()) && model.alphabet() == alphabet =>
             {
-                model.score(plaintext)
+                match indices {
+                    Some(_) => model.score_valid(plaintext),
+                    None => model.score(plaintext),
+                }
             }
             (MeasureId::Trie, Some(BoundResource::Trie(model))) if model.alphabet() == alphabet => {
                 model.score(plaintext)
@@ -196,10 +233,10 @@ const TABLE_DATA_LIMIT: usize = 1024 * 1024;
 
 fn table_entries(length: usize, width: usize) -> Option<usize> {
     let entries = length.checked_mul(width)?;
-    (entries.checked_mul(std::mem::size_of::<char>())? <= TABLE_DATA_LIMIT).then_some(entries)
+    (entries.checked_mul(std::mem::size_of::<u32>())? <= TABLE_DATA_LIMIT).then_some(entries)
 }
 
-fn reserved_rows(length: usize, width: usize, deny: bool) -> Option<Vec<char>> {
+fn reserved_rows(length: usize, width: usize, deny: bool) -> Option<Vec<u32>> {
     let entries = table_entries(length, width)?;
     let mut rows = Vec::new();
     if deny || rows.try_reserve_exact(entries).is_err() {
@@ -292,6 +329,33 @@ mod tests {
         crate::engine::ROW_BUILDS.with(|count| assert_eq!(count.get(), 1));
     }
 
+    #[test]
+    fn prepared_trials_decrypt_and_score_without_symbol_lookups() {
+        let initial = machine("ABC", "BAC", "A", true);
+        let alphabet = initial.topology().alphabet();
+        let domain = domain(alphabet, &[], "ABC", 1);
+        let resource = ngram(alphabet, 2);
+        for (objective, resource) in [
+            (MeasureId::Ic, None),
+            (MeasureId::Entropy, None),
+            (MeasureId::SinkovBigram, Some(&resource)),
+        ] {
+            let input = "ABCAB".repeat(4);
+            let trial = TrialEvaluator::new(
+                &initial,
+                &domain,
+                &input,
+                Direction::Decrypt,
+                objective,
+                resource,
+            );
+            let first = trial.evaluate(&[]).unwrap();
+            crate::INDEX_LOOKUPS.with(|count| count.set(0));
+            assert_eq!(trial.evaluate(&[]).unwrap(), first);
+            crate::INDEX_LOOKUPS.with(|count| assert_eq!(count.get(), 0, "{objective:?}"));
+        }
+    }
+
     fn turnover_machine(symbols: &str, reflector: bool) -> ResolvedConfiguration {
         let s: Vec<_> = symbols.chars().collect();
         let mut slots = Vec::new();
@@ -356,37 +420,56 @@ mod tests {
                     .transform(&s[0].to_string(), Direction::Encrypt)
                     .unwrap();
                 assert_eq!(&probe.positions()[start..], &[s[2], s[0], s[1]]);
-                for direction in [Direction::Encrypt, Direction::Decrypt] {
-                    for input in [symbols.to_owned(), symbols.repeat(9)] {
-                        for deny in [false, true] {
-                            let mut trial = TrialEvaluator::new(
-                                &initial,
-                                &domain,
-                                &input,
-                                direction,
-                                MeasureId::Ic,
-                                None,
-                            );
-                            trial.deny_reservation = deny;
-                            for pairs in [vec![], vec![(s[2], s[3])], vec![]] {
-                                let board =
-                                    validated_trial_board(&initial, &domain, &pairs).unwrap();
-                                let mut fresh = Engine::new(
-                                    initial.topology().clone(),
-                                    initial.stepping().clone(),
-                                    board,
-                                )
-                                .unwrap();
-                                let plaintext = fresh.transform(&input, direction).unwrap();
-                                let score =
-                                    index_of_coincidence(initial.topology().alphabet(), &plaintext)
-                                        .unwrap();
-                                assert_eq!(trial.evaluate(&pairs).unwrap(), (plaintext, score));
-                                assert_eq!(trial.prepared.get().unwrap().is_none(), deny);
-                                assert!(matches!(
-                                    trial.evaluate(&[(s[2], s[2])]),
-                                    Err(TrialEvaluationError::Board(_))
-                                ));
+                let alphabet = initial.topology().alphabet();
+                let resources: Vec<_> = (1..=6)
+                    .map(|order| {
+                        let mixed = s.iter().cycle().skip(2).take(order).copied().collect();
+                        let entries = vec![(vec![s[0]; order], 3), (vec![s[1]; order], 1)];
+                        let entries = entries.into_iter().chain([(mixed, 2)]).collect();
+                        let model = crate::NgramModel::new(alphabet.clone(), order, entries);
+                        BoundResource::Ngram(model.unwrap())
+                    })
+                    .collect();
+                let objectives = [(MeasureId::Ic, None), (MeasureId::Entropy, None)]
+                    .into_iter()
+                    .chain(SINKOV.into_iter().zip(resources.iter().map(Some)));
+                for (objective, resource) in objectives {
+                    for direction in [Direction::Encrypt, Direction::Decrypt] {
+                        for input in [symbols.to_owned(), symbols.repeat(9)] {
+                            for deny in [false, true] {
+                                let mut trial = TrialEvaluator::new(
+                                    &initial, &domain, &input, direction, objective, resource,
+                                );
+                                trial.deny_reservation = deny;
+                                for pairs in [vec![], vec![(s[2], s[3])], vec![]] {
+                                    let board =
+                                        validated_trial_board(&initial, &domain, &pairs).unwrap();
+                                    let mut fresh = Engine::new(
+                                        initial.topology().clone(),
+                                        initial.stepping().clone(),
+                                        board,
+                                    )
+                                    .unwrap();
+                                    let plaintext = fresh.transform(&input, direction).unwrap();
+                                    let score = match resource {
+                                        Some(BoundResource::Ngram(model)) => {
+                                            model.score(&plaintext)
+                                        }
+                                        _ if objective == MeasureId::Ic => {
+                                            index_of_coincidence(alphabet, &plaintext)
+                                        }
+                                        _ => shannon_entropy(alphabet, &plaintext),
+                                    };
+                                    let expected = score
+                                        .map(|score| (plaintext, score))
+                                        .map_err(TrialEvaluationError::Measure);
+                                    assert_eq!(trial.evaluate(&pairs), expected, "{objective:?}");
+                                    assert_eq!(trial.prepared.get().unwrap().is_none(), deny);
+                                    assert!(matches!(
+                                        trial.evaluate(&[(s[2], s[2])]),
+                                        Err(TrialEvaluationError::Board(_))
+                                    ));
+                                }
                             }
                         }
                     }
@@ -397,7 +480,7 @@ mod tests {
 
     #[test]
     fn table_allocation_policy_checks_overflow_boundary_and_denial() {
-        let entries = TABLE_DATA_LIMIT / std::mem::size_of::<char>();
+        let entries = TABLE_DATA_LIMIT / std::mem::size_of::<u32>();
         assert_eq!(table_entries(entries, 1), Some(entries));
         assert_eq!(table_entries(entries + 1, 1), None);
         assert_eq!(table_entries(usize::MAX, 2), None);

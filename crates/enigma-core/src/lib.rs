@@ -340,8 +340,15 @@ impl Alphabet {
 
     /// Returns the index of a symbol without normalization, if present.
     pub fn index_of(&self, symbol: char) -> Option<usize> {
+        #[cfg(test)]
+        INDEX_LOOKUPS.with(|count| count.set(count.get() + 1));
         self.indices.get(&symbol).copied()
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static INDEX_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether a slot may change position under a stepping rule.

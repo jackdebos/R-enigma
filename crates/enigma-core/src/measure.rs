@@ -113,6 +113,30 @@ fn monograms(
         counts[index] = counts[index].checked_add(1).ok_or(ScoreError::Overflow)?;
         length = length.checked_add(1).ok_or(ScoreError::Overflow)?;
     }
+    sufficient(counts, length, required)
+}
+
+/// Counts prevalidated alphabet indices, skipping the per-symbol membership lookup.
+fn index_monograms(
+    width: usize,
+    indices: &[u32],
+    required: u128,
+) -> Result<(Vec<u128>, u128), MeasureError> {
+    let mut counts = vec![0_u128; width];
+    let mut length = 0_u128;
+    for &index in indices {
+        let count = &mut counts[index as usize];
+        *count = count.checked_add(1).ok_or(ScoreError::Overflow)?;
+        length = length.checked_add(1).ok_or(ScoreError::Overflow)?;
+    }
+    sufficient(counts, length, required)
+}
+
+fn sufficient(
+    counts: Vec<u128>,
+    length: u128,
+    required: u128,
+) -> Result<(Vec<u128>, u128), MeasureError> {
     if length < required {
         return Err(MeasureError::InsufficientSamples {
             required,
@@ -130,6 +154,23 @@ pub fn index_of_coincidence(
     text: &str,
 ) -> Result<MeasuredScore, MeasureError> {
     let (counts, length) = monograms(alphabet, text, 2)?;
+    coincidence(alphabet.len(), counts, length)
+}
+
+/// [`index_of_coincidence`] over prevalidated indices of an alphabet of `width` symbols.
+pub(crate) fn index_coincidence(
+    width: usize,
+    indices: &[u32],
+) -> Result<MeasuredScore, MeasureError> {
+    let (counts, length) = index_monograms(width, indices, 2)?;
+    coincidence(width, counts, length)
+}
+
+fn coincidence(
+    width: usize,
+    counts: Vec<u128>,
+    length: u128,
+) -> Result<MeasuredScore, MeasureError> {
     let mut pairs = 0_u128;
     for count in counts.into_iter().filter(|&count| count > 0) {
         let previous = count.checked_sub(1).ok_or(ScoreError::Overflow)?;
@@ -138,7 +179,7 @@ pub fn index_of_coincidence(
             .checked_add(contribution)
             .ok_or(ScoreError::Overflow)?;
     }
-    let alphabet_size = u128::try_from(alphabet.len()).map_err(|_| ScoreError::Overflow)?;
+    let alphabet_size = u128::try_from(width).map_err(|_| ScoreError::Overflow)?;
     let scale = u128::try_from(SCALE).map_err(|_| ScoreError::Overflow)?;
     let numerator = pairs
         .checked_mul(alphabet_size)
@@ -163,6 +204,16 @@ pub fn index_of_coincidence(
 /// Ranking negates the positive measured value only after Q32 quantization.
 pub fn shannon_entropy(alphabet: &Alphabet, text: &str) -> Result<MeasuredScore, MeasureError> {
     let (counts, length) = monograms(alphabet, text, 1)?;
+    entropy(counts, length)
+}
+
+/// [`shannon_entropy`] over prevalidated indices of an alphabet of `width` symbols.
+pub(crate) fn index_entropy(width: usize, indices: &[u32]) -> Result<MeasuredScore, MeasureError> {
+    let (counts, length) = index_monograms(width, indices, 1)?;
+    entropy(counts, length)
+}
+
+fn entropy(counts: Vec<u128>, length: u128) -> Result<MeasuredScore, MeasureError> {
     let log_length = integer_log2_q48(length)?;
     let mut numerator = 0_i128;
     for count in counts.into_iter().filter(|&count| count > 0) {
@@ -316,6 +367,25 @@ mod tests {
         let error = MeasureError::from(ScoreError::Overflow);
         assert_eq!(error.to_string(), "fixed-point score arithmetic overflow");
         assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn index_counts_match_character_scores_and_sample_errors() {
+        let unicode = Alphabet::new(vec!['λ', 'A', 'é']).unwrap();
+        for text in ["", "λ", "λλ", "Aé", "éλAAéλλ", "AAAAAAAAé"] {
+            let indices: Vec<u32> = text
+                .chars()
+                .map(|symbol| unicode.index_of(symbol).unwrap() as u32)
+                .collect();
+            assert_eq!(
+                index_coincidence(unicode.len(), &indices),
+                index_of_coincidence(&unicode, text)
+            );
+            assert_eq!(
+                index_entropy(unicode.len(), &indices),
+                shannon_entropy(&unicode, text)
+            );
+        }
     }
 
     #[test]

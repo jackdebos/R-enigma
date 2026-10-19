@@ -114,20 +114,27 @@ impl Engine {
             .ok_or(ModelError::UnknownSymbol(signal))
     }
 
-    /// Builds board-independent rows, stepping exactly once before each row.
+    /// Builds board-independent rows of alphabet indices, stepping exactly once before
+    /// each row.
     pub(crate) fn scrambler_rows(
         &mut self,
         length: usize,
         direction: Direction,
-        rows: &mut Vec<char>,
+        rows: &mut Vec<u32>,
     ) -> Result<(), ModelError> {
         #[cfg(test)]
         ROW_BUILDS.with(|count| count.set(count.get() + 1));
         for _ in 0..length {
             self.stepping
                 .advance_prevalidated(&self.topology, &mut self.positions)?;
-            for &symbol in &self.topology.alphabet().symbols {
-                rows.push(self.traverse_scrambler(symbol, direction)?);
+            let alphabet = self.topology.alphabet();
+            for &symbol in &alphabet.symbols {
+                let output = self.traverse_scrambler(symbol, direction)?;
+                let index = alphabet
+                    .index_of(output)
+                    .and_then(|index| u32::try_from(index).ok())
+                    .ok_or(ModelError::UnknownSymbol(output))?;
+                rows.push(index);
             }
         }
         Ok(())
