@@ -60,6 +60,7 @@ pub struct NgramModel {
     alphabet: Alphabet,
     order: usize,
     weights: HashMap<Vec<char>, FixedScore>,
+    dense: Option<DenseWeights>,
     unseen: FixedScore,
     total: u128,
     minimum: u64,
@@ -123,10 +124,12 @@ impl NgramModel {
                 }
             }
         }
+        let dense = DenseWeights::new(&alphabet, order, &weights, unseen, false);
         Ok(Self {
             alphabet,
             order,
             weights,
+            dense,
             unseen,
             total,
             minimum,
@@ -176,6 +179,43 @@ impl NgramModel {
         self.score_windows(text, length)
     }
 
+    /// Score matching plaintext indices in this model's ordered alphabet. The caller
+    /// must establish alphabet identity and supply one valid index per text scalar.
+    pub(crate) fn score_indices(
+        &self,
+        text: &str,
+        indices: &[u32],
+    ) -> Result<MeasuredScore, MeasureError> {
+        let Some(dense) = &self.dense else {
+            return self.score_valid(text);
+        };
+        let length = u128::try_from(indices.len()).map_err(|_| ScoreError::Overflow)?;
+        let required = u128::try_from(self.order).map_err(|_| ScoreError::Overflow)?;
+        if length < required {
+            return Err(MeasureError::InsufficientSamples {
+                required,
+                actual: length,
+            });
+        }
+        let windows = length
+            .checked_sub(required)
+            .and_then(|n| n.checked_add(1))
+            .ok_or(ScoreError::Overflow)?;
+        let width = self.alphabet.len();
+        // Dense dimensions bound every radix key; indices are already validated.
+        let mut key = indices[..self.order]
+            .iter()
+            .fold(0, |key, &index| key * width + index as usize);
+        let mut sum = dense.weights[key];
+        for &incoming in &indices[self.order..] {
+            key = (key % dense.suffix_modulus) * width + incoming as usize;
+            sum = sum.checked_add(dense.weights[key])?;
+        }
+        let divisor = i128::try_from(windows).map_err(|_| ScoreError::Overflow)?;
+        let measured = FixedScore::from_units(floor_div(sum.units(), divisor)?);
+        Ok(MeasuredScore::higher_is_better(measured))
+    }
+
     fn score_windows(&self, text: &str, length: u128) -> Result<MeasuredScore, MeasureError> {
         let required = u128::try_from(self.order).map_err(|_| ScoreError::Overflow)?;
         if length < required {
@@ -194,7 +234,11 @@ impl NgramModel {
         for (slot, symbol) in window.iter_mut().zip(symbols.by_ref()) {
             *slot = symbol;
         }
-        let weight = |gram: &[char]| self.weights.get(gram).copied().unwrap_or(self.unseen);
+        let weight = |gram: &[char]| {
+            #[cfg(test)]
+            SPARSE_LOOKUPS.with(|count| count.set(count.get() + 1));
+            self.weights.get(gram).copied().unwrap_or(self.unseen)
+        };
         let mut sum = weight(window);
         for symbol in symbols {
             window.rotate_left(1);
@@ -205,6 +249,54 @@ impl NgramModel {
         let measured = FixedScore::from_units(floor_div(sum.units(), divisor)?);
         Ok(MeasuredScore::higher_is_better(measured))
     }
+}
+
+const DENSE_DATA_LIMIT: usize = 4 * 1024 * 1024;
+
+#[derive(Debug)]
+struct DenseWeights {
+    weights: Vec<FixedScore>,
+    suffix_modulus: usize,
+}
+
+fn dense_dimensions(width: usize, order: usize) -> Option<(usize, usize)> {
+    let exponent = u32::try_from(order.checked_sub(1)?).ok()?;
+    let suffix_modulus = width.checked_pow(exponent)?;
+    let entries = suffix_modulus.checked_mul(width)?;
+    (entries.checked_mul(std::mem::size_of::<FixedScore>())? <= DENSE_DATA_LIMIT)
+        .then_some((entries, suffix_modulus))
+}
+
+impl DenseWeights {
+    fn new(
+        alphabet: &Alphabet,
+        order: usize,
+        sparse: &HashMap<Vec<char>, FixedScore>,
+        unseen: FixedScore,
+        deny_reservation: bool,
+    ) -> Option<Self> {
+        let (entries, suffix_modulus) = dense_dimensions(alphabet.len(), order)?;
+        let mut weights = Vec::new();
+        if deny_reservation || weights.try_reserve_exact(entries).is_err() {
+            return None;
+        }
+        weights.resize(entries, unseen);
+        for (gram, &weight) in sparse {
+            let key = gram.iter().fold(0, |key, &symbol| {
+                key * alphabet.len() + alphabet.index_of(symbol).expect("validated model gram")
+            });
+            weights[key] = weight;
+        }
+        Some(Self {
+            weights,
+            suffix_modulus,
+        })
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SPARSE_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -370,6 +462,126 @@ mod tests {
         for text in ["", "λ", "λβ", "λβA", "AAAλβAλβ", "βββ"] {
             assert_eq!(model.score_valid(text), model.score(text), "{text}");
         }
+    }
+
+    #[test]
+    fn dense_scores_match_both_sparse_paths_for_all_orders_and_lengths() {
+        for symbols in ["A", "BA", "λ界\u{301}", "\u{301}界λ"] {
+            let alphabet = Alphabet::new(symbols.chars().collect()).unwrap();
+            let s = &alphabet.symbols;
+            for order in 1..=6 {
+                for count in [3, u64::MAX] {
+                    let mut entries = vec![(vec![s[0]; order], count)];
+                    if s.len() > 1 {
+                        entries.push((vec![s[1]; order], 1));
+                        if order > 1 {
+                            let mixed = s.iter().cycle().take(order).copied().collect();
+                            entries.push((mixed, u64::MAX));
+                        }
+                    }
+                    let model = NgramModel::new(alphabet.clone(), order, entries).unwrap();
+                    assert!(model.dense.is_some());
+                    for pattern in [
+                        vec![s[0]],
+                        vec![s[s.len() - 1]],
+                        s.clone(),
+                        vec![s[0], s[0], s[s.len() - 1], s[0], s[s.len() - 1]],
+                    ] {
+                        for length in 0..=3 * order + 1 {
+                            let text: String = pattern.iter().cycle().take(length).collect();
+                            let indices: Vec<_> = text
+                                .chars()
+                                .map(|c| alphabet.index_of(c).unwrap() as u32)
+                                .collect();
+                            let expected = model.score(&text);
+                            assert_eq!(model.score_valid(&text), expected);
+                            SPARSE_LOOKUPS.with(|count| count.set(0));
+                            assert_eq!(
+                                model.score_indices(&text, &indices),
+                                expected,
+                                "{symbols:?}, order {order}, text {text:?}"
+                            );
+                            SPARSE_LOOKUPS.with(|count| assert_eq!(count.get(), 0));
+                        }
+                    }
+                    // Public validation must still precede insufficient samples.
+                    for text in ["X".to_owned(), format!("{symbols}X")] {
+                        assert_eq!(
+                            model.score(&text),
+                            Err(MeasureError::InvalidSymbol {
+                                symbol: 'X',
+                                scalar_index: text.chars().count() - 1,
+                            })
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_models_and_denied_reservations_keep_sparse_scoring() {
+        let alphabet = Alphabet::new("ABCDEFGHIJKLMNOPQRSTUVWXYZ".chars().collect()).unwrap();
+        let trigram = NgramModel::new(alphabet.clone(), 3, vec![(vec!['A'; 3], 1)]).unwrap();
+        assert_eq!(
+            trigram.dense.as_ref().unwrap().weights.len() * std::mem::size_of::<FixedScore>(),
+            281_216
+        );
+        for order in 3..=6 {
+            let mut model =
+                NgramModel::new(alphabet.clone(), order, vec![(vec!['A'; order], 1)]).unwrap();
+            assert_eq!(model.dense.is_some(), order == 3);
+            if order == 3 {
+                model.dense =
+                    DenseWeights::new(&model.alphabet, order, &model.weights, model.unseen, true);
+                assert!(model.dense.is_none());
+            }
+            let text = format!("{}BAAAA", "A".repeat(order));
+            let indices: Vec<_> = text
+                .chars()
+                .map(|c| alphabet.index_of(c).unwrap() as u32)
+                .collect();
+            let expected = model.score(&text);
+            assert_eq!(model.score_valid(&text), expected);
+            SPARSE_LOOKUPS.with(|count| count.set(0));
+            assert_eq!(model.score_indices(&text, &indices), expected);
+            SPARSE_LOOKUPS.with(|count| assert_eq!(count.get(), text.len() - order + 1));
+            for length in 0..order {
+                let short = "A".repeat(length);
+                assert_eq!(
+                    model.score_indices(&short, &vec![0; length]),
+                    model.score(&short)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dense_dimensions_check_payload_ceiling_and_arithmetic_overflow() {
+        let entries = DENSE_DATA_LIMIT / std::mem::size_of::<FixedScore>();
+        assert_eq!(dense_dimensions(2, 18), Some((entries, entries / 2)));
+        assert_eq!(dense_dimensions(2, 19), None);
+        assert_eq!(dense_dimensions(usize::MAX, 6), None);
+        assert_eq!(dense_dimensions(usize::MAX, 1), None);
+        if usize::BITS > u32::BITS {
+            assert_eq!(dense_dimensions(1, usize::MAX), None);
+        }
+        assert_eq!(dense_dimensions(1, 0), None);
+        for order in 1..=6 {
+            assert_eq!(dense_dimensions(1, order), Some((1, 1)));
+        }
+    }
+
+    #[test]
+    fn later_entry_validation_still_precedes_duplicate_detection() {
+        let entries = vec![(vec!['A'], 1), (vec!['A'], 2), (vec!['B'], 0)];
+        assert_eq!(
+            NgramModel::new(alphabet(), 1, entries).unwrap_err(),
+            NgramError::InvalidEntry {
+                index: 2,
+                message: "count must be positive".into(),
+            }
+        );
     }
 
     #[test]

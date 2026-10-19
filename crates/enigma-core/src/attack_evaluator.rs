@@ -216,7 +216,7 @@ impl<'a> TrialEvaluator<'a> {
                 if objective.order() == Some(model.order()) && model.alphabet() == alphabet =>
             {
                 match indices {
-                    Some(_) => model.score_valid(plaintext),
+                    Some(indices) => model.score_indices(plaintext, indices),
                     None => model.score(plaintext),
                 }
             }
@@ -353,6 +353,58 @@ mod tests {
             crate::INDEX_LOOKUPS.with(|count| count.set(0));
             assert_eq!(trial.evaluate(&[]).unwrap(), first);
             crate::INDEX_LOOKUPS.with(|count| assert_eq!(count.get(), 0, "{objective:?}"));
+        }
+    }
+
+    #[test]
+    fn prepared_trigram_trials_bypass_sparse_lookups() {
+        let alphabet = Alphabet::new("ABC".chars().collect()).unwrap();
+        let initial = initial(&alphabet, &[]);
+        let domain = domain(&alphabet, &[], "ABC", 1);
+        let resource = ngram(&alphabet, 3);
+        let input = "ABCAAABBBABC";
+        let trial = TrialEvaluator::new(
+            &initial,
+            &domain,
+            input,
+            Direction::Decrypt,
+            MeasureId::SinkovTrigram,
+            Some(&resource),
+        );
+        let first = trial.evaluate(&[]).unwrap();
+        assert_eq!(first.0, input);
+        crate::ngram::SPARSE_LOOKUPS.with(|count| count.set(0));
+        assert_eq!(trial.measure(input), Ok(first.1));
+        crate::ngram::SPARSE_LOOKUPS.with(|count| assert_eq!(count.get(), input.len() - 2));
+        crate::ngram::SPARSE_LOOKUPS.with(|count| count.set(0));
+        assert_eq!(trial.evaluate(&[]).unwrap(), first);
+        crate::ngram::SPARSE_LOOKUPS.with(|count| assert_eq!(count.get(), 0));
+    }
+
+    #[test]
+    fn prepared_trials_keep_sparse_fallback_for_oversized_models() {
+        let symbols = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let alphabet = Alphabet::new(symbols.chars().collect()).unwrap();
+        let initial = initial(&alphabet, &[]);
+        let domain = domain(&alphabet, &[], symbols, 13);
+        let input = "AAAABAAABBBBB";
+        for (order, objective) in (4..=6).zip(SINKOV.into_iter().skip(3)) {
+            let resource = ngram(&alphabet, order);
+            let trial = TrialEvaluator::new(
+                &initial,
+                &domain,
+                input,
+                Direction::Decrypt,
+                objective,
+                Some(&resource),
+            );
+            let first = trial.evaluate(&[]).unwrap();
+            assert_eq!(first.0, input);
+            assert_eq!(trial.measure(input), Ok(first.1));
+            crate::ngram::SPARSE_LOOKUPS.with(|count| count.set(0));
+            assert_eq!(trial.evaluate(&[]).unwrap(), first);
+            crate::ngram::SPARSE_LOOKUPS
+                .with(|count| assert_eq!(count.get(), input.len() - order + 1));
         }
     }
 
