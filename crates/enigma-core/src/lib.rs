@@ -305,8 +305,19 @@ impl std::error::Error for ModelError {}
 #[derive(Clone, Debug)]
 pub struct Alphabet {
     symbols: Vec<char>,
-    indices: HashMap<char, usize>,
+    indices: SymbolIndex,
 }
+
+/// Index derived from an alphabet's symbols: a dense table when every symbol is ASCII
+/// (at most 128 symbols, so each index fits in a `u8`), otherwise a hash map.
+#[derive(Clone, Debug, PartialEq)]
+enum SymbolIndex {
+    // `ASCII_ABSENT` marks code points that are not in the alphabet.
+    Ascii(Box<[u8; 128]>),
+    Map(HashMap<char, usize>),
+}
+
+const ASCII_ABSENT: u8 = u8::MAX;
 
 impl PartialEq for Alphabet {
     fn eq(&self, other: &Self) -> bool {
@@ -329,12 +340,26 @@ impl Alphabet {
         if symbols.is_empty() {
             return Err(ModelError::EmptyAlphabet);
         }
-        let mut indices = HashMap::with_capacity(symbols.len());
-        for (index, &symbol) in symbols.iter().enumerate() {
-            if indices.insert(symbol, index).is_some() {
-                return Err(ModelError::DuplicateAlphabetSymbol(symbol));
+        let indices = if symbols.iter().all(char::is_ascii) {
+            let mut table = Box::new([ASCII_ABSENT; 128]);
+            for (index, &symbol) in symbols.iter().enumerate() {
+                let entry = &mut table[symbol as usize];
+                if *entry != ASCII_ABSENT {
+                    return Err(ModelError::DuplicateAlphabetSymbol(symbol));
+                }
+                // Distinct ASCII symbols number at most 128, so every index fits.
+                *entry = index as u8;
             }
-        }
+            SymbolIndex::Ascii(table)
+        } else {
+            let mut map = HashMap::with_capacity(symbols.len());
+            for (index, &symbol) in symbols.iter().enumerate() {
+                if map.insert(symbol, index).is_some() {
+                    return Err(ModelError::DuplicateAlphabetSymbol(symbol));
+                }
+            }
+            SymbolIndex::Map(map)
+        };
         Ok(Self { symbols, indices })
     }
 
@@ -357,7 +382,17 @@ impl Alphabet {
     pub fn index_of(&self, symbol: char) -> Option<usize> {
         #[cfg(test)]
         INDEX_LOOKUPS.with(|count| count.set(count.get() + 1));
-        self.indices.get(&symbol).copied()
+        match &self.indices {
+            SymbolIndex::Ascii(table) => match table.get(symbol as usize) {
+                Some(&index) if index != ASCII_ABSENT => Some(usize::from(index)),
+                _ => None,
+            },
+            SymbolIndex::Map(map) => {
+                #[cfg(test)]
+                ALPHABET_HASH_LOOKUPS.with(|count| count.set(count.get() + 1));
+                map.get(&symbol).copied()
+            }
+        }
     }
 }
 
@@ -365,6 +400,7 @@ impl Alphabet {
 thread_local! {
     pub(crate) static INDEX_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ALPHABET_MAP_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ALPHABET_HASH_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether a slot may change position under a stepping rule.
@@ -1328,6 +1364,165 @@ mod tests {
         assert_eq!(alphabet.index_of('é'), Some(2));
         assert_eq!(alphabet.index_of('e'), None);
         assert_eq!(Alphabet::new(vec!['e', '\u{301}']).unwrap().len(), 2);
+    }
+
+    fn hash_lookups_during<T>(action: impl FnOnce() -> T) -> (T, usize) {
+        super::ALPHABET_HASH_LOOKUPS.with(|count| count.set(0));
+        let result = action();
+        (
+            result,
+            super::ALPHABET_HASH_LOOKUPS.with(|count| count.get()),
+        )
+    }
+
+    fn index_probes() -> impl Iterator<Item = char> {
+        (0..=0x7F_u32).filter_map(char::from_u32).chain([
+            'é',
+            'λ',
+            'Ω',
+            '中',
+            '\u{301}',
+            '😀',
+            '\u{80}',
+            '\u{FF}',
+            char::MAX,
+        ])
+    }
+
+    fn ascii_test_alphabets() -> [Alphabet; 4] {
+        [
+            Alphabet::new(('A'..='Z').collect()).unwrap(),
+            Alphabet::new(('0'..='9').collect()).unwrap(),
+            Alphabet::new("QWERTZUIOASDFGHJKPYXCVBNML".chars().collect()).unwrap(),
+            Alphabet::new((0..=0x7F_u32).rev().filter_map(char::from_u32).collect()).unwrap(),
+        ]
+    }
+
+    fn large_unicode_symbols() -> Vec<char> {
+        let mut large: Vec<char> = (0x100..0x100 + 300)
+            .map(|code| char::from_u32(code).unwrap())
+            .collect();
+        large.extend(('a'..='z').rev());
+        large.insert(100, 'Z');
+        large
+    }
+
+    #[test]
+    fn alphabet_index_of_on_ascii_alphabets_never_hashes() {
+        for alphabet in &ascii_test_alphabets() {
+            let (indices, lookups) = hash_lookups_during(|| {
+                (0..alphabet.len())
+                    .map(|index| alphabet.index_of(alphabet.symbol_at(index).unwrap()))
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(indices, (0..alphabet.len()).map(Some).collect::<Vec<_>>());
+            assert_eq!(lookups, 0);
+            let (_, lookups) = hash_lookups_during(|| {
+                index_probes()
+                    .map(|symbol| alphabet.index_of(symbol))
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(lookups, 0);
+        }
+        let upper = Alphabet::new(('A'..='Z').collect()).unwrap();
+        assert_eq!([upper.index_of('a'), upper.index_of('é')], [None, None]);
+        let reordered = Alphabet::new("QWERTZUIOASDFGHJKPYXCVBNML".chars().collect()).unwrap();
+        assert_eq!(reordered.index_of('Q'), Some(0));
+        assert_eq!(reordered.index_of('L'), Some(25));
+    }
+
+    #[test]
+    fn alphabet_index_of_uses_the_map_for_unicode_and_mixed_alphabets() {
+        let unicode = Alphabet::new(vec!['α', 'β', 'γ', 'e', '\u{301}', '😀']).unwrap();
+        let (indices, lookups) = hash_lookups_during(|| {
+            ['α', '\u{301}', '😀', 'Ω', 'e', 'a'].map(|symbol| unicode.index_of(symbol))
+        });
+        assert_eq!(indices, [Some(0), Some(4), Some(5), None, Some(3), None]);
+        assert_eq!(lookups, 6);
+
+        let mixed = Alphabet::new(vec!['A', 'λ', 'B', '中', 'C']).unwrap();
+        let (indices, lookups) = hash_lookups_during(|| {
+            ['A', 'λ', 'B', '中', 'C', 'D'].map(|symbol| mixed.index_of(symbol))
+        });
+        assert_eq!(indices, [Some(0), Some(1), Some(2), Some(3), Some(4), None]);
+        assert_eq!(lookups, 6);
+    }
+
+    #[test]
+    fn alphabet_index_of_falls_back_to_the_map_for_alphabets_beyond_ascii_size() {
+        let alphabet = Alphabet::new(large_unicode_symbols()).unwrap();
+        assert_eq!(alphabet.len(), 327);
+        let (indices, lookups) = hash_lookups_during(|| {
+            [
+                alphabet.index_of('Z'),
+                alphabet.index_of('a'),
+                alphabet.index_of('A'),
+            ]
+        });
+        assert_eq!(indices, [Some(100), Some(326), None]);
+        assert_eq!(lookups, 3);
+    }
+
+    #[test]
+    fn alphabet_index_of_matches_symbol_positions_for_every_ascii_and_sampled_unicode_probe() {
+        let mut alphabets = ascii_test_alphabets().to_vec();
+        alphabets.extend([
+            Alphabet::new(vec!['α', 'β', 'γ', 'e', '\u{301}', '😀']).unwrap(),
+            Alphabet::new(vec!['A', 'λ', 'B', '中', 'C']).unwrap(),
+            Alphabet::new(large_unicode_symbols()).unwrap(),
+        ]);
+        for alphabet in &alphabets {
+            for candidate in [alphabet, &alphabet.clone()] {
+                for symbol in index_probes() {
+                    assert_eq!(
+                        candidate.index_of(symbol),
+                        alphabet.symbols.iter().position(|&s| s == symbol),
+                        "index_of({symbol:?}) diverged from the symbol order"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn alphabet_new_reports_first_repeated_symbol_for_every_index_kind() {
+        assert_eq!(Alphabet::new(Vec::new()), Err(ModelError::EmptyAlphabet));
+        let cases = [
+            (vec!['A', 'B', 'C', 'B', 'A'], 'B'),
+            (vec!['A', 'A'], 'A'),
+            (vec!['λ', '中', 'é', '中', 'λ'], '中'),
+            (vec!['A', 'λ', 'B', 'λ', 'A'], 'λ'),
+            (vec!['A', 'λ', 'B', 'A', 'λ'], 'A'),
+        ];
+        for (symbols, repeated) in cases {
+            assert_eq!(
+                Alphabet::new(symbols),
+                Err(ModelError::DuplicateAlphabetSymbol(repeated))
+            );
+        }
+    }
+
+    #[test]
+    fn alphabet_clone_and_equality_ignore_the_derived_index() {
+        let alphabet = Alphabet::new("QWERTZUIOASDFGHJKPYXCVBNML".chars().collect()).unwrap();
+        let clone = alphabet.clone();
+        assert_eq!(clone, alphabet);
+        assert!(clone.indices_equal(&alphabet));
+        assert_eq!(clone.index_of('M'), alphabet.index_of('M'));
+        assert_ne!(alphabet, Alphabet::new(('A'..='Z').collect()).unwrap());
+        let mixed = Alphabet::new(vec!['A', 'λ', 'B']).unwrap();
+        assert_eq!(mixed.clone(), mixed);
+        assert!(mixed.clone().indices_equal(&mixed));
+    }
+
+    #[test]
+    fn alphabet_does_not_grow_beyond_its_symbols_and_map() {
+        assert!(
+            std::mem::size_of::<Alphabet>()
+                <= std::mem::size_of::<Vec<char>>()
+                    + std::mem::size_of::<std::collections::HashMap<char, usize>>()
+                    + 8
+        );
     }
 
     #[test]
