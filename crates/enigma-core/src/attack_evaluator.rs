@@ -1,6 +1,6 @@
 //! Private fresh-state trial evaluation with retained, caller-borrowed scoring models.
 
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 
 use crate::measure::{index_coincidence, index_entropy};
 use crate::{
@@ -51,6 +51,8 @@ pub(super) struct TrialEvaluator<'a> {
     binding: OnceCell<()>,
     // None in the cell remembers an allocation-policy fallback, not an unbuilt cache.
     prepared: OnceCell<Option<Prepared>>,
+    shared: Option<(&'a RunPreparation<'a>, u128)>,
+    engine_validated: OnceCell<()>,
     #[cfg(test)]
     deny_reservation: bool,
 }
@@ -60,6 +62,41 @@ pub(super) struct TrialEvaluator<'a> {
 struct Prepared {
     input: Vec<u32>,
     rows: Vec<u32>,
+}
+
+/// A single run's input/domain/direction and most recently evaluated outer.
+/// The scheduler supplies absolute outer indices from this same request only.
+/// No row reference escapes a trial, so eviction drops the old payload before building.
+pub(super) struct RunPreparation<'a> {
+    owner: &'a crate::AttackRequest,
+    latest: RefCell<Option<(u128, OnceCell<Option<Prepared>>)>>,
+}
+
+impl<'a> RunPreparation<'a> {
+    pub(super) fn new(owner: &'a crate::AttackRequest) -> Self {
+        Self {
+            owner,
+            latest: RefCell::new(None),
+        }
+    }
+
+    pub(super) fn evaluator(
+        &'a self,
+        initial: &'a ResolvedConfiguration,
+        outer_index: u128,
+        objective: MeasureId,
+    ) -> TrialEvaluator<'a> {
+        let mut evaluator = TrialEvaluator::new(
+            initial,
+            self.owner.domain(),
+            self.owner.text(),
+            Direction::Decrypt,
+            objective,
+            self.owner.bound_resource(objective),
+        );
+        evaluator.shared = Some((self, outer_index));
+        evaluator
+    }
 }
 
 impl<'a> TrialEvaluator<'a> {
@@ -80,9 +117,15 @@ impl<'a> TrialEvaluator<'a> {
             resource,
             binding: OnceCell::new(),
             prepared: OnceCell::new(),
+            shared: None,
+            engine_validated: OnceCell::new(),
             #[cfg(test)]
             deny_reservation: false,
         }
+    }
+
+    pub(super) fn objective(&self) -> MeasureId {
+        self.objective
     }
 
     pub(super) fn evaluate(
@@ -96,10 +139,34 @@ impl<'a> TrialEvaluator<'a> {
         }
         let board = checked_mutable_board(self.initial, self.domain, mutable)
             .map_err(TrialEvaluationError::Board)?;
+        if let Some((run, outer)) = self.shared {
+            let mut latest = run.latest.borrow_mut();
+            if latest.as_ref().map(|(key, _)| *key) != Some(outer) {
+                // Explicitly drop the previous table before any new allocation.
+                *latest = None;
+                *latest = Some((outer, OnceCell::new()));
+            }
+            self.evaluate_prepared(board, &latest.as_ref().expect("selected outer").1)
+        } else {
+            self.evaluate_prepared(board, &self.prepared)
+        }
+    }
+
+    fn evaluate_prepared(
+        &self,
+        board: Plugboard,
+        prepared: &OnceCell<Option<Prepared>>,
+    ) -> Result<(String, MeasuredScore), TrialEvaluationError> {
         let mut engine = None;
-        if self.prepared.get().is_none() {
+        // Shared rows never certify a new evaluator's Engine constructor. Cache
+        // only its successful immutable validation, after this trial's board check.
+        if self.engine_validated.get().is_none() || prepared.get().is_none() {
+            engine = Some(self.fresh_engine(board.clone())?);
+            self.engine_validated.set(()).ok();
+        }
+        if prepared.get().is_none() {
             // Preserve constructor-before-full-input validation, even on fallback.
-            let mut fresh = self.fresh_engine(board.clone())?;
+            let mut fresh = engine.take().expect("cold preparation has fresh engine");
             let alphabet = self.initial.topology().alphabet();
             let mut input = Vec::with_capacity(self.input.len());
             for symbol in self.input.chars() {
@@ -121,11 +188,11 @@ impl<'a> TrialEvaluator<'a> {
                 engine = Some(fresh);
             }
             // Failed model/input validation never initializes the cell.
-            self.prepared
+            prepared
                 .set(rows.map(|rows| Prepared { input, rows }))
                 .expect("single-threaded lazy preparation");
         }
-        match self.prepared.get().expect("prepared above") {
+        match prepared.get().expect("prepared above") {
             Some(prepared) => {
                 let symbols = &self.initial.topology().alphabet().symbols;
                 let width = symbols.len();
@@ -157,6 +224,8 @@ impl<'a> TrialEvaluator<'a> {
     }
 
     fn fresh_engine(&self, board: Plugboard) -> Result<Engine, TrialEvaluationError> {
+        #[cfg(test)]
+        ENGINE_CHECKS.with(|count| count.set(count.get() + 1));
         Engine::new(
             self.initial.topology().clone(),
             self.initial.stepping().clone(),
@@ -286,6 +355,7 @@ impl std::error::Error for TrialBoardError {
 #[cfg(test)]
 thread_local! {
     pub(super) static BINDING_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ENGINE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Accept only mutable guesses, bound to the selected initial scrambler.
@@ -1260,5 +1330,226 @@ mod tests {
             assert_eq!(initial.topology().alphabet(), &alphabet);
         }
         assert_mapping(initial.plugboard(), "BACDEFHG");
+    }
+
+    /// A minimal bound request; shared tests only need a run owner.
+    fn run_owner() -> crate::AttackRequest {
+        let value = serde_json::json!({"protocol_version":1,"machine":{"definition":{
+            "kind":"custom","value":{"alphabet":["A","B","C"],
+            "wheels":[{"name":"r","wiring":["B","A","C"],"turnovers":[]}],
+            "slots":[{"id":"r","role":"rotor","movement":"movable","wheel":"r"}],
+            "stepping":{"rules":[{"when":{"always":true},"advance":["r"]}]}}}},
+            "job":{"kind":"search","configuration":{"slots":[{"id":"r","position":"A","ring":"A"}],
+            "plugboard":[]},"space":{"plugboard":{"kind":"attack","symbols":["A","B","C"],"max_pairs":1}},
+            "text":"AA","passes":["hill_climb"],"measures":["ic"],
+            "attack":{"kind":"hill_climb","initial_measure":"ic","final_measure":"ic",
+            "switch_pairs":1,"backtrack_pairs":0,"evaluation_budget":100,"start":[]}}});
+        crate::ParsedAttackRequest::parse_json(&value.to_string())
+            .unwrap()
+            .bind_resources(&std::collections::BTreeMap::new())
+            .unwrap()
+    }
+
+    fn shared<'a>(
+        mut trial: TrialEvaluator<'a>,
+        run: &'a RunPreparation<'a>,
+        outer: u128,
+    ) -> TrialEvaluator<'a> {
+        trial.shared = Some((run, outer));
+        trial
+    }
+
+    /// The retained outer and its cell: None unbuilt, Some(false) a remembered fallback.
+    fn slot(run: &RunPreparation<'_>) -> Option<(u128, Option<bool>)> {
+        let latest = run.latest.borrow();
+        (latest.as_ref()).map(|(outer, cell)| (*outer, cell.get().map(Option::is_some)))
+    }
+
+    fn row_builds() -> usize {
+        crate::engine::ROW_BUILDS.with(|count| count.get())
+    }
+
+    #[test]
+    fn warm_shared_rows_keep_new_evaluator_checks_and_precedence() {
+        let initial = machine("ABC", "BAC", "A", true);
+        let alphabet = initial.topology().alphabet();
+        let valid = domain(alphabet, &[], "ABC", 1);
+        let reversed = Alphabet::new("CBA".chars().collect()).unwrap();
+        let wrong_alphabet = domain(&reversed, &[], "ABC", 1);
+        let wrong_fixed = domain(alphabet, &[('A', 'B')], "C", 1);
+        let narrow = domain(alphabet, &[], "AB", 1);
+        let full = domain(alphabet, &[], "ABC", 0);
+        let owner = run_owner();
+        let run = RunPreparation::new(&owner);
+        let expected = shared(evaluator(&initial, &valid, "AA"), &run, 0)
+            .evaluate(&[])
+            .unwrap();
+        crate::engine::ROW_BUILDS.with(|count| count.set(0));
+        // Binding errors precede mutable errors; each case is a new evaluator B.
+        let cases = [
+            (
+                &wrong_alphabet,
+                vec![('A', 'A')],
+                TrialBoardError::AlphabetBinding,
+            ),
+            (
+                &wrong_fixed,
+                vec![('C', 'C')],
+                TrialBoardError::FixedFactsBinding,
+            ),
+            (
+                &valid,
+                vec![('A', 'A')],
+                TrialBoardError::Model(ModelError::PlugboardSelfPair('A')),
+            ),
+            (
+                &valid,
+                vec![('A', 'Z')],
+                TrialBoardError::Model(ModelError::UnknownSymbol('Z')),
+            ),
+            (
+                &narrow,
+                vec![('A', 'C')],
+                TrialBoardError::OutsideMutable('C'),
+            ),
+            (&full, vec![('A', 'B')], TrialBoardError::TotalCapacity),
+        ];
+        for (domain, board, error) in cases {
+            ENGINE_CHECKS.with(|count| count.set(0));
+            let standalone = evaluator(&initial, domain, "AA").evaluate(&board);
+            assert_eq!(standalone, Err(TrialEvaluationError::Board(error)));
+            let trial = shared(evaluator(&initial, domain, "AA"), &run, 0);
+            for _ in 0..2 {
+                assert_eq!(trial.evaluate(&board), standalone, "{board:?}");
+            }
+            ENGINE_CHECKS.with(|count| assert_eq!(count.get(), 0));
+        }
+        // A failed binding is retried, never cached by the warm table.
+        let trial = shared(evaluator(&initial, &wrong_fixed, "AA"), &run, 0);
+        BINDING_CHECKS.with(|count| count.set(0));
+        assert!(trial.evaluate(&[]).is_err());
+        assert!(trial.evaluate(&[]).is_err());
+        BINDING_CHECKS.with(|count| assert_eq!(count.get(), 2));
+        // The warm rows never certify B's Engine constructor: it runs on B's first
+        // valid trial, after the board check, and only once.
+        let trial = shared(evaluator(&initial, &valid, "AA"), &run, 0);
+        ENGINE_CHECKS.with(|count| count.set(0));
+        assert!(trial.evaluate(&[('A', 'A')]).is_err());
+        ENGINE_CHECKS.with(|count| assert_eq!(count.get(), 0));
+        assert_eq!(trial.evaluate(&[]).unwrap(), expected);
+        assert_eq!(trial.evaluate(&[]).unwrap(), expected);
+        ENGINE_CHECKS.with(|count| assert_eq!(count.get(), 1));
+        assert_eq!(slot(&run), Some((0, Some(true))));
+        assert_eq!(row_builds(), 0);
+    }
+
+    #[test]
+    fn shared_preparation_errors_leave_the_slot_unprepared_for_retry() {
+        let initial = machine("ABC", "BAC", "A", true);
+        let domain = domain(initial.topology().alphabet(), &[], "ABC", 1);
+        let expected = evaluator(&initial, &domain, "AA").evaluate(&[]);
+        let owner = run_owner();
+        for deny in [false, true] {
+            let run = RunPreparation::new(&owner);
+            shared(evaluator(&initial, &domain, "AA"), &run, 0)
+                .evaluate(&[])
+                .unwrap();
+            crate::engine::ROW_BUILDS.with(|count| count.set(0));
+            let mut invalid = shared(evaluator(&initial, &domain, "AZ"), &run, 1);
+            invalid.deny_reservation = deny;
+            for _ in 0..2 {
+                assert_eq!(
+                    invalid.evaluate(&[]),
+                    Err(TrialEvaluationError::Model(ModelError::UnknownSymbol('Z')))
+                );
+                // Neither rows nor a fallback marker were recorded for outer 1.
+                assert_eq!(slot(&run), Some((1, None)));
+            }
+            assert_eq!(row_builds(), 0);
+            let valid = shared(evaluator(&initial, &domain, "AA"), &run, 1);
+            assert_eq!(valid.evaluate(&[]), expected);
+            assert_eq!(valid.evaluate(&[]), expected);
+            assert_eq!(slot(&run), Some((1, Some(true))));
+            assert_eq!(row_builds(), 1);
+        }
+    }
+
+    #[test]
+    fn shared_scoring_failures_retain_successful_preparation() {
+        let initial = machine("ABC", "BAC", "A", true);
+        let alphabet = initial.topology().alphabet();
+        let domain = domain(alphabet, &[], "ABC", 1);
+        let resource = ngram(alphabet, 2);
+        let expected = evaluator(&initial, &domain, "AA").evaluate(&[]);
+        let owner = run_owner();
+        let run = RunPreparation::new(&owner);
+        crate::engine::ROW_BUILDS.with(|count| count.set(0));
+        for (objective, resource, error) in [
+            (
+                MeasureId::SinkovBigram,
+                None,
+                TrialEvaluationError::MissingResource(MeasureId::SinkovBigram),
+            ),
+            (
+                MeasureId::Trie,
+                Some(&resource),
+                TrialEvaluationError::IncompatibleResource(MeasureId::Trie),
+            ),
+        ] {
+            let failing = TrialEvaluator::new(
+                &initial,
+                &domain,
+                "AA",
+                Direction::Decrypt,
+                objective,
+                resource,
+            );
+            let failing = shared(failing, &run, 0);
+            let first = failing.evaluate(&[]);
+            assert_eq!(first, Err(error));
+            assert_eq!(failing.evaluate(&[]), first);
+            assert_eq!(slot(&run), Some((0, Some(true))));
+        }
+        let valid = shared(evaluator(&initial, &domain, "AA"), &run, 0);
+        assert_eq!(valid.evaluate(&[]), expected);
+        assert_eq!(row_builds(), 1);
+    }
+
+    #[test]
+    fn shared_reservation_denial_is_remembered_per_outer() {
+        let initial = machine("ABC", "BAC", "A", true);
+        let domain = domain(initial.topology().alphabet(), &[], "ABC", 1);
+        let input = "ABCAB";
+        let prepared = evaluator(&initial, &domain, input);
+        let plain = prepared.evaluate(&[]).unwrap();
+        let swapped = prepared.evaluate(&[('A', 'B')]).unwrap();
+        assert!(matches!(prepared.prepared.get(), Some(Some(_))));
+        let owner = run_owner();
+        let run = RunPreparation::new(&owner);
+        let trial = |outer, deny| {
+            let mut trial = shared(evaluator(&initial, &domain, input), &run, outer);
+            trial.deny_reservation = deny;
+            trial
+        };
+        crate::engine::ROW_BUILDS.with(|count| count.set(0));
+        let denied = trial(0, true);
+        assert_eq!(denied.evaluate(&[]).unwrap(), plain);
+        assert_eq!(denied.evaluate(&[('A', 'B')]).unwrap(), swapped);
+        assert_eq!(slot(&run), Some((0, Some(false))));
+        // A later evaluator on the same outer keeps the remembered fallback.
+        let allowed = trial(0, false);
+        assert_eq!(allowed.evaluate(&[('A', 'B')]).unwrap(), swapped);
+        assert_eq!(allowed.evaluate(&[]).unwrap(), plain);
+        assert_eq!(slot(&run), Some((0, Some(false))));
+        assert_eq!(row_builds(), 0);
+        // Switching outer evicts the marker and evaluates the policy again.
+        assert_eq!(trial(1, false).evaluate(&[]).unwrap(), plain);
+        assert_eq!(slot(&run), Some((1, Some(true))));
+        assert_eq!(row_builds(), 1);
+        assert_eq!(trial(0, true).evaluate(&[]).unwrap(), plain);
+        assert_eq!(slot(&run), Some((0, Some(false))));
+        assert_eq!(trial(1, false).evaluate(&[('A', 'B')]).unwrap(), swapped);
+        assert_eq!(slot(&run), Some((1, Some(true))));
+        assert_eq!(row_builds(), 2);
     }
 }

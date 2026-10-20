@@ -1,7 +1,9 @@
 //! Private complete-neighborhood strict ascent with bound scoring and shared accounting.
 
 use crate::attack_control::{AttackControl, CounterObserver, CounterOverflow};
-use crate::attack_evaluator::{validated_trial_board, TrialEvaluationError, TrialEvaluator};
+use crate::attack_evaluator::{
+    validated_trial_board, RunPreparation, TrialEvaluationError, TrialEvaluator,
+};
 use crate::attack_neighborhood::NeighborhoodCursor;
 use crate::attack_result::AttackRunErrorData;
 use crate::{
@@ -179,8 +181,10 @@ impl crate::AttackRequest {
         };
         let mut control = AttackControl::default();
         let mut observer = ProgressObserver(observe);
+        let preparation = RunPreparation::new(self);
         let result = if self.settings().kind() == crate::AttackKind::PartialExhaustion {
-            match self.schedule_partial_outers_using(
+            match self.schedule_partial_outers_prepared(
+                &preparation,
                 &mut allowance,
                 &mut control,
                 &mut observer,
@@ -196,7 +200,8 @@ impl crate::AttackRequest {
             }
         } else {
             let mut acceptance = DirectAcceptance::new(self.settings().hold_capacity());
-            let run = self.schedule_direct_outers_using(
+            let run = self.schedule_direct_outers_prepared(
+                &preparation,
                 &mut allowance,
                 &mut control,
                 &mut observer,
@@ -222,7 +227,12 @@ impl crate::AttackRequest {
                 observer: &mut observer,
             };
             result = stages_over_hold(result, |result| {
-                self.finalist_stages(result, accounting, &mut cancel_requested)
+                self.finalist_stages_prepared(
+                    &preparation,
+                    result,
+                    accounting,
+                    &mut cancel_requested,
+                )
             })?;
         }
         control.notify(&mut observer);
@@ -231,8 +241,24 @@ impl crate::AttackRequest {
 
     /// Runs every listed stage on `result.best` alone; unprocessed finalists ride
     /// in `held_tail` only so a stage error still returns them.
+    #[cfg(test)]
     fn finalist_stages(
         &self,
+        result: crate::AttackResult,
+        accounting: &mut ObservedAccounting<'_, impl CounterObserver>,
+        cancel_requested: impl FnMut() -> bool,
+    ) -> Result<crate::AttackResult, crate::AttackRunError> {
+        self.finalist_stages_prepared(
+            &RunPreparation::new(self),
+            result,
+            accounting,
+            cancel_requested,
+        )
+    }
+
+    fn finalist_stages_prepared(
+        &self,
+        preparation: &RunPreparation<'_>,
         mut result: crate::AttackResult,
         accounting: &mut ObservedAccounting<'_, impl CounterObserver>,
         mut cancel_requested: impl FnMut() -> bool,
@@ -255,16 +281,8 @@ impl crate::AttackRequest {
                 (initial.as_ref())
                     .map_err(|_| RunPayload::Invariant("winning slots failed to resolve"))
             };
-            let evaluator = |initial, measure| {
-                TrialEvaluator::new(
-                    initial,
-                    self.domain(),
-                    self.text(),
-                    Direction::Decrypt,
-                    measure,
-                    self.bound_resource(measure),
-                )
-            };
+            let outer_index = best.outer_index;
+            let evaluator = |initial, measure| preparation.evaluator(initial, outer_index, measure);
             result = if let crate::space::AttackStage::Reswapping { measure } = *stage {
                 // Retain one lazy scorer for this resolved stage/finalist. Construction
                 // does no traversal; resolution errors still surface after admission.
@@ -843,8 +861,28 @@ impl crate::AttackRequest {
     }
 
     /// Capacity one keeps raw strict-best selection; larger capacities hold seeds.
+    #[cfg(test)]
     fn schedule_partial_outers_using(
         &self,
+        allowance: &mut EvaluationAllowance,
+        control: &mut AttackControl,
+        observer: &mut impl CounterObserver,
+        requested: impl FnMut() -> bool,
+        capacity: usize,
+    ) -> Result<ControlledPartialRun, Box<ControlledPartialRunError>> {
+        self.schedule_partial_outers_prepared(
+            &RunPreparation::new(self),
+            allowance,
+            control,
+            observer,
+            requested,
+            capacity,
+        )
+    }
+
+    fn schedule_partial_outers_prepared(
+        &self,
+        preparation: &RunPreparation<'_>,
         allowance: &mut EvaluationAllowance,
         control: &mut AttackControl,
         observer: &mut impl CounterObserver,
@@ -863,8 +901,9 @@ impl crate::AttackRequest {
                 held: None,
             }))
         } else {
-            schedule_controlled_partial(
+            schedule_controlled_partial_prepared(
                 self,
+                preparation,
                 self.gate().outer_selected(),
                 self.outer_candidates(),
                 &mut ObservedAccounting {
@@ -901,10 +940,36 @@ impl crate::AttackRequest {
         )
     }
 
+    #[cfg(test)]
     fn climb_partial_outer_controlled_with<O: CounterObserver, F: FnMut() -> bool>(
         &self,
         initial: ResolvedConfiguration,
         outer_index: u128,
+        accounting: &mut ObservedAccounting<'_, O>,
+        requested: &mut F,
+        capacity: usize,
+        climb: impl FnMut(
+            &BoundClimbScoring<'_>,
+            u128,
+            MutableBoard,
+            &mut ObservedAccounting<'_, O>,
+            &mut F,
+        ) -> Result<ClimbOutcome, ObservedClimbError>,
+    ) -> Result<ControlledPartialOutcome, ControlledPartialError> {
+        self.climb_partial_outer_prepared(
+            &RunPreparation::new(self),
+            (initial, outer_index),
+            accounting,
+            requested,
+            capacity,
+            climb,
+        )
+    }
+
+    fn climb_partial_outer_prepared<O: CounterObserver, F: FnMut() -> bool>(
+        &self,
+        preparation: &RunPreparation<'_>,
+        outer: (ResolvedConfiguration, u128),
         accounting: &mut ObservedAccounting<'_, O>,
         requested: &mut F,
         capacity: usize,
@@ -916,6 +981,7 @@ impl crate::AttackRequest {
             &mut F,
         ) -> Result<ClimbOutcome, ObservedClimbError>,
     ) -> Result<ControlledPartialOutcome, ControlledPartialError> {
+        let (initial, outer_index) = outer;
         accounting.control.notify(accounting.observer);
         let result = (|| {
             let settings = self.settings();
@@ -937,7 +1003,8 @@ impl crate::AttackRequest {
                 (first, self.bound_resource(first)),
                 (last, self.bound_resource(last)),
                 settings.switch_pairs(),
-            );
+            )
+            .with_preparation(preparation, outer_index);
             let mut held = (capacity > 1).then(|| crate::attack_hold::AttackHold::new(capacity));
             let mut fault = None;
             let seeds = scoring
@@ -1144,8 +1211,28 @@ impl crate::AttackRequest {
         )
     }
 
+    #[cfg(test)]
     fn schedule_direct_outers_using(
         &self,
+        allowance: &mut EvaluationAllowance,
+        control: &mut AttackControl,
+        observer: &mut impl CounterObserver,
+        requested: impl FnMut() -> bool,
+        accept: impl FnMut(DirectOuterOutcome) -> Result<Option<DirectOuterOutcome>, ProjectionError>,
+    ) -> Result<DirectRunOutcome, Box<ControlledDirectError>> {
+        self.schedule_direct_outers_prepared(
+            &RunPreparation::new(self),
+            allowance,
+            control,
+            observer,
+            requested,
+            accept,
+        )
+    }
+
+    fn schedule_direct_outers_prepared(
+        &self,
+        preparation: &RunPreparation<'_>,
         allowance: &mut EvaluationAllowance,
         control: &mut AttackControl,
         observer: &mut impl CounterObserver,
@@ -1175,6 +1262,7 @@ impl crate::AttackRequest {
                     let (scoring, start) = self
                         .direct_scoring(&initial)
                         .map_err(DirectRunError::Climb)?;
+                    let scoring = scoring.with_preparation(preparation, index);
                     let climb = scoring
                         .climb_cancellable(
                             start,
@@ -1332,8 +1420,34 @@ impl crate::AttackRequest {
 
 /// Known cardinality establishes exhaustion without resolving a speculative next outer.
 /// The adapter seam also permits deterministic indexed resolution/scoring fault tests.
+#[cfg(test)]
 fn schedule_controlled_partial<O: CounterObserver, F: FnMut() -> bool>(
     owner: &crate::AttackRequest,
+    selected: u128,
+    outers: impl Iterator<
+        Item = (
+            u128,
+            Result<ResolvedConfiguration, Vec<crate::SearchDiagnostic>>,
+        ),
+    >,
+    accounting: &mut ObservedAccounting<'_, O>,
+    requested: &mut F,
+    capacity: usize,
+) -> Result<ControlledPartialRun, Box<ControlledPartialRunError>> {
+    schedule_controlled_partial_prepared(
+        owner,
+        &RunPreparation::new(owner),
+        selected,
+        outers,
+        accounting,
+        requested,
+        capacity,
+    )
+}
+
+fn schedule_controlled_partial_prepared<O: CounterObserver, F: FnMut() -> bool>(
+    owner: &crate::AttackRequest,
+    preparation: &RunPreparation<'_>,
     selected: u128,
     outers: impl Iterator<
         Item = (
@@ -1352,9 +1466,9 @@ fn schedule_controlled_partial<O: CounterObserver, F: FnMut() -> bool>(
         accounting,
         requested,
         |initial, index, accounting, requested| {
-            owner.climb_partial_outer_controlled_with(
-                initial,
-                index,
+            owner.climb_partial_outer_prepared(
+                preparation,
+                (initial, index),
                 accounting,
                 requested,
                 capacity,
@@ -2277,6 +2391,17 @@ impl<'a> BoundClimbScoring<'a> {
             identical: first.0 == last.0 && same_resource,
             switch_pairs,
         }
+    }
+
+    fn with_preparation(mut self, preparation: &'a RunPreparation<'a>, outer_index: u128) -> Self {
+        self.initial_evaluator = preparation.evaluator(
+            self.initial,
+            outer_index,
+            self.initial_evaluator.objective(),
+        );
+        self.final_evaluator =
+            preparation.evaluator(self.initial, outer_index, self.final_evaluator.objective());
+        self
     }
 
     fn start<A: EvaluationAccounting>(
@@ -9263,6 +9388,71 @@ mod tests {
     }
 
     #[test]
+    fn latest_outer_preparation_evicts_and_is_run_local() {
+        let request = hold_stages_request(false, &[], 1000, 3);
+        let outers: Vec<_> = request
+            .outer_candidates()
+            .take(2)
+            .map(|(index, initial)| (index, initial.unwrap()))
+            .collect();
+        crate::engine::ROW_BUILDS.with(|count| count.set(0));
+        for _ in 0..2 {
+            let run = RunPreparation::new(&request);
+            for (step, outer) in [0, 0, 1, 0, 0].into_iter().enumerate() {
+                let (index, initial) = &outers[outer];
+                let objective = if step % 2 == 0 {
+                    MeasureId::Ic
+                } else {
+                    MeasureId::Entropy
+                };
+                let scorer = run.evaluator(initial, *index, objective);
+                assert_eq!(
+                    scorer.evaluate(&[]).unwrap(),
+                    TrialEvaluator::new(
+                        initial,
+                        request.domain(),
+                        request.text(),
+                        Direction::Decrypt,
+                        objective,
+                        None,
+                    )
+                    .evaluate(&[])
+                    .unwrap()
+                );
+            }
+        }
+        // Three shared builds per run (A/B/A), plus ten standalone oracle builds.
+        crate::engine::ROW_BUILDS.with(|count| assert_eq!(count.get(), 16));
+    }
+
+    #[test]
+    fn hc_and_pe_share_consecutive_finalist_stages_without_retaining_all_outers() {
+        for pe in [false, true] {
+            crate::engine::ROW_BUILDS.with(|count| count.set(0));
+            let plain = hold_stages_request(pe, &[], 1000, 3)
+                .run(|_| {}, || false)
+                .unwrap();
+            let exploration = crate::engine::ROW_BUILDS.with(|count| count.get());
+            assert_eq!(exploration, 3);
+            let mut latest = 2;
+            let mut expected = exploration;
+            for entry in plain.best.iter().chain(&plain.held_tail) {
+                if latest != entry.outer_index {
+                    expected += 1;
+                    latest = entry.outer_index;
+                }
+            }
+            crate::engine::ROW_BUILDS.with(|count| count.set(0));
+            let staged = hold_stages_request(pe, &["reswapping", "trie"], 1000, 3)
+                .run(|_| {}, || false)
+                .unwrap();
+            assert_eq!(staged.termination, crate::AttackTermination::Completed);
+            assert!(staged.hold().all(|entry| entry.stages().len() == 2));
+            crate::engine::ROW_BUILDS.with(|count| assert_eq!(count.get(), expected));
+        }
+    }
+
+    #[test]
     fn reswapping_retains_one_lazy_evaluator_and_stops_before_preparation() {
         let builds = || crate::engine::ROW_BUILDS.with(|count| count.get());
         let reset = || crate::engine::ROW_BUILDS.with(|count| count.set(0));
@@ -9300,7 +9490,8 @@ mod tests {
         reset();
         let result = request(true).run(|_| {}, || false).unwrap();
         assert!(result.stages[0].evaluations_used > 1);
-        assert_eq!(builds(), direct + 1);
+        assert_eq!(direct, 1);
+        assert_eq!(builds(), direct);
     }
 
     #[test]
