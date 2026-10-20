@@ -15,6 +15,7 @@ pub(super) struct NeighborhoodCursor<'a> {
     initial: &'a ResolvedConfiguration,
     domain: &'a AttackPlugboardDomain,
     current: MutableBoard,
+    mutable_symbols: Vec<bool>,
     backtrack_pairs: usize,
     next_pair: (usize, usize),
     pending: std::vec::IntoIter<MutableBoard>,
@@ -28,11 +29,13 @@ impl<'a> NeighborhoodCursor<'a> {
         current: &[(char, char)],
         backtrack_pairs: usize,
     ) -> Result<Self, TrialBoardError> {
-        TrialContext::new(initial, domain, current, backtrack_pairs)?;
+        let mutable_symbols = mutable_symbol_mask(initial, domain);
+        TrialContext::new(initial, domain, current, backtrack_pairs, &mutable_symbols)?;
         Ok(Self {
             initial,
             domain,
             current: current.to_vec(),
+            mutable_symbols,
             backtrack_pairs,
             next_pair: (0, 1),
             pending: Vec::new().into_iter(),
@@ -64,6 +67,7 @@ impl Iterator for NeighborhoodCursor<'_> {
                 initial: self.initial,
                 domain: self.domain,
                 current: &self.current,
+                mutable_symbols: &self.mutable_symbols,
                 backtrack_pairs: self.backtrack_pairs,
             };
             // Constructor validation and legal alphabet indices make helper errors
@@ -76,10 +80,24 @@ impl Iterator for NeighborhoodCursor<'_> {
     }
 }
 
+fn mutable_symbol_mask(
+    initial: &ResolvedConfiguration,
+    domain: &AttackPlugboardDomain,
+) -> Vec<bool> {
+    initial
+        .topology()
+        .alphabet()
+        .symbols
+        .iter()
+        .map(|s| domain.symbols().contains(s))
+        .collect()
+}
+
 struct TrialContext<'a> {
     initial: &'a ResolvedConfiguration,
     domain: &'a AttackPlugboardDomain,
     current: &'a [(char, char)],
+    mutable_symbols: &'a [bool],
     backtrack_pairs: usize,
 }
 
@@ -89,12 +107,14 @@ impl<'a> TrialContext<'a> {
         domain: &'a AttackPlugboardDomain,
         current: &'a [(char, char)],
         backtrack_pairs: usize,
+        mutable_symbols: &'a [bool],
     ) -> Result<Self, TrialBoardError> {
         validated_trial_board(initial, domain, current)?;
         Ok(Self {
             initial,
             domain,
             current,
+            mutable_symbols,
             backtrack_pairs,
         })
     }
@@ -104,11 +124,12 @@ impl<'a> TrialContext<'a> {
     fn trials_for(&self, a: usize, b: usize) -> Result<Vec<MutableBoard>, TrialBoardError> {
         #[cfg(test)]
         PAIR_VISITS.with(|visits| visits.set(visits.get() + 1));
-        let alphabet = &self.initial.topology().alphabet().symbols;
-        if a >= b || b >= alphabet.len() {
+        let alphabet = self.initial.topology().alphabet();
+        if a >= b || b >= alphabet.symbols.len() {
             return Err(TrialBoardError::AlphabetBinding);
         }
-        let (a, b) = (alphabet[a], alphabet[b]);
+        let (a, b) = (alphabet.symbols[a], alphabet.symbols[b]);
+        let index = |s| alphabet.index_of(s).unwrap();
         let partner = |symbol| {
             self.domain
                 .fixed_pairs()
@@ -170,20 +191,20 @@ impl<'a> TrialContext<'a> {
                 .filter(|&(x, y)| x != a && y != a && x != b && y != b)
                 .collect();
             trial.extend(added);
-            if trial.iter().any(|&(x, y)| {
-                !self.domain.symbols().contains(&x) || !self.domain.symbols().contains(&y)
-            }) || self.domain.fixed_pairs().len() + trial.len() > self.domain.max_pairs()
+            if trial
+                .iter()
+                .any(|&(x, y)| !self.mutable_symbols[index(x)] || !self.mutable_symbols[index(y)])
+                || self.domain.fixed_pairs().len() + trial.len() > self.domain.max_pairs()
             {
                 continue;
             }
             // Canonicalize by alphabet indices, not Unicode character order.
-            let index = |s| alphabet.iter().position(|c| *c == s).unwrap();
             for pair in &mut trial {
                 if index(pair.0) > index(pair.1) {
                     *pair = (pair.1, pair.0);
                 }
             }
-            trial.sort_by_key(|&(x, y)| (index(x), index(y)));
+            trial.sort_unstable_by_key(|&(x, y)| (index(x), index(y)));
             trials.push(trial);
         }
         Ok(trials)
@@ -343,9 +364,16 @@ mod tests {
                         let initial = initial(&alphabet, &fixed);
                         let domain = domain(&alphabet, &fixed, &symbols, cap);
                         let snapshot = (initial.clone(), domain.clone(), current.clone());
+                        let mutable_symbols = mutable_symbol_mask(&initial, &domain);
                         for threshold in [0, all.len(), all.len() + 1] {
-                            let context =
-                                TrialContext::new(&initial, &domain, &current, threshold).unwrap();
+                            let context = TrialContext::new(
+                                &initial,
+                                &domain,
+                                &current,
+                                threshold,
+                                &mutable_symbols,
+                            )
+                            .unwrap();
                             let mut flattened = Vec::new();
                             for a in 0..6 {
                                 for b in a + 1..6 {
@@ -372,9 +400,14 @@ mod tests {
                                             !fixed.iter().any(|&(f, g)| x == f || x == g)
                                         })
                                         .collect();
-                                    let alternate =
-                                        TrialContext::new(&initial, &domain, &canonical, threshold)
-                                            .unwrap();
+                                    let alternate = TrialContext::new(
+                                        &initial,
+                                        &domain,
+                                        &canonical,
+                                        threshold,
+                                        &mutable_symbols,
+                                    )
+                                    .unwrap();
                                     assert_eq!(alternate.trials_for(a, b).unwrap(), actual);
                                     assert_eq!(
                                         actual, expected,
@@ -422,7 +455,9 @@ mod tests {
         let assert_error =
             |d: &AttackPlugboardDomain, board: &[(char, char)], expected: TrialBoardError| {
                 assert_eq!(
-                    TrialContext::new(&initial, d, board, 0).err().as_ref(),
+                    TrialContext::new(&initial, d, board, 0, &mutable_symbol_mask(&initial, d))
+                        .err()
+                        .as_ref(),
                     Some(&expected)
                 );
                 assert_eq!(
@@ -459,7 +494,8 @@ mod tests {
         ] {
             assert_error(&full, &board, TrialBoardError::Model(error));
         }
-        let context = TrialContext::new(&initial, &full, &[], 0).unwrap();
+        let mutable_symbols = mutable_symbol_mask(&initial, &full);
+        let context = TrialContext::new(&initial, &full, &[], 0, &mutable_symbols).unwrap();
         for (a, b) in [(0, 0), (2, 1), (0, 4), (usize::MAX, usize::MAX)] {
             assert_eq!(
                 context.trials_for(a, b),
@@ -620,7 +656,14 @@ mod tests {
         let board = [('A', 'C')];
         let expected = TrialBoardError::Model(crate::ModelError::DuplicatePlugboardSymbol('A'));
         assert_eq!(
-            TrialContext::new(&initial, &domain, &board, 0).err(),
+            TrialContext::new(
+                &initial,
+                &domain,
+                &board,
+                0,
+                &mutable_symbol_mask(&initial, &domain),
+            )
+            .err(),
             Some(expected)
         );
         assert_eq!(
@@ -636,7 +679,8 @@ mod tests {
         let alphabet = Alphabet::new("ABCD".chars().collect()).unwrap();
         let initial = initial(&alphabet, &[]);
         let domain = domain(&alphabet, &[], &alphabet.symbols, 2);
-        let context = TrialContext::new(&initial, &domain, &[], 1).unwrap();
+        let mutable_symbols = mutable_symbol_mask(&initial, &domain);
+        let context = TrialContext::new(&initial, &domain, &[], 1, &mutable_symbols).unwrap();
         assert_eq!(context.trials_for(0, 1).unwrap(), vec![vec![('A', 'B')]]);
     }
 }
