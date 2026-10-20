@@ -186,9 +186,25 @@ impl NgramModel {
         text: &str,
         indices: &[u32],
     ) -> Result<MeasuredScore, MeasureError> {
-        let Some(dense) = &self.dense else {
-            return self.score_valid(text);
-        };
+        self.score_index_iter(indices.iter().copied())
+            .unwrap_or_else(|| self.score_valid(text))
+    }
+
+    /// Dense-table [`Self::score_indices`] over streamed indices; `None` means this
+    /// model has no dense table and the caller must score text sparsely instead.
+    pub(crate) fn score_index_iter<I: ExactSizeIterator<Item = u32>>(
+        &self,
+        indices: I,
+    ) -> Option<Result<MeasuredScore, MeasureError>> {
+        let dense = self.dense.as_ref()?;
+        Some(self.score_dense(dense, indices))
+    }
+
+    fn score_dense<I: ExactSizeIterator<Item = u32>>(
+        &self,
+        dense: &DenseWeights,
+        mut indices: I,
+    ) -> Result<MeasuredScore, MeasureError> {
         let length = u128::try_from(indices.len()).map_err(|_| ScoreError::Overflow)?;
         let required = u128::try_from(self.order).map_err(|_| ScoreError::Overflow)?;
         if length < required {
@@ -203,11 +219,12 @@ impl NgramModel {
             .ok_or(ScoreError::Overflow)?;
         let width = self.alphabet.len();
         // Dense dimensions bound every radix key; indices are already validated.
-        let mut key = indices[..self.order]
-            .iter()
-            .fold(0, |key, &index| key * width + index as usize);
+        let mut key = indices
+            .by_ref()
+            .take(self.order)
+            .fold(0, |key, index| key * width + index as usize);
         let mut sum = dense.weights[key];
-        for &incoming in &indices[self.order..] {
+        for incoming in indices {
             key = (key % dense.suffix_modulus) * width + incoming as usize;
             sum = sum.checked_add(dense.weights[key])?;
         }
@@ -554,6 +571,67 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Deterministic LCG index sequence in `0..width`.
+    fn pseudo_random_indices(width: usize, length: usize, seed: u64) -> Vec<u32> {
+        let mut state = seed;
+        (0..length)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((state >> 33) % width as u64) as u32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn index_iterator_matches_slice_and_text_scores_or_reports_sparse() {
+        for (width, order) in [(1, 1), (1, 4), (2, 2), (2, 6), (5, 3), (26, 1), (26, 3)] {
+            let symbols: Vec<char> = (0..width)
+                .map(|i| char::from_u32(0x3b1 + i as u32).unwrap())
+                .collect();
+            let alphabet = Alphabet::new(symbols.clone()).unwrap();
+            let entries: Vec<(Vec<char>, u64)> = (0..width.min(40) as u64)
+                .map(|seed| {
+                    let gram = pseudo_random_indices(width, order, seed + 11);
+                    (
+                        gram.iter().map(|&i| symbols[i as usize]).collect(),
+                        seed + 1,
+                    )
+                })
+                .collect::<HashMap<_, _>>()
+                .into_iter()
+                .collect();
+            let model = NgramModel::new(alphabet, order, entries).unwrap();
+            assert!(model.dense.is_some());
+            for length in [0, order - 1, order, order + 1, 64, 301] {
+                for seed in [3, 0x9e37_79b9] {
+                    let indices = pseudo_random_indices(width, length, seed);
+                    let text: String = indices.iter().map(|&i| symbols[i as usize]).collect();
+                    let streamed = (0..indices.len()).map(|i| indices[i]);
+                    let result = model.score_index_iter(streamed).unwrap();
+                    assert_eq!(result, model.score_indices(&text, &indices));
+                    assert_eq!(result, model.score(&text), "{width}, {order}, {length}");
+                    if length < order {
+                        assert_eq!(
+                            result,
+                            Err(MeasureError::InsufficientSamples {
+                                required: order as u128,
+                                actual: length as u128
+                            })
+                        );
+                    } else {
+                        assert!(result.is_ok());
+                    }
+                }
+            }
+        }
+        let alphabet = Alphabet::new("ABCDEFGHIJKLMNOPQRSTUVWXYZ".chars().collect()).unwrap();
+        let sparse = NgramModel::new(alphabet, 4, vec![(vec!['A'; 4], 1)]).unwrap();
+        assert!(sparse.dense.is_none());
+        assert!(sparse.score_index_iter([0_u32; 8].into_iter()).is_none());
     }
 
     #[test]

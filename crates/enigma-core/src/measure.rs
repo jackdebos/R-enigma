@@ -117,17 +117,16 @@ fn monograms(
 }
 
 /// Counts prevalidated alphabet indices, skipping the per-symbol membership lookup.
-fn index_monograms(
+fn index_monograms<I: ExactSizeIterator<Item = u32>>(
     width: usize,
-    indices: &[u32],
+    indices: I,
     required: u128,
 ) -> Result<(Vec<u128>, u128), MeasureError> {
+    // The exact length bounds every count by `usize::MAX`, so no u128 count overflows.
+    let length = u128::try_from(indices.len()).map_err(|_| ScoreError::Overflow)?;
     let mut counts = vec![0_u128; width];
-    let mut length = 0_u128;
-    for &index in indices {
-        let count = &mut counts[index as usize];
-        *count = count.checked_add(1).ok_or(ScoreError::Overflow)?;
-        length = length.checked_add(1).ok_or(ScoreError::Overflow)?;
+    for index in indices {
+        counts[index as usize] += 1;
     }
     sufficient(counts, length, required)
 }
@@ -161,6 +160,14 @@ pub fn index_of_coincidence(
 pub(crate) fn index_coincidence(
     width: usize,
     indices: &[u32],
+) -> Result<MeasuredScore, MeasureError> {
+    index_coincidence_iter(width, indices.iter().copied())
+}
+
+/// [`index_coincidence`] over streamed prevalidated indices.
+pub(crate) fn index_coincidence_iter<I: ExactSizeIterator<Item = u32>>(
+    width: usize,
+    indices: I,
 ) -> Result<MeasuredScore, MeasureError> {
     let (counts, length) = index_monograms(width, indices, 2)?;
     coincidence(width, counts, length)
@@ -209,6 +216,14 @@ pub fn shannon_entropy(alphabet: &Alphabet, text: &str) -> Result<MeasuredScore,
 
 /// [`shannon_entropy`] over prevalidated indices of an alphabet of `width` symbols.
 pub(crate) fn index_entropy(width: usize, indices: &[u32]) -> Result<MeasuredScore, MeasureError> {
+    index_entropy_iter(width, indices.iter().copied())
+}
+
+/// [`index_entropy`] over streamed prevalidated indices.
+pub(crate) fn index_entropy_iter<I: ExactSizeIterator<Item = u32>>(
+    width: usize,
+    indices: I,
+) -> Result<MeasuredScore, MeasureError> {
     let (counts, length) = index_monograms(width, indices, 1)?;
     entropy(counts, length)
 }
@@ -385,6 +400,63 @@ mod tests {
                 index_entropy(unicode.len(), &indices),
                 shannon_entropy(&unicode, text)
             );
+        }
+    }
+
+    /// Deterministic LCG index sequence in `0..width`.
+    fn pseudo_random_indices(width: usize, length: usize, seed: u64) -> Vec<u32> {
+        let mut state = seed;
+        (0..length)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((state >> 33) % width as u64) as u32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn iterator_kernels_match_slice_and_text_scores_and_sample_errors() {
+        for width in [1, 2, 7, 26] {
+            let symbols: Vec<char> = (0..width)
+                .map(|i| char::from_u32(0x3b1 + i as u32).unwrap())
+                .collect();
+            let unicode = Alphabet::new(symbols.clone()).unwrap();
+            for length in [0, 1, 2, 3, 26, 27, 257] {
+                for seed in [1, 0x9e37_79b9] {
+                    let indices = pseudo_random_indices(width, length, seed);
+                    let text: String = indices.iter().map(|&i| symbols[i as usize]).collect();
+                    let streamed = || (0..indices.len()).map(|i| indices[i]);
+                    let coincidence = index_coincidence_iter(width, streamed());
+                    assert_eq!(coincidence, index_coincidence(width, &indices));
+                    assert_eq!(coincidence, index_of_coincidence(&unicode, &text));
+                    let entropy = index_entropy_iter(width, streamed());
+                    assert_eq!(entropy, index_entropy(width, &indices));
+                    assert_eq!(entropy, shannon_entropy(&unicode, &text));
+                    match length {
+                        0 => assert_eq!(
+                            entropy,
+                            Err(MeasureError::InsufficientSamples {
+                                required: 1,
+                                actual: 0
+                            })
+                        ),
+                        _ => assert!(entropy.is_ok()),
+                    }
+                    if length < 2 {
+                        assert_eq!(
+                            coincidence,
+                            Err(MeasureError::InsufficientSamples {
+                                required: 2,
+                                actual: length as u128
+                            })
+                        );
+                    } else {
+                        assert!(coincidence.is_ok());
+                    }
+                }
+            }
         }
     }
 
