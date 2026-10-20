@@ -12,14 +12,9 @@ thread_local! {
 
 /// Owns the current snapshot; only immutable configuration and domain are borrowed.
 pub(super) struct NeighborhoodCursor<'a> {
-    initial: &'a ResolvedConfiguration,
-    domain: &'a AttackPlugboardDomain,
-    current: MutableBoard,
-    mutable_symbols: Vec<bool>,
-    backtrack_pairs: usize,
-    next_pair: (usize, usize),
-    pending: std::vec::IntoIter<MutableBoard>,
-    exhausted: bool,
+    symbols: &'a [char],
+    walker: NeighborhoodWalker,
+    next_action: usize,
 }
 
 impl<'a> NeighborhoodCursor<'a> {
@@ -29,17 +24,17 @@ impl<'a> NeighborhoodCursor<'a> {
         current: &[(char, char)],
         backtrack_pairs: usize,
     ) -> Result<Self, TrialBoardError> {
-        let mutable_symbols = mutable_symbol_mask(initial, domain);
-        TrialContext::new(initial, domain, current, backtrack_pairs, &mutable_symbols)?;
+        validated_trial_board(initial, domain, current)?;
         Ok(Self {
-            initial,
-            domain,
-            current: current.to_vec(),
-            mutable_symbols,
-            backtrack_pairs,
-            next_pair: (0, 1),
-            pending: Vec::new().into_iter(),
-            exhausted: false,
+            symbols: &initial.topology().alphabet().symbols,
+            walker: NeighborhoodWalker::new(
+                initial,
+                domain,
+                current,
+                backtrack_pairs,
+                mutable_symbol_mask(initial, domain),
+            ),
+            next_action: 0,
         })
     }
 }
@@ -49,33 +44,14 @@ impl Iterator for NeighborhoodCursor<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some(board) = self.pending.next() {
-                return Some(board);
+            if self.next_action < self.walker.actions.count {
+                self.next_action += 1;
+                return Some(self.walker.trial(self.next_action - 1, self.symbols));
             }
-            let n = self.initial.topology().alphabet().symbols.len();
-            let (a, b) = self.next_pair;
-            if self.exhausted || b >= n {
-                self.exhausted = true;
+            if !self.walker.advance() {
                 return None;
             }
-            self.next_pair = if b + 1 < n {
-                (a, b + 1)
-            } else {
-                (a + 1, a + 2)
-            };
-            let context = TrialContext {
-                initial: self.initial,
-                domain: self.domain,
-                current: &self.current,
-                mutable_symbols: &self.mutable_symbols,
-                backtrack_pairs: self.backtrack_pairs,
-            };
-            // Constructor validation and legal alphabet indices make helper errors
-            // invariant failures; candidate admissibility filtering remains in trials_for.
-            self.pending = context
-                .trials_for(a, b)
-                .expect("validated snapshot and increasing in-range alphabet indices")
-                .into_iter();
+            self.next_action = 0;
         }
     }
 }
@@ -93,88 +69,97 @@ fn mutable_symbol_mask(
         .collect()
 }
 
-struct TrialContext<'a> {
-    initial: &'a ResolvedConfiguration,
-    domain: &'a AttackPlugboardDomain,
-    current: &'a [(char, char)],
-    mutable_symbols: &'a [bool],
-    backtrack_pairs: usize,
+/// Admissible replacement actions for one selected pair, held on the stack.
+#[derive(Clone, Copy, Default)]
+struct PairActions {
+    /// a, b and their baseline partners c, d (a free endpoint is its own partner).
+    endpoints: [usize; 4],
+    links: [[(usize, usize); 2]; 4],
+    lens: [u8; 4],
+    count: usize,
 }
 
-impl<'a> TrialContext<'a> {
+/// Walks the neighborhood over one full involution (fixed and current pairs),
+/// rewriting only the touched endpoints of a trial and restoring them afterwards.
+#[derive(Clone)]
+struct NeighborhoodWalker {
+    map: Vec<usize>,
+    fixed: Vec<bool>,
+    mutable_symbols: Vec<bool>,
+    pairs: usize,
+    backtrack_pairs: usize,
+    max_pairs: usize,
+    next_pair: (usize, usize),
+    actions: PairActions,
+    saved: [usize; 4],
+}
+
+impl NeighborhoodWalker {
+    /// The snapshot must already be validated against configuration and domain.
     fn new(
-        initial: &'a ResolvedConfiguration,
-        domain: &'a AttackPlugboardDomain,
-        current: &'a [(char, char)],
+        initial: &ResolvedConfiguration,
+        domain: &AttackPlugboardDomain,
+        current: &[(char, char)],
         backtrack_pairs: usize,
-        mutable_symbols: &'a [bool],
-    ) -> Result<Self, TrialBoardError> {
-        validated_trial_board(initial, domain, current)?;
-        Ok(Self {
-            initial,
-            domain,
-            current,
+        mutable_symbols: Vec<bool>,
+    ) -> Self {
+        let alphabet = initial.topology().alphabet();
+        let index = |s| alphabet.index_of(s).expect("validated snapshot symbol");
+        let mut map: Vec<usize> = (0..alphabet.symbols.len()).collect();
+        let mut fixed = vec![false; map.len()];
+        for &(x, y) in domain.fixed_pairs() {
+            let (x, y) = (index(x), index(y));
+            (map[x], map[y], fixed[x], fixed[y]) = (y, x, true, true);
+        }
+        for &(x, y) in current {
+            let (x, y) = (index(x), index(y));
+            (map[x], map[y]) = (y, x);
+        }
+        Self {
+            map,
+            fixed,
             mutable_symbols,
+            pairs: domain.fixed_pairs().len() + current.len(),
             backtrack_pairs,
-        })
+            max_pairs: domain.max_pairs(),
+            next_pair: (0, 1),
+            actions: PairActions::default(),
+            saved: [0; 4],
+        }
+    }
+
+    /// Loads the next pair in lexicographic alphabet-index order; false once exhausted.
+    fn advance(&mut self) -> bool {
+        let n = self.map.len();
+        let (a, b) = self.next_pair;
+        if b >= n {
+            return false;
+        }
+        self.next_pair = if b + 1 < n {
+            (a, b + 1)
+        } else {
+            (a + 1, a + 2)
+        };
+        self.load(a, b);
+        true
     }
 
     /// Indices must be increasing and inside the runtime alphabet.
-    /// Invalid selections report AlphabetBinding without producing any trials.
-    fn trials_for(&self, a: usize, b: usize) -> Result<Vec<MutableBoard>, TrialBoardError> {
+    /// Only reads the baseline map; every action starts from it, never from the
+    /// preceding trial.
+    fn load(&mut self, a: usize, b: usize) {
         #[cfg(test)]
         PAIR_VISITS.with(|visits| visits.set(visits.get() + 1));
-        let alphabet = self.initial.topology().alphabet();
-        if a >= b || b >= alphabet.symbols.len() {
-            return Err(TrialBoardError::AlphabetBinding);
-        }
-        let (a, b) = (alphabet.symbols[a], alphabet.symbols[b]);
-        let index = |s| alphabet.index_of(s).unwrap();
-        let partner = |symbol| {
-            self.domain
-                .fixed_pairs()
-                .iter()
-                .chain(self.current)
-                .find_map(|&(x, y)| {
-                    if x == symbol {
-                        Some(y)
-                    } else if y == symbol {
-                        Some(x)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(symbol)
+        let (c, d) = (self.map[a], self.map[b]);
+        self.actions = PairActions {
+            endpoints: [a, b, c, d],
+            ..PairActions::default()
         };
-        let (c, d) = (partner(a), partner(b));
         let both_free = a == c && b == d;
-        if !both_free && self.domain.fixed_pairs().len() + self.current.len() < self.backtrack_pairs
+        if (!both_free && self.pairs < self.backtrack_pairs)
+            || [a, b, c, d].iter().any(|&s| self.fixed[s])
         {
-            return Ok(Vec::new());
-        }
-        // Every action starts from the same board, never from the preceding trial.
-        let additions = if both_free {
-            vec![vec![(a, b)]]
-        } else if c == b {
-            vec![vec![]]
-        } else if a == c || b == d {
-            let (f, x, y) = if a == c { (a, b, d) } else { (b, a, c) };
-            vec![vec![(f, x)], vec![(f, y)]]
-        } else {
-            vec![
-                vec![(a, b)],
-                vec![(a, b), (c, d)],
-                vec![(a, d)],
-                vec![(a, d), (c, b)],
-            ]
-        };
-        if [a, b, c, d].iter().any(|s| {
-            self.domain
-                .fixed_pairs()
-                .iter()
-                .any(|&(x, y)| *s == x || *s == y)
-        }) {
-            return Ok(Vec::new());
+            return;
         }
         // The validated snapshot is a disjoint involution. Fixed endpoints were
         // rejected above. Severing a/b frees their partners; every action reconnects
@@ -182,32 +167,113 @@ impl<'a> TrialContext<'a> {
         // Add/remove, moving a link to a free endpoint, and reconnecting two links
         // all change the mapping. Thus only mask and capacity can reject a trial;
         // neither model construction nor an electrical no-op comparison is needed.
-        let mut trials = Vec::with_capacity(4);
-        for added in additions {
-            let mut trial: MutableBoard = self
-                .current
-                .iter()
-                .copied()
-                .filter(|&(x, y)| x != a && y != a && x != b && y != b)
-                .collect();
-            trial.extend(added);
-            if trial
-                .iter()
-                .any(|&(x, y)| !self.mutable_symbols[index(x)] || !self.mutable_symbols[index(y)])
-                || self.domain.fixed_pairs().len() + trial.len() > self.domain.max_pairs()
+        // Severing removes each existing link once; c == b is a single link.
+        let remaining = self.pairs - usize::from(a != c) - usize::from(b != d && c != b);
+        let (mask, max_pairs, actions) = (&self.mutable_symbols, self.max_pairs, &mut self.actions);
+        let mut push = |links: &[(usize, usize)]| {
+            if remaining + links.len() <= max_pairs
+                && links.iter().all(|&(x, y)| mask[x] && mask[y])
             {
-                continue;
+                actions.links[actions.count][..links.len()].copy_from_slice(links);
+                actions.lens[actions.count] = links.len() as u8;
+                actions.count += 1;
             }
-            // Canonicalize by alphabet indices, not Unicode character order.
-            for pair in &mut trial {
-                if index(pair.0) > index(pair.1) {
-                    *pair = (pair.1, pair.0);
-                }
-            }
-            trial.sort_unstable_by_key(|&(x, y)| (index(x), index(y)));
-            trials.push(trial);
+        };
+        if both_free {
+            push(&[(a, b)]);
+        } else if c == b {
+            push(&[]);
+        } else if a == c || b == d {
+            let (f, x, y) = if a == c { (a, b, d) } else { (b, a, c) };
+            push(&[(f, x)]);
+            push(&[(f, y)]);
+        } else {
+            push(&[(a, b)]);
+            push(&[(a, b), (c, d)]);
+            push(&[(a, d)]);
+            push(&[(a, d), (c, b)]);
         }
-        Ok(trials)
+    }
+
+    /// Rewrites the loaded action k in place; restore must follow before another apply.
+    fn apply(&mut self, k: usize) {
+        let endpoints = self.actions.endpoints;
+        for (saved, &s) in self.saved.iter_mut().zip(&endpoints) {
+            *saved = self.map[s];
+        }
+        for s in endpoints {
+            self.map[s] = s;
+        }
+        let links = self.actions.links[k];
+        for &(x, y) in &links[..usize::from(self.actions.lens[k])] {
+            (self.map[x], self.map[y]) = (y, x);
+        }
+    }
+
+    /// Duplicate endpoints saved the same baseline value, so write order is irrelevant.
+    fn restore(&mut self) {
+        for (&s, &value) in self.actions.endpoints.iter().zip(&self.saved) {
+            self.map[s] = value;
+        }
+    }
+
+    /// Canonical mutable board: pairs by ascending lower alphabet index, fixed omitted.
+    fn board(&self, symbols: &[char]) -> MutableBoard {
+        (0..self.map.len())
+            .filter(|&i| i < self.map[i] && !self.fixed[i])
+            .map(|i| (symbols[i], symbols[self.map[i]]))
+            .collect()
+    }
+
+    fn trial(&mut self, k: usize, symbols: &[char]) -> MutableBoard {
+        self.apply(k);
+        let board = self.board(symbols);
+        self.restore();
+        board
+    }
+}
+
+/// Test-only per-pair view: validates like the cursor and owns the alphabet copy.
+#[cfg(test)]
+struct TrialContext {
+    walker: NeighborhoodWalker,
+    symbols: Vec<char>,
+}
+
+#[cfg(test)]
+impl TrialContext {
+    fn new(
+        initial: &ResolvedConfiguration,
+        domain: &AttackPlugboardDomain,
+        current: &[(char, char)],
+        backtrack_pairs: usize,
+        mutable_symbols: &[bool],
+    ) -> Result<Self, TrialBoardError> {
+        validated_trial_board(initial, domain, current)?;
+        Ok(Self {
+            walker: NeighborhoodWalker::new(
+                initial,
+                domain,
+                current,
+                backtrack_pairs,
+                mutable_symbols.to_vec(),
+            ),
+            symbols: initial.topology().alphabet().symbols.clone(),
+        })
+    }
+
+    /// Indices must be increasing and inside the runtime alphabet.
+    /// Invalid selections report AlphabetBinding without producing any trials.
+    fn trials_for(&self, a: usize, b: usize) -> Result<Vec<MutableBoard>, TrialBoardError> {
+        if a >= b || b >= self.walker.map.len() {
+            PAIR_VISITS.with(|visits| visits.set(visits.get() + 1));
+            return Err(TrialBoardError::AlphabetBinding);
+        }
+        let mut walker = self.walker.clone();
+        walker.load(a, b);
+        Ok((0..walker.actions.count)
+            .map(|k| walker.trial(k, &self.symbols))
+            .collect())
     }
 }
 
@@ -445,6 +511,88 @@ mod tests {
         assert_eq!(comparisons, 86_760);
         assert_eq!(neighborhoods, 11_568);
         println!("independent per-pair comparisons: {comparisons}; neighborhoods: {neighborhoods}");
+    }
+
+    #[test]
+    fn walker_actions_match_oracle_per_pair() {
+        let alphabet = Alphabet::new("Ωa🦀Zé中".chars().collect()).unwrap();
+        let mut comparisons = 0;
+        for map in mappings(6) {
+            let all = pairs(&map, &alphabet.symbols);
+            for fixed_bits in 0..1usize << all.len() {
+                let mut fixed = Vec::new();
+                let mut current = Vec::new();
+                let mut protected = vec![false; 6];
+                for (i, &(x, y)) in all.iter().enumerate() {
+                    if fixed_bits & (1 << i) != 0 {
+                        fixed.push((y, x));
+                        protected[alphabet.symbols.iter().position(|s| *s == x).unwrap()] = true;
+                        protected[alphabet.symbols.iter().position(|s| *s == y).unwrap()] = true;
+                    } else {
+                        current.push((y, x));
+                    }
+                }
+                current.reverse();
+                for mask_bits in 1..64usize {
+                    let mask: Vec<_> = (0..6).map(|i| mask_bits & (1 << i) != 0).collect();
+                    if (0..6).any(|i| {
+                        (protected[i] && mask[i]) || (!protected[i] && map[i] != i && !mask[i])
+                    }) {
+                        continue;
+                    }
+                    let symbols: Vec<_> = (0..6)
+                        .filter(|&i| mask[i])
+                        .map(|i| alphabet.symbols[i])
+                        .collect();
+                    for cap in all.len()..=fixed.len() + symbols.len() / 2 {
+                        let initial = initial(&alphabet, &fixed);
+                        let domain = domain(&alphabet, &fixed, &symbols, cap);
+                        for threshold in [0, all.len(), all.len() + 1] {
+                            let mut walker = NeighborhoodWalker::new(
+                                &initial,
+                                &domain,
+                                &current,
+                                threshold,
+                                mutable_symbol_mask(&initial, &domain),
+                            );
+                            assert_eq!(walker.map, map);
+                            for a in 0..6 {
+                                for b in a + 1..6 {
+                                    let expected: Vec<_> =
+                                        oracle(&map, &protected, &mask, cap, threshold, a, b)
+                                            .iter()
+                                            .map(|m| {
+                                                pairs(m, &alphabet.symbols)
+                                                    .into_iter()
+                                                    .filter(|&(x, _)| {
+                                                        !fixed
+                                                            .iter()
+                                                            .any(|&(f, g)| x == f || x == g)
+                                                    })
+                                                    .collect::<MutableBoard>()
+                                            })
+                                            .collect();
+                                    walker.load(a, b);
+                                    let mut actual = Vec::new();
+                                    for k in 0..walker.actions.count {
+                                        walker.apply(k);
+                                        actual.push(walker.board(&alphabet.symbols));
+                                        walker.restore();
+                                        assert_eq!(walker.map, map);
+                                    }
+                                    assert_eq!(
+                                        actual, expected,
+                                        "{map:?} {fixed:?} {mask:?} {cap} {threshold} {a} {b}"
+                                    );
+                                    comparisons += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(comparisons, 86_760);
     }
 
     #[test]
