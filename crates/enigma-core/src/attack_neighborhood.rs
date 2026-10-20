@@ -10,13 +10,15 @@ thread_local! {
     static PAIR_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Owns the current snapshot; only immutable configuration and domain are borrowed.
+/// Test-only owned-board adapter; owns the current snapshot, and only immutable
+/// configuration and domain are borrowed.
+#[cfg(test)]
 pub(super) struct NeighborhoodCursor<'a> {
     symbols: &'a [char],
     walker: NeighborhoodWalker,
-    next_action: usize,
 }
 
+#[cfg(test)]
 impl<'a> NeighborhoodCursor<'a> {
     pub(super) fn new(
         initial: &'a ResolvedConfiguration,
@@ -24,35 +26,20 @@ impl<'a> NeighborhoodCursor<'a> {
         current: &[(char, char)],
         backtrack_pairs: usize,
     ) -> Result<Self, TrialBoardError> {
-        validated_trial_board(initial, domain, current)?;
         Ok(Self {
             symbols: &initial.topology().alphabet().symbols,
-            walker: NeighborhoodWalker::new(
-                initial,
-                domain,
-                current,
-                backtrack_pairs,
-                mutable_symbol_mask(initial, domain),
-            ),
-            next_action: 0,
+            walker: NeighborhoodWalker::validated(initial, domain, current, backtrack_pairs)?,
         })
     }
 }
 
+#[cfg(test)]
 impl Iterator for NeighborhoodCursor<'_> {
     type Item = MutableBoard;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if self.next_action < self.walker.actions.count {
-                self.next_action += 1;
-                return Some(self.walker.trial(self.next_action - 1, self.symbols));
-            }
-            if !self.walker.advance() {
-                return None;
-            }
-            self.next_action = 0;
-        }
+        let k = self.walker.next_action()?;
+        Some(self.walker.trial(k, self.symbols))
     }
 }
 
@@ -79,10 +66,17 @@ struct PairActions {
     count: usize,
 }
 
+/// A loaded pair's actions and one selected action, replayable after the walk moves on.
+#[derive(Clone, Copy)]
+pub(super) struct WalkerTrial {
+    actions: PairActions,
+    action: usize,
+}
+
 /// Walks the neighborhood over one full involution (fixed and current pairs),
 /// rewriting only the touched endpoints of a trial and restoring them afterwards.
 #[derive(Clone)]
-struct NeighborhoodWalker {
+pub(super) struct NeighborhoodWalker {
     map: Vec<usize>,
     fixed: Vec<bool>,
     mutable_symbols: Vec<bool>,
@@ -91,10 +85,28 @@ struct NeighborhoodWalker {
     max_pairs: usize,
     next_pair: (usize, usize),
     actions: PairActions,
+    next_action: usize,
     saved: [usize; 4],
 }
 
 impl NeighborhoodWalker {
+    /// Validates the snapshot like [`NeighborhoodCursor::new`] before walking it.
+    pub(super) fn validated(
+        initial: &ResolvedConfiguration,
+        domain: &AttackPlugboardDomain,
+        current: &[(char, char)],
+        backtrack_pairs: usize,
+    ) -> Result<Self, TrialBoardError> {
+        validated_trial_board(initial, domain, current)?;
+        Ok(Self::new(
+            initial,
+            domain,
+            current,
+            backtrack_pairs,
+            mutable_symbol_mask(initial, domain),
+        ))
+    }
+
     /// The snapshot must already be validated against configuration and domain.
     fn new(
         initial: &ResolvedConfiguration,
@@ -124,6 +136,7 @@ impl NeighborhoodWalker {
             max_pairs: domain.max_pairs(),
             next_pair: (0, 1),
             actions: PairActions::default(),
+            next_action: 0,
             saved: [0; 4],
         }
     }
@@ -142,6 +155,27 @@ impl NeighborhoodWalker {
         };
         self.load(a, b);
         true
+    }
+
+    /// Whether another admissible trial remains, loading pairs as needed; visits
+    /// exactly the pairs a peeking iterator would, and never revisits them.
+    pub(super) fn has_next(&mut self) -> bool {
+        while self.next_action >= self.actions.count {
+            if !self.advance() {
+                return false;
+            }
+            self.next_action = 0;
+        }
+        true
+    }
+
+    /// The next admissible action of the loaded pair, to [`Self::apply`].
+    pub(super) fn next_action(&mut self) -> Option<usize> {
+        if !self.has_next() {
+            return None;
+        }
+        self.next_action += 1;
+        Some(self.next_action - 1)
     }
 
     /// Indices must be increasing and inside the runtime alphabet.
@@ -196,7 +230,7 @@ impl NeighborhoodWalker {
     }
 
     /// Rewrites the loaded action k in place; restore must follow before another apply.
-    fn apply(&mut self, k: usize) {
+    pub(super) fn apply(&mut self, k: usize) {
         let endpoints = self.actions.endpoints;
         for (saved, &s) in self.saved.iter_mut().zip(&endpoints) {
             *saved = self.map[s];
@@ -211,7 +245,7 @@ impl NeighborhoodWalker {
     }
 
     /// Duplicate endpoints saved the same baseline value, so write order is irrelevant.
-    fn restore(&mut self) {
+    pub(super) fn restore(&mut self) {
         for (&s, &value) in self.actions.endpoints.iter().zip(&self.saved) {
             self.map[s] = value;
         }
@@ -223,6 +257,27 @@ impl NeighborhoodWalker {
             .filter(|&i| i < self.map[i] && !self.fixed[i])
             .map(|i| (symbols[i], symbols[self.map[i]]))
             .collect()
+    }
+
+    /// The full fixed and mutable involution, including any applied trial.
+    pub(super) fn mapping(&self) -> &[usize] {
+        &self.map
+    }
+
+    /// Captures loaded action k so its board can be rebuilt once the walk is done.
+    pub(super) fn selected(&self, k: usize) -> WalkerTrial {
+        WalkerTrial {
+            actions: self.actions,
+            action: k,
+        }
+    }
+
+    /// Re-applies a selected trial to the unchanged baseline and reads its board.
+    pub(super) fn winner_board(&mut self, winner: &WalkerTrial, symbols: &[char]) -> MutableBoard {
+        let loaded = std::mem::replace(&mut self.actions, winner.actions);
+        let board = self.trial(winner.action, symbols);
+        self.actions = loaded;
+        board
     }
 
     fn trial(&mut self, k: usize, symbols: &[char]) -> MutableBoard {

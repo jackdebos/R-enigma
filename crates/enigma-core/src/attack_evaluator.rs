@@ -190,8 +190,8 @@ impl<'a> TrialEvaluator<'a> {
         &self,
         mutable: &[(char, char)],
     ) -> Result<(String, MeasuredScore), TrialEvaluationError> {
-        self.with_trial(mutable, |scratch, prepared, engine| {
-            self.materialize(scratch, prepared, engine)
+        self.with_trial(mutable, |mapping, indices, prepared, engine| {
+            self.materialize(mapping, indices, prepared, engine)
         })
     }
 
@@ -201,23 +201,51 @@ impl<'a> TrialEvaluator<'a> {
         &self,
         mutable: &[(char, char)],
     ) -> Result<(Option<String>, MeasuredScore), TrialEvaluationError> {
-        self.with_trial(mutable, |scratch, prepared, engine| {
-            if let (Some(rows), Some(kind)) = (prepared, self.stream_kind()) {
-                let decoded = || Decoded::new(rows, &scratch.mapping);
-                let width = self.initial.topology().alphabet().len();
-                let score = match kind {
-                    StreamKind::Ic => Some(index_coincidence_iter(width, decoded())),
-                    StreamKind::Entropy => Some(index_entropy_iter(width, decoded())),
-                    StreamKind::Dense(model) => model.score_index_iter(decoded()),
-                };
-                // A model without a dense table keeps its sparse text scoring.
-                if let Some(score) = score {
-                    return Ok((None, score.map_err(TrialEvaluationError::Measure)?));
-                }
-            }
-            let (plaintext, score) = self.materialize(scratch, prepared, engine)?;
-            Ok((Some(plaintext), score))
+        self.with_trial(mutable, |mapping, indices, prepared, engine| {
+            self.score(mapping, indices, prepared, engine)
         })
+    }
+
+    /// [`Self::evaluate_score`] for a full alphabet-index involution that already
+    /// holds the fixed pairs and a mutable board within mask and capacity. Callers
+    /// own that invariant, so no board is built or limit checked; binding,
+    /// preparation and scoring errors keep their order.
+    pub(super) fn evaluate_score_mapped(
+        &self,
+        mapping: &[usize],
+    ) -> Result<(Option<String>, MeasuredScore), TrialEvaluationError> {
+        debug_assert_eq!(mapping.len(), self.initial.topology().alphabet().len());
+        self.check_binding()?;
+        let mut scratch = self.scratch.borrow_mut();
+        self.with_mapping(
+            mapping,
+            &mut scratch.indices,
+            |mapping, indices, prepared, engine| self.score(mapping, indices, prepared, engine),
+        )
+    }
+
+    fn score(
+        &self,
+        mapping: &[usize],
+        indices: &mut Vec<u32>,
+        prepared: Option<&Prepared>,
+        engine: Option<Engine>,
+    ) -> Result<(Option<String>, MeasuredScore), TrialEvaluationError> {
+        if let (Some(rows), Some(kind)) = (prepared, self.stream_kind()) {
+            let decoded = || Decoded::new(rows, mapping);
+            let width = self.initial.topology().alphabet().len();
+            let score = match kind {
+                StreamKind::Ic => Some(index_coincidence_iter(width, decoded())),
+                StreamKind::Entropy => Some(index_entropy_iter(width, decoded())),
+                StreamKind::Dense(model) => model.score_index_iter(decoded()),
+            };
+            // A model without a dense table keeps its sparse text scoring.
+            if let Some(score) = score {
+                return Ok((None, score.map_err(TrialEvaluationError::Measure)?));
+            }
+        }
+        let (plaintext, score) = self.materialize(mapping, indices, prepared, engine)?;
+        Ok((Some(plaintext), score))
     }
 
     /// Rebuild a streamed winner's plaintext without scoring or accounting. Only
@@ -228,42 +256,68 @@ impl<'a> TrialEvaluator<'a> {
     ) -> Result<String, TrialEvaluationError> {
         const FAILED: TrialEvaluationError =
             TrialEvaluationError::Invariant("winner plaintext replay failed");
-        self.with_trial(mutable, |scratch, prepared, _| {
+        self.with_trial(mutable, |mapping, _, prepared, _| {
             let symbols = &self.initial.topology().alphabet().symbols;
             let rows = prepared.ok_or(FAILED)?;
             #[cfg(test)]
             PLAINTEXT_BUILDS.with(|count| count.set(count.get() + 1));
-            Ok(Decoded::new(rows, &scratch.mapping)
+            Ok(Decoded::new(rows, mapping)
                 .map(|output| symbols[output as usize])
                 .collect())
         })
         .map_err(|_| FAILED)
     }
 
-    /// Shared trial prefix: binding, board model, mutable limits, then the selected
-    /// outer's preparation; `run` receives the rows and any leftover fresh Engine.
-    fn with_trial<T>(
-        &self,
-        mutable: &[(char, char)],
-        run: impl FnOnce(
-            &mut TrialScratch,
-            Option<&Prepared>,
-            Option<Engine>,
-        ) -> Result<T, TrialEvaluationError>,
-    ) -> Result<T, TrialEvaluationError> {
+    /// Only a successful check of the immutable, borrowed binding is cached.
+    fn check_binding(&self) -> Result<(), TrialEvaluationError> {
         if self.binding.get().is_none() {
             validate_binding(self.initial, self.domain).map_err(TrialEvaluationError::Board)?;
             // Retain success even if mutable, input or scoring validation below fails.
             self.binding.set(()).expect("single-threaded binding check");
         }
+        Ok(())
+    }
+
+    /// Shared board prefix: binding, board model and mutable limits, then
+    /// [`Self::with_mapping`] over the filled scratch mapping.
+    fn with_trial<T>(
+        &self,
+        mutable: &[(char, char)],
+        run: impl FnOnce(
+            &[usize],
+            &mut Vec<u32>,
+            Option<&Prepared>,
+            Option<Engine>,
+        ) -> Result<T, TrialEvaluationError>,
+    ) -> Result<T, TrialEvaluationError> {
+        self.check_binding()?;
         let mut scratch = self.scratch.borrow_mut();
+        let TrialScratch { mapping, indices } = &mut *scratch;
+        #[cfg(test)]
+        BOARD_FILLS.with(|count| count.set(count.get() + 1));
         Plugboard::fill_mapping(
             self.initial.topology().alphabet(),
             self.domain.fixed_pairs().iter().chain(mutable).copied(),
-            &mut scratch.mapping,
+            mapping,
         )
         .map_err(|error| TrialEvaluationError::Board(TrialBoardError::Model(error)))?;
         check_mutable_limits(self.domain, mutable).map_err(TrialEvaluationError::Board)?;
+        self.with_mapping(mapping, indices, run)
+    }
+
+    /// Selects the outer's preparation for a bound, valid mapping; `run` receives
+    /// the mapping, index scratch, rows and any leftover fresh Engine.
+    fn with_mapping<T>(
+        &self,
+        mapping: &[usize],
+        indices: &mut Vec<u32>,
+        run: impl FnOnce(
+            &[usize],
+            &mut Vec<u32>,
+            Option<&Prepared>,
+            Option<Engine>,
+        ) -> Result<T, TrialEvaluationError>,
+    ) -> Result<T, TrialEvaluationError> {
         let latest;
         let prepared = if let Some((run_preparation, outer)) = self.shared {
             let mut slot = run_preparation.latest.borrow_mut();
@@ -277,9 +331,10 @@ impl<'a> TrialEvaluator<'a> {
         } else {
             &self.prepared
         };
-        let engine = self.prepare(&scratch, prepared)?;
+        let engine = self.prepare(mapping, prepared)?;
         run(
-            &mut scratch,
+            mapping,
+            indices,
             prepared.get().expect("prepared above").as_ref(),
             engine,
         )
@@ -289,7 +344,7 @@ impl<'a> TrialEvaluator<'a> {
     /// that the fallback path may reuse.
     fn prepare(
         &self,
-        scratch: &TrialScratch,
+        mapping: &[usize],
         prepared: &OnceCell<Option<Prepared>>,
     ) -> Result<Option<Engine>, TrialEvaluationError> {
         let mut engine = None;
@@ -298,7 +353,7 @@ impl<'a> TrialEvaluator<'a> {
         if self.engine_validated.get().is_none() || prepared.get().is_none() {
             engine = Some(self.fresh_engine(Plugboard::from_validated_mapping(
                 self.initial.topology().alphabet(),
-                &scratch.mapping,
+                mapping,
             ))?);
             self.engine_validated.set(()).ok();
         }
@@ -335,7 +390,8 @@ impl<'a> TrialEvaluator<'a> {
 
     fn materialize(
         &self,
-        scratch: &mut TrialScratch,
+        mapping: &[usize],
+        indices: &mut Vec<u32>,
         prepared: Option<&Prepared>,
         engine: Option<Engine>,
     ) -> Result<(String, MeasuredScore), TrialEvaluationError> {
@@ -345,7 +401,6 @@ impl<'a> TrialEvaluator<'a> {
             Some(prepared) => {
                 let symbols = &self.initial.topology().alphabet().symbols;
                 let mut plaintext = String::with_capacity(self.input.len());
-                let TrialScratch { mapping, indices } = scratch;
                 indices.clear();
                 for output in Decoded::new(prepared, mapping) {
                     plaintext.push(symbols[output as usize]);
@@ -359,7 +414,7 @@ impl<'a> TrialEvaluator<'a> {
                     Some(engine) => engine,
                     None => self.fresh_engine(Plugboard::from_validated_mapping(
                         self.initial.topology().alphabet(),
-                        &scratch.mapping,
+                        mapping,
                     ))?,
                 };
                 let plaintext = engine
@@ -527,6 +582,7 @@ thread_local! {
     pub(super) static BINDING_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ENGINE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static PLAINTEXT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static BOARD_FILLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Accept only mutable guesses, bound to the selected initial scrambler.
@@ -1229,6 +1285,150 @@ mod tests {
                     actual.map(|(carried, score)| (carried.is_none(), score)),
                     expected.map(|(_, score)| (true, score))
                 );
+            }
+        }
+    }
+
+    fn trial_counters() -> [usize; 5] {
+        [
+            BINDING_CHECKS.with(|count| count.replace(0)),
+            crate::PLUGBOARD_BUILDS.with(|count| count.replace(0)),
+            PLAINTEXT_BUILDS.with(|count| count.replace(0)),
+            ENGINE_CHECKS.with(|count| count.replace(0)),
+            crate::engine::ROW_BUILDS.with(|count| count.replace(0)),
+        ]
+    }
+
+    fn board_fills() -> usize {
+        BOARD_FILLS.with(|count| count.replace(0))
+    }
+
+    #[test]
+    fn mapped_score_equals_board_score() {
+        let mut seed = 0x2545_f491_u32;
+        let mut next = |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as usize % bound
+        };
+        let mut compared = 0;
+        for symbols in ["ABCDEFGH", "界éHβAGλ中", "ABCDEFGHIJKLMNOPQRSTUVWXYZ"] {
+            let s: Vec<_> = symbols.chars().collect();
+            let wiring: String = s.iter().cycle().skip(3).take(s.len()).collect();
+            let initial = machine(symbols, &wiring, "AA", true);
+            let alphabet = initial.topology().alphabet();
+            let domain = domain(alphabet, &[], symbols, 3);
+            let other = Alphabet::new("AB".chars().collect()).unwrap();
+            let tries = vec![(vec![s[0]], 2), (vec![s[0], s[1]], -1), (vec![s[1]], 1)];
+            let model = |order| {
+                let entries = vec![(vec![s[0]; order], 3), (vec![s[1]; order], 1)];
+                BoundResource::Ngram(
+                    crate::NgramModel::new(alphabet.clone(), order, entries).unwrap(),
+                )
+            };
+            let mut cases = vec![
+                (MeasureId::Ic, None),
+                (MeasureId::Entropy, None),
+                (MeasureId::SinkovBigram, None),
+                (MeasureId::Ic, Some(model(1))),
+                (MeasureId::SinkovBigram, Some(ngram(&other, 2))),
+                (
+                    MeasureId::Trie,
+                    Some(BoundResource::Trie(
+                        crate::TrieModel::new(alphabet.clone(), tries).unwrap(),
+                    )),
+                ),
+            ];
+            for (order, objective) in (1..=6).zip(SINKOV) {
+                cases.push((objective, Some(model(order))));
+            }
+            let inputs = [
+                String::new(),
+                s[..1].iter().collect(),
+                s[..5].iter().collect(),
+                symbols.repeat(3),
+                format!("{}?{}", s[0], s[1]),
+            ];
+            for (objective, resource) in &cases {
+                for input in &inputs {
+                    for deny in [false, true] {
+                        let new = || {
+                            let mut trial = TrialEvaluator::new(
+                                &initial,
+                                &domain,
+                                input,
+                                Direction::Decrypt,
+                                *objective,
+                                resource.as_ref(),
+                            );
+                            trial.deny_reservation = deny;
+                            trial
+                        };
+                        let (by_board, by_mapping) = (new(), new());
+                        for _ in 0..12 {
+                            let board: Vec<_> = (0..next(4))
+                                .map(|_| (s[next(s.len())], s[next(s.len())]))
+                                .collect();
+                            // Only valid boards have a mapping; derive it independently.
+                            let Ok(plugboard) = validated_trial_board(&initial, &domain, &board)
+                            else {
+                                continue;
+                            };
+                            let mapping: Vec<_> = s
+                                .iter()
+                                .map(|&c| alphabet.index_of(plugboard.map(c).unwrap()).unwrap())
+                                .collect();
+                            let label = format!("{symbols} {objective:?} {input} {deny} {board:?}");
+                            // Cold pairs first, then the long-lived warm pair.
+                            for (board_trial, mapped_trial) in
+                                [(&new(), &new()), (&by_board, &by_mapping)]
+                            {
+                                trial_counters();
+                                board_fills();
+                                let expected = board_trial.evaluate_score(&board);
+                                let counts = trial_counters();
+                                assert_eq!(board_fills(), 1, "{label}");
+                                let actual = mapped_trial.evaluate_score_mapped(&mapping);
+                                assert_eq!(actual, expected, "{label}");
+                                // Binding, plugboard, plaintext, engine and row work all
+                                // match; only the board-to-mapping fill is skipped.
+                                assert_eq!(trial_counters(), counts, "{label}");
+                                assert_eq!(board_fills(), 0, "{label}");
+                                compared += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(compared > 1000, "{compared}");
+        // Binding errors keep precedence on cold evaluators for either entry point.
+        let alphabet = alphabet();
+        let initial = initial(&alphabet, &[('A', 'B')]);
+        let mapping = [1, 0, 2, 3, 4, 5, 6, 7];
+        let reversed = Alphabet::new("HGFEDCBA".chars().collect()).unwrap();
+        for (invalid, error) in [
+            (
+                domain(&reversed, &[], "CD", 1),
+                TrialEvaluationError::Board(TrialBoardError::AlphabetBinding),
+            ),
+            (
+                domain(&alphabet, &[], "CD", 1),
+                TrialEvaluationError::Board(TrialBoardError::FixedFactsBinding),
+            ),
+        ] {
+            let (board_trial, mapped_trial) = (
+                evaluator(&initial, &invalid, "Z"),
+                evaluator(&initial, &invalid, "Z"),
+            );
+            for _ in 0..2 {
+                trial_counters();
+                let expected = board_trial.evaluate_score(&[]);
+                assert_eq!(expected.as_ref().err(), Some(&error));
+                let counts = trial_counters();
+                assert_eq!(mapped_trial.evaluate_score_mapped(&mapping), expected);
+                assert_eq!(trial_counters(), counts);
             }
         }
     }

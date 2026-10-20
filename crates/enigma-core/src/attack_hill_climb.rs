@@ -4,7 +4,9 @@ use crate::attack_control::{AttackControl, CounterObserver, CounterOverflow};
 use crate::attack_evaluator::{
     validated_trial_board, RunPreparation, TrialEvaluationError, TrialEvaluator,
 };
+#[cfg(test)]
 use crate::attack_neighborhood::NeighborhoodCursor;
+use crate::attack_neighborhood::NeighborhoodWalker;
 use crate::attack_result::AttackRunErrorData;
 use crate::{
     AttackPlugboardDomain, BoundResource, Direction, FixedScore, MeasureId, MeasuredScore,
@@ -1957,17 +1959,18 @@ pub(super) trait EvaluationAccounting {
         self.transition(AttackControl::record_evaluation_completed)?;
         Ok(Some(result))
     }
-    /// [`Self::evaluate`] with the same accounting; plaintext only when materialized.
-    fn evaluate_score(
+    /// [`Self::evaluate`] with the same accounting over a walker-guaranteed valid
+    /// full mapping; plaintext only when materialized.
+    fn evaluate_score_mapped(
         &mut self,
         evaluator: &TrialEvaluator<'_>,
-        board: &[(char, char)],
+        mapping: &[usize],
         reserve: u64,
     ) -> Result<Option<(Option<String>, MeasuredScore)>, Self::Error> {
         if !self.admit(reserve)? {
             return Ok(None);
         }
-        let result = evaluator.evaluate_score(board)?;
+        let result = evaluator.evaluate_score_mapped(mapping)?;
         self.transition(AttackControl::record_evaluation_completed)?;
         Ok(Some(result))
     }
@@ -2532,44 +2535,49 @@ impl NeighborhoodSelection<'_> {
         allowance: &mut A,
         reserve: u64,
     ) -> Result<ScanOutcome, A::Error> {
-        let mut cursor =
-            NeighborhoodCursor::new(self.initial, self.domain, current, self.backtrack_pairs)
-                .map_err(TrialEvaluationError::Board)?
-                .peekable();
+        // The walker owns its mapping, so no early return can leak an applied trial.
+        let mut walker =
+            NeighborhoodWalker::validated(self.initial, self.domain, current, self.backtrack_pairs)
+                .map_err(TrialEvaluationError::Board)?;
         let mut best = None;
         let mut best_ranking = ranking;
-        while let Some(board) = cursor.next() {
+        while let Some(action) = walker.next_action() {
             if allowance.cancelled() {
                 return Ok(ScanOutcome::Cancelled);
             }
-            let Some((plaintext, score)) =
-                allowance.evaluate_score(self.evaluator, &board, reserve)?
-            else {
+            walker.apply(action);
+            let scored = allowance.evaluate_score_mapped(self.evaluator, walker.mapping(), reserve);
+            walker.restore();
+            let Some((plaintext, score)) = scored? else {
                 return Ok(ScanOutcome::Interrupted);
             };
             if score.ranking().units() > best_ranking.units() {
                 best_ranking = score.ranking();
-                best = Some((board, plaintext, score));
+                best = Some((walker.selected(action), plaintext, score));
             }
             if allowance.cancelled() {
                 // A completed losing scan has already established exhaustion.
-                if best.is_none() && cursor.peek().is_none() {
+                if best.is_none() && !walker.has_next() {
                     return Ok(ScanOutcome::Complete(None));
                 }
                 return Ok(ScanOutcome::Cancelled);
             }
         }
-        // Only a completed scan's winner gets plaintext; streamed winners replay
-        // once, outside accounting.
+        // Only a completed scan's winner gets a board and plaintext; streamed
+        // winners replay once, outside accounting.
         let winner = match best {
-            Some((board, plaintext, score)) => Some(ScoredBoard {
-                plaintext: match plaintext {
-                    Some(plaintext) => plaintext,
-                    None => self.evaluator.replay_plaintext(&board)?,
-                },
-                board,
-                score,
-            }),
+            Some((trial, plaintext, score)) => {
+                let symbols = &self.initial.topology().alphabet().symbols;
+                let board = walker.winner_board(&trial, symbols);
+                Some(ScoredBoard {
+                    plaintext: match plaintext {
+                        Some(plaintext) => plaintext,
+                        None => self.evaluator.replay_plaintext(&board)?,
+                    },
+                    board,
+                    score,
+                })
+            }
             None => None,
         };
         Ok(ScanOutcome::Complete(winner))
@@ -9576,6 +9584,55 @@ mod tests {
             ScanOutcome::Complete(None),
         ] {
             assert!(seen.contains(&std::mem::discriminant(&outcome)));
+        }
+    }
+
+    #[test]
+    fn mapped_scans_fill_no_trial_board_and_build_one_winner_plaintext() {
+        let (initial, domain) = fixture();
+        let fills = || crate::attack_evaluator::BOARD_FILLS.with(|count| count.replace(0));
+        for deny in [false, true] {
+            let evaluator = TrialEvaluator::new(
+                &initial,
+                &domain,
+                "ABCABCAB",
+                Direction::Decrypt,
+                MeasureId::Ic,
+                None,
+            );
+            let evaluator = if deny {
+                evaluator.with_reservation_denied()
+            } else {
+                evaluator
+            };
+            let selection = NeighborhoodSelection {
+                initial: &initial,
+                domain: &domain,
+                evaluator: &evaluator,
+                backtrack_pairs: 0,
+            };
+            for ranking in [i128::MIN, i128::MAX].map(FixedScore::from_units) {
+                for current in [vec![], vec![('A', 'B')]] {
+                    let mut allowance = EvaluationAllowance { used: 0, limit: 99 };
+                    plaintext_builds();
+                    fills();
+                    let outcome = selection.scan(&current, ranking, &mut allowance, 0);
+                    let Ok(ScanOutcome::Complete(winner)) = outcome else {
+                        panic!("{outcome:?}");
+                    };
+                    let trials = usize::try_from(allowance.used).unwrap();
+                    assert!(trials > 1);
+                    let winner = usize::from(winner.is_some());
+                    assert_eq!(winner, usize::from(ranking.units() == i128::MIN));
+                    // Trials never fill a board mapping; only a streamed winner's
+                    // replay does, once per scan.
+                    assert_eq!(fills(), if deny { 0 } else { winner }, "{deny}");
+                    // Denied rows materialize every trial; streamed scans build only
+                    // the winner's plaintext.
+                    let builds = if deny { trials } else { winner };
+                    assert_eq!(plaintext_builds(), builds, "{deny}");
+                }
+            }
         }
     }
 
