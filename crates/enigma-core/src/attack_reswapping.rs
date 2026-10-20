@@ -1,7 +1,7 @@
 //! Private constrained steepest-ascent reswapping stage (search-passes §9.3, §9.5).
 
 use crate::attack_control::{AttackControl, CounterObserver};
-use crate::attack_hill_climb::{EvaluationAccounting, ObservedAccounting, ScoredBoard};
+use crate::attack_hill_climb::{EvaluationAccounting, ObservedAccounting};
 use crate::attack_result::{AttackRunErrorData, RunPayload};
 use crate::{Alphabet, AttackPlugboardDomain, AttackTermination, MeasureId, MeasuredScore};
 
@@ -19,6 +19,13 @@ fn normalize(alphabet: &Alphabet, board: &mut [(char, char)]) {
     board.sort_by_key(|&(a, b)| (order(alphabet, a), order(alphabet, b)));
 }
 
+/// A scored trial board; plaintext only when a materializing fallback carried it.
+struct Trial {
+    board: Vec<(char, char)>,
+    plaintext: Option<String>,
+    score: MeasuredScore,
+}
+
 struct Reswapper<'s, 'a, O, C, E> {
     alphabet: &'s Alphabet,
     domain: &'s AttackPlugboardDomain,
@@ -31,7 +38,7 @@ impl<O, C, E> Reswapper<'_, '_, O, C, E>
 where
     O: CounterObserver,
     C: FnMut() -> bool,
-    E: FnMut(&[(char, char)]) -> Result<(String, MeasuredScore), RunPayload>,
+    E: FnMut(&[(char, char)]) -> Result<(Option<String>, MeasuredScore), RunPayload>,
 {
     fn cancelled(&mut self) -> bool {
         let requested = (self.cancel_requested)();
@@ -42,7 +49,7 @@ where
     fn trial(
         &mut self,
         board: &[(char, char)],
-    ) -> Result<Result<ScoredBoard, AttackTermination>, RunPayload> {
+    ) -> Result<Result<Trial, AttackTermination>, RunPayload> {
         if self.cancelled() {
             return Ok(Err(AttackTermination::Cancelled));
         }
@@ -53,7 +60,7 @@ where
         let record = AttackControl::record_evaluation_completed;
         self.accounting.transition(record)?;
         let board = board.to_vec();
-        Ok(Ok(ScoredBoard {
+        Ok(Ok(Trial {
             board,
             plaintext,
             score,
@@ -64,7 +71,7 @@ where
     fn run(
         &mut self,
         start: &[(char, char)],
-        committed: &mut Option<ScoredBoard>,
+        committed: &mut Option<Trial>,
     ) -> Result<Option<AttackTermination>, RunPayload> {
         let mut current = match self.trial(start)? {
             Ok(initial) => initial,
@@ -114,6 +121,8 @@ where
 }
 
 /// Runs one reswapping stage on the committed best; history follows first admission.
+/// Trials are score-only; only the final commit's plaintext is replayed, once and
+/// outside accounting, unless a materializing fallback already carried it.
 pub(crate) fn reswapping_stage(
     mut result: crate::AttackResult,
     measure: MeasureId,
@@ -121,7 +130,10 @@ pub(crate) fn reswapping_stage(
     domain: &AttackPlugboardDomain,
     accounting: &mut ObservedAccounting<'_, impl CounterObserver>,
     cancel_requested: impl FnMut() -> bool,
-    evaluate: impl FnMut(&[(char, char)]) -> Result<(String, MeasuredScore), RunPayload>,
+    (evaluate, replay): (
+        impl FnMut(&[(char, char)]) -> Result<(Option<String>, MeasuredScore), RunPayload>,
+        impl FnOnce(&[(char, char)]) -> Result<String, RunPayload>,
+    ),
 ) -> Result<crate::AttackResult, crate::AttackRunError> {
     let before = accounting.allowance.used;
     let best = result.best.as_mut().expect("completed run has best");
@@ -134,16 +146,34 @@ pub(crate) fn reswapping_stage(
         evaluate,
     }
     .run(&best.mutable_plugboard.clone(), &mut committed);
+    let score = committed.as_ref().map(|key| key.score);
+    // A replay failure is an invariant; any earlier trial error keeps precedence.
+    let (committed, outcome) = match committed {
+        Some(Trial {
+            board,
+            plaintext: None,
+            score,
+        }) => match replay(&board) {
+            Ok(plaintext) => (Some((board, plaintext, score)), outcome),
+            Err(source) => (None, outcome.and(Err(source))),
+        },
+        Some(Trial {
+            board,
+            plaintext: Some(plaintext),
+            score,
+        }) => (Some((board, plaintext, score)), outcome),
+        None => (None, outcome),
+    };
     // Admission charges the allowance first; an unchanged count means not started.
     if accounting.allowance.used != before {
-        if let Some(key) = &committed {
-            let mut pairs = [domain.fixed_pairs(), &key.board].concat();
+        if let Some((board, plaintext, score)) = committed {
+            let mut pairs = [domain.fixed_pairs(), &board].concat();
             normalize(alphabet, &mut pairs);
             let slots = best.configuration.slots().to_vec();
             best.configuration = crate::TransformConfiguration::new(slots, pairs);
-            best.mutable_plugboard.clone_from(&key.board);
-            best.plaintext.clone_from(&key.plaintext);
-            (best.score, best.measure) = (key.score, measure);
+            best.mutable_plugboard = board;
+            best.plaintext = plaintext;
+            (best.score, best.measure) = (score, measure);
         }
         result.evaluations_used = accounting.allowance.used;
         result.counters = crate::AttackProgress(accounting.control.snapshot());
@@ -151,7 +181,7 @@ pub(crate) fn reswapping_stage(
             pass: "reswapping",
             measure,
             base_measure: None,
-            score: committed.map(|key| key.score),
+            score,
             evaluations_used: accounting.allowance.used - before,
             completed: matches!(outcome, Ok(None)),
         });
@@ -206,7 +236,25 @@ mod tests {
     /// score -100. `stop` is [budget, cancel after, fail at]; boards are logged raw
     /// and scored by their sorted symbols (default 0).
     fn run(start: &[(char, char)], scores: &[(&str, i128)], stop: [usize; 3]) -> Run {
-        run_with(AttackControl::default(), start, scores, stop)
+        run_with(AttackControl::default(), start, scores, stop, Mode::Stream)
+    }
+
+    /// How synthetic trials deliver plaintext: streamed and replayed on commit,
+    /// carried from a materializing fallback, or streamed with a failing replay.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mode {
+        Stream,
+        Carry,
+        ReplayFails,
+    }
+
+    thread_local! {
+        static REPLAYS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Raw boards replayed since the last call.
+    fn replays() -> Vec<String> {
+        REPLAYS.with(|replays| replays.take())
     }
 
     fn run_with(
@@ -214,6 +262,7 @@ mod tests {
         start: &[(char, char)],
         scores: &[(&str, i128)],
         stop: [usize; 3],
+        mode: Mode,
     ) -> Run {
         let alphabet = Alphabet::new("ABCDEF".chars().collect()).unwrap();
         let json = r#"{"kind":"attack","symbols":["D","A","C","B"],"max_pairs":3}"#;
@@ -250,22 +299,45 @@ mod tests {
             observer: &mut Recorder,
         };
         let cancel = || count.get() >= stop[1];
+        let raw = |board: &[(char, char)]| -> String {
+            board.iter().flat_map(|&(a, b)| [a, b]).collect()
+        };
+        let key = |raw: &str| {
+            let mut key: Vec<char> = raw.chars().collect();
+            key.sort_unstable();
+            key.into_iter().collect::<String>()
+        };
         let evaluate = |board: &[(char, char)]| {
             count.set(count.get() + 1);
-            let raw: String = board.iter().flat_map(|&(a, b)| [a, b]).collect();
-            let mut key: Vec<char> = raw.chars().collect();
+            let raw = raw(board);
+            let key = key(&raw);
             log.borrow_mut().push(raw);
             if count.get() == stop[2] {
                 return Err(RunPayload::Invariant("synthetic trial failure"));
             }
-            key.sort_unstable();
-            let key: String = key.into_iter().collect();
             let units = scores.iter().find(|(k, _)| *k == key).map_or(0, |e| e.1);
-            Ok((format!("p{key}"), score(units)))
+            let carried = (mode == Mode::Carry).then(|| format!("p{key}"));
+            Ok((carried, score(units)))
+        };
+        let replay = |board: &[(char, char)]| {
+            let raw = raw(board);
+            let plaintext = format!("p{}", key(&raw));
+            REPLAYS.with(|replays| replays.borrow_mut().push(raw));
+            match mode {
+                Mode::ReplayFails => Err(RunPayload::Invariant("synthetic replay failure")),
+                _ => Ok(plaintext),
+            }
         };
         let measure = MeasureId::SinkovTrigram;
+        replays();
         let outcome = reswapping_stage(
-            result, measure, &alphabet, &domain, accounting, cancel, evaluate,
+            result,
+            measure,
+            &alphabet,
+            &domain,
+            accounting,
+            cancel,
+            (evaluate, replay),
         );
         let retained = match &outcome {
             Ok(result) => &result.held_tail[..],
@@ -388,7 +460,9 @@ mod tests {
             ..CounterSnapshot::default()
         };
         let control = AttackControl::with_counters(counters);
-        let error = run_with(control, AB, &[], [N, N, N]).0.unwrap_err();
+        let error = run_with(control, AB, &[], [N, N, N], Mode::Stream)
+            .0
+            .unwrap_err();
         let overflow = crate::AttackCounterOverflow::EvaluationsAdmitted;
         assert_eq!(error.run_source().overflow(), Some(overflow));
         let s = &error.stages()[0];
@@ -405,5 +479,412 @@ mod tests {
         assert_eq!(prior.score, score(-100));
         let s = &error.stages()[0];
         assert_eq!((s.score(), s.evaluations_used()), (None, 1));
+    }
+
+    #[test]
+    fn only_the_committed_board_is_replayed_once() {
+        ok(run(&[('B', 'A')], &[], [N, N, N]));
+        assert_eq!(replays(), ["AB"]);
+        ok(run(AB, &[("AC", 5), ("BC", 5)], [N, N, N]));
+        assert_eq!(replays(), ["AC"]);
+        // Interruptions discard the provisional winner; only the commit replays.
+        let (result, _) = ok(run(AB_CD, &[("CD", 3), ("AC", 9)], [12, N, N]));
+        assert_eq!(replays(), ["CD"]);
+        assert_eq!(best(result.best.as_ref().unwrap()).2, "pCD");
+        ok(run(AB_CD, &[("CD", 3)], [N, 9, N]));
+        assert_eq!(replays(), ["ABCD"]);
+        for stop in [[0, N, N], [N, 0, N], [N, N, 1]] {
+            let _ = run(AB, &[], stop);
+            assert!(replays().is_empty());
+        }
+        run(AB_CD, &[("CD", 3)], [N, N, 12]).0.unwrap_err();
+        assert_eq!(replays(), ["CD"]);
+    }
+
+    #[test]
+    fn carried_plaintext_is_never_replayed_and_matches_streamed_runs() {
+        type Scores<'a> = &'a [(&'a str, i128)];
+        let cases: [(Pairs, Scores, [usize; 3]); 6] = [
+            (&[('B', 'A')], &[], [N, N, N]),
+            (AB, &[("AC", 5), ("BC", 5)], [N, N, N]),
+            (AB_CD, &[("CD", 3), ("AC", 9)], [12, N, N]),
+            (AB_CD, &[("CD", 3)], [N, 9, N]),
+            (AB_CD, &[("CD", 3)], [N, N, 12]),
+            (AB, &[], [N, N, 1]),
+        ];
+        for (start, scores, stop) in cases {
+            let control = AttackControl::default;
+            let streamed = run_with(control(), start, scores, stop, Mode::Stream);
+            let carried = run_with(control(), start, scores, stop, Mode::Carry);
+            assert!(replays().is_empty());
+            assert_eq!(format!("{carried:?}"), format!("{streamed:?}"));
+        }
+    }
+
+    #[test]
+    fn replay_failure_is_an_invariant_after_any_trial_error() {
+        let control = AttackControl::default;
+        let failed = |stop| run_with(control(), AB_CD, &[("CD", 3)], stop, Mode::ReplayFails);
+        let error = failed([N, N, N]).0.unwrap_err();
+        assert!(matches!(
+            error.run_source().0,
+            RunPayload::Invariant("synthetic replay failure")
+        ));
+        // The unreplayable commit never reaches best; history still records it.
+        assert_eq!(best(error.best().unwrap().unwrap()).2, "old");
+        let s = &error.stages()[0];
+        let history = (s.score(), s.evaluations_used(), s.completed());
+        assert_eq!(history, (Some(score(3)), 17, false));
+        assert_eq!(error.evaluations_used(), 22);
+        assert_eq!(error.counters().evaluations_completed(), 17);
+        let error = failed([N, N, 12]).0.unwrap_err();
+        assert!(matches!(
+            error.run_source().0,
+            RunPayload::Invariant("synthetic trial failure")
+        ));
+    }
+
+    /// The materializing stage before score-only trials, kept as an oracle.
+    mod reference {
+        use super::super::{normalize, order};
+        use crate::attack_control::{AttackControl, CounterObserver};
+        use crate::attack_hill_climb::{EvaluationAccounting, ObservedAccounting, ScoredBoard};
+        use crate::attack_result::{AttackRunErrorData, RunPayload};
+        use crate::MeasuredScore;
+        use crate::{Alphabet, AttackPlugboardDomain, AttackTermination, MeasureId};
+
+        struct Reswapper<'s, 'a, O, C, E> {
+            alphabet: &'s Alphabet,
+            domain: &'s AttackPlugboardDomain,
+            accounting: &'s mut ObservedAccounting<'a, O>,
+            cancel_requested: C,
+            evaluate: E,
+        }
+
+        impl<O, C, E> Reswapper<'_, '_, O, C, E>
+        where
+            O: CounterObserver,
+            C: FnMut() -> bool,
+            E: FnMut(&[(char, char)]) -> Result<(String, MeasuredScore), RunPayload>,
+        {
+            fn cancelled(&mut self) -> bool {
+                let requested = (self.cancel_requested)();
+                self.accounting.control.poll_cancellation(requested)
+            }
+
+            fn trial(
+                &mut self,
+                board: &[(char, char)],
+            ) -> Result<Result<ScoredBoard, AttackTermination>, RunPayload> {
+                if self.cancelled() {
+                    return Ok(Err(AttackTermination::Cancelled));
+                }
+                if !self.accounting.admit(0)? {
+                    return Ok(Err(AttackTermination::EvaluationBudget));
+                }
+                let (plaintext, score) = (self.evaluate)(board)?;
+                let record = AttackControl::record_evaluation_completed;
+                self.accounting.transition(record)?;
+                let board = board.to_vec();
+                Ok(Ok(ScoredBoard {
+                    board,
+                    plaintext,
+                    score,
+                }))
+            }
+
+            fn run(
+                &mut self,
+                start: &[(char, char)],
+                committed: &mut Option<ScoredBoard>,
+            ) -> Result<Option<AttackTermination>, RunPayload> {
+                let mut current = match self.trial(start)? {
+                    Ok(initial) => initial,
+                    Err(stop) => return Ok(Some(stop)),
+                };
+                loop {
+                    normalize(self.alphabet, &mut current.board);
+                    let (pairs, mut bar) = (current.board.clone(), current.score);
+                    *committed = Some(current);
+                    let mut winner = None;
+                    for (index, &(i, k)) in pairs.iter().enumerate() {
+                        let mut rest = pairs.clone();
+                        rest.remove(index);
+                        let mut free: Vec<char> = (self.domain.symbols().iter().copied())
+                            .filter(|&x| rest.iter().all(|&(a, b)| a != x && b != x))
+                            .collect();
+                        free.sort_by_key(|&x| order(self.alphabet, x));
+                        for x in free {
+                            for end in [i, k] {
+                                let mut board = rest.clone();
+                                if x != end {
+                                    board.push((end, x));
+                                }
+                                let trial = match self.trial(&board)? {
+                                    Ok(trial) => trial,
+                                    Err(stop) => return Ok(Some(stop)),
+                                };
+                                if trial.score.ranking().units() > bar.ranking().units() {
+                                    bar = trial.score;
+                                    winner = Some(trial);
+                                }
+                            }
+                        }
+                    }
+                    let Some(winner) = winner else {
+                        return Ok(None);
+                    };
+                    if self.cancelled() {
+                        return Ok(Some(AttackTermination::Cancelled));
+                    }
+                    current = winner;
+                }
+            }
+        }
+
+        pub(super) fn reswapping_stage(
+            mut result: crate::AttackResult,
+            measure: MeasureId,
+            alphabet: &Alphabet,
+            domain: &AttackPlugboardDomain,
+            accounting: &mut ObservedAccounting<'_, impl CounterObserver>,
+            cancel_requested: impl FnMut() -> bool,
+            evaluate: impl FnMut(&[(char, char)]) -> Result<(String, MeasuredScore), RunPayload>,
+        ) -> Result<crate::AttackResult, crate::AttackRunError> {
+            let before = accounting.allowance.used;
+            let best = result.best.as_mut().expect("completed run has best");
+            let mut committed = None;
+            let outcome = Reswapper {
+                alphabet,
+                domain,
+                accounting: &mut *accounting,
+                cancel_requested,
+                evaluate,
+            }
+            .run(&best.mutable_plugboard.clone(), &mut committed);
+            if accounting.allowance.used != before {
+                if let Some(key) = &committed {
+                    let mut pairs = [domain.fixed_pairs(), &key.board].concat();
+                    normalize(alphabet, &mut pairs);
+                    let slots = best.configuration.slots().to_vec();
+                    best.configuration = crate::TransformConfiguration::new(slots, pairs);
+                    best.mutable_plugboard.clone_from(&key.board);
+                    best.plaintext.clone_from(&key.plaintext);
+                    (best.score, best.measure) = (key.score, measure);
+                }
+                result.evaluations_used = accounting.allowance.used;
+                result.counters = crate::AttackProgress(accounting.control.snapshot());
+                result.stages.push(crate::AttackStageResult {
+                    pass: "reswapping",
+                    measure,
+                    base_measure: None,
+                    score: committed.map(|key| key.score),
+                    evaluations_used: accounting.allowance.used - before,
+                    completed: matches!(outcome, Ok(None)),
+                });
+            }
+            match outcome {
+                Ok(stop) => {
+                    result.termination = stop.unwrap_or(result.termination);
+                    Ok(result)
+                }
+                Err(source) => {
+                    accounting.control.notify(accounting.observer);
+                    Err(crate::AttackRunError::new(AttackRunErrorData {
+                        outer_index: result.best.as_ref().map(|best| best.outer_index),
+                        start_index: result.best.as_ref().map(|best| best.start_index),
+                        source: crate::AttackRunSource(source),
+                        held_tail: result.held_tail,
+                        stages: result.stages,
+                        evaluations_used: result.evaluations_used,
+                        counters: result.counters,
+                        best: Ok(result.best),
+                    }))
+                }
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct Snapshots(Vec<CounterSnapshot>);
+    impl CounterObserver for Snapshots {
+        fn observe(&mut self, snapshot: CounterSnapshot) {
+            self.0.push(snapshot);
+        }
+    }
+
+    #[test]
+    fn score_only_reswapping_matches_materializing_reference() {
+        use crate::attack_evaluator::{TrialEvaluator, PLAINTEXT_BUILDS};
+        use crate::{BoundResource, SlotConfiguration, TransformConfiguration};
+        use MeasureId::{Entropy, Ic, SinkovBigram, SinkovQuadgram, Trie};
+        let builds = || PLAINTEXT_BUILDS.with(|count| count.replace(0));
+        let mut improved = 0;
+        for symbols in ["ABCDEF", "界éHβAGλ", "ABCDEFGHIJKLMNOPQRSTUVWXYZ"] {
+            let s: Vec<char> = symbols.chars().collect();
+            let wiring: Vec<char> = s.iter().cycle().skip(3).take(s.len()).copied().collect();
+            let source = serde_json::json!({"kind": "custom", "value": {
+                "alphabet": s, "wheels": [{"name": "r", "wiring": wiring, "turnovers": []}],
+                "slots": [{"id": "r", "role": "rotor", "movement": "movable", "wheel": "r"}],
+                "stepping": {"rules": [{"when": {"always": true}, "advance": ["r"]}]}
+            }});
+            let definition = crate::DefinitionSource::parse_json(&source.to_string())
+                .unwrap()
+                .resolve()
+                .unwrap();
+            let slots = vec![SlotConfiguration::new("r", "r", s[0], 'A')];
+            let initial = TransformConfiguration::new(slots.clone(), vec![])
+                .resolve(&definition)
+                .unwrap();
+            let alphabet = initial.topology().alphabet();
+            let json = serde_json::json!({"kind": "attack", "symbols": s, "max_pairs": 3});
+            let domain =
+                AttackPlugboardDomain::parse_json(alphabet, &[], &json.to_string()).unwrap();
+            let ngram = |order| {
+                let entries = vec![(s[..order].to_vec(), 5), (vec![s[1]; order], 2)];
+                BoundResource::Ngram(
+                    crate::NgramModel::new(alphabet.clone(), order, entries).unwrap(),
+                )
+            };
+            let entries = vec![(vec![s[0], s[2]], 3), (vec![s[1]], -1), (vec![s[4]], 2)];
+            let trie =
+                BoundResource::Trie(crate::TrieModel::new(alphabet.clone(), entries).unwrap());
+            let (bigram, quadgram) = (ngram(2), ngram(4));
+            let input: String = (0..40).map(|i| s[(i * 7 + i / 3) % s.len()]).collect();
+            let start = [(s[0], s[1]), (s[2], s[3])];
+            for (measure, resource) in [
+                (Ic, None),
+                (Entropy, None),
+                (SinkovBigram, Some(&bigram)),
+                (SinkovQuadgram, Some(&quadgram)),
+                (Trie, Some(&trie)),
+            ] {
+                // Quadgrams over 26 symbols have no dense table and score sparsely.
+                let streamable = measure != Trie && (measure != SinkovQuadgram || s.len() < 26);
+                for deny in [false, true] {
+                    for (limit, cancel_at) in [
+                        (N, N),
+                        (0, N),
+                        (1, N),
+                        (7, N),
+                        (30, N),
+                        (N, 0),
+                        (N, 1),
+                        (N, 10),
+                        (N, 40),
+                    ] {
+                        let run = |old: bool| {
+                            let evaluator = TrialEvaluator::new(
+                                &initial,
+                                &domain,
+                                &input,
+                                crate::Direction::Decrypt,
+                                measure,
+                                resource,
+                            );
+                            let evaluator = if deny {
+                                evaluator.with_reservation_denied()
+                            } else {
+                                evaluator
+                            };
+                            let configuration =
+                                TransformConfiguration::new(slots.clone(), start.to_vec());
+                            let result = AttackResult {
+                                held_tail: Vec::new(),
+                                termination: Completed,
+                                counters: crate::AttackProgress(CounterSnapshot::default()),
+                                evaluations_used: 5,
+                                best: Some(AttackBest {
+                                    configuration,
+                                    mutable_plugboard: start.to_vec(),
+                                    plaintext: "old".into(),
+                                    score: score(-100),
+                                    measure: MeasureId::Ic,
+                                    outer_index: 1,
+                                    start_index: 2,
+                                    incomplete: false,
+                                    final_objective_ascent: false,
+                                    neighborhood_exhausted: false,
+                                    stages: Vec::new(),
+                                }),
+                                stages: Vec::new(),
+                            };
+                            let mut control = AttackControl::default();
+                            let mut observer = Snapshots::default();
+                            let limit = (limit as u64).saturating_add(5);
+                            let mut allowance = EvaluationAllowance { used: 5, limit };
+                            let accounting = &mut ObservedAccounting {
+                                allowance: &mut allowance,
+                                control: &mut control,
+                                observer: &mut observer,
+                            };
+                            let polls = Cell::new(0);
+                            let cancel = || {
+                                polls.set(polls.get() + 1);
+                                polls.get() > cancel_at
+                            };
+                            builds();
+                            let outcome = if old {
+                                let evaluate = |board: &[(char, char)]| {
+                                    evaluator.evaluate(board).map_err(RunPayload::Evaluation)
+                                };
+                                reference::reswapping_stage(
+                                    result, measure, alphabet, &domain, accounting, cancel,
+                                    evaluate,
+                                )
+                            } else {
+                                let evaluate = |board: &[(char, char)]| {
+                                    evaluator
+                                        .evaluate_score(board)
+                                        .map_err(RunPayload::Evaluation)
+                                };
+                                let replay = |board: &[(char, char)]| {
+                                    evaluator.replay_plaintext(board).map_err(RunPayload::from)
+                                };
+                                reswapping_stage(
+                                    result,
+                                    measure,
+                                    alphabet,
+                                    &domain,
+                                    accounting,
+                                    cancel,
+                                    (evaluate, replay),
+                                )
+                            };
+                            let builds = builds();
+                            let used = allowance.used;
+                            (
+                                format!("{outcome:?}"),
+                                outcome,
+                                used,
+                                control.snapshot(),
+                                observer.0,
+                                builds,
+                            )
+                        };
+                        let label = format!("{symbols} {measure:?} {deny} {limit} {cancel_at}");
+                        let (old, new) = (run(true), run(false));
+                        assert_eq!(
+                            (&new.0, new.2, new.3, &new.4),
+                            (&old.0, old.2, old.3, &old.4),
+                            "{label}"
+                        );
+                        let result = new.1.unwrap();
+                        let stage = result.stages.first();
+                        let committed = stage.is_some_and(|stage| stage.score().is_some());
+                        let expected = if streamable && !deny {
+                            usize::from(committed)
+                        } else {
+                            old.5
+                        };
+                        assert_eq!(new.5, expected, "{label}");
+                        assert_eq!(old.5, usize::try_from(old.2 - 5).unwrap(), "{label}");
+                        let board = &result.best.as_ref().unwrap().mutable_plugboard;
+                        improved += usize::from(committed && board[..] != start[..]);
+                    }
+                }
+            }
+        }
+        assert!(improved > 0);
     }
 }

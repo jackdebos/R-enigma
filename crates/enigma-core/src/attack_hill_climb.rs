@@ -294,14 +294,23 @@ impl crate::AttackRequest {
                     self.domain(),
                     accounting,
                     &mut cancel_requested,
-                    |board| {
-                        initial()?;
-                        scorer
-                            .as_ref()
-                            .expect("resolved stage scorer")
-                            .evaluate(board)
-                            .map_err(RunPayload::Evaluation)
-                    },
+                    (
+                        |board| {
+                            initial()?;
+                            scorer
+                                .as_ref()
+                                .expect("resolved stage scorer")
+                                .evaluate_score(board)
+                                .map_err(RunPayload::Evaluation)
+                        },
+                        // Only a scored, hence resolved, commit is ever replayed.
+                        |board| {
+                            let scorer = scorer.as_ref();
+                            let scorer =
+                                scorer.ok_or(RunPayload::Invariant("missing replay scorer"))?;
+                            scorer.replay_plaintext(board).map_err(RunPayload::from)
+                        },
+                    ),
                 )?
             } else {
                 let (_, measure, base_measure) = scoring_stage_metadata(*stage);
@@ -9760,6 +9769,14 @@ mod tests {
         assert!(result.stages[0].evaluations_used > 1);
         assert_eq!(direct, 1);
         assert_eq!(builds(), direct);
+        // Streamed reswapping trials build no plaintext; only the commit replays.
+        let plaintexts = |staged| {
+            plaintext_builds();
+            let result = request(staged).run(|_| {}, || false).unwrap();
+            (result, plaintext_builds())
+        };
+        let ((_, plain), (staged, builds)) = (plaintexts(false), plaintexts(true));
+        assert_eq!((builds - plain, staged.stages.len()), (1, 1));
     }
 
     #[test]
