@@ -260,7 +260,18 @@ impl From<crate::attack_hill_climb::ObservedClimbError> for RunPayload {
         use crate::attack_hill_climb::ObservedClimbError;
         match error {
             ObservedClimbError::Counter(source) => Self::Counter(source),
-            ObservedClimbError::Evaluation(source) => Self::Evaluation(source),
+            ObservedClimbError::Evaluation(source) => source.into(),
+        }
+    }
+}
+
+/// Evaluator invariants keep the invariant category instead of an evaluation cause.
+impl From<crate::attack_evaluator::TrialEvaluationError> for RunPayload {
+    fn from(error: crate::attack_evaluator::TrialEvaluationError) -> Self {
+        use crate::attack_evaluator::TrialEvaluationError;
+        match error {
+            TrialEvaluationError::Invariant(message) => Self::Invariant(message),
+            source => Self::Evaluation(source),
         }
     }
 }

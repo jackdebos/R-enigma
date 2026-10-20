@@ -813,10 +813,7 @@ impl ControlledPartialRunError {
                 RunPayload::Invariant("unsupported partial pass")
             }
             ControlledPartialRunSource::Climb(ControlledPartialSource::Climb(source)) => {
-                match source {
-                    ObservedClimbError::Evaluation(source) => RunPayload::Evaluation(source),
-                    ObservedClimbError::Counter(source) => RunPayload::Counter(source),
-                }
+                RunPayload::from(source)
             }
         };
         let error = crate::AttackRunError::new(AttackRunErrorData {
@@ -1664,9 +1661,7 @@ impl ControlledDirectError {
                 RunPayload::Invariant("accepted best projection failed")
             }
             DirectRunError::Resolution(diagnostics) => RunPayload::Resolution(diagnostics),
-            DirectRunError::Climb(DirectClimbError::Evaluation(source)) => {
-                RunPayload::Evaluation(source)
-            }
+            DirectRunError::Climb(DirectClimbError::Evaluation(source)) => source.into(),
             DirectRunError::Counter(source) => RunPayload::Counter(source),
             DirectRunError::MissingOuter => RunPayload::Invariant("missing selected outer"),
             DirectRunError::Climb(DirectClimbError::MissingStart) => {
@@ -1950,6 +1945,20 @@ pub(super) trait EvaluationAccounting {
             return Ok(None);
         }
         let result = evaluator.evaluate(board)?;
+        self.transition(AttackControl::record_evaluation_completed)?;
+        Ok(Some(result))
+    }
+    /// [`Self::evaluate`] with the same accounting; plaintext only when materialized.
+    fn evaluate_score(
+        &mut self,
+        evaluator: &TrialEvaluator<'_>,
+        board: &[(char, char)],
+        reserve: u64,
+    ) -> Result<Option<(Option<String>, MeasuredScore)>, Self::Error> {
+        if !self.admit(reserve)? {
+            return Ok(None);
+        }
+        let result = evaluator.evaluate_score(board)?;
         self.transition(AttackControl::record_evaluation_completed)?;
         Ok(Some(result))
     }
@@ -2524,17 +2533,14 @@ impl NeighborhoodSelection<'_> {
             if allowance.cancelled() {
                 return Ok(ScanOutcome::Cancelled);
             }
-            let Some((plaintext, score)) = allowance.evaluate(self.evaluator, &board, reserve)?
+            let Some((plaintext, score)) =
+                allowance.evaluate_score(self.evaluator, &board, reserve)?
             else {
                 return Ok(ScanOutcome::Interrupted);
             };
             if score.ranking().units() > best_ranking.units() {
                 best_ranking = score.ranking();
-                best = Some(ScoredBoard {
-                    board,
-                    plaintext,
-                    score,
-                });
+                best = Some((board, plaintext, score));
             }
             if allowance.cancelled() {
                 // A completed losing scan has already established exhaustion.
@@ -2544,7 +2550,20 @@ impl NeighborhoodSelection<'_> {
                 return Ok(ScanOutcome::Cancelled);
             }
         }
-        Ok(ScanOutcome::Complete(best))
+        // Only a completed scan's winner gets plaintext; streamed winners replay
+        // once, outside accounting.
+        let winner = match best {
+            Some((board, plaintext, score)) => Some(ScoredBoard {
+                plaintext: match plaintext {
+                    Some(plaintext) => plaintext,
+                    None => self.evaluator.replay_plaintext(&board)?,
+                },
+                board,
+                score,
+            }),
+            None => None,
+        };
+        Ok(ScanOutcome::Complete(winner))
     }
 }
 
@@ -9338,6 +9357,255 @@ mod tests {
             Err(TrialEvaluationError::Board(_))
         ));
         assert_eq!(allowance.used, 1);
+    }
+
+    /// The materializing scan before score-only trials, kept as an oracle.
+    fn reference_scan<A: EvaluationAccounting>(
+        selection: &NeighborhoodSelection<'_>,
+        current: &[(char, char)],
+        ranking: FixedScore,
+        allowance: &mut A,
+        reserve: u64,
+    ) -> Result<ScanOutcome, A::Error> {
+        let mut cursor = NeighborhoodCursor::new(
+            selection.initial,
+            selection.domain,
+            current,
+            selection.backtrack_pairs,
+        )
+        .map_err(TrialEvaluationError::Board)?
+        .peekable();
+        let mut best = None;
+        let mut best_ranking = ranking;
+        while let Some(board) = cursor.next() {
+            if allowance.cancelled() {
+                return Ok(ScanOutcome::Cancelled);
+            }
+            let Some((plaintext, score)) =
+                allowance.evaluate(selection.evaluator, &board, reserve)?
+            else {
+                return Ok(ScanOutcome::Interrupted);
+            };
+            if score.ranking().units() > best_ranking.units() {
+                best_ranking = score.ranking();
+                best = Some(ScoredBoard {
+                    board,
+                    plaintext,
+                    score,
+                });
+            }
+            if allowance.cancelled() {
+                if best.is_none() && cursor.peek().is_none() {
+                    return Ok(ScanOutcome::Complete(None));
+                }
+                return Ok(ScanOutcome::Cancelled);
+            }
+        }
+        Ok(ScanOutcome::Complete(best))
+    }
+
+    /// Budget accounting whose cancellation poll fires from the `stop`th poll on.
+    struct CancelAfter {
+        allowance: EvaluationAllowance,
+        polls: usize,
+        stop: usize,
+    }
+
+    impl EvaluationAccounting for CancelAfter {
+        type Error = TrialEvaluationError;
+        fn cancelled(&mut self) -> bool {
+            self.polls += 1;
+            self.polls >= self.stop
+        }
+        fn admit(&mut self, reserve: u64) -> Result<bool, Self::Error> {
+            Ok(self.allowance.admit(reserve))
+        }
+    }
+
+    fn plaintext_builds() -> usize {
+        crate::attack_evaluator::PLAINTEXT_BUILDS.with(|count| count.replace(0))
+    }
+
+    #[test]
+    fn score_only_scans_match_materializing_reference_and_build_one_plaintext() {
+        let (initial, domain) = fixture();
+        let trie = resource(&initial);
+        let bigram = crate::BoundResource::Ngram(
+            crate::NgramModel::new(
+                initial.topology().alphabet().clone(),
+                2,
+                vec![(vec!['C', 'B'], 3), (vec!['A', 'C'], 1)],
+            )
+            .unwrap(),
+        );
+        for (objective, resource) in [
+            (MeasureId::Ic, None),
+            (MeasureId::Entropy, None),
+            (MeasureId::SinkovBigram, Some(&bigram)),
+            (MeasureId::Trie, Some(&trie)),
+        ] {
+            for deny in [false, true] {
+                for input in ["A", "AA", "ABCABCAB"] {
+                    let new = || {
+                        let evaluator = TrialEvaluator::new(
+                            &initial,
+                            &domain,
+                            input,
+                            Direction::Decrypt,
+                            objective,
+                            resource,
+                        );
+                        if deny {
+                            evaluator.with_reservation_denied()
+                        } else {
+                            evaluator
+                        }
+                    };
+                    let (old, new) = (new(), new());
+                    let streams = !deny && objective != MeasureId::Trie;
+                    for ranking in [i128::MIN, 0, i128::MAX].map(FixedScore::from_units) {
+                        for (current, limit) in [(vec![], 9), (vec![('A', 'B')], 9), (vec![], 2)] {
+                            let mut outcomes = Vec::new();
+                            for evaluator in [&old, &new] {
+                                let selection = NeighborhoodSelection {
+                                    initial: &initial,
+                                    domain: &domain,
+                                    evaluator,
+                                    backtrack_pairs: 0,
+                                };
+                                let mut allowance = EvaluationAllowance { used: 3, limit };
+                                let mut control = AttackControl::default();
+                                let mut observer = Recorder::default();
+                                let mut accounting = ObservedAccounting {
+                                    allowance: &mut allowance,
+                                    control: &mut control,
+                                    observer: &mut observer,
+                                };
+                                plaintext_builds();
+                                let outcome = if std::ptr::eq(evaluator, &old) {
+                                    reference_scan(
+                                        &selection,
+                                        &current,
+                                        ranking,
+                                        &mut accounting,
+                                        0,
+                                    )
+                                } else {
+                                    selection.scan(&current, ranking, &mut accounting, 0)
+                                };
+                                let builds = plaintext_builds();
+                                if std::ptr::eq(evaluator, &new) {
+                                    let trials = usize::try_from(allowance.used - 3).unwrap();
+                                    let winner =
+                                        matches!(outcome, Ok(ScanOutcome::Complete(Some(_))));
+                                    let expected =
+                                        if streams { usize::from(winner) } else { trials };
+                                    assert_eq!(builds, expected, "{objective:?} {input} {deny}");
+                                }
+                                outcomes.push((
+                                    outcome,
+                                    allowance.used,
+                                    control.snapshot(),
+                                    observer.0,
+                                ));
+                            }
+                            assert_eq!(outcomes[0], outcomes[1], "{objective:?} {input} {deny}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cancelled_interrupted_and_losing_scans_build_no_plaintext() {
+        let (initial, domain) = fixture();
+        let evaluator = TrialEvaluator::new(
+            &initial,
+            &domain,
+            "ABCABCAB",
+            Direction::Decrypt,
+            MeasureId::Ic,
+            None,
+        );
+        let selection = NeighborhoodSelection {
+            initial: &initial,
+            domain: &domain,
+            evaluator: &evaluator,
+            backtrack_pairs: 0,
+        };
+        let mut seen = Vec::new();
+        for ranking in [i128::MIN, i128::MAX].map(FixedScore::from_units) {
+            for (stop, limit) in [(1, 9), (2, 9), (3, 9), (5, 9), (99, 1), (99, 2), (99, 9)] {
+                let mut runs = Vec::new();
+                for reference in [true, false] {
+                    let mut accounting = CancelAfter {
+                        allowance: EvaluationAllowance { used: 0, limit },
+                        polls: 0,
+                        stop,
+                    };
+                    plaintext_builds();
+                    let outcome = if reference {
+                        reference_scan(&selection, &[], ranking, &mut accounting, 0)
+                    } else {
+                        selection.scan(&[], ranking, &mut accounting, 0)
+                    };
+                    let builds = plaintext_builds();
+                    if !reference {
+                        let winner = matches!(outcome, Ok(ScanOutcome::Complete(Some(_))));
+                        assert_eq!(builds, usize::from(winner), "{stop} {limit}");
+                        seen.push(std::mem::discriminant(outcome.as_ref().unwrap()));
+                    }
+                    runs.push((outcome, accounting.allowance.used, accounting.polls));
+                }
+                assert_eq!(runs[0], runs[1], "{stop} {limit}");
+            }
+        }
+        for outcome in [
+            ScanOutcome::Cancelled,
+            ScanOutcome::Interrupted,
+            ScanOutcome::Complete(None),
+        ] {
+            assert!(seen.contains(&std::mem::discriminant(&outcome)));
+        }
+    }
+
+    #[test]
+    fn replay_invariants_project_to_the_invariant_category() {
+        use crate::attack_result::RunPayload;
+        let (_, domain) = fixture();
+        let invariant = || TrialEvaluationError::Invariant("winner replay failed");
+        let observed = || ObservedClimbError::Evaluation(invariant());
+        let direct = ControlledDirectError {
+            outer_index: Some(0),
+            evaluations_used: 0,
+            source: DirectRunError::from(observed()),
+            best: None,
+            counters: Default::default(),
+        }
+        .project(&domain, MeasureId::Ic);
+        let partial = ControlledPartialRunError {
+            outer_index: Some(0),
+            seed_index: Some(0),
+            evaluations_used: 0,
+            source: ControlledPartialRunSource::Climb(ControlledPartialSource::Climb(observed())),
+            best: None,
+            counters: Default::default(),
+            held: None,
+        }
+        .project(&domain, MeasureId::Ic);
+        for source in [
+            crate::AttackRunSource(RunPayload::from(observed())),
+            crate::AttackRunSource(RunPayload::from(invariant())),
+        ] {
+            assert_eq!(source.category(), crate::AttackRunCategory::Invariant);
+            assert_eq!(source.to_string(), "winner replay failed");
+        }
+        for error in [direct, partial] {
+            let source = error.run_source();
+            assert_eq!(source.category(), crate::AttackRunCategory::Invariant);
+            assert_eq!(source.to_string(), "winner replay failed");
+        }
     }
 
     /// Outers B, A, C decrypt "ABA" to AAC, CCB and BBA, tied on IC; the
