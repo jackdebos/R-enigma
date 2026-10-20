@@ -53,8 +53,15 @@ pub(super) struct TrialEvaluator<'a> {
     prepared: OnceCell<Option<Prepared>>,
     shared: Option<(&'a RunPreparation<'a>, u128)>,
     engine_validated: OnceCell<()>,
+    scratch: RefCell<TrialScratch>,
     #[cfg(test)]
     deny_reservation: bool,
+}
+
+#[derive(Default)]
+struct TrialScratch {
+    mapping: Vec<usize>,
+    indices: Vec<u32>,
 }
 
 /// Board-independent alphabet indices: the input, then one scrambler row per offset.
@@ -119,6 +126,7 @@ impl<'a> TrialEvaluator<'a> {
             prepared: OnceCell::new(),
             shared: None,
             engine_validated: OnceCell::new(),
+            scratch: RefCell::new(TrialScratch::default()),
             #[cfg(test)]
             deny_reservation: false,
         }
@@ -137,8 +145,14 @@ impl<'a> TrialEvaluator<'a> {
             // Retain success even if mutable, input or scoring validation below fails.
             self.binding.set(()).expect("single-threaded binding check");
         }
-        let board = checked_mutable_board(self.initial, self.domain, mutable)
-            .map_err(TrialEvaluationError::Board)?;
+        let mut scratch = self.scratch.borrow_mut();
+        Plugboard::fill_mapping(
+            self.initial.topology().alphabet(),
+            self.domain.fixed_pairs().iter().chain(mutable).copied(),
+            &mut scratch.mapping,
+        )
+        .map_err(|error| TrialEvaluationError::Board(TrialBoardError::Model(error)))?;
+        check_mutable_limits(self.domain, mutable).map_err(TrialEvaluationError::Board)?;
         if let Some((run, outer)) = self.shared {
             let mut latest = run.latest.borrow_mut();
             if latest.as_ref().map(|(key, _)| *key) != Some(outer) {
@@ -146,22 +160,25 @@ impl<'a> TrialEvaluator<'a> {
                 *latest = None;
                 *latest = Some((outer, OnceCell::new()));
             }
-            self.evaluate_prepared(board, &latest.as_ref().expect("selected outer").1)
+            self.evaluate_prepared(&mut scratch, &latest.as_ref().expect("selected outer").1)
         } else {
-            self.evaluate_prepared(board, &self.prepared)
+            self.evaluate_prepared(&mut scratch, &self.prepared)
         }
     }
 
     fn evaluate_prepared(
         &self,
-        board: Plugboard,
+        scratch: &mut TrialScratch,
         prepared: &OnceCell<Option<Prepared>>,
     ) -> Result<(String, MeasuredScore), TrialEvaluationError> {
         let mut engine = None;
         // Shared rows never certify a new evaluator's Engine constructor. Cache
         // only its successful immutable validation, after this trial's board check.
         if self.engine_validated.get().is_none() || prepared.get().is_none() {
-            engine = Some(self.fresh_engine(board.clone())?);
+            engine = Some(self.fresh_engine(Plugboard::from_validated_mapping(
+                self.initial.topology().alphabet(),
+                &scratch.mapping,
+            ))?);
             self.engine_validated.set(()).ok();
         }
         if prepared.get().is_none() {
@@ -197,22 +214,26 @@ impl<'a> TrialEvaluator<'a> {
                 let symbols = &self.initial.topology().alphabet().symbols;
                 let width = symbols.len();
                 let mut plaintext = String::with_capacity(self.input.len());
-                let mut indices = Vec::with_capacity(prepared.input.len());
+                let TrialScratch { mapping, indices } = scratch;
+                indices.clear();
                 // The trial board is bound to this alphabet, so its mapping is
                 // indexed by the same alphabet indices as the rows.
                 for (offset, &symbol) in prepared.input.iter().enumerate() {
-                    let signal = board.mapping[symbol as usize];
-                    let output = board.mapping[prepared.rows[offset * width + signal] as usize];
+                    let signal = mapping[symbol as usize];
+                    let output = mapping[prepared.rows[offset * width + signal] as usize];
                     plaintext.push(symbols[output]);
                     indices.push(output as u32);
                 }
-                let score = self.measure_with(&plaintext, Some(&indices))?;
+                let score = self.measure_with(&plaintext, Some(indices))?;
                 Ok((plaintext, score))
             }
             None => {
                 let mut engine = match engine {
                     Some(engine) => engine,
-                    None => self.fresh_engine(board)?,
+                    None => self.fresh_engine(Plugboard::from_validated_mapping(
+                        self.initial.topology().alphabet(),
+                        &scratch.mapping,
+                    ))?,
                 };
                 let plaintext = engine
                     .transform(self.input, self.direction)
@@ -397,6 +418,14 @@ fn checked_mutable_board(
     pairs.extend_from_slice(mutable);
     // Existing model validation reports self-pairs, foreign and reused endpoints.
     let board = Plugboard::new(alphabet, &pairs).map_err(TrialBoardError::Model)?;
+    check_mutable_limits(domain, mutable)?;
+    Ok(board)
+}
+
+fn check_mutable_limits(
+    domain: &AttackPlugboardDomain,
+    mutable: &[(char, char)],
+) -> Result<(), TrialBoardError> {
     for &(a, b) in mutable {
         for symbol in [a, b] {
             if !domain.symbols().contains(&symbol) {
@@ -404,10 +433,10 @@ fn checked_mutable_board(
             }
         }
     }
-    if pairs.len() > domain.max_pairs() {
+    if domain.fixed_pairs().len() + mutable.len() > domain.max_pairs() {
         return Err(TrialBoardError::TotalCapacity);
     }
-    Ok(board)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -416,7 +445,7 @@ mod tests {
     use crate::{Alphabet, DefinitionSource, SlotConfiguration, TransformConfiguration};
 
     #[test]
-    fn warm_trials_build_only_the_mutable_board() {
+    fn warm_trials_build_no_plugboard() {
         let initial = machine("ABC", "BAC", "A", true);
         let domain = domain(initial.topology().alphabet(), &[], "ABC", 1);
         let trial = evaluator(&initial, &domain, "AA");
@@ -424,8 +453,71 @@ mod tests {
         crate::PLUGBOARD_BUILDS.with(|c| c.set(0));
         BINDING_CHECKS.with(|c| c.set(0));
         assert_eq!(trial.evaluate(&[]).unwrap(), expected);
-        assert_eq!(crate::PLUGBOARD_BUILDS.with(|c| c.get()), 1);
+        assert_eq!(crate::PLUGBOARD_BUILDS.with(|c| c.get()), 0);
         assert_eq!(BINDING_CHECKS.with(|c| c.get()), 0);
+    }
+
+    #[test]
+    fn cold_and_fallback_trials_still_build_plugboards() {
+        let initial = machine("ABC", "BAC", "A", true);
+        let domain = domain(initial.topology().alphabet(), &[], "ABC", 1);
+        for deny in [false, true] {
+            let mut trial = evaluator(&initial, &domain, "AA");
+            trial.deny_reservation = deny;
+            crate::PLUGBOARD_BUILDS.with(|c| c.set(0));
+            let expected = trial.evaluate(&[]).unwrap();
+            assert_eq!(crate::PLUGBOARD_BUILDS.with(|c| c.get()), 2);
+            crate::PLUGBOARD_BUILDS.with(|c| c.set(0));
+            assert_eq!(trial.evaluate(&[]).unwrap(), expected);
+            assert_eq!(crate::PLUGBOARD_BUILDS.with(|c| c.get()), usize::from(deny));
+        }
+    }
+
+    #[test]
+    fn scratch_trials_match_standalone_boards_and_reset_after_errors() {
+        for symbols in ["ABCDEFGH", "界éHβAGλ中"] {
+            let alphabet = Alphabet::new(symbols.chars().collect()).unwrap();
+            let s = &alphabet.symbols;
+            let fixed = [(s[0], s[1])];
+            let initial = initial(&alphabet, &fixed);
+            let mutable_symbols: String = s[2..6].iter().collect();
+            let domain = domain(&alphabet, &fixed, &mutable_symbols, 2);
+            let trial = evaluator(&initial, &domain, symbols);
+            let valid = [(s[2], s[3])];
+            let expected_valid = trial.evaluate(&valid).unwrap();
+            let endpoints: Vec<_> = s.iter().copied().chain(['?']).collect();
+            let mut cases = vec![vec![], valid.to_vec()];
+            for &left in &endpoints {
+                for &right in &endpoints {
+                    let pair = (left, right);
+                    cases.push(vec![pair]);
+                    for second in [
+                        (s[2], s[3]),
+                        (s[4], s[5]),
+                        (s[6], s[7]),
+                        (s[4], s[4]),
+                        (s[4], '?'),
+                    ] {
+                        cases.push(vec![pair, second]);
+                    }
+                }
+            }
+            for board in cases {
+                let expected = validated_trial_board(&initial, &domain, &board)
+                    .map_err(TrialEvaluationError::Board)
+                    .and_then(|board| {
+                        let mut engine = trial.fresh_engine(board)?;
+                        let plaintext = engine
+                            .transform(symbols, Direction::Decrypt)
+                            .map_err(TrialEvaluationError::Model)?;
+                        let score = trial.measure(&plaintext)?;
+                        Ok((plaintext, score))
+                    });
+                assert_eq!(trial.evaluate(&board), expected, "{symbols}: {board:?}");
+                assert_eq!(trial.evaluate(&valid).unwrap(), expected_valid);
+                assert_eq!(trial.evaluate(&[]).unwrap().0, symbols);
+            }
+        }
     }
 
     #[test]

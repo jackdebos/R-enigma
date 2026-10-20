@@ -906,8 +906,22 @@ impl Plugboard {
     pub fn new(alphabet: &Alphabet, pairs: &[(char, char)]) -> Result<Self, ModelError> {
         #[cfg(test)]
         PLUGBOARD_BUILDS.with(|count| count.set(count.get() + 1));
-        let mut mapping: Vec<usize> = (0..alphabet.len()).collect();
-        for &(left, right) in pairs {
+        let mut mapping = Vec::new();
+        Self::fill_mapping(alphabet, pairs.iter().copied(), &mut mapping)?;
+        Ok(Self {
+            alphabet: alphabet.clone(),
+            mapping,
+        })
+    }
+
+    pub(crate) fn fill_mapping(
+        alphabet: &Alphabet,
+        pairs: impl IntoIterator<Item = (char, char)>,
+        mapping: &mut Vec<usize>,
+    ) -> Result<(), ModelError> {
+        mapping.clear();
+        mapping.extend(0..alphabet.len());
+        for (left, right) in pairs {
             let left_index = alphabet
                 .index_of(left)
                 .ok_or(ModelError::UnknownSymbol(left))?;
@@ -926,10 +940,16 @@ impl Plugboard {
             mapping[left_index] = right_index;
             mapping[right_index] = left_index;
         }
-        Ok(Self {
+        Ok(())
+    }
+
+    pub(crate) fn from_validated_mapping(alphabet: &Alphabet, mapping: &[usize]) -> Self {
+        #[cfg(test)]
+        PLUGBOARD_BUILDS.with(|count| count.set(count.get() + 1));
+        Self {
             alphabet: alphabet.clone(),
-            mapping,
-        })
+            mapping: mapping.to_vec(),
+        }
     }
 
     /// Builds the identity plugboard over `alphabet`, where every symbol maps to itself.
