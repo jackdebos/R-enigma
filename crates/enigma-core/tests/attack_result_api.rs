@@ -218,9 +218,17 @@ fn measure_rescores_the_same_hc_and_pe_winner_once() {
 
 #[test]
 fn measure_starts_only_after_first_admission() {
-    use std::cell::Cell;
     for pe in [false, true] {
-        let complete = fixture(100, 0, pe).run(|_| {}, || false).unwrap();
+        let mut prefix_polls = 0;
+        let complete = fixture(100, 0, pe)
+            .run(
+                |_| {},
+                || {
+                    prefix_polls += 1;
+                    false
+                },
+            )
+            .unwrap();
         let used = complete.evaluations_used();
         for (budget, offset, cancel, termination) in [
             (1, 0, false, AttackTermination::EvaluationBudget),
@@ -229,15 +237,17 @@ fn measure_starts_only_after_first_admission() {
             (used + 1, 0, true, AttackTermination::Cancelled),
             (used + 1, 1, true, AttackTermination::OuterSliceEnd),
         ] {
-            let completed = Cell::new(0);
+            let mut polls = 0;
             let mut last = None;
             let result = measure_fixture(budget, offset, pe)
                 .run(
-                    |p| {
-                        completed.set(p.outers_completed());
-                        last = Some(p);
+                    |p| last = Some(p),
+                    // The unstaged run's polling prefix ends with HC/PE.
+                    // Its next poll is stage entry, after outer accounting.
+                    || {
+                        polls += 1;
+                        cancel && polls == prefix_polls + 1
                     },
-                    || cancel && completed.get() == 1,
                 )
                 .unwrap();
             assert_eq!(result.termination(), termination);
@@ -255,11 +265,14 @@ fn measure_starts_only_after_first_admission() {
             }
         }
         // Completion must not add a speculative cancellation poll after the final score.
-        let completed = Cell::new(0);
+        let mut polls = 0;
         let result = measure_fixture(used + 1, 0, pe)
             .run(
-                |p| completed.set(p.evaluations_completed()),
-                || completed.get() > used,
+                |_| {},
+                || {
+                    polls += 1;
+                    polls == prefix_polls + 2
+                },
             )
             .unwrap();
         assert_eq!(result.termination(), AttackTermination::Completed);
@@ -364,32 +377,45 @@ fn trie_composes_rankings_once_on_the_same_hc_and_pe_plaintext() {
 
 #[test]
 fn supported_stage_orders_share_allowance_and_cancellation_boundaries() {
-    use std::cell::Cell;
     for pe in [false, true] {
+        let mut prefix_polls = 0;
         let before = trie_fixture(100, pe, &[], None, 3)
-            .run(|_| {}, || false)
+            .run(
+                |_| {},
+                || {
+                    prefix_polls += 1;
+                    false
+                },
+            )
             .unwrap();
         let used = before.evaluations_used();
-        let outers = Cell::new(0);
+        let mut polls = 0;
         let cancelled = trie_fixture(used + 1, pe, &["trie"], None, 3)
-            .run(|p| outers.set(p.outers_completed()), || outers.get() > 0)
+            .run(
+                |_| {},
+                || {
+                    polls += 1;
+                    polls == prefix_polls + 1
+                },
+            )
             .unwrap();
         assert_eq!(cancelled.termination(), AttackTermination::Cancelled);
         assert!(cancelled.stages().is_empty());
         assert_eq!(cancelled.evaluations_used(), used);
         for order in [["measure", "trie"], ["trie", "measure"]] {
-            let completed = Cell::new(0);
             for extra in 0..=2 {
                 for cancel in [false, true] {
-                    completed.set(0);
+                    let mut polls = 0;
                     let mut last = None;
                     let result = trie_fixture(used + extra, pe, &order, None, 3)
                         .run(
-                            |p| {
-                                completed.set(p.evaluations_completed());
-                                last = Some(p);
+                            |p| last = Some(p),
+                            // Each scoring stage has one entry poll. The second
+                            // observes cancellation after the first stage completes.
+                            || {
+                                polls += 1;
+                                cancel && polls == prefix_polls + 2
                             },
-                            || cancel && completed.get() > used,
                         )
                         .unwrap();
                     let stages = if cancel { extra.min(1) } else { extra };
@@ -430,11 +456,14 @@ fn supported_stage_orders_share_allowance_and_cancellation_boundaries() {
                 }
             }
             // A pending cancellation after the final evaluation cannot undo completion.
-            completed.set(0);
+            let mut polls = 0;
             let result = trie_fixture(used + 2, pe, &order, None, 3)
                 .run(
-                    |p| completed.set(p.evaluations_completed()),
-                    || completed.get() == used + 2,
+                    |_| {},
+                    || {
+                        polls += 1;
+                        polls == prefix_polls + 3
+                    },
                 )
                 .unwrap();
             assert_eq!(result.termination(), AttackTermination::Completed);
@@ -504,24 +533,37 @@ fn reswapping_climbs_the_hc_and_pe_winner_under_shared_accounting() {
 
 #[test]
 fn reswapping_stops_mid_stage_or_before_start_on_budget_and_cancellation() {
-    use std::cell::Cell;
     use AttackTermination::{Cancelled, Completed, EvaluationBudget};
     for pe in [false, true] {
-        let before = fixture(100, 0, pe).run(|_| {}, || false).unwrap();
+        let mut prefix_polls = 0;
+        let before = fixture(100, 0, pe)
+            .run(
+                |_| {},
+                || {
+                    prefix_polls += 1;
+                    false
+                },
+            )
+            .unwrap();
         let used = before.evaluations_used();
         let full = reswapping_fixture(used + 20, pe, &["reswapping"])
             .run(|_| {}, || false)
             .unwrap();
         let spent = full.stages()[0].evaluations_used();
-        let completed = Cell::new(0);
         for extra in 0..=spent {
             for cancel in [false, true] {
-                completed.set(0);
+                let mut polls = 0;
+                // Stage entry precedes all trials; each trial polls once before
+                // admission. Natural final exhaustion adds no speculative poll.
+                let stop_poll = prefix_polls + if extra == 0 { 1 } else { 2 + extra };
                 let budget = if cancel { used + 20 } else { used + extra };
                 let result = reswapping_fixture(budget, pe, &["reswapping"])
                     .run(
-                        |p| completed.set(p.evaluations_completed()),
-                        || cancel && completed.get() >= used + extra,
+                        |_| {},
+                        || {
+                            polls += 1;
+                            cancel && polls == stop_poll
+                        },
                     )
                     .unwrap();
                 assert_eq!(result.evaluations_used(), used + extra);

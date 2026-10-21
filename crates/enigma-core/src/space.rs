@@ -388,6 +388,7 @@ pub struct AttackSettings {
     switch_pairs: usize,
     backtrack_pairs: usize,
     evaluation_budget: u64,
+    progress_every: u64,
     hold_capacity: usize,
     initialization: AttackInitialization,
     stages: Vec<AttackStage>,
@@ -455,6 +456,7 @@ impl AttackSettings {
                 "switch_pairs",
                 "backtrack_pairs",
                 "evaluation_budget",
+                "progress_every",
                 "hold",
                 "start",
                 "seeds",
@@ -534,6 +536,16 @@ impl AttackSettings {
                     "evaluation_budget must be a positive u64 integer",
                     child(PATH, "evaluation_budget"),
                 )]
+            })?;
+        let progress_every = settings
+            .get("progress_every")
+            .map_or(Ok(100_000), |value| {
+                value.as_u64().filter(|&count| count > 0).ok_or_else(|| {
+                    vec![invalid(
+                        "progress_every must be a positive u64 integer",
+                        child(PATH, "progress_every"),
+                    )]
+                })
             })?;
         let initialization = if kind == AttackKind::PartialExhaustion {
             AttackInitialization::Seeds(parse_seed_policy(
@@ -637,6 +649,7 @@ impl AttackSettings {
             switch_pairs,
             backtrack_pairs,
             evaluation_budget,
+            progress_every,
             hold_capacity,
             initialization,
             stages,
@@ -664,6 +677,11 @@ impl AttackSettings {
     pub fn backtrack_pairs(&self) -> usize {
         self.backtrack_pairs
     }
+    /// Whole-attack completed-evaluation progress interval (default 100000).
+    pub fn progress_every(&self) -> u64 {
+        self.progress_every
+    }
+
     /// Positive whole-run evaluation budget; syntax, not execution feasibility.
     pub fn evaluation_budget(&self) -> u64 {
         self.evaluation_budget
@@ -4320,6 +4338,93 @@ mod tests {
                 "/job/attack/evaluation_budget".into()
             )
         );
+    }
+
+    #[test]
+    fn progress_every_full_and_detached_validation() {
+        for pe in [false, true] {
+            let mut value = attack_request();
+            if pe {
+                value["job"]["passes"] = json!(["partial_exhaustion"]);
+                let attack = value["job"]["attack"].as_object_mut().unwrap();
+                attack.insert("kind".into(), json!("partial_exhaustion"));
+                attack.remove("start");
+                attack.insert(
+                    "seeds".into(),
+                    json!({"kind":"empty_single", "selection":"all"}),
+                );
+            }
+            let parsed = ParsedAttackRequest::parse_json(&value.to_string()).unwrap();
+            assert_eq!(parsed.settings.progress_every(), 100_000);
+            let detached = |attack: &str| {
+                AttackSettings::parse_json(
+                    parsed.carrier.definition().alphabet(),
+                    &parsed.domain,
+                    parsed.carrier.passes(),
+                    parsed.carrier.measures(),
+                    attack,
+                )
+            };
+            assert_eq!(
+                detached(&value["job"]["attack"].to_string())
+                    .unwrap()
+                    .progress_every(),
+                100_000
+            );
+            for raw in [
+                "1",
+                "18446744073709551615",
+                "0",
+                "-1",
+                "-0",
+                "1.0",
+                "1e0",
+                "true",
+                "\"1\"",
+                "null",
+                "[]",
+                "{}",
+                "18446744073709551616",
+            ] {
+                let attack = value["job"]["attack"].to_string();
+                let attack = format!("{{\"progress_every\":{raw},{}", &attack[1..]);
+                let full = value
+                    .to_string()
+                    .replace(&value["job"]["attack"].to_string(), &attack);
+                let full = ParsedAttackRequest::parse_json(&full);
+                let detached = detached(&attack);
+                if let Ok(expected) = raw.parse::<u64>() {
+                    if expected > 0 {
+                        assert_eq!(full.unwrap().settings.progress_every(), expected);
+                        assert_eq!(detached.unwrap().progress_every(), expected);
+                        continue;
+                    }
+                }
+                for error in [
+                    full.unwrap_err().remove(0),
+                    detached.unwrap_err().remove(0).into(),
+                ] {
+                    assert_eq!(
+                        (error.code(), error.location()),
+                        ("invalid_request", "/job/attack/progress_every"),
+                        "{raw}"
+                    );
+                }
+            }
+            value["job"]["attack"]["progress_every"] = json!(0);
+            value["job"]["attack"]["unknown"] = json!(true);
+            assert_eq!(
+                attack_error(&value),
+                ("unknown_field".into(), "/job/attack/unknown".into())
+            );
+            let error = detached(&value["job"]["attack"].to_string())
+                .unwrap_err()
+                .remove(0);
+            assert_eq!(
+                (error.code(), error.location()),
+                ("unknown_field", "/job/attack/unknown")
+            );
+        }
     }
 
     #[test]

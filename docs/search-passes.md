@@ -2,7 +2,7 @@
 
 Status: **Core HC/PE execution and the shared production CLI JSONL adapter ship.**
 [Current availability](protocol.md#41-planned-hcpe-search-events--task-127) describes
-validated HC/PE execution, legacy unsupported search and internal 250 ms coalescing.
+validated HC/PE execution, legacy unsupported search and Core evaluation-count progress.
 Task 11.2a provides only `AttackPlugboardDomain::parse_json`: strict typed fragment
 validation with immutable known fixed pairs. It is separate from legacy search
 spaces and grants neither complete request acceptance nor candidate enumeration.
@@ -138,6 +138,7 @@ requires exactly one identifier, `hill_climb` or `partial_exhaustion`. Add requi
 | `switch_pairs` | Integer in [0, C], total board cardinality threshold |
 | `backtrack_pairs` | Integer in [0, C], total board cardinality threshold |
 | `evaluation_budget` | Positive unsigned 64-bit integer, whole request run |
+| `progress_every` | Optional positive `u64` integer, default 100000; global completed-evaluation interval |
 | `start` | Required only for direct `hill_climb`; array of mutable pairs |
 | `seeds` | Required only for `partial_exhaustion`; strict object below |
 
@@ -314,7 +315,7 @@ Single climbs, HC outer scheduling, PE seeds/resolved owners and PE outer schedu
 share checked accounting, counter snapshots and cooperative cancellation.
 Budget-only callers retain Task 11 behavior; both controlled paths use fresh
 per-invocation control and evaluation allowances.
-Fallible JSONL projections and the shared timed HC/PE adapter ship in the CLI.
+Fallible JSONL projections and the shared synchronous HC/PE adapter ship in the CLI.
 The CLI `--cancel-file` marker (Task12.12) and platform signals (Task12.13) are
 the external cancellation sources; checkpoint cadence remains deferred.
 Checkpoint/resume belongs to Task 16 and the hold list to Task 14 (§10); Task 12 is done.
@@ -374,19 +375,24 @@ final rescoring nor an earlier completed winner makes a cancelled run complete.
 
 #### Counter-only observation boundary
 
-The implemented private observer is synchronous and infallible and receives immutable
-counters only: at entry, after successful evaluations, at accounting transitions,
-and at terminal success, cancellation or error. Duplicate snapshots are allowed.
-No callback runs mid-evaluation; cancellation polling is independent of observer
-cadence. Error snapshots retain admitted usage and only successful completions.
+The Core observer is synchronous and infallible and receives immutable counters
+only: once initially, at completed evaluation counts X, 2X, ..., and once on
+terminal success, cooperative cancellation or returned error. X is the positive
+`job.attack.progress_every` (default **100000**), shared across the entire HC or
+Partial Exhaustion (PE) attack, including outers, seeds, objectives, stages and held
+finalists. Admission and internal boundaries update counters without notifying.
+Failed evaluations retain admission but do not advance cadence; winner plaintext
+replay is not an evaluation. Threshold overflow ends cadence without wrapping or
+repeating; existing checked counter overflow remains an error.
 
-This boundary decides no clock, rate, I/O, hold capacity (§10) or candidate payload.
-The production adapter coalesces at safe callbacks using monotonic elapsed time,
-UTC event timestamps and an internal positive 250 ms interval. It flushes each line,
-emits terminal snapshots without waiting and latches delivery failures with
-independently polled cancellation. Synchronous callbacks guarantee no timer delivery
-or wall-clock cadence; external cancellation comes only from the optional
-`--cancel-file` marker ([protocol §5](protocol.md#5-control)).
+Keep terminal observations even when equal to an initial or cadence snapshot.
+No callback runs mid-evaluation; cancellation polling is independent of observer
+cadence. The CLI forwards every Core snapshot directly, reads the progress elapsed
+clock only for delivery, flushes each line and latches output failures into
+independently polled cancellation. Broken output or hard process exit can prevent
+terminal delivery. No timer thread or wall-clock delivery bound is promised.
+External cancellation uses the optional `--cancel-file` marker and platform signals
+([protocol §5](protocol.md#5-control)).
 [Protocol control](protocol.md#5-control) retains its public obligations; Task 16
 still owns checkpoint/resume design and implementation.
 
@@ -455,11 +461,11 @@ variants are `Completed`, `OuterSliceEnd`, `EvaluationBudget`, `Cancelled`.
 facade and production CLI use the corresponding controlled HC/PE path.
 No current-climb result exists before initial success; a failed final rescore cannot
 make that board eligible. Errors dominate cancellation and preserve charged usage.
-The transport adds clock/coalescing and exact decimal-string encoding; Core keeps
+The transport adds elapsed clocks and exact decimal-string encoding; Core keeps
 u64/u128/i128 values and Q32 units. Transport failures latch cancellation without
 turning the infallible observer into a fallible evaluator or hiding a runtime error.
 
-First-release JSONL is `started`, optional `progress`, final `result`, then `done`
+First-release JSONL is `started`, initial/cadence/terminal `progress`, final `result`, then `done`
 or runtime `error`; validation errors remain seq1-only. Task 14 specifies the hold,
 delivered once as the final `result.hold` array (§10); no candidate/hold/checkpoint event
 is promised. Task16 owns checkpoint/resume. File and POSIX/Windows adapters are

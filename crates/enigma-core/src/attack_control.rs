@@ -1,7 +1,7 @@
 //! Private counters and cancellation integrated with HC and PE runtimes; public control is deferred.
 //!
-//! Accounting records facts only. Callers own transition eligibility, stop
-//! precedence, observer cadence and any reserved final-objective rescore.
+//! Accounting records facts; successful completions own the global progress grid.
+//! Callers own transition eligibility, stop precedence and reserved final rescoring.
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct CounterSnapshot {
@@ -34,18 +34,51 @@ pub(super) trait CounterObserver {
     fn observe(&mut self, snapshot: CounterSnapshot);
 }
 
-#[derive(Default)]
 pub(super) struct AttackControl {
     counters: CounterSnapshot,
     cancelled: bool,
+    progress_every: u64,
+    next: Option<u64>,
+}
+
+impl Default for AttackControl {
+    fn default() -> Self {
+        Self::with_progress_every(100_000)
+    }
 }
 
 impl AttackControl {
+    pub(super) fn with_progress_every(progress_every: u64) -> Self {
+        assert!(progress_every > 0);
+        Self {
+            counters: CounterSnapshot::default(),
+            cancelled: false,
+            progress_every,
+            next: Some(progress_every),
+        }
+    }
+
+    /// Only successful evaluations advance the global public cadence.
+    pub(super) fn complete(
+        &mut self,
+        observer: &mut impl CounterObserver,
+    ) -> Result<(), CounterOverflow> {
+        self.record_evaluation_completed()?;
+        if self.next == Some(self.counters.evaluations_completed) {
+            self.next = self
+                .counters
+                .evaluations_completed
+                .checked_add(self.progress_every);
+            self.notify(observer);
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(super) fn with_counters(counters: CounterSnapshot) -> Self {
         Self {
             counters,
-            cancelled: false,
+            ..Self::default()
         }
     }
 
@@ -121,6 +154,43 @@ mod tests {
         fn observe(&mut self, snapshot: CounterSnapshot) {
             self.0.push(snapshot);
         }
+    }
+
+    #[test]
+    fn completion_cadence_is_global_and_checked() {
+        let mut control = AttackControl::with_progress_every(3);
+        let mut observer = Recorder::default();
+        for count in 1..=7 {
+            control.record_evaluation_admitted().unwrap();
+            control.record_climb_started().unwrap();
+            control.record_climb_completed().unwrap();
+            control.record_outer_completed().unwrap();
+            control.complete(&mut observer).unwrap();
+            assert_eq!(control.snapshot().evaluations_completed, count);
+        }
+        assert_eq!(
+            observer
+                .0
+                .iter()
+                .map(|s| s.evaluations_completed)
+                .collect::<Vec<_>>(),
+            [3, 6]
+        );
+        control.notify(&mut observer);
+        assert_eq!(observer.0.last().unwrap().evaluations_completed, 7);
+
+        let mut control = AttackControl::with_progress_every(u64::MAX - 1);
+        control.counters.evaluations_completed = u64::MAX - 2;
+        let mut observer = Recorder::default();
+        control.complete(&mut observer).unwrap();
+        control.complete(&mut observer).unwrap();
+        assert_eq!(observer.0.len(), 1);
+        assert_eq!(control.next, None);
+        assert_eq!(
+            control.complete(&mut observer),
+            Err(CounterOverflow::EvaluationsCompleted)
+        );
+        assert_eq!(observer.0.len(), 1);
     }
 
     #[test]
@@ -233,7 +303,7 @@ mod tests {
                     climbs_completed: u128::MAX,
                     outers_completed: u128::MAX,
                 },
-                cancelled: false,
+                ..AttackControl::default()
             };
             let retained = control.snapshot();
             assert_eq!(transition(&mut control), Err(expected));

@@ -14,7 +14,6 @@ mod signals;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::num::NonZeroU128;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -280,7 +279,6 @@ fn run_attack<'s>(
                 out,
                 || entry.elapsed(),
                 now_ts,
-                NonZeroU128::new(250).unwrap(),
                 // Poll the marker first so a raised signal never masks its runtime error.
                 || marker.as_mut().is_some_and(CancelFile::poll) || signal.load(Ordering::Relaxed),
             ) {

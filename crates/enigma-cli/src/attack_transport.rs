@@ -2,7 +2,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::io::{self, Write};
-use std::num::NonZeroU128;
 use std::time::Duration;
 
 use enigma_core::{encode, AttackProgress, AttackRequest, Event};
@@ -13,8 +12,6 @@ struct Transport<W, M, U> {
     monotonic: M,
     utc: U,
     entry: Duration,
-    interval_ms: NonZeroU128,
-    last_progress_ms: Option<u128>,
     seq: u64,
     failure: Option<io::Error>,
 }
@@ -28,15 +25,13 @@ pub(super) struct Failure {
 }
 
 impl<W: Write, M: FnMut() -> Duration, U: FnMut() -> String> Transport<W, M, U> {
-    fn new(writer: W, mut monotonic: M, utc: U, interval_ms: NonZeroU128) -> Self {
+    fn new(writer: W, mut monotonic: M, utc: U) -> Self {
         let entry = monotonic();
         Self {
             writer,
             monotonic,
             utc,
             entry,
-            interval_ms,
-            last_progress_ms: None,
             seq: 1,
             failure: None,
         }
@@ -64,19 +59,10 @@ impl<W: Write, M: FnMut() -> Duration, U: FnMut() -> String> Transport<W, M, U> 
     }
 
     fn observe(&mut self, progress: AttackProgress) {
-        let elapsed = self.elapsed();
-        if self
-            .last_progress_ms
-            .is_none_or(|last| elapsed.saturating_sub(last) >= self.interval_ms.get())
-        {
+        if self.failure.is_none() {
+            let elapsed = self.elapsed();
             self.emit(Event::progress(progress, elapsed));
-            self.last_progress_ms = Some(elapsed);
         }
-    }
-
-    /// Final counters need not wait for cadence, even if the snapshot is a duplicate.
-    fn final_progress(&mut self, progress: AttackProgress, elapsed: u128) {
-        self.emit(Event::progress(progress, elapsed));
     }
 
     /// A fallible projection is resolved before either terminal line is emitted.
@@ -118,10 +104,9 @@ pub(super) fn run(
     writer: impl Write,
     monotonic: impl FnMut() -> Duration,
     utc: impl FnMut() -> String,
-    interval_ms: NonZeroU128,
     mut cancel_requested: impl FnMut() -> bool,
 ) -> Result<(), Failure> {
-    let transport = RefCell::new(Transport::new(writer, monotonic, utc, interval_ms));
+    let transport = RefCell::new(Transport::new(writer, monotonic, utc));
     let cancelled = Cell::new(false);
     transport.borrow_mut().emit(Event::Started);
     let result = request.run(
@@ -136,22 +121,18 @@ pub(super) fn run(
     // Measure after run: Core's reserved final rescore is included.
     let elapsed = transport.elapsed();
     match result {
-        Ok(result) => {
-            transport.final_progress(result.counters(), elapsed);
-            transport.finish(
-                Ok((
-                    Event::result(&result, elapsed),
-                    Event::Done {
-                        reason: result.termination().into(),
-                    },
-                )),
-                None,
-            )
-        }
+        Ok(result) => transport.finish(
+            Ok((
+                Event::result(&result, elapsed),
+                Event::Done {
+                    reason: result.termination().into(),
+                },
+            )),
+            None,
+        ),
         Err(error) => {
             let projected = Event::runtime_error(&error, elapsed)
                 .map_err(|projection| projection.best_projection().to_string());
-            transport.final_progress(error.counters(), elapsed);
             transport.finish(projected, Some(Box::new(error)))
         }
     }
@@ -167,6 +148,15 @@ mod tests {
     }
 
     fn request_with_objectives(pe: bool, budget: u64, rescore: bool) -> AttackRequest {
+        request_with_progress(pe, budget, rescore, 100_000)
+    }
+
+    fn request_with_progress(
+        pe: bool,
+        budget: u64,
+        rescore: bool,
+        progress_every: u64,
+    ) -> AttackRequest {
         let mut value = json!({
             "protocol_version": 1,
             "machine": {"definition": {"kind": "custom", "value": {
@@ -180,7 +170,7 @@ mod tests {
                 "configuration": {"slots": [{"id": "r", "position": "A", "ring": "A"}], "plugboard": []},
                 "space": {"plugboard": {"kind": "attack", "symbols": ["A", "B"], "max_pairs": 1}},
                 "attack": {"kind": "hill_climb", "initial_measure": "ic", "final_measure": "ic",
-                    "switch_pairs": 1, "backtrack_pairs": 1, "evaluation_budget": budget, "start": []}
+                    "switch_pairs": 1, "backtrack_pairs": 1, "evaluation_budget": budget, "progress_every": progress_every, "start": []}
             }
         });
         if pe {
@@ -205,10 +195,6 @@ mod tests {
             .run(|_| {}, || false)
             .unwrap()
             .counters()
-    }
-
-    fn interval() -> NonZeroU128 {
-        NonZeroU128::new(250).unwrap()
     }
 
     fn lines(bytes: &[u8]) -> Vec<Value> {
@@ -294,7 +280,6 @@ mod tests {
                     // Deliberately goes backwards; cadence never uses UTC.
                     format!("UTC-{}", 100 - wall.get())
                 },
-                interval(),
                 || false,
             )
             .unwrap();
@@ -329,6 +314,62 @@ mod tests {
     }
 
     #[test]
+    fn core_grid_is_forwarded_exactly_with_one_clock_read_per_progress() {
+        for pe in [false, true] {
+            for budget in [1, 3, 6, 100] {
+                let request = request_with_progress(pe, budget, false, 3);
+                let mut core = Vec::new();
+                let expected = request.run(|p| core.push(p), || false).unwrap();
+                let clock_calls = Cell::new(0u64);
+                let mut output = Vec::new();
+                run(
+                    &request,
+                    &mut output,
+                    || {
+                        clock_calls.set(clock_calls.get() + 1);
+                        Duration::ZERO
+                    },
+                    || "UTC".into(),
+                    || false,
+                )
+                .unwrap();
+                let events = lines(&output);
+                let progress: Vec<_> = events
+                    .iter()
+                    .filter(|event| event["event"] == "progress")
+                    .collect();
+                assert_eq!(progress.len(), core.len());
+                for (wire, snapshot) in progress.iter().zip(&core) {
+                    assert_eq!(
+                        wire["counters"],
+                        serde_json::to_value(enigma_core::ProgressCounters::from(*snapshot))
+                            .unwrap()
+                    );
+                }
+                assert_eq!(clock_calls.get(), core.len() as u64 + 2); // entry + result
+                assert_eq!(events.first().unwrap()["event"], "started");
+                assert_eq!(events[events.len() - 2]["event"], "result");
+                assert_eq!(events.last().unwrap()["event"], "done");
+                assert_eq!(
+                    progress.last().unwrap()["counters"],
+                    events[events.len() - 2]["counters"]
+                );
+                assert_eq!(core.last(), Some(&expected.counters()));
+                if expected
+                    .counters()
+                    .evaluations_completed()
+                    .is_multiple_of(3)
+                {
+                    assert_eq!(
+                        core[core.len() - 2].evaluations_completed(),
+                        core.last().unwrap().evaluations_completed()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn terminal_elapsed_is_measured_after_final_rescore() {
         let clock = Cell::new(0);
         let request = request_with_objectives(false, 2, true);
@@ -342,7 +383,6 @@ mod tests {
                 Duration::from_millis(now)
             },
             || "UTC".into(),
-            interval(),
             || false,
         )
         .unwrap();
@@ -352,7 +392,8 @@ mod tests {
             .find(|event| event["event"] == "result")
             .unwrap();
         assert_eq!(result["elapsed_ms"], (clock.get() - 17).to_string());
-        assert_eq!(events[events.len() - 3]["elapsed_ms"], result["elapsed_ms"]);
+        assert_eq!(events[events.len() - 3]["elapsed_ms"], "34");
+        assert_eq!(clock.get(), 68); // entry, initial, terminal, result: no per-trial reads
         assert_eq!(result["counters"]["evaluations_completed"], "2");
         assert_eq!(result["best"]["score"]["measure"], "entropy");
         assert_eq!(events.last().unwrap()["reason"], "evaluation_budget");
@@ -360,8 +401,8 @@ mod tests {
 
     #[test]
     fn write_and_flush_failures_at_every_lifecycle_stage_latch() {
-        // A frozen clock emits entry and forced final progress only: occurrence 1
-        // therefore covers failure at final progress separately from entry progress.
+        // With the default Core cadence this small job emits initial and terminal
+        // progress only; occurrence 1 faults terminal delivery separately.
         for (event, fail_occurrence) in [
             ("started", 0),
             ("progress", 0),
@@ -381,7 +422,6 @@ mod tests {
                     &mut writer,
                     || Duration::ZERO,
                     || "UTC".into(),
-                    interval(),
                     || false,
                 )
                 .unwrap_err();
@@ -412,7 +452,6 @@ mod tests {
             &mut output,
             || Duration::ZERO,
             || "UTC".into(),
-            interval(),
             || {
                 polls.set(polls.get() + 1);
                 polls.get() == 2 // a one-poll pulse, not a persistent external flag
@@ -446,7 +485,6 @@ mod tests {
             &mut writer,
             || Duration::ZERO,
             || "UTC".into(),
-            interval(),
             || false,
         )
         .unwrap_err();
@@ -467,7 +505,6 @@ mod tests {
                 &mut output,
                 || Duration::ZERO,
                 || "UTC".into(),
-                interval(),
                 || {
                     polls.set(polls.get() + 1);
                     true
@@ -488,8 +525,8 @@ mod tests {
 
     #[test]
     fn latched_transport_cancellation_permits_reserved_final_rescore() {
-        // Fail delivery immediately after Core admits its first evaluation.
-        // Continue measuring callbacks to prove reserved finalization is not aborted.
+        // Fail the first completed-evaluation cadence delivery (X = 1).
+        // Reserved finalization must still finish after cancellation is latched.
         struct FailAfterAdmission {
             last: Cell<u64>,
             writes: Cell<usize>,
@@ -514,7 +551,7 @@ mod tests {
         };
         let clock = Cell::new(0);
         let failure = run(
-            &request_with_objectives(false, 100, true),
+            &request_with_progress(false, 100, true, 1),
             &writer,
             || {
                 let now = clock.get();
@@ -522,19 +559,19 @@ mod tests {
                 Duration::from_millis(now)
             },
             || "UTC".into(),
-            interval(),
             || false,
         )
         .unwrap_err();
         assert!(failure.transport.is_some());
         assert_eq!(writer.last.get(), 1);
-        // Core finalization invokes more callbacks/elapsed reads, without more writes.
-        assert!(clock.get() / 250 > writer.writes.get() as u64);
+        // No further progress clock reads or writes after delivery failure.
+        assert_eq!(clock.get() / 250, 4); // entry, initial, failed cadence, result
+        assert_eq!(writer.writes.get(), 3);
 
-        // Real Core evidence: cancellation after admission still completes the reserved
+        // Real Core evidence: cancellation after completion still completes the reserved
         // initial/final evaluation and retains the committed winner, never a trial.
         let admitted = Cell::new(false);
-        let result = request_with_objectives(false, 100, true)
+        let result = request_with_progress(false, 100, true, 1)
             .run(
                 |progress| admitted.set(progress.evaluations_admitted() > 0),
                 || admitted.get(),
@@ -559,10 +596,20 @@ mod tests {
                     flush_failure,
                     ..Writer::default()
                 };
-                let mut transport =
-                    Transport::new(&mut writer, || Duration::ZERO, || "UTC".into(), interval());
+                let mut transport = Transport::new(&mut writer, || Duration::ZERO, || "UTC".into());
                 transport.emit(Event::Started);
-                let expected = request(false, 100).run(|_| {}, || false).unwrap();
+                let mut initial = None;
+                let expected = request(false, 100)
+                    .run(
+                        |p| {
+                            initial.get_or_insert(p);
+                        },
+                        || false,
+                    )
+                    .unwrap();
+                transport.observe(initial.unwrap());
+                transport.observe(expected.counters()); // injected cadence snapshot
+                transport.observe(expected.counters()); // terminal is not deduplicated
                 let projected = Ok((
                     Event::result(&expected, 9),
                     Event::Error {
@@ -590,9 +637,15 @@ mod tests {
                 let events = lines(&writer.bytes);
                 assert!(!events.iter().any(|event| event["event"] == "done"));
                 if fail_event.is_none() {
-                    assert_eq!(events.len(), 3);
-                    assert_eq!(events[1]["event"], "result");
-                    assert_eq!(events[2]["event"], "error");
+                    assert_eq!(
+                        events
+                            .iter()
+                            .map(|event| event["event"].as_str().unwrap())
+                            .collect::<Vec<_>>(),
+                        ["started", "progress", "progress", "progress", "result", "error"]
+                    );
+                    assert_eq!(events[2]["counters"], events[3]["counters"]);
+                    assert_eq!(events[3]["counters"], events[4]["counters"]);
                 }
             }
         }
@@ -605,8 +658,7 @@ mod tests {
                 fail_event: fail_started.then_some("started"),
                 ..Writer::default()
             };
-            let mut transport =
-                Transport::new(&mut writer, || Duration::ZERO, || "UTC".into(), interval());
+            let mut transport = Transport::new(&mut writer, || Duration::ZERO, || "UTC".into());
             transport.emit(Event::Started);
             // Explicit injection of the fallible Core projection's Err arm.
             let failure = transport
@@ -631,13 +683,12 @@ mod tests {
     }
 
     #[test]
-    fn cadence_below_exact_above_and_duplicate_snapshots() {
+    fn forwarding_ignores_elapsed_gaps_and_keeps_duplicate_snapshots() {
         let clock = Cell::new(1000);
         let mut transport = Transport::new(
             Vec::new(),
             || Duration::from_millis(clock.get()),
             || "independent UTC".into(),
-            interval(),
         );
         let progress = snapshot();
         for time in [1000, 1249, 1250, 1250, 1501] {
@@ -645,13 +696,13 @@ mod tests {
             transport.observe(progress);
         }
         let events = lines(&transport.writer);
-        assert_eq!(events.len(), 3);
+        assert_eq!(events.len(), 5);
         assert_eq!(
             events
                 .iter()
                 .map(|event| event["elapsed_ms"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["0", "250", "501"]
+            ["0", "249", "250", "250", "501"]
         );
     }
 }

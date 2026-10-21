@@ -16,7 +16,8 @@ loads bounded external resources, and binds search contents before execution.
 Core HC/PE execution and fallible wire projections feed the shared production CLI
 adapter. See protocol
 [current availability](protocol.md#41-planned-hcpe-search-events--task-127) for
-HC/PE lifecycle, internal 250 ms safe-callback coalescing and legacy unsupported search.
+HC/PE lifecycle, Core-owned global evaluation-count progress (`progress_every`,
+default 100000) and legacy unsupported search.
 UTC timestamps and monotonic elapsed time are separate; no timer delivery is promised.
 Slice 10.1 froze this contract before those implementation slices; the formulas below
 remain normative.

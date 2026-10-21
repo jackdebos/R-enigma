@@ -1,6 +1,8 @@
 //! Private constrained steepest-ascent reswapping stage (search-passes §9.3, §9.5).
 
-use crate::attack_control::{AttackControl, CounterObserver};
+#[cfg(test)]
+use crate::attack_control::AttackControl;
+use crate::attack_control::CounterObserver;
 use crate::attack_hill_climb::{EvaluationAccounting, ObservedAccounting};
 use crate::attack_result::{AttackRunErrorData, RunPayload};
 use crate::{Alphabet, AttackPlugboardDomain, AttackTermination, MeasureId, MeasuredScore};
@@ -57,8 +59,7 @@ where
             return Ok(Err(AttackTermination::EvaluationBudget));
         }
         let (plaintext, score) = (self.evaluate)(board)?;
-        let record = AttackControl::record_evaluation_completed;
-        self.accounting.transition(record)?;
+        self.accounting.complete()?;
         let board = board.to_vec();
         Ok(Ok(Trial {
             board,
@@ -547,7 +548,7 @@ mod tests {
     /// The materializing stage before score-only trials, kept as an oracle.
     mod reference {
         use super::super::{normalize, order};
-        use crate::attack_control::{AttackControl, CounterObserver};
+        use crate::attack_control::CounterObserver;
         use crate::attack_hill_climb::{EvaluationAccounting, ObservedAccounting, ScoredBoard};
         use crate::attack_result::{AttackRunErrorData, RunPayload};
         use crate::MeasuredScore;
@@ -583,8 +584,7 @@ mod tests {
                     return Ok(Err(AttackTermination::EvaluationBudget));
                 }
                 let (plaintext, score) = (self.evaluate)(board)?;
-                let record = AttackControl::record_evaluation_completed;
-                self.accounting.transition(record)?;
+                self.accounting.complete()?;
                 let board = board.to_vec();
                 Ok(Ok(ScoredBoard {
                     board,

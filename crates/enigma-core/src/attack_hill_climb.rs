@@ -166,6 +166,19 @@ impl<F: FnMut(crate::AttackProgress)> CounterObserver for ProgressObserver<F> {
     }
 }
 
+/// One lifecycle boundary around all fallible scheduling, projection and stages.
+/// Terminal delivery uses the live control even when an inner `?` returns early.
+fn observed_run<O: CounterObserver>(
+    control: &mut AttackControl,
+    observer: &mut O,
+    run: impl FnOnce(&mut AttackControl, &mut O) -> Result<crate::AttackResult, crate::AttackRunError>,
+) -> Result<crate::AttackResult, crate::AttackRunError> {
+    control.notify(observer);
+    let result = run(control, observer);
+    control.notify(observer);
+    result
+}
+
 impl crate::AttackRequest {
     /// Run this resource-bound owner with fresh accounting and latched cancellation.
     ///
@@ -181,64 +194,67 @@ impl crate::AttackRequest {
             used: 0,
             limit: self.settings().evaluation_budget(),
         };
-        let mut control = AttackControl::default();
+        let mut control = AttackControl::with_progress_every(self.settings().progress_every());
         let mut observer = ProgressObserver(observe);
-        let preparation = RunPreparation::new(self);
-        let result = if self.settings().kind() == crate::AttackKind::PartialExhaustion {
-            match self.schedule_partial_outers_prepared(
-                &preparation,
-                &mut allowance,
-                &mut control,
-                &mut observer,
-                &mut cancel_requested,
-                self.settings().hold_capacity(),
-            ) {
-                Ok(outcome) => outcome.project_public(
+        observed_run(&mut control, &mut observer, |control, observer| {
+            let preparation = RunPreparation::new(self);
+            let result = if self.settings().kind() == crate::AttackKind::PartialExhaustion {
+                match self.schedule_partial_outers_prepared(
+                    &preparation,
+                    &mut allowance,
+                    control,
+                    observer,
+                    &mut cancel_requested,
+                    self.settings().hold_capacity(),
+                ) {
+                    Ok(outcome) => outcome.project_public(
+                        control.snapshot(),
+                        self.domain(),
+                        self.settings().final_measure(),
+                    ),
+                    Err(error) => {
+                        Err(error.project(self.domain(), self.settings().final_measure()))
+                    }
+                }
+            } else {
+                let mut acceptance = DirectAcceptance::new(self.settings().hold_capacity());
+                let run = self.schedule_direct_outers_prepared(
+                    &preparation,
+                    &mut allowance,
+                    control,
+                    observer,
+                    &mut cancel_requested,
+                    |outcome| {
+                        acceptance.accept(outcome, self.domain(), self.settings().final_measure())
+                    },
+                );
+                acceptance.finish(
+                    run,
                     control.snapshot(),
                     self.domain(),
                     self.settings().final_measure(),
-                ),
-                Err(error) => Err(error.project(self.domain(), self.settings().final_measure())),
-            }
-        } else {
-            let mut acceptance = DirectAcceptance::new(self.settings().hold_capacity());
-            let run = self.schedule_direct_outers_prepared(
-                &preparation,
-                &mut allowance,
-                &mut control,
-                &mut observer,
-                &mut cancel_requested,
-                |outcome| {
-                    acceptance.accept(outcome, self.domain(), self.settings().final_measure())
-                },
-            );
-            acceptance.finish(
-                run,
-                control.snapshot(),
-                self.domain(),
-                self.settings().final_measure(),
-            )
-        }?;
-        let mut result = result;
-        let completed = crate::AttackTermination::Completed;
-        let staged = !self.settings().stages().is_empty();
-        if staged && result.termination == completed && result.best.is_some() {
-            let accounting = &mut ObservedAccounting {
-                allowance: &mut allowance,
-                control: &mut control,
-                observer: &mut observer,
-            };
-            result = stages_over_hold(result, |result| {
-                self.finalist_stages_prepared(
-                    &preparation,
-                    result,
-                    accounting,
-                    &mut cancel_requested,
                 )
-            })?;
-        }
-        control.notify(&mut observer);
-        Ok(result)
+            }?;
+            let mut result = result;
+            let completed = crate::AttackTermination::Completed;
+            let staged = !self.settings().stages().is_empty();
+            if staged && result.termination == completed && result.best.is_some() {
+                let accounting = &mut ObservedAccounting {
+                    allowance: &mut allowance,
+                    control,
+                    observer,
+                };
+                result = stages_over_hold(result, |result| {
+                    self.finalist_stages_prepared(
+                        &preparation,
+                        result,
+                        accounting,
+                        &mut cancel_requested,
+                    )
+                })?;
+            }
+            Ok(result)
+        })
     }
 
     /// Runs every listed stage on `result.best` alone; unprocessed finalists ride
@@ -409,7 +425,7 @@ fn scoring_stage(
         }
         Ok(true) => {
             evaluate(result.best.as_ref().expect("completed run has best")).and_then(|value| {
-                accounting.transition(AttackControl::record_evaluation_completed)?;
+                accounting.complete()?;
                 Ok(value)
             })
         }
@@ -433,19 +449,16 @@ fn scoring_stage(
             best.measure = measure;
             Ok(result)
         }
-        Err(source) => {
-            accounting.control.notify(accounting.observer);
-            Err(crate::AttackRunError::new(AttackRunErrorData {
-                outer_index: result.best.as_ref().map(|best| best.outer_index),
-                start_index: result.best.as_ref().map(|best| best.start_index),
-                source: crate::AttackRunSource(source),
-                held_tail: result.held_tail,
-                stages: result.stages,
-                evaluations_used: result.evaluations_used,
-                counters: result.counters,
-                best: Ok(result.best),
-            }))
-        }
+        Err(source) => Err(crate::AttackRunError::new(AttackRunErrorData {
+            outer_index: result.best.as_ref().map(|best| best.outer_index),
+            start_index: result.best.as_ref().map(|best| best.start_index),
+            source: crate::AttackRunSource(source),
+            held_tail: result.held_tail,
+            stages: result.stages,
+            evaluations_used: result.evaluations_used,
+            counters: result.counters,
+            best: Ok(result.best),
+        })),
     }
 }
 
@@ -897,7 +910,6 @@ impl crate::AttackRequest {
         mut requested: impl FnMut() -> bool,
         capacity: usize,
     ) -> Result<ControlledPartialRun, Box<ControlledPartialRunError>> {
-        control.notify(observer);
         let result = if self.settings().kind() != crate::AttackKind::PartialExhaustion {
             Err(Box::new(ControlledPartialRunError {
                 outer_index: None,
@@ -923,7 +935,6 @@ impl crate::AttackRequest {
                 capacity,
             )
         };
-        control.notify(observer);
         result
     }
 
@@ -990,7 +1001,6 @@ impl crate::AttackRequest {
         ) -> Result<ClimbOutcome, ObservedClimbError>,
     ) -> Result<ControlledPartialOutcome, ControlledPartialError> {
         let (initial, outer_index) = outer;
-        accounting.control.notify(accounting.observer);
         let result = (|| {
             let settings = self.settings();
             if settings.kind() != crate::AttackKind::PartialExhaustion {
@@ -1064,7 +1074,6 @@ impl crate::AttackRequest {
                 held,
             })
         })();
-        accounting.control.notify(accounting.observer);
         result
     }
 
@@ -1247,7 +1256,6 @@ impl crate::AttackRequest {
         mut requested: impl FnMut() -> bool,
         accept: impl FnMut(DirectOuterOutcome) -> Result<Option<DirectOuterOutcome>, ProjectionError>,
     ) -> Result<DirectRunOutcome, Box<ControlledDirectError>> {
-        control.notify(observer);
         let result = if self.settings().kind() != crate::AttackKind::HillClimb {
             Err(Box::new(ControlledDirectError {
                 outer_index: None,
@@ -1289,7 +1297,6 @@ impl crate::AttackRequest {
                 accept,
             )
         };
-        control.notify(observer);
         result
     }
 
@@ -1505,7 +1512,6 @@ fn schedule_controlled_partial_with_climb<O: CounterObserver, F: FnMut() -> bool
         &mut F,
     ) -> Result<ControlledPartialOutcome, ControlledPartialError>,
 ) -> Result<ControlledPartialRun, Box<ControlledPartialRunError>> {
-    accounting.control.notify(accounting.observer);
     let run = (|| -> Result<_, Box<ControlledPartialRunError>> {
         let before = accounting.control.snapshot();
         let mut result = ControlledPartialRun {
@@ -1645,7 +1651,6 @@ fn schedule_controlled_partial_with_climb<O: CounterObserver, F: FnMut() -> bool
         }
         Ok(result)
     })();
-    accounting.control.notify(accounting.observer);
     run
 }
 
@@ -1720,7 +1725,6 @@ fn schedule_controlled_direct<O: CounterObserver, F: FnMut() -> bool>(
     ) -> Result<DirectOuterOutcome, DirectRunError>,
     mut accept: impl FnMut(DirectOuterOutcome) -> Result<Option<DirectOuterOutcome>, ProjectionError>,
 ) -> Result<DirectRunOutcome, Box<ControlledDirectError>> {
-    accounting.control.notify(accounting.observer);
     let before = accounting.control.snapshot();
     let mut result = DirectRunOutcome {
         termination: DirectRunTermination::OuterSliceEnd,
@@ -1801,7 +1805,6 @@ fn schedule_controlled_direct<O: CounterObserver, F: FnMut() -> bool>(
         }
         Ok(())
     })();
-    accounting.control.notify(accounting.observer);
     run.map_err(|error: IndexedDirectRunError| {
         Box::new(ControlledDirectError {
             outer_index: error.outer_index,
@@ -1946,6 +1949,9 @@ pub(super) trait EvaluationAccounting {
     ) -> Result<(), Self::Error> {
         Ok(())
     }
+    fn complete(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
     fn evaluate(
         &mut self,
         evaluator: &TrialEvaluator<'_>,
@@ -1956,7 +1962,7 @@ pub(super) trait EvaluationAccounting {
             return Ok(None);
         }
         let result = evaluator.evaluate(board)?;
-        self.transition(AttackControl::record_evaluation_completed)?;
+        self.complete()?;
         Ok(Some(result))
     }
     /// [`Self::evaluate`] with the same accounting over a walker-guaranteed valid
@@ -1971,7 +1977,7 @@ pub(super) trait EvaluationAccounting {
             return Ok(None);
         }
         let result = evaluator.evaluate_score_mapped(mapping)?;
-        self.transition(AttackControl::record_evaluation_completed)?;
+        self.complete()?;
         Ok(Some(result))
     }
 }
@@ -2004,9 +2010,12 @@ impl<O: CounterObserver> EvaluationAccounting for ObservedAccounting<'_, O> {
         &mut self,
         record: fn(&mut AttackControl) -> Result<(), CounterOverflow>,
     ) -> Result<(), Self::Error> {
-        record(self.control).map_err(ObservedClimbError::Counter)?;
-        self.control.notify(self.observer);
-        Ok(())
+        record(self.control).map_err(ObservedClimbError::Counter)
+    }
+    fn complete(&mut self) -> Result<(), Self::Error> {
+        self.control
+            .complete(self.observer)
+            .map_err(ObservedClimbError::Counter)
     }
 }
 
@@ -2034,6 +2043,10 @@ impl<O: CounterObserver, F: FnMut() -> bool> EvaluationAccounting
         record: fn(&mut AttackControl) -> Result<(), CounterOverflow>,
     ) -> Result<(), Self::Error> {
         self.observed.transition(record)
+    }
+
+    fn complete(&mut self) -> Result<(), Self::Error> {
+        self.observed.complete()
     }
 }
 
@@ -2136,7 +2149,6 @@ impl<'a> BoundClimbScoring<'a> {
         // Continue(Some) keeps raw strict-best selection; Break stops before later seeds.
         mut accept: impl FnMut(SeedBest) -> ControlFlow<(), Option<SeedBest>>,
     ) -> Result<ControlledSeedOutcome, ControlledSeedError> {
-        accounting.control.notify(accounting.observer);
         let run = (|| {
             let seeds = SeedCursor::new(self.initial, self.domain, policy).map_err(|source| {
                 ControlledSeedError {
@@ -2198,7 +2210,6 @@ impl<'a> BoundClimbScoring<'a> {
             result.seeds.evaluations_used = accounting.allowance.used;
             Ok(result)
         })();
-        accounting.control.notify(accounting.observer);
         run
     }
 
@@ -2266,19 +2277,6 @@ impl<'a> BoundClimbScoring<'a> {
         self.climb_accounted(board, backtrack_pairs, allowance)
     }
 
-    #[cfg(test)]
-    fn climb_observed(
-        &self,
-        board: MutableBoard,
-        backtrack_pairs: usize,
-        accounting: &mut ObservedAccounting<'_, impl CounterObserver>,
-    ) -> Result<ClimbOutcome, ObservedClimbError> {
-        accounting.control.notify(accounting.observer);
-        let result = self.climb_accounted(board, backtrack_pairs, accounting);
-        accounting.control.notify(accounting.observer);
-        result
-    }
-
     fn climb_cancellable(
         &self,
         board: MutableBoard,
@@ -2286,17 +2284,14 @@ impl<'a> BoundClimbScoring<'a> {
         accounting: &mut ObservedAccounting<'_, impl CounterObserver>,
         requested: impl FnMut() -> bool,
     ) -> Result<ClimbOutcome, ObservedClimbError> {
-        accounting.control.notify(accounting.observer);
-        let result = self.climb_accounted(
+        self.climb_accounted(
             board,
             backtrack_pairs,
             &mut CancellableAccounting {
                 observed: accounting,
                 requested,
             },
-        );
-        accounting.control.notify(accounting.observer);
-        result
+        )
     }
 
     fn climb_accounted<A: EvaluationAccounting>(
@@ -2600,6 +2595,52 @@ mod tests {
         }
     }
 
+    /// Test-only accounting decorator: inspect live facts only when the driver
+    /// polls cancellation, never through the public observation stream.
+    struct PollingAccounting<'a, 'b, O, F> {
+        inner: &'a mut ObservedAccounting<'b, O>,
+        stop: F,
+    }
+
+    impl<O: CounterObserver, F: FnMut(crate::attack_control::CounterSnapshot) -> bool>
+        EvaluationAccounting for PollingAccounting<'_, '_, O, F>
+    {
+        type Error = ObservedClimbError;
+        fn cancelled(&mut self) -> bool {
+            let stop = (self.stop)(self.inner.control.snapshot());
+            self.inner.control.poll_cancellation(stop)
+        }
+        fn admit(&mut self, reserve: u64) -> Result<bool, Self::Error> {
+            self.inner.admit(reserve)
+        }
+        fn complete(&mut self) -> Result<(), Self::Error> {
+            self.inner.complete()
+        }
+        fn transition(
+            &mut self,
+            record: fn(&mut AttackControl) -> Result<(), CounterOverflow>,
+        ) -> Result<(), Self::Error> {
+            self.inner.transition(record)
+        }
+    }
+
+    fn climb_stopping_when(
+        scoring: &BoundClimbScoring<'_>,
+        board: MutableBoard,
+        backtrack: usize,
+        accounting: &mut ObservedAccounting<'_, impl CounterObserver>,
+        stop: impl FnMut(crate::attack_control::CounterSnapshot) -> bool,
+    ) -> Result<ClimbOutcome, ObservedClimbError> {
+        scoring.climb_accounted(
+            board,
+            backtrack,
+            &mut PollingAccounting {
+                inner: accounting,
+                stop,
+            },
+        )
+    }
+
     fn run_cancellation(
         context: &BoundClimbScoring<'_>,
         stop_poll: usize,
@@ -2631,7 +2672,10 @@ mod tests {
             },
         );
         let snapshot = control.snapshot();
-        assert_eq!(observer.0.last(), Some(&snapshot));
+        assert!(
+            observer.0.is_empty(),
+            "private climbs have no lifecycle notifications"
+        );
         assert_eq!(snapshot.outers_completed, 0);
         (result, snapshot, allowance.used - 7, polls)
     }
@@ -2929,7 +2973,7 @@ mod tests {
             let mut control = AttackControl::default();
             let mut observer = Recorder::default();
             let outcome = context
-                .climb_observed(
+                .climb_accounted(
                     vec![],
                     0,
                     &mut ObservedAccounting {
@@ -2970,11 +3014,9 @@ mod tests {
             } else {
                 assert_eq!(used, 0);
             }
-            assert_eq!(observer.0.first(), Some(&Default::default()));
-            assert_eq!(observer.0.last(), Some(&snapshot));
-            assert_eq!(
-                observer.0.len() as u64,
-                2 + used * 2 + u64::from(used > 0) + u64::from(exhausted)
+            assert!(
+                observer.0.is_empty(),
+                "all completions are below the default cadence"
             );
             assert!(observer
                 .0
@@ -3003,7 +3045,7 @@ mod tests {
             let mut control = AttackControl::default();
             let mut observer = Recorder::default();
             let error = context
-                .climb_observed(
+                .climb_accounted(
                     vec![],
                     0,
                     &mut ObservedAccounting {
@@ -3036,7 +3078,7 @@ mod tests {
                 (1, 0, 0)
             );
             assert_eq!(allowance.used, 7 + used);
-            assert_eq!(observer.0.last(), Some(&snapshot));
+            assert!(observer.0.is_empty(), "failed evaluations do not notify");
         }
     }
 
@@ -3145,6 +3187,271 @@ mod tests {
             .unwrap()
             .bind_resources(&supplied)
             .unwrap()
+    }
+
+    #[test]
+    fn early_scheduler_error_keeps_distinct_initial_and_terminal_observations() {
+        // Characterization: even an error before the first admission must pass
+        // through the same terminal boundary as a successfully evaluated run.
+        for pe in [false, true] {
+            let request = scheduler_request(1000, false, pe, 0);
+            let mut control = AttackControl::default();
+            let mut snapshots = Vec::new();
+            let mut observer = ProgressObserver(|p| snapshots.push(p));
+            let error = observed_run(&mut control, &mut observer, |control, observer| {
+                let mut allowance = EvaluationAllowance {
+                    used: 0,
+                    limit: 1000,
+                };
+                let accounting = &mut ObservedAccounting {
+                    allowance: &mut allowance,
+                    control,
+                    observer,
+                };
+                if pe {
+                    let error = schedule_controlled_partial_with_climb(
+                        1,
+                        request.outer_candidates().take(0),
+                        accounting,
+                        &mut || false,
+                        |_, _, _, _| panic!("no outer may start"),
+                    )
+                    .unwrap_err();
+                    Err(error.project(request.domain(), MeasureId::Trie))
+                } else {
+                    let error = schedule_controlled_direct(
+                        1,
+                        request.outer_candidates().take(0),
+                        accounting,
+                        &mut || false,
+                        |_, _, _, _| panic!("no outer may start"),
+                        |_| panic!("no outer may be accepted"),
+                    )
+                    .unwrap_err();
+                    Err(error.project(request.domain(), MeasureId::Trie))
+                }
+            })
+            .unwrap_err();
+            assert_eq!(error.evaluations_used(), 0);
+            assert_eq!(error.counters().0, Default::default());
+            assert_eq!(
+                snapshots,
+                vec![crate::AttackProgress(Default::default()); 2]
+            );
+        }
+    }
+
+    #[test]
+    fn observed_run_errors_keep_terminal_live_counters() {
+        use crate::attack_result::RunPayload;
+        // Valid external requests cannot deterministically manufacture these
+        // invariant failures. Inject at the existing scheduler/projection/scorer
+        // seams, inside the exact lifecycle boundary used by public run().
+        for pe in [false, true] {
+            for fault in [
+                "early_scheduler",
+                "later_scheduler",
+                "projection",
+                "chained_stage",
+            ] {
+                for every in [1, 3, 100_000] {
+                    let request = scheduler_request(1000, false, pe, 0);
+                    let mut allowance = EvaluationAllowance {
+                        used: 0,
+                        limit: 1000,
+                    };
+                    let mut control = AttackControl::with_progress_every(every);
+                    let mut snapshots = Vec::new();
+                    let mut observer = ProgressObserver(|p| snapshots.push(p));
+                    let error = observed_run(&mut control, &mut observer, |control, observer| {
+                        let accounting = &mut ObservedAccounting {
+                            allowance: &mut allowance,
+                            control,
+                            observer,
+                        };
+                        let selected = if fault == "later_scheduler" { 2 } else { 1 };
+                        let take = usize::from(fault != "early_scheduler");
+                        let result = if pe {
+                            let run = schedule_controlled_partial_with_climb(
+                                selected,
+                                request.outer_candidates().take(take),
+                                accounting,
+                                &mut || false,
+                                |initial, index, accounting, requested| {
+                                    let mut outer = request.climb_partial_outer_controlled(
+                                        initial, index, accounting, requested,
+                                    )?;
+                                    if fault == "projection" {
+                                        outer
+                                            .seeds
+                                            .seeds
+                                            .best
+                                            .as_mut()
+                                            .unwrap()
+                                            .current
+                                            .board
+                                            .push(('A', 'Z'));
+                                    }
+                                    Ok(outer)
+                                },
+                            );
+                            match run {
+                                Ok(run) => run.project_public(
+                                    accounting.control.snapshot(),
+                                    request.domain(),
+                                    MeasureId::Trie,
+                                )?,
+                                Err(error) => {
+                                    return Err(error.project(request.domain(), MeasureId::Trie))
+                                }
+                            }
+                        } else {
+                            let mut acceptance = DirectAcceptance::new(1);
+                            let run = schedule_controlled_direct(
+                                selected,
+                                request.outer_candidates().take(take),
+                                accounting,
+                                &mut || false,
+                                |initial, index, accounting, requested| {
+                                    let (scoring, start) = request
+                                        .direct_scoring(&initial)
+                                        .map_err(DirectRunError::Climb)?;
+                                    let mut climb = scoring
+                                        .climb_cancellable(start, 0, accounting, requested)
+                                        .map_err(DirectRunError::from)?;
+                                    if fault == "projection" {
+                                        climb.current.as_mut().unwrap().board.push(('A', 'Z'));
+                                    }
+                                    Ok(DirectOuterOutcome {
+                                        initial,
+                                        outer_index: index,
+                                        start_index: 0,
+                                        climb,
+                                    })
+                                },
+                                |outcome| {
+                                    acceptance.accept(outcome, request.domain(), MeasureId::Trie)
+                                },
+                            );
+                            acceptance.finish(
+                                run,
+                                accounting.control.snapshot(),
+                                request.domain(),
+                                MeasureId::Trie,
+                            )?
+                        };
+                        assert_eq!(fault, "chained_stage", "projection must fail before stages");
+                        stages_over_hold(result, |result| {
+                            let result = scoring_stage(
+                                result,
+                                crate::space::AttackStage::Measure {
+                                    measure: MeasureId::Trie,
+                                },
+                                accounting,
+                                |best| Ok((best.plaintext.clone(), best.score)),
+                            )?;
+                            scoring_stage(
+                                result,
+                                crate::space::AttackStage::Trie { base_measure: None },
+                                accounting,
+                                |_| {
+                                    Err(RunPayload::Evaluation(
+                                        TrialEvaluationError::MissingResource(MeasureId::Trie),
+                                    ))
+                                },
+                            )
+                        })
+                    })
+                    .unwrap_err();
+                    let live = control.snapshot();
+                    assert_eq!(error.counters().0, live, "pe={pe}, fault={fault}");
+                    assert_eq!(error.evaluations_used(), allowance.used);
+                    assert_eq!(live.evaluations_admitted, allowance.used);
+                    assert_eq!(
+                        live.evaluations_admitted - live.evaluations_completed,
+                        u64::from(fault == "chained_stage")
+                    );
+                    if fault == "early_scheduler" {
+                        assert_eq!(live, Default::default());
+                    } else {
+                        assert!(live.evaluations_completed > 0);
+                        assert_eq!(live.outers_completed, 1);
+                    }
+                    let mut expected = vec![0];
+                    expected.extend((1..=live.evaluations_completed).filter(|n| n % every == 0));
+                    expected.push(live.evaluations_completed);
+                    assert_eq!(
+                        snapshots
+                            .iter()
+                            .map(|p| p.evaluations_completed())
+                            .collect::<Vec<_>>(),
+                        expected
+                    );
+                    assert_eq!(snapshots.last(), Some(&crate::AttackProgress(live)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn public_progress_grid_spans_outers_seeds_objectives_stages_and_finalists() {
+        for pe in [false, true] {
+            for every in [1, 3, 100_000, u64::MAX] {
+                let request = direct_request_with(serde_json::json!([]), true, pe, |job| {
+                    job["configuration"]["slots"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("position");
+                    job["space"]["slots"] =
+                        serde_json::json!([{"id":"r","positions":["B","A","C"]}]);
+                    job["attack"]["evaluation_budget"] = serde_json::json!(10_000);
+                    job["attack"]["progress_every"] = serde_json::json!(every);
+                    job["attack"]["hold"] = serde_json::json!(3);
+                    for pass in ["reswapping", "trie", "measure"] {
+                        job["passes"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(serde_json::json!(pass));
+                        job["attack"][pass] = if pass == "trie" {
+                            serde_json::json!({})
+                        } else {
+                            serde_json::json!({"measure":"trie"})
+                        };
+                    }
+                });
+                for cancel in [false, true] {
+                    let mut snapshots = Vec::new();
+                    let mut polls = 0;
+                    let result = request
+                        .run(
+                            |p| snapshots.push(p),
+                            || {
+                                polls += 1;
+                                cancel && polls == 5
+                            },
+                        )
+                        .unwrap();
+                    let completed = result.counters().evaluations_completed();
+                    let mut expected = vec![0];
+                    expected.extend((1..=completed).filter(|count| count % every == 0));
+                    expected.push(completed);
+                    assert_eq!(
+                        snapshots
+                            .iter()
+                            .map(|p| p.evaluations_completed())
+                            .collect::<Vec<_>>(),
+                        expected,
+                        "pe={pe}, every={every}, cancel={cancel}"
+                    );
+                    assert_eq!(snapshots.last(), Some(&result.counters()));
+                    if !cancel {
+                        assert_eq!(result.counters().outers_completed(), 3);
+                        assert_eq!(result.hold().count(), 3);
+                        assert!(result.hold().all(|entry| entry.stages().len() == 3));
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -3392,7 +3699,10 @@ mod tests {
         assert_eq!(error.evaluations_used(), used + 1);
         assert_eq!(error.counters().evaluations_admitted(), used + 1);
         assert_eq!(error.counters().evaluations_completed(), used);
-        assert_eq!(recorder.0.last(), Some(&error.counters().0));
+        assert!(
+            recorder.0.is_empty(),
+            "stage errors leave terminal delivery to run"
+        );
         let best = error.best().unwrap().unwrap();
         assert_eq!(best.configuration(), &key);
         assert_eq!(best.score(), score);
@@ -3467,7 +3777,10 @@ mod tests {
         assert_eq!(error.evaluations_used(), used + 1);
         assert_eq!(error.counters().evaluations_admitted(), used + 1);
         assert_eq!(error.counters().evaluations_completed(), used);
-        assert_eq!(recorder.0.last(), Some(&error.counters().0));
+        assert!(
+            recorder.0.is_empty(),
+            "failed composition is not a completion"
+        );
         let stage = &error.stages()[1];
         assert_eq!(stage.pass(), "trie");
         assert_eq!(stage.score(), None);
@@ -3535,7 +3848,7 @@ mod tests {
             )
             .unwrap_err();
             assert_eq!(error.counters, control.snapshot());
-            assert_eq!(recorder.0.last(), Some(&error.counters));
+            assert!(recorder.0.is_empty());
             let error = error.project(request.domain(), request.settings().final_measure());
             assert_eq!(error.outer_index(), resolution.then_some(failure_index));
             assert_eq!(error.start_index(), None);
@@ -3638,7 +3951,7 @@ mod tests {
                 },
             )
             .unwrap_err();
-            assert_eq!(recorder.0.last(), Some(&error.counters));
+            assert!(recorder.0.is_empty());
             let error = error.project(request.domain(), MeasureId::Trie);
             assert_eq!(error.outer_index(), Some(failure));
             assert_eq!(error.start_index(), Some(u128::MAX));
@@ -3678,7 +3991,7 @@ mod tests {
                 if outer_overflow { None } else { Some(1) }
             );
             assert_eq!(error.counters, control.snapshot());
-            assert_eq!(recorder.0.last(), Some(&error.counters));
+            assert!(recorder.0.is_empty());
             let best = error.best.as_ref().unwrap();
             if outer_overflow {
                 assert_eq!(
@@ -3940,17 +4253,66 @@ mod tests {
         request: &crate::AttackRequest,
         stop: impl Fn(crate::AttackProgress) -> bool,
     ) -> crate::AttackResult {
-        let cancel = std::cell::Cell::new(false);
+        // Derive the external pulse from independent driver polling in the
+        // existing private scheduler seam, not from public progress callbacks.
+        let polls = std::cell::Cell::new(0usize);
+        let stop_poll = std::cell::Cell::new(usize::MAX);
+        let poll = |facts| {
+            polls.set(polls.get() + 1);
+            if stop(crate::AttackProgress(facts)) {
+                stop_poll.set(stop_poll.get().min(polls.get()));
+                true
+            } else {
+                false
+            }
+        };
+        let mut control = AttackControl::default();
+        let mut observer = Recorder::default();
+        schedule_controlled_partial_with_climb(
+            request.gate().outer_selected(),
+            request.outer_candidates(),
+            &mut ObservedAccounting {
+                allowance: &mut EvaluationAllowance {
+                    used: 0,
+                    limit: request.settings().evaluation_budget(),
+                },
+                control: &mut control,
+                observer: &mut observer,
+            },
+            &mut || poll(Default::default()),
+            |initial, index, accounting, requested| {
+                request.climb_partial_outer_controlled_with(
+                    initial,
+                    index,
+                    accounting,
+                    requested,
+                    request.settings().hold_capacity(),
+                    |scoring, _, board, accounting, _| {
+                        climb_stopping_when(
+                            scoring,
+                            board,
+                            request.settings().backtrack_pairs(),
+                            accounting,
+                            &poll,
+                        )
+                    },
+                )
+            },
+        )
+        .unwrap();
+        assert!(observer.0.is_empty());
         let mut last = None;
+        let mut actual_polls = 0;
         let result = request
             .run(
-                |p| {
-                    cancel.set(stop(p));
-                    last = Some(p);
+                |p| last = Some(p),
+                || {
+                    actual_polls += 1;
+                    actual_polls == stop_poll.get()
                 },
-                || cancel.get(),
             )
             .expect("public PE executes");
+        assert_eq!(result.counters().0, control.snapshot());
         assert_eq!(last, Some(result.counters()));
         assert_eq!(
             result.evaluations_used(),
@@ -4314,17 +4676,28 @@ mod tests {
         assert_eq!(allowance.used, 32);
         assert_eq!(outer.seeds.seeds.climbs_completed, 4);
         let cancelled = std::cell::Cell::new(false);
-        struct Observer<'a>(&'a std::cell::Cell<bool>);
-        impl CounterObserver for Observer<'_> {
-            fn observe(&mut self, snapshot: crate::attack_control::CounterSnapshot) {
-                self.0.set(snapshot.outers_completed == 1);
-            }
-        }
-        let mut observer = Observer(&cancelled);
+        let mut observer = Recorder::default();
         let mut control = AttackControl::default();
-        let run = request
-            .schedule_partial_outers_controlled(&mut control, &mut observer, || cancelled.get())
-            .unwrap();
+        let run = schedule_controlled_partial_with_climb(
+            request.gate().outer_selected(),
+            request.outer_candidates(),
+            &mut ObservedAccounting {
+                allowance: &mut EvaluationAllowance { used: 0, limit: 32 },
+                control: &mut control,
+                observer: &mut observer,
+            },
+            &mut || cancelled.get(),
+            |initial, index, accounting, requested| {
+                let outer = request
+                    .climb_partial_outer_controlled(initial, index, accounting, requested)?;
+                // Inject an external request after the first outer's climbs return;
+                // the scheduler accounts that outer before polling the next one.
+                cancelled.set(true);
+                Ok(outer)
+            },
+        )
+        .unwrap();
+        assert!(observer.0.is_empty());
         assert_eq!(run.termination, ControlledPartialTermination::Cancelled);
         assert_eq!(
             (
@@ -4345,23 +4718,49 @@ mod tests {
         prior: crate::attack_control::CounterSnapshot,
         stop_at: Option<u64>,
     ) -> (ControlledPartialRun, Recorder, AttackControl) {
-        struct Observer<'a>(&'a std::cell::Cell<u64>, Recorder);
-        impl CounterObserver for Observer<'_> {
-            fn observe(&mut self, snapshot: crate::attack_control::CounterSnapshot) {
-                self.0.set(snapshot.evaluations_completed);
-                self.1.observe(snapshot);
-            }
-        }
-        let completed = std::cell::Cell::new(0);
-        let mut observer = Observer(&completed, Recorder::default());
+        let mut observer = Recorder::default();
         let mut control = AttackControl::with_counters(prior);
-        let run = request
-            .schedule_partial_outers_controlled(&mut control, &mut observer, || {
-                stop_at.is_some_and(|stop| completed.get() >= stop)
-            })
-            .unwrap();
-        assert_eq!(observer.1 .0.last(), Some(&control.snapshot()));
-        (run, observer.1, control)
+        let pending = std::cell::Cell::new(stop_at == Some(0));
+        let run = schedule_controlled_partial_with_climb(
+            request.gate().outer_selected(),
+            request.outer_candidates(),
+            &mut ObservedAccounting {
+                allowance: &mut EvaluationAllowance {
+                    used: 0,
+                    limit: request.settings().evaluation_budget(),
+                },
+                control: &mut control,
+                observer: &mut observer,
+            },
+            &mut || pending.get(),
+            |initial, index, accounting, requested| {
+                let result = request.climb_partial_outer_controlled_with(
+                    initial,
+                    index,
+                    accounting,
+                    requested,
+                    1,
+                    |scoring, _, board, accounting, _| {
+                        climb_stopping_when(
+                            scoring,
+                            board,
+                            request.settings().backtrack_pairs(),
+                            accounting,
+                            |facts| stop_at.is_some_and(|stop| facts.evaluations_completed >= stop),
+                        )
+                    },
+                );
+                // If the final evaluation exhausts an outer with no further poll,
+                // deliver the independent request at the next outer's entry poll.
+                pending.set(stop_at.is_some_and(|stop| {
+                    accounting.control.snapshot().evaluations_completed >= stop
+                }));
+                result
+            },
+        )
+        .unwrap();
+        assert!(observer.0.is_empty());
+        (run, observer, control)
     }
 
     #[test]
@@ -4550,7 +4949,7 @@ mod tests {
             assert!(matches!(error.source, ControlledPartialRunSource::Climb(
                 ControlledPartialSource::Climb(ObservedClimbError::Counter(actual))
             ) if actual == expected));
-            assert_eq!(recorder.0.last(), Some(&control.snapshot()));
+            assert!(recorder.0.is_empty());
             assert_eq!(error.counters, control.snapshot());
             let projected = error.project(request.domain(), MeasureId::Trie);
             assert_eq!(projected.evaluations_used(), used);
@@ -4627,7 +5026,7 @@ mod tests {
             error.source,
             ControlledPartialRunSource::Climb(ControlledPartialSource::UnsupportedPass)
         ));
-        assert_eq!(recorder.0.last(), Some(&control.snapshot()));
+        assert!(recorder.0.is_empty());
     }
 
     #[test]
@@ -4702,7 +5101,7 @@ mod tests {
             }
             assert_eq!(polls, 1);
             assert_eq!(control.snapshot(), prior);
-            assert_eq!(recorder.0.last(), Some(&prior));
+            assert!(recorder.0.is_empty());
         }
     }
 
@@ -4725,17 +5124,7 @@ mod tests {
             limit: 100,
         };
         let pending = std::cell::Cell::new(false);
-        let mut snapshots = Vec::new();
-        struct Observer<'a>(&'a mut Vec<CounterSnapshot>, &'a std::cell::Cell<bool>);
-        impl CounterObserver for Observer<'_> {
-            fn observe(&mut self, snapshot: CounterSnapshot) {
-                self.0.push(snapshot);
-                if snapshot.evaluations_admitted > 3 {
-                    self.1.set(true);
-                }
-            }
-        }
-        let mut observer = Observer(&mut snapshots, &pending);
+        let mut observer = Recorder::default();
         let mut polls = 0;
         let mut expected = None;
         // Helper-qualified synthetic Board/seed-context fault, not a valid-owner runtime failure.
@@ -4763,6 +5152,9 @@ mod tests {
                 let original = evaluator.evaluate(&[('A', 'Z')]).unwrap_err();
                 assert!(matches!(original, TrialEvaluationError::Board(_)));
                 expected = Some(original);
+                // External cancellation arrives after the scheduler poll, before
+                // this nonpreemptible failing evaluation; no observer drives it.
+                pending.set(true);
                 let source = accounting
                     .evaluate(&evaluator, &[('A', 'Z')], 0)
                     .unwrap_err();
@@ -4796,8 +5188,10 @@ mod tests {
         );
         assert!(pending.get());
         assert_eq!(polls, 1); // No post-fault poll masks the admitted evaluator error.
-        assert_eq!(snapshots.first(), Some(&prior));
-        assert_eq!(snapshots.last(), Some(&control.snapshot()));
+        assert!(
+            observer.0.is_empty(),
+            "failed evaluations do not advance cadence"
+        );
     }
 
     fn partial_counts(run: &PartialRunOutcome) -> (u128, u128, u128, u64) {
@@ -5105,19 +5499,39 @@ mod tests {
 
     #[test]
     fn controlled_outer_cancel_between_outers() {
-        struct Observer<'a>(&'a std::cell::Cell<u128>, Recorder);
-        impl CounterObserver for Observer<'_> {
-            fn observe(&mut self, snapshot: crate::attack_control::CounterSnapshot) {
-                self.0.set(snapshot.outers_completed);
-                self.1.observe(snapshot);
-            }
-        }
-        let completed = std::cell::Cell::new(0);
-        let mut observer = Observer(&completed, Recorder::default());
+        let pending = std::cell::Cell::new(false);
+        let mut observer = Recorder::default();
         let mut control = AttackControl::default();
-        let run = scheduler_request(9, false, false, 0)
-            .schedule_direct_outers_controlled(&mut control, &mut observer, || completed.get() == 1)
-            .unwrap();
+        let request = scheduler_request(9, false, false, 0);
+        let run = schedule_controlled_direct(
+            request.gate().outer_selected(),
+            request.outer_candidates(),
+            &mut ObservedAccounting {
+                allowance: &mut EvaluationAllowance { used: 0, limit: 9 },
+                control: &mut control,
+                observer: &mut observer,
+            },
+            &mut || pending.get(),
+            |initial, index, accounting, requested| {
+                let (scoring, start) = request
+                    .direct_scoring(&initial)
+                    .map_err(DirectRunError::Climb)?;
+                let climb = scoring
+                    .climb_cancellable(start, 0, accounting, requested)
+                    .map_err(DirectRunError::from)?;
+                // External cancellation arrives after the completed climb, before
+                // the next outer poll. Accounting still records the first outer.
+                pending.set(true);
+                Ok(DirectOuterOutcome {
+                    initial,
+                    outer_index: index,
+                    start_index: 0,
+                    climb,
+                })
+            },
+            |outcome| Ok(Some(outcome)),
+        )
+        .unwrap();
         assert_eq!(run.termination, DirectRunTermination::Cancelled);
         assert_eq!(direct_counts(&run), (1, 1, 1, 9));
         let best = run.best.unwrap();
@@ -5145,8 +5559,7 @@ mod tests {
             ),
             (1, 1, 1)
         );
-        assert_eq!(observer.1 .0.last(), Some(&snapshot));
-        assert_eq!(observer.1 .0.first(), Some(&Default::default()));
+        assert!(observer.0.is_empty());
     }
 
     fn direct_counts(run: &DirectRunOutcome) -> (u128, u128, u128, u64) {
@@ -5158,7 +5571,10 @@ mod tests {
         )
     }
 
-    fn controlled_run(request: &crate::AttackRequest, stop: usize) -> (DirectRunOutcome, Recorder) {
+    fn controlled_run(
+        request: &crate::AttackRequest,
+        stop: usize,
+    ) -> (DirectRunOutcome, crate::attack_control::CounterSnapshot) {
         let mut control = AttackControl::default();
         let mut observer = Recorder::default();
         let mut polls = 0;
@@ -5168,8 +5584,8 @@ mod tests {
                 polls == stop // Subsequent false polls must not clear cancellation.
             })
             .unwrap();
-        assert_eq!(observer.0.last(), Some(&control.snapshot()));
-        (run, observer)
+        assert!(observer.0.is_empty());
+        (run, control.snapshot())
     }
 
     #[test]
@@ -5240,7 +5656,7 @@ mod tests {
                     && !best.climb.neighborhood_exhausted
             );
             assert_eq!(best.climb.final_objective_ascent, paired);
-            let final_snapshot = snapshots.0.last().unwrap();
+            let final_snapshot = snapshots;
             assert_eq!(
                 (
                     final_snapshot.evaluations_admitted,
@@ -5295,7 +5711,7 @@ mod tests {
             } else {
                 assert!(expected.best.is_none());
             }
-            assert_eq!(observer.0[0], before);
+            assert!(observer.0.is_empty());
             assert_eq!(
                 control.snapshot().outers_completed,
                 before.outers_completed + run.outer_completed
@@ -5464,7 +5880,7 @@ mod tests {
             },
             |outcome| acceptance.accept(outcome, request.domain(), MeasureId::Ic),
         );
-        assert_eq!(observer.0.last(), Some(&control.snapshot()));
+        assert!(observer.0.is_empty());
         let result = acceptance.finish(run, control.snapshot(), request.domain(), MeasureId::Ic);
         let (used, counters) = match &result {
             Ok(r) => (r.evaluations_used, r.counters),
@@ -5599,9 +6015,8 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
-            // The public facade adds its existing terminal notification after stages.
-            observer.0.push(control.snapshot());
-            assert_eq!(snapshots, observer.0);
+            assert!(observer.0.is_empty());
+            assert_eq!(snapshots, [Default::default(), control.snapshot()]);
             assert_eq!(polls, expected_polls);
         }
     }
@@ -5886,9 +6301,8 @@ mod tests {
                 .project_public(control.snapshot(), request.domain(), MeasureId::Trie)
                 .unwrap();
             assert_eq!(format!("{raw:?}"), format!("{expected:?}"));
-            // The public facade adds its existing terminal notification after stages.
-            observer.0.push(control.snapshot());
-            assert_eq!(snapshots, observer.0);
+            assert!(observer.0.is_empty());
+            assert_eq!(snapshots, [Default::default(), control.snapshot()]);
             assert_eq!(polls, expected_polls);
             // Larger capacities add no evaluation or polling; scored stops still offer.
             let (_, held, held_snapshots, held_polls) = observe(1000);
@@ -6140,7 +6554,7 @@ mod tests {
         assert!(matches!(error.source, DirectRunError::MissingOuter));
         assert_eq!(error.outer_index, None);
         assert_eq!(error.counters.outers_completed, 1);
-        assert_eq!(observer.0.last(), Some(&error.counters));
+        assert!(observer.0.is_empty());
         assert_eq!(error.evaluations_used, expected_allowance.used);
         let expected = expected.project(request.domain(), MeasureId::Trie).unwrap();
         let error = error.project(request.domain(), MeasureId::Trie);
@@ -6421,7 +6835,7 @@ mod tests {
             .unwrap_err();
             assert_eq!(error.outer_index, Some(1));
             assert_eq!(error.counters, control.snapshot());
-            assert_eq!(observer.0.last(), Some(&error.counters));
+            assert!(observer.0.is_empty());
             let additional = match fault {
                 0 => 0,
                 1 | 2 => 1,
@@ -6557,8 +6971,7 @@ mod tests {
             assert!(error.best.is_none());
             assert_eq!(error.counters, control.snapshot());
             let snapshot = control.snapshot();
-            assert_eq!(observer.0.last(), Some(&snapshot));
-            assert_eq!(observer.0.first(), Some(&Default::default()));
+            assert!(observer.0.is_empty());
             assert_eq!(snapshot.outers_completed, 0);
             assert_eq!(snapshot.climbs_completed, 0);
             if fault == 0 {
@@ -6620,8 +7033,9 @@ mod tests {
             assert!(matches!(error.source, DirectRunError::Counter(source) if source == expected));
             assert_eq!(error.outer_index, Some(0));
             assert_eq!(error.evaluations_used, used);
-            assert_eq!(observer.0[0], before); // Retained copies never change.
-            assert_eq!(observer.0.last(), Some(&control.snapshot()));
+            assert!(observer.0.is_empty());
+            // The retained input facts survive every failed checked increment.
+            assert_eq!(before, AttackControl::with_counters(before).snapshot());
         }
     }
 
@@ -7068,7 +7482,7 @@ mod tests {
     ) -> (
         Result<ControlledSeedOutcome, ControlledSeedError>,
         u64,
-        Recorder,
+        crate::attack_control::CounterSnapshot,
         usize,
     ) {
         let mut allowance = EvaluationAllowance { used: 7, limit };
@@ -7088,13 +7502,12 @@ mod tests {
                 requested(polls)
             },
         );
-        assert_eq!(observer.0.first(), Some(&counters));
-        assert_eq!(observer.0.last(), Some(&control.snapshot()));
+        assert!(observer.0.is_empty());
         assert_eq!(
             control.snapshot().outers_completed,
             counters.outers_completed
         );
-        (result, allowance.used, observer, polls)
+        (result, allowance.used, control.snapshot(), polls)
     }
 
     #[test]
@@ -7262,7 +7675,7 @@ mod tests {
                 // The later climb scores successfully before its final fault.
                 assert!(snapshot.evaluations_completed > first_used);
             }
-            assert_eq!(observer.0.last(), Some(&snapshot));
+            assert!(observer.0.is_empty());
             let mapped = ControlledPartialError::from_seed(99, initial.clone(), error);
             assert_eq!(mapped.outer_index, 99);
             assert_eq!(mapped.seed_index, Some(1));
@@ -7360,7 +7773,7 @@ mod tests {
         assert!(best.neighborhood_exhausted);
         assert_eq!(control.snapshot().climbs_started, u128::MAX);
         assert_eq!(control.snapshot().climbs_completed, 1);
-        assert_eq!(observer.0.last(), Some(&control.snapshot()));
+        assert!(observer.0.is_empty());
         let projected = best
             .into_direct(key, 73)
             .project(request.domain(), MeasureId::Ic)
@@ -7418,7 +7831,7 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            assert_eq!(recorder.0.last(), Some(&expected));
+            assert_eq!(recorder, expected);
             assert_eq!(actual, used);
             let error = result.unwrap_err();
             assert_eq!(error.seed_index, Some(0));
@@ -7438,7 +7851,7 @@ mod tests {
             (result.climbs_started, result.climbs_completed, used),
             (4, 4, 39)
         );
-        let after = recorder.0.last().unwrap();
+        let after = recorder;
         assert_eq!(
             (after.evaluations_admitted, after.evaluations_completed),
             (43, 42)
@@ -7502,7 +7915,7 @@ mod tests {
                 assert_eq!(best.current.score.ranking().units(), 1 << 32);
                 assert!(!best.incomplete && !best.final_objective_ascent);
                 assert!(best.neighborhood_exhausted);
-                let after = recorder.0.last().unwrap();
+                let after = recorder;
                 assert_eq!(
                     (after.evaluations_admitted, after.evaluations_completed),
                     (2, 2)
@@ -7541,7 +7954,7 @@ mod tests {
                 let best = result.seeds.best.unwrap();
                 assert_eq!(best.seed_index, 0);
                 assert!(!best.incomplete && best.neighborhood_exhausted);
-                let after = recorder.0.last().unwrap();
+                let after = recorder;
                 assert_eq!(
                     (after.evaluations_admitted, after.evaluations_completed),
                     (32, 32)
@@ -7600,7 +8013,7 @@ mod tests {
                 if paired { vec![('A', 'C')] } else { vec![] }
             );
             assert_eq!(control.snapshot().evaluations_completed, used);
-            assert_eq!(observer.0.last(), Some(&control.snapshot()));
+            assert!(observer.0.is_empty());
         }
         for (missing_initial, stop, used) in
             [(true, 2, 1), (false, 2, 2), (false, 8, 5), (false, 9, 5)]
@@ -7648,7 +8061,7 @@ mod tests {
             );
             assert_eq!(allowance.used, 7 + used);
             assert_eq!(control.snapshot().evaluations_completed, used - 1);
-            assert_eq!(observer.0.last(), Some(&control.snapshot()));
+            assert!(observer.0.is_empty());
         }
     }
 
@@ -7681,7 +8094,7 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(outcome.cancelled, cancel);
-            assert_eq!(observer.0.last(), Some(&control.snapshot()));
+            assert!(observer.0.is_empty());
             assert_eq!(control.snapshot().outers_completed, 0);
             if cancel {
                 assert!(outcome.seeds.best.is_none());
@@ -7750,7 +8163,7 @@ mod tests {
                 mapped.source,
                 ControlledPartialSource::Climb(expected.into())
             );
-            let snapshot = recorder.0.last().unwrap();
+            let snapshot = recorder;
             assert_eq!(
                 (
                     snapshot.evaluations_admitted,
@@ -7786,7 +8199,7 @@ mod tests {
             ))
         );
         assert_eq!(polls, 0);
-        assert_eq!(recorder.0.last().unwrap().evaluations_admitted, 0);
+        assert_eq!(recorder.evaluations_admitted, 0);
     }
 
     #[test]
@@ -7897,17 +8310,9 @@ mod tests {
             limit: 100,
         };
         let mut control = AttackControl::default();
-        struct Observer<'a>(&'a std::cell::Cell<u128>, Recorder);
-        impl CounterObserver for Observer<'_> {
-            fn observe(&mut self, snapshot: crate::attack_control::CounterSnapshot) {
-                self.0.set(snapshot.climbs_completed);
-                self.1.observe(snapshot);
-            }
-        }
-        let completed = std::cell::Cell::new(0);
-        let mut observer = Observer(&completed, Recorder::default());
+        let mut observer = Recorder::default();
         let result = request
-            .climb_partial_outer_controlled(
+            .climb_partial_outer_controlled_with(
                 equivalent.clone(),
                 99,
                 &mut ObservedAccounting {
@@ -7915,8 +8320,13 @@ mod tests {
                     control: &mut control,
                     observer: &mut observer,
                 },
-                // The next seed's entry poll follows notification of the prior completion.
-                &mut || completed.get() == 1,
+                &mut || false,
+                1,
+                |scoring, _, board, accounting, _| {
+                    climb_stopping_when(scoring, board, 0, accounting, |facts| {
+                        facts.climbs_completed == 1
+                    })
+                },
             )
             .unwrap();
         assert_eq!(initial.plugboard(), equivalent.plugboard());
@@ -7933,7 +8343,7 @@ mod tests {
         assert!(!best.incomplete);
         assert!(best.final_objective_ascent && best.neighborhood_exhausted);
         assert_eq!(control.snapshot().outers_completed, 0);
-        assert_eq!(observer.1 .0.last(), Some(&control.snapshot()));
+        assert!(observer.0.is_empty());
     }
 
     #[test]
@@ -8045,7 +8455,7 @@ mod tests {
             );
             assert_eq!(polls, usize::from(pe));
             assert_eq!(control.snapshot().outers_completed, 3);
-            assert_eq!(observer.0.last(), Some(&control.snapshot()));
+            assert!(observer.0.is_empty());
         }
     }
 
@@ -8060,17 +8470,9 @@ mod tests {
             limit: 100,
         };
         let mut control = AttackControl::default();
-        struct Observer<'a>(&'a std::cell::Cell<u128>, Recorder);
-        impl CounterObserver for Observer<'_> {
-            fn observe(&mut self, snapshot: crate::attack_control::CounterSnapshot) {
-                self.0.set(snapshot.climbs_completed);
-                self.1.observe(snapshot);
-            }
-        }
-        let completed = std::cell::Cell::new(0);
-        let mut observer = Observer(&completed, Recorder::default());
+        let mut observer = Recorder::default();
         let result = request
-            .climb_partial_outer_controlled(
+            .climb_partial_outer_controlled_with(
                 initial,
                 index,
                 &mut ObservedAccounting {
@@ -8078,7 +8480,13 @@ mod tests {
                     control: &mut control,
                     observer: &mut observer,
                 },
-                &mut || completed.get() == 1,
+                &mut || false,
+                1,
+                |scoring, _, board, accounting, _| {
+                    climb_stopping_when(scoring, board, 0, accounting, |facts| {
+                        facts.climbs_completed == 1
+                    })
+                },
             )
             .expect("validated PE adapter must retain the completed seed on cancellation");
         assert!(result.seeds.cancelled);
@@ -8106,18 +8514,11 @@ mod tests {
         assert_eq!(best.seed_index, 0);
         assert!(!best.incomplete);
         assert!(best.final_objective_ascent && best.neighborhood_exhausted);
-        assert_eq!(observer.1 .0.last(), Some(&control.snapshot()));
+        assert!(observer.0.is_empty());
     }
 
     #[test]
     fn controlled_seeds_cancel_between_seeds() {
-        struct Observer<'a>(&'a std::cell::Cell<u128>, Recorder);
-        impl CounterObserver for Observer<'_> {
-            fn observe(&mut self, snapshot: crate::attack_control::CounterSnapshot) {
-                self.0.set(snapshot.climbs_completed);
-                self.1.observe(snapshot);
-            }
-        }
         let (initial, domain) = fixture();
         let first = resource(&initial);
         let context = BoundClimbScoring::new(
@@ -8128,23 +8529,27 @@ mod tests {
             (MeasureId::Trie, Some(&first)),
             1,
         );
-        let completed = std::cell::Cell::new(0);
-        let mut observer = Observer(&completed, Recorder::default());
+        let mut observer = Recorder::default();
         let mut control = AttackControl::default();
         let mut allowance = EvaluationAllowance {
             used: 7,
             limit: 100,
         };
         let result = context
-            .climb_seeds_controlled(
+            .climb_seeds_controlled_with(
                 &crate::AttackSeedPolicy::All,
-                0,
                 &mut ObservedAccounting {
                     allowance: &mut allowance,
                     control: &mut control,
                     observer: &mut observer,
                 },
-                &mut || completed.get() == 1,
+                &mut || false,
+                |_, board, accounting, _| {
+                    climb_stopping_when(&context, board, 0, accounting, |facts| {
+                        facts.climbs_completed == 1
+                    })
+                },
+                |seed| ControlFlow::Continue(Some(seed)),
             )
             .unwrap();
         assert_eq!(result.seeds.evaluations_used, 16);
@@ -8164,7 +8569,7 @@ mod tests {
         assert_eq!(snapshot.evaluations_admitted, 9);
         assert_eq!(snapshot.evaluations_completed, 9);
         assert_eq!(snapshot.outers_completed, 0);
-        assert_eq!(observer.1 .0.last(), Some(&snapshot));
+        assert!(observer.0.is_empty());
     }
 
     #[test]
@@ -9925,7 +10330,8 @@ mod tests {
                         .project_public(control.snapshot(), domain, measure)
                 }
                 .unwrap();
-                // Task 13: the single winner runs the stage loop, then one terminal notification.
+                // Task 13: the single winner runs the stage loop without
+                // introducing internal public boundary notifications.
                 if expected.termination == crate::AttackTermination::Completed
                     && expected.best.is_some()
                 {
@@ -9942,7 +10348,7 @@ mod tests {
                         .finalist_stages(expected, accounting, &mut requested)
                         .unwrap();
                 }
-                control.notify(&mut observer);
+                assert!(observer.0.is_empty());
                 let (mut snapshots, mut actual_polls) = (Vec::new(), 0);
                 let actual = request
                     .run(
@@ -9954,7 +10360,8 @@ mod tests {
                     )
                     .unwrap();
                 assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
-                assert_eq!((snapshots, actual_polls), (observer.0, polls));
+                assert_eq!(snapshots, [Default::default(), control.snapshot()]);
+                assert_eq!(actual_polls, polls);
             }
         }
     }
@@ -10022,17 +10429,31 @@ mod tests {
         let used = (hold_stages_request(false, &[], 1000, 3).run(|_| {}, || false))
             .unwrap()
             .evaluations_used;
-        let completed = std::cell::Cell::new(0);
-        for (budget, cancel_at, termination, partial) in [
-            (used + 3, u64::MAX, EvaluationBudget, true),
-            (used + 2, u64::MAX, EvaluationBudget, false),
-            (1000, used + 2, Cancelled, false),
+        // A one-finalist run establishes the exact independent polling prefix.
+        // The next poll in the three-finalist run is entry to finalist two.
+        let mut prefix_polls = 0;
+        hold_stages_request(false, &["trie", "reswapping"], 1000, 1)
+            .run(
+                |_| {},
+                || {
+                    prefix_polls += 1;
+                    false
+                },
+            )
+            .unwrap();
+        for (budget, cancel, termination, partial) in [
+            (used + 3, false, EvaluationBudget, true),
+            (used + 2, false, EvaluationBudget, false),
+            (1000, true, Cancelled, false),
         ] {
-            completed.set(0);
+            let mut polls = 0;
             let result = hold_stages_request(false, &["trie", "reswapping"], budget, 3)
                 .run(
-                    |p| completed.set(p.evaluations_completed()),
-                    || completed.get() >= cancel_at,
+                    |_| {},
+                    || {
+                        polls += 1;
+                        cancel && polls == prefix_polls + 1
+                    },
                 )
                 .unwrap();
             assert_eq!(result.termination, termination);
@@ -10131,7 +10552,8 @@ mod tests {
             assert_eq!(error.evaluations_used(), used + fail_at);
             assert_eq!(error.counters().evaluations_admitted(), used + fail_at);
             assert_eq!(error.counters().evaluations_completed(), used + fail_at - 1);
-            assert_eq!(recorder.0.last(), Some(&error.counters().0));
+            assert_eq!(error.counters().0, control.snapshot());
+            assert!(recorder.0.is_empty());
         }
     }
 }

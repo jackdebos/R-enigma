@@ -392,7 +392,7 @@ mixed/deferred/legacy rejection is unchanged. `result.stages` is live: it lists 
 started stages in pipeline order (§9.6 there), empty when none started.
 
 After all parsing, resource loading/binding, eligibility and count/budget validation,
-emit `started`, zero or more `progress`, one `result`, then exactly one terminal
+emit `started`, initial/cadence/terminal `progress`, one `result`, then exactly one terminal
 `done` or runtime `error`. Preflight failures retain the existing seq1 `error` only.
 Task12.8 exposes Core HC; Task12.9c adds Core PE through the same synchronous API.
 The lifecycle below is implemented by the shared production HC/PE adapter;
@@ -444,14 +444,20 @@ integer grammar and transform envelope numbers (`protocol_version`, `seq`) do no
 change; strings are used consistently even inside the safe JSON integer range.
 
 Elapsed time is monotonic whole milliseconds since execution entry after preflight,
-not RFC3339 wall-clock subtraction; terminal values include final rescoring. The
-transport coalesces immutable private snapshots at safe callback boundaries using
-an explicitly supplied positive adapter progress interval, independent of cancel
-polling. Entry and final snapshots are available without waiting for the interval;
-the final counters always travel in `result`. Duplicate snapshots are allowed.
-The shipped internal production interval is **250 ms**, not a request cadence field.
-The adapter receives a positive interval, monotonic elapsed clock and UTC event
-timestamps from the CLI boundary. Delivery is synchronous
+not RFC3339 wall-clock subtraction; terminal values include final rescoring.
+Core owns the snapshot stream: one initial snapshot, one at each globally completed
+evaluation count X, 2X, ..., and one terminal snapshot on success, cooperative
+cancellation or returned error. Optional `job.attack.progress_every` sets X (default
+**100000**); it must be a positive JSON `u64` integer. Zero, negative values
+(including `-0`), decimal/exponent forms, wrong types, null and overflow are
+`invalid_request` at `/job/attack/progress_every`; unknown-member validation retains
+precedence. HC and Partial Exhaustion (PE) share this grammar.
+The grid never resets across outers, seeds, objective changes, stages or held
+finalists. Failed evaluations and winner plaintext replay do not advance it.
+Admissions and internal boundaries do not notify. Initial and terminal observations
+are retained even when equal to each other or to a cadence snapshot.
+The CLI forwards Core snapshots without a second gate, using monotonic elapsed
+and UTC event clocks only at the transport boundary. Delivery is synchronous
 at safe callbacks, with no timer threads, mid-evaluation callbacks or hard wall-clock
 delivery/cancellation bound. Timestamp `ts` remains supplied UTC wall time.
 No clock or I/O enters the private evaluator.
@@ -500,7 +506,7 @@ for private HC climbs/outer scheduling and PE seeds/resolved owners/outer schedu
 Admitted evaluations are nonpreemptive; established exhaustion wins over cancellation,
 which wins over budget. Stops retain committed results and required reserved final
 rescoring; original errors and charged usage are preserved, not masked by cancellation.
-Core runtime, fallible JSONL projections and the timed HC/PE adapter ship in the
+Core runtime, fallible JSONL projections and the synchronous HC/PE adapter ship in the
 production CLI (§4.1), including the final retained hold. Live hold events and
 checkpoint cadence remain unimplemented.
 Task12.12 ships `--cancel-file` and Task12.13 platform signals as the external

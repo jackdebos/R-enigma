@@ -391,10 +391,17 @@ fn attack_events(output: &Output) -> Vec<Value> {
         events[events.len() - 3]["counters"],
         events[events.len() - 2]["counters"]
     );
-    assert_eq!(
-        events[events.len() - 3]["elapsed_ms"],
-        events[events.len() - 2]["elapsed_ms"]
-    );
+    let terminal_elapsed = events[events.len() - 3]["elapsed_ms"]
+        .as_str()
+        .unwrap()
+        .parse::<u128>()
+        .unwrap();
+    let result_elapsed = events[events.len() - 2]["elapsed_ms"]
+        .as_str()
+        .unwrap()
+        .parse::<u128>()
+        .unwrap();
+    assert!(result_elapsed >= terminal_elapsed);
     events
 }
 
