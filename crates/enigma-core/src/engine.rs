@@ -148,6 +148,35 @@ impl Engine {
         direction: Direction,
         rows: &mut Vec<u32>,
     ) -> Result<(), ModelError> {
+        self.each_row_output(length, direction, |output| {
+            u32::try_from(output)
+                .map(|output| rows.push(output))
+                .is_ok()
+        })
+    }
+
+    /// [`Self::scrambler_rows`] with one byte per output in the same compact
+    /// layout. An output that does not fit a byte (alphabets above 256 symbols)
+    /// fails like an output that does not fit `u32`.
+    pub(crate) fn scrambler_byte_rows(
+        &mut self,
+        length: usize,
+        direction: Direction,
+        rows: &mut Vec<u8>,
+    ) -> Result<(), ModelError> {
+        self.each_row_output(length, direction, |output| {
+            u8::try_from(output).map(|output| rows.push(output)).is_ok()
+        })
+    }
+
+    /// Steps once before each row, then hands `emit` every output index in row
+    /// order; `emit` returning false rejects that output.
+    fn each_row_output(
+        &mut self,
+        length: usize,
+        direction: Direction,
+        mut emit: impl FnMut(usize) -> bool,
+    ) -> Result<(), ModelError> {
         #[cfg(test)]
         ROW_BUILDS.with(|count| count.set(count.get() + 1));
         let size = self.topology.alphabet().len();
@@ -156,9 +185,11 @@ impl Engine {
             self.step(&mut offsets)?;
             for input in 0..size {
                 let output = self.scramble(&offsets, input, direction);
-                rows.push(u32::try_from(output).map_err(|_| {
-                    ModelError::UnknownSymbol(self.topology.alphabet().symbols[output])
-                })?);
+                if !emit(output) {
+                    return Err(ModelError::UnknownSymbol(
+                        self.topology.alphabet().symbols[output],
+                    ));
+                }
             }
         }
         Ok(())
@@ -982,12 +1013,21 @@ mod tests {
                     );
                     assert_eq!(transformed.positions(), positions.as_slice());
                     let mut rows_engine = engine;
+                    let mut byte_engine = rows_engine.clone();
                     let mut rows = Vec::new();
                     rows_engine
                         .scrambler_rows(text.chars().count(), direction, &mut rows)
                         .unwrap();
                     assert_eq!(rows, expected_rows);
                     assert_eq!(rows_engine.positions(), positions.as_slice());
+                    // Byte rows hold the same outputs in the same compact layout.
+                    let mut byte_rows = Vec::new();
+                    byte_engine
+                        .scrambler_byte_rows(text.chars().count(), direction, &mut byte_rows)
+                        .unwrap();
+                    let widened: Vec<u32> = byte_rows.iter().map(|&b| u32::from(b)).collect();
+                    assert_eq!(widened, expected_rows);
+                    assert_eq!(byte_engine.positions(), positions.as_slice());
                 }
             }
         }

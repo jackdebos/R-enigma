@@ -62,6 +62,8 @@ pub(super) struct TrialEvaluator<'a> {
     scratch: RefCell<TrialScratch>,
     #[cfg(test)]
     deny_reservation: bool,
+    #[cfg(test)]
+    force_wide: bool,
 }
 
 #[derive(Default)]
@@ -71,41 +73,101 @@ struct TrialScratch {
 }
 
 /// Board-independent alphabet indices: the input, then one scrambler row per offset.
+/// Alphabets of at most 256 symbols use compact byte rows (one byte per entry, one
+/// alphabet-wide row per offset, no padding) when they fit the data limit; larger
+/// alphabets or inputs keep `u32` rows under their own limit.
 #[derive(Debug)]
-struct Prepared {
-    input: Vec<u32>,
-    rows: Vec<u32>,
+enum Prepared {
+    Bytes { input: Vec<u8>, rows: Vec<u8> },
+    Wide { input: Vec<u32>, rows: Vec<u32> },
 }
 
 /// Index kernels a prepared trial can stream into without materializing output.
+#[derive(Clone, Copy)]
 enum StreamKind<'a> {
     Ic,
     Entropy,
     Dense(&'a NgramModel),
 }
 
-/// Decrypted output indices of a prepared trial, computed on demand.
-struct Decoded<'p> {
+/// Runs `$body` with `$decoded` bound to the prepared table's concrete decoder, so
+/// each kernel is compiled once per table kind with no per-symbol dispatch.
+macro_rules! with_decoded {
+    ($prepared:expr, $mapping:expr, |$decoded:ident| $body:expr) => {
+        match $prepared {
+            Prepared::Bytes { input, rows } => {
+                let $decoded = ByteDecoded::new(input, rows, $mapping);
+                $body
+            }
+            Prepared::Wide { input, rows } => {
+                let $decoded = WideDecoded::new(input, rows, $mapping);
+                $body
+            }
+        }
+    };
+}
+
+/// Decrypted output indices of a byte table, computed on demand.
+struct ByteDecoded<'p> {
+    steps: std::iter::Zip<std::slice::Iter<'p, u8>, std::slice::ChunksExact<'p, u8>>,
+    mapping: [u8; 256],
+}
+
+impl<'p> ByteDecoded<'p> {
+    fn new(input: &'p [u8], rows: &'p [u8], mapping: &[usize]) -> Self {
+        // Byte tables exist only for alphabets of at most 256 symbols, so every
+        // mapping value fits a byte; entries past the alphabet are never read.
+        // A 256-entry copy keeps byte-indexed mapping lookups in bounds by type,
+        // while row lookups stay checked against the alphabet width.
+        let mut bytes = [0; 256];
+        for (byte, &index) in bytes.iter_mut().zip(mapping) {
+            debug_assert!(index < 256);
+            *byte = index as u8;
+        }
+        Self {
+            steps: input.iter().zip(rows.chunks_exact(mapping.len())),
+            mapping: bytes,
+        }
+    }
+}
+
+impl Iterator for ByteDecoded<'_> {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<u32> {
+        let (&symbol, row) = self.steps.next()?;
+        let signal = self.mapping[usize::from(symbol)];
+        Some(u32::from(
+            self.mapping[usize::from(row[usize::from(signal)])],
+        ))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.steps.size_hint()
+    }
+}
+
+impl ExactSizeIterator for ByteDecoded<'_> {}
+
+/// Decrypted output indices of a `u32` table, computed on demand.
+struct WideDecoded<'p> {
     steps: std::iter::Zip<std::slice::Iter<'p, u32>, std::slice::ChunksExact<'p, u32>>,
     mapping: &'p [usize],
 }
 
-impl<'p> Decoded<'p> {
-    fn new(prepared: &'p Prepared, mapping: &'p [usize]) -> Self {
+impl<'p> WideDecoded<'p> {
+    fn new(input: &'p [u32], rows: &'p [u32], mapping: &'p [usize]) -> Self {
         // The trial board is bound to this alphabet, so its mapping is indexed by
         // the same alphabet indices as the rows, and every row is one mapping wide.
         // Alphabets are never empty, so the width is positive.
         Self {
-            steps: prepared
-                .input
-                .iter()
-                .zip(prepared.rows.chunks_exact(mapping.len())),
+            steps: input.iter().zip(rows.chunks_exact(mapping.len())),
             mapping,
         }
     }
 }
 
-impl Iterator for Decoded<'_> {
+impl Iterator for WideDecoded<'_> {
     type Item = u32;
 
     fn next(&mut self) -> Option<u32> {
@@ -119,7 +181,7 @@ impl Iterator for Decoded<'_> {
     }
 }
 
-impl ExactSizeIterator for Decoded<'_> {}
+impl ExactSizeIterator for WideDecoded<'_> {}
 
 /// A single run's input/domain/direction and most recently evaluated outer.
 /// The scheduler supplies absolute outer indices from this same request only.
@@ -179,6 +241,8 @@ impl<'a> TrialEvaluator<'a> {
             scratch: RefCell::new(TrialScratch::default()),
             #[cfg(test)]
             deny_reservation: false,
+            #[cfg(test)]
+            force_wide: false,
         }
     }
 
@@ -231,14 +295,13 @@ impl<'a> TrialEvaluator<'a> {
         prepared: Option<&Prepared>,
         engine: Option<Engine>,
     ) -> Result<(Option<String>, MeasuredScore), TrialEvaluationError> {
-        if let (Some(rows), Some(kind)) = (prepared, self.stream_kind()) {
-            let decoded = || Decoded::new(rows, mapping);
+        if let (Some(prepared), Some(kind)) = (prepared, self.stream_kind()) {
             let width = self.initial.topology().alphabet().len();
-            let score = match kind {
-                StreamKind::Ic => Some(index_coincidence_iter(width, decoded())),
-                StreamKind::Entropy => Some(index_entropy_iter(width, decoded())),
-                StreamKind::Dense(model) => model.score_index_iter(decoded()),
-            };
+            let score = with_decoded!(prepared, mapping, |decoded| match kind {
+                StreamKind::Ic => Some(index_coincidence_iter(width, decoded)),
+                StreamKind::Entropy => Some(index_entropy_iter(width, decoded)),
+                StreamKind::Dense(model) => model.score_index_iter(decoded),
+            });
             // A model without a dense table keeps its sparse text scoring.
             if let Some(score) = score {
                 return Ok((None, score.map_err(TrialEvaluationError::Measure)?));
@@ -261,9 +324,9 @@ impl<'a> TrialEvaluator<'a> {
             let rows = prepared.ok_or(FAILED)?;
             #[cfg(test)]
             PLAINTEXT_BUILDS.with(|count| count.set(count.get() + 1));
-            Ok(Decoded::new(rows, mapping)
+            Ok(with_decoded!(rows, mapping, |decoded| decoded
                 .map(|output| symbols[output as usize])
-                .collect())
+                .collect()))
         })
         .map_err(|_| FAILED)
     }
@@ -372,17 +435,33 @@ impl<'a> TrialEvaluator<'a> {
                 input.push(index);
             }
             let length = input.len();
-            let mut rows = reserved_rows(length, alphabet.symbols.len(), self.reserve_denied());
-            if let Some(rows) = &mut rows {
+            let width = alphabet.symbols.len();
+            let table = if self.reserve_denied() {
+                None
+            } else if let Some(mut rows) = (byte_rows_fit(length, width) && !self.wide_forced())
+                .then(|| reserved_byte_rows(length, width))
+                .flatten()
+            {
                 fresh
-                    .scrambler_rows(length, self.direction, rows)
+                    .scrambler_byte_rows(length, self.direction, &mut rows)
                     .map_err(TrialEvaluationError::Model)?;
+                // Indices below a width of at most 256 fit a byte.
+                let input = input.iter().map(|&index| index as u8).collect();
+                Some(Prepared::Bytes { input, rows })
+            } else if let Some(mut rows) = reserved_rows(length, width, false) {
+                fresh
+                    .scrambler_rows(length, self.direction, &mut rows)
+                    .map_err(TrialEvaluationError::Model)?;
+                Some(Prepared::Wide { input, rows })
             } else {
+                None
+            };
+            if table.is_none() {
                 engine = Some(fresh);
             }
             // Failed model/input validation never initializes the cell.
             prepared
-                .set(rows.map(|rows| Prepared { input, rows }))
+                .set(table)
                 .expect("single-threaded lazy preparation");
         }
         Ok(engine)
@@ -402,10 +481,12 @@ impl<'a> TrialEvaluator<'a> {
                 let symbols = &self.initial.topology().alphabet().symbols;
                 let mut plaintext = String::with_capacity(self.input.len());
                 indices.clear();
-                for output in Decoded::new(prepared, mapping) {
-                    plaintext.push(symbols[output as usize]);
-                    indices.push(output);
-                }
+                with_decoded!(prepared, mapping, |decoded| {
+                    for output in decoded {
+                        plaintext.push(symbols[output as usize]);
+                        indices.push(output);
+                    }
+                });
                 let score = self.measure_with(&plaintext, Some(indices))?;
                 Ok((plaintext, score))
             }
@@ -457,6 +538,17 @@ impl<'a> TrialEvaluator<'a> {
     pub(super) fn with_reservation_denied(mut self) -> Self {
         self.deny_reservation = true;
         self
+    }
+
+    fn wide_forced(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.force_wide
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
     }
 
     fn reserve_denied(&self) -> bool {
@@ -536,6 +628,24 @@ const TABLE_DATA_LIMIT: usize = 1024 * 1024;
 fn table_entries(length: usize, width: usize) -> Option<usize> {
     let entries = length.checked_mul(width)?;
     (entries.checked_mul(std::mem::size_of::<u32>())? <= TABLE_DATA_LIMIT).then_some(entries)
+}
+
+/// Compact byte rows cost `width` bytes per input symbol under the same data limit.
+fn byte_rows_fit(length: usize, width: usize) -> bool {
+    width <= 256 && byte_row_entries(length, width).is_some()
+}
+
+fn byte_row_entries(length: usize, width: usize) -> Option<usize> {
+    length
+        .checked_mul(width)
+        .filter(|&bytes| bytes <= TABLE_DATA_LIMIT)
+}
+
+fn reserved_byte_rows(length: usize, width: usize) -> Option<Vec<u8>> {
+    let entries = byte_row_entries(length, width)?;
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(entries).ok()?;
+    Some(rows)
 }
 
 fn reserved_rows(length: usize, width: usize, deny: bool) -> Option<Vec<u32>> {
@@ -1009,11 +1119,12 @@ mod tests {
                 for (objective, resource) in objectives {
                     for direction in [Direction::Encrypt, Direction::Decrypt] {
                         for input in [symbols.to_owned(), symbols.repeat(9)] {
-                            for deny in [false, true] {
+                            for (deny, wide) in [(false, false), (false, true), (true, false)] {
                                 let mut trial = TrialEvaluator::new(
                                     &initial, &domain, &input, direction, objective, resource,
                                 );
                                 trial.deny_reservation = deny;
+                                trial.force_wide = wide;
                                 for pairs in [vec![], vec![(s[2], s[3])], vec![]] {
                                     let board =
                                         validated_trial_board(&initial, &domain, &pairs).unwrap();
@@ -1037,7 +1148,12 @@ mod tests {
                                         .map(|score| (plaintext, score))
                                         .map_err(TrialEvaluationError::Measure);
                                     assert_eq!(trial.evaluate(&pairs), expected, "{objective:?}");
-                                    assert_eq!(trial.prepared.get().unwrap().is_none(), deny);
+                                    let prepared = trial.prepared.get().unwrap();
+                                    assert_eq!(prepared.is_none(), deny);
+                                    if let Some(prepared) = prepared {
+                                        let is_wide = matches!(prepared, Prepared::Wide { .. });
+                                        assert_eq!(is_wide, wide);
+                                    }
                                     assert!(matches!(
                                         trial.evaluate(&[(s[2], s[2])]),
                                         Err(TrialEvaluationError::Board(_))
@@ -1054,29 +1170,83 @@ mod tests {
     #[test]
     fn decoded_reads_one_row_per_input_symbol_through_the_mapping() {
         // Width 3, input of 4 symbols, rows laid out offset-major.
-        let prepared = Prepared {
-            input: vec![0, 2, 1, 2],
-            rows: vec![1, 0, 2, 2, 1, 0, 0, 2, 1, 1, 2, 0],
-        };
+        let input = [0_u32, 2, 1, 2];
+        let rows = [1_u32, 0, 2, 2, 1, 0, 0, 2, 1, 1, 2, 0];
         let mapping = [2, 1, 0];
-        let naive: Vec<u32> = prepared
-            .input
+        let naive: Vec<u32> = input
             .iter()
             .enumerate()
             .map(|(offset, &symbol)| {
                 let signal = mapping[symbol as usize];
-                mapping[prepared.rows[offset * 3 + signal] as usize] as u32
+                mapping[rows[offset * 3 + signal] as usize] as u32
             })
             .collect();
-        let decoded = Decoded::new(&prepared, &mapping);
+        let decoded = WideDecoded::new(&input, &rows, &mapping);
         assert_eq!(decoded.len(), 4);
         assert_eq!(decoded.collect::<Vec<_>>(), naive);
         assert_eq!(naive, vec![0, 0, 0, 1]);
-        let single = Prepared {
-            input: vec![0; 3],
-            rows: vec![0; 3],
-        };
-        assert_eq!(Decoded::new(&single, &[0]).collect::<Vec<_>>(), vec![0; 3]);
+        let single = WideDecoded::new(&[0; 3], &[0; 3], &[0]);
+        assert_eq!(single.collect::<Vec<_>>(), vec![0; 3]);
+    }
+
+    #[test]
+    fn byte_decoded_matches_wide_decoded_over_compact_rows() {
+        let input = [0_u32, 2, 1, 2];
+        let rows = [1_u32, 0, 2, 2, 1, 0, 0, 2, 1, 1, 2, 0];
+        let mapping = [2, 1, 0];
+        let byte_input: Vec<u8> = input.iter().map(|&s| s as u8).collect();
+        let byte_rows: Vec<u8> = rows.iter().map(|&output| output as u8).collect();
+        let bytes = ByteDecoded::new(&byte_input, &byte_rows, &mapping);
+        assert_eq!(bytes.len(), 4);
+        let wide: Vec<_> = WideDecoded::new(&input, &rows, &mapping).collect();
+        assert_eq!(bytes.collect::<Vec<_>>(), wide);
+        let single = ByteDecoded::new(&[0; 3], &[0; 3], &[0]);
+        assert_eq!(single.collect::<Vec<_>>(), vec![0; 3]);
+    }
+
+    #[test]
+    fn byte_rows_cover_alphabets_through_256_within_the_data_limit() {
+        // Compact byte rows cost `width` bytes per input symbol.
+        assert!(byte_rows_fit(40_329, 26));
+        assert!(!byte_rows_fit(40_330, 26));
+        assert!(byte_rows_fit(349_525, 3));
+        assert!(!byte_rows_fit(349_526, 3));
+        assert!(byte_rows_fit(4096, 256));
+        assert!(!byte_rows_fit(4097, 256));
+        assert!(!byte_rows_fit(1, 257));
+        assert!(byte_rows_fit(0, 1));
+        assert!(!byte_rows_fit(usize::MAX, 2));
+        // Width 256 (the definition limit) admits 4,096 byte-row letters but only
+        // 1,024 `u32` ones, so past 4,096 there is no table.
+        for (length, bytes) in [(1025, Some(true)), (4096, Some(true)), (4097, None)] {
+            let width = 256;
+            // The test machine's ring is 'A', so it leads the alphabet.
+            let symbols: String = std::iter::once('A')
+                .chain((1..width).map(|i| char::from_u32(0x100 + i).unwrap()))
+                .collect();
+            let wiring: String = symbols
+                .chars()
+                .cycle()
+                .skip(1)
+                .take(width as usize)
+                .collect();
+            let first = symbols.chars().next().unwrap().to_string();
+            let initial = machine(&symbols, &wiring, &first, true);
+            let pool: String = symbols.chars().take(4).collect();
+            let domain = domain(initial.topology().alphabet(), &[], &pool, 1);
+            let input: String = symbols.chars().cycle().take(length).collect();
+            let trial = evaluator(&initial, &domain, &input);
+            let expected = initial
+                .clone()
+                .into_engine()
+                .unwrap()
+                .transform(&input, Direction::Decrypt)
+                .unwrap();
+            assert_eq!(trial.evaluate(&[]).unwrap().0, expected);
+            let prepared = trial.prepared.get().unwrap().as_ref();
+            let kind = prepared.map(|prepared| matches!(prepared, Prepared::Bytes { .. }));
+            assert_eq!(kind, bytes, "{width} x {length}");
+        }
     }
 
     #[test]
@@ -1091,7 +1261,9 @@ mod tests {
         let initial = machine("ABC", "BAC", "A", true);
         let domain = domain(initial.topology().alphabet(), &[], "ABC", 1);
         let input = "ABC".repeat(entries / 9 + 1);
-        let trial = evaluator(&initial, &domain, &input);
+        // Byte rows would admit this input; the `u32` limit is under test.
+        let mut trial = evaluator(&initial, &domain, &input);
+        trial.force_wide = true;
         assert_eq!(table_entries(input.chars().count(), 3), None);
         let expected = initial
             .clone()
