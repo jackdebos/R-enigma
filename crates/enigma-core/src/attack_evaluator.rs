@@ -86,21 +86,21 @@ enum StreamKind<'a> {
 
 /// Decrypted output indices of a prepared trial, computed on demand.
 struct Decoded<'p> {
-    input: std::iter::Enumerate<std::slice::Iter<'p, u32>>,
-    rows: &'p [u32],
+    steps: std::iter::Zip<std::slice::Iter<'p, u32>, std::slice::ChunksExact<'p, u32>>,
     mapping: &'p [usize],
-    width: usize,
 }
 
 impl<'p> Decoded<'p> {
     fn new(prepared: &'p Prepared, mapping: &'p [usize]) -> Self {
+        // The trial board is bound to this alphabet, so its mapping is indexed by
+        // the same alphabet indices as the rows, and every row is one mapping wide.
+        // Alphabets are never empty, so the width is positive.
         Self {
-            input: prepared.input.iter().enumerate(),
-            rows: &prepared.rows,
-            // The trial board is bound to this alphabet, so its mapping is
-            // indexed by the same alphabet indices as the rows.
+            steps: prepared
+                .input
+                .iter()
+                .zip(prepared.rows.chunks_exact(mapping.len())),
             mapping,
-            width: mapping.len(),
         }
     }
 }
@@ -109,13 +109,13 @@ impl Iterator for Decoded<'_> {
     type Item = u32;
 
     fn next(&mut self) -> Option<u32> {
-        let (offset, &symbol) = self.input.next()?;
+        let (&symbol, row) = self.steps.next()?;
         let signal = self.mapping[symbol as usize];
-        Some(self.mapping[self.rows[offset * self.width + signal] as usize] as u32)
+        Some(self.mapping[row[signal] as usize] as u32)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.input.size_hint()
+        self.steps.size_hint()
     }
 }
 
@@ -1049,6 +1049,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn decoded_reads_one_row_per_input_symbol_through_the_mapping() {
+        // Width 3, input of 4 symbols, rows laid out offset-major.
+        let prepared = Prepared {
+            input: vec![0, 2, 1, 2],
+            rows: vec![1, 0, 2, 2, 1, 0, 0, 2, 1, 1, 2, 0],
+        };
+        let mapping = [2, 1, 0];
+        let naive: Vec<u32> = prepared
+            .input
+            .iter()
+            .enumerate()
+            .map(|(offset, &symbol)| {
+                let signal = mapping[symbol as usize];
+                mapping[prepared.rows[offset * 3 + signal] as usize] as u32
+            })
+            .collect();
+        let decoded = Decoded::new(&prepared, &mapping);
+        assert_eq!(decoded.len(), 4);
+        assert_eq!(decoded.collect::<Vec<_>>(), naive);
+        assert_eq!(naive, vec![0, 0, 0, 1]);
+        let single = Prepared {
+            input: vec![0; 3],
+            rows: vec![0; 3],
+        };
+        assert_eq!(Decoded::new(&single, &[0]).collect::<Vec<_>>(), vec![0; 3]);
     }
 
     #[test]
