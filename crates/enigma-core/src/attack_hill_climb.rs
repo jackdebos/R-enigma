@@ -992,18 +992,20 @@ impl crate::AttackRequest {
         )
     }
 
-    fn climb_partial_outer_prepared<O: CounterObserver, F: FnMut() -> bool>(
+    // F is climb-local context: serial adapters forward their stop callback;
+    // worker adapters use (), so no cancellation callback enters worker code.
+    fn climb_partial_outer_prepared<A: SeedAccounting, F>(
         &self,
         preparation: &RunPreparation<'_>,
         outer: (ResolvedConfiguration, u128),
-        accounting: &mut ObservedAccounting<'_, O>,
+        accounting: &mut A,
         requested: &mut F,
         capacity: usize,
         mut climb: impl FnMut(
             &BoundClimbScoring<'_>,
             u128,
             MutableBoard,
-            &mut ObservedAccounting<'_, O>,
+            &mut A,
             &mut F,
         ) -> Result<ClimbOutcome, ObservedClimbError>,
     ) -> Result<ControlledPartialOutcome, ControlledPartialError> {
@@ -1968,6 +1970,156 @@ impl EvaluationAccounting for EvaluationAllowance {
     }
 }
 
+/// Only seed scheduling needs cumulative admission usage in addition to the
+/// evaluator interface. Both serial observed and worker-local accounting reuse it.
+trait SeedAccounting: EvaluationAccounting<Error = ObservedClimbError> {
+    fn evaluations_used(&self) -> u64;
+}
+
+impl<O: CounterObserver> SeedAccounting for ObservedAccounting<'_, O> {
+    fn evaluations_used(&self) -> u64 {
+        self.allowance.used
+    }
+}
+
+/// No observer, cadence or stop latch: cancellation's default is constant false
+/// and completion records a fact only. The optimized evaluation loop therefore
+/// has no progress or cancellation dispatch in worker code.
+#[derive(Default)]
+struct BlockAccounting {
+    control: AttackControl,
+    used: u64,
+}
+
+impl EvaluationAccounting for BlockAccounting {
+    type Error = ObservedClimbError;
+    fn admit(&mut self) -> Result<(), Self::Error> {
+        self.used = self.used.checked_add(1).ok_or(ObservedClimbError::Counter(
+            CounterOverflow::EvaluationsAdmitted,
+        ))?;
+        self.transition(AttackControl::record_evaluation_admitted)
+    }
+    fn complete(&mut self) -> Result<(), Self::Error> {
+        self.transition(AttackControl::record_evaluation_completed)
+    }
+    fn transition(
+        &mut self,
+        record: fn(&mut AttackControl) -> Result<(), CounterOverflow>,
+    ) -> Result<(), Self::Error> {
+        record(&mut self.control).map_err(ObservedClimbError::Counter)
+    }
+}
+
+impl SeedAccounting for BlockAccounting {
+    fn evaluations_used(&self) -> u64 {
+        self.used
+    }
+}
+
+// Standalone worker seam; the next slice wires coordinator D1/D2 reduction.
+#[allow(dead_code)]
+#[derive(Debug)]
+enum BlockFailure<E> {
+    Resolution(Vec<crate::SearchDiagnostic>),
+    Climb(E),
+    Counter(ObservedClimbError),
+}
+
+/// Every successful outer, in key order, followed by the first failure (if any).
+/// Error accounting includes the failing admission but no failed completion.
+#[allow(dead_code)] // Coordinator integration follows in the next slice.
+struct BlockOutcome<T, E> {
+    outers: Vec<T>,
+    error: Option<(u128, BlockFailure<E>)>,
+    accounting: BlockAccounting,
+}
+
+#[allow(dead_code)] // Coordinator integration follows in the next slice.
+fn run_worker_block<T, E>(
+    keys: impl Iterator<
+        Item = (
+            u128,
+            Result<ResolvedConfiguration, Vec<crate::SearchDiagnostic>>,
+        ),
+    >,
+    mut climb: impl FnMut(ResolvedConfiguration, u128, &mut BlockAccounting) -> Result<T, E>,
+) -> BlockOutcome<T, E> {
+    let mut outcome = BlockOutcome {
+        outers: Vec::new(),
+        error: None,
+        accounting: BlockAccounting::default(),
+    };
+    for (index, initial) in keys {
+        let result = initial
+            .map_err(BlockFailure::Resolution)
+            .and_then(|initial| {
+                let outer =
+                    climb(initial, index, &mut outcome.accounting).map_err(BlockFailure::Climb)?;
+                outcome
+                    .accounting
+                    .transition(AttackControl::record_outer_completed)
+                    .map_err(BlockFailure::Counter)?;
+                Ok(outer)
+            });
+        match result {
+            Ok(outer) => outcome.outers.push(outer),
+            Err(error) => {
+                outcome.error = Some((index, error));
+                break;
+            }
+        }
+    }
+    outcome
+}
+
+#[allow(dead_code)] // Coordinator integration follows in the next slice.
+impl crate::AttackRequest {
+    /// `preparation` belongs to this worker and is reused between its blocks;
+    /// neither the coordinator nor another worker borrows its mutable cells.
+    fn run_direct_block(
+        &self,
+        preparation: &RunPreparation<'_>,
+        plan: &crate::attack_blocks::OuterPlan<'_>,
+        block: crate::attack_blocks::OuterBlock,
+    ) -> BlockOutcome<DirectOuterOutcome, DirectRunError> {
+        run_worker_block(plan.keys(block), |initial, index, accounting| {
+            let (scoring, start) = self
+                .direct_scoring(&initial)
+                .map_err(DirectRunError::Climb)?;
+            let climb = scoring
+                .with_preparation(preparation, index)
+                .climb_accounted(start, self.settings().backtrack_pairs(), accounting)
+                .map_err(DirectRunError::from)?;
+            Ok(DirectOuterOutcome {
+                initial,
+                outer_index: index,
+                start_index: 0,
+                climb,
+            })
+        })
+    }
+
+    fn run_partial_block(
+        &self,
+        preparation: &RunPreparation<'_>,
+        plan: &crate::attack_blocks::OuterPlan<'_>,
+        block: crate::attack_blocks::OuterBlock,
+    ) -> BlockOutcome<ControlledPartialOutcome, ControlledPartialError> {
+        run_worker_block(plan.keys(block), |initial, index, accounting| {
+            self.climb_partial_outer_prepared(
+                preparation,
+                (initial, index),
+                accounting,
+                &mut (),
+                self.settings().hold_capacity(),
+                |scoring, _, board, accounting, _| {
+                    scoring.climb_accounted(board, self.settings().backtrack_pairs(), accounting)
+                },
+            )
+        })
+    }
+}
+
 /// A one-outer worker's owned outcome, including accounting on the first error.
 /// The serial adapter seeds cumulative facts to preserve overflow, cadence and
 /// cancellation semantics. Future workers can start from fresh local accounting.
@@ -2016,6 +2168,8 @@ const _: fn() = || {
     assert_sync::<crate::attack_blocks::OuterPlan<'_>>();
     assert_send::<OuterExecution<DirectOuterOutcome, DirectRunError>>();
     assert_send::<OuterExecution<ControlledPartialOutcome, ControlledPartialError>>();
+    assert_send::<BlockOutcome<DirectOuterOutcome, DirectRunError>>();
+    assert_send::<BlockOutcome<ControlledPartialOutcome, ControlledPartialError>>();
 };
 
 pub(super) struct ObservedAccounting<'a, O> {
@@ -2160,15 +2314,15 @@ impl<'a> BoundClimbScoring<'a> {
         )
     }
 
-    fn climb_seeds_controlled_with<O: CounterObserver, F: FnMut() -> bool>(
+    fn climb_seeds_controlled_with<A: SeedAccounting, F>(
         &self,
         policy: &crate::AttackSeedPolicy,
-        accounting: &mut ObservedAccounting<'_, O>,
+        accounting: &mut A,
         requested: &mut F,
         mut climb: impl FnMut(
             u128,
             MutableBoard,
-            &mut ObservedAccounting<'_, O>,
+            &mut A,
             &mut F,
         ) -> Result<ClimbOutcome, ObservedClimbError>,
         // Continue(Some) keeps raw strict-best selection; Break stops before later seeds.
@@ -2184,7 +2338,7 @@ impl<'a> BoundClimbScoring<'a> {
             })?;
             let mut result = ControlledSeedOutcome {
                 seeds: SeedRunOutcome {
-                    evaluations_used: accounting.allowance.used,
+                    evaluations_used: accounting.evaluations_used(),
                     climbs_started: 0,
                     climbs_completed: 0,
                     best: None,
@@ -2230,7 +2384,7 @@ impl<'a> BoundClimbScoring<'a> {
                     break;
                 }
             }
-            result.seeds.evaluations_used = accounting.allowance.used;
+            result.seeds.evaluations_used = accounting.evaluations_used();
             Ok(result)
         })();
         run
@@ -2815,6 +2969,157 @@ mod tests {
                         "pe={pe}, hold={hold}, staged={staged}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn worker_block_runner_matches_serial_on_another_thread() {
+        fn compare<T, E>(
+            run: impl Fn() -> BlockOutcome<T, E> + Send,
+            reference: &crate::AttackResult,
+        ) where
+            T: Send + std::fmt::Debug,
+            E: Send + std::fmt::Debug,
+        {
+            let serial = run();
+            assert_eq!(serial.accounting.control.snapshot(), reference.counters().0);
+            assert_eq!(serial.accounting.used, reference.evaluations_used());
+            assert_eq!(
+                serial.outers.len() as u128,
+                reference.counters().outers_completed()
+            );
+            // The actual owned outcome crosses the thread boundary, not a
+            // projection made inside the worker. Its preparation stays local.
+            let threaded = std::thread::scope(|scope| scope.spawn(run).join().unwrap());
+            assert!(serial.error.is_none() && threaded.error.is_none());
+            assert_eq!(
+                format!("{:?}", serial.outers),
+                format!("{:?}", threaded.outers)
+            );
+            assert_eq!(serial.accounting.used, threaded.accounting.used);
+            assert_eq!(
+                serial.accounting.control.snapshot(),
+                threaded.accounting.control.snapshot()
+            );
+        }
+        for pe in [false, true] {
+            for hold in [1, 5] {
+                let request = hold_stages_request(pe, &[], hold);
+                let plan = request.outer_plan();
+                let block = plan.blocks().next().unwrap();
+                let reference = request.run(|_| {}, || false).unwrap();
+                if pe {
+                    compare(
+                        || request.run_partial_block(&RunPreparation::new(&request), &plan, block),
+                        &reference,
+                    );
+                } else {
+                    compare(
+                        || request.run_direct_block(&RunPreparation::new(&request), &plan, block),
+                        &reference,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn worker_later_block_error_keeps_work_before_first_failed_evaluation() {
+        let request = hold_stages_request(false, &[], 1);
+        let initial = request.outer_candidates().next().unwrap().1.unwrap();
+        let resolved = std::cell::Cell::new(0);
+        let run = |start| {
+            run_worker_block(
+                (start..start + crate::attack_blocks::OUTER_BLOCK_KEYS).map(|index| {
+                    resolved.set(resolved.get() + 1);
+                    (index, Ok(initial.clone()))
+                }),
+                |initial, index, accounting| {
+                    let evaluator = TrialEvaluator::new(
+                        &initial,
+                        request.domain(),
+                        if index >= 130 { "?" } else { request.text() },
+                        Direction::Decrypt,
+                        MeasureId::Ic,
+                        None,
+                    );
+                    accounting.evaluate(&evaluator, &[])?;
+                    Ok::<_, ObservedClimbError>(index)
+                },
+            )
+        };
+        let first = run(0);
+        assert_eq!(first.outers, (0..128).collect::<Vec<_>>());
+        assert!(first.error.is_none());
+        assert_eq!(first.accounting.used, 128);
+        let later = run(128);
+        assert_eq!(later.outers, [128, 129]);
+        assert!(matches!(
+            later.error,
+            Some((
+                130,
+                BlockFailure::Climb(ObservedClimbError::Evaluation(TrialEvaluationError::Model(
+                    crate::ModelError::UnknownSymbol('?')
+                )))
+            ))
+        ));
+        assert_eq!(
+            resolved.get(),
+            131,
+            "no key after the first error is resolved"
+        );
+        assert_eq!(later.accounting.used, 3);
+        assert_eq!(
+            later.accounting.control.snapshot(),
+            crate::attack_control::CounterSnapshot {
+                evaluations_admitted: 3,
+                evaluations_completed: 2,
+                outers_completed: 2,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn worker_duplicate_across_blocks_preserves_first_offered_payload() {
+        for capacity in [1, 5] {
+            let request = hold_stages_request(false, &[], capacity);
+            let preparation = RunPreparation::new(&request);
+            let initial = request.outer_candidates().next().unwrap().1.unwrap();
+            let mut hold = crate::attack_hold::AttackHold::new(capacity as usize);
+            for start in [0, crate::attack_blocks::OUTER_BLOCK_KEYS] {
+                let block = run_worker_block(
+                    (start..start + crate::attack_blocks::OUTER_BLOCK_KEYS)
+                        .map(|index| (index, Ok(initial.clone()))),
+                    |initial, index, accounting| {
+                        let (scoring, board) = request
+                            .direct_scoring(&initial)
+                            .map_err(DirectRunError::Climb)?;
+                        let climb = scoring
+                            .with_preparation(&preparation, index)
+                            .climb_accounted(board, 0, accounting)
+                            .map_err(DirectRunError::from)?;
+                        let mut best = DirectOuterOutcome {
+                            initial,
+                            outer_index: index,
+                            start_index: 0,
+                            climb,
+                        }
+                        .project(request.domain(), request.settings().final_measure())
+                        .map_err(DirectRunError::Projection)?;
+                        best.plaintext = format!("payload-{index}");
+                        Ok::<_, DirectRunError>(best)
+                    },
+                );
+                assert!(block.error.is_none());
+                assert_eq!(block.accounting.control.snapshot().outers_completed, 128);
+                for best in block.outers {
+                    hold.offer(best);
+                }
+                assert_eq!(hold.entries().len(), 1);
+                assert_eq!(hold.entries()[0].outer_index, 0);
+                assert_eq!(hold.entries()[0].plaintext, "payload-0");
             }
         }
     }
