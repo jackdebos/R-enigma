@@ -211,7 +211,7 @@ supplied text and never perform filesystem I/O.
 Shared strict job dispatch must distinguish transform and search without weakening
 duplicate-key detection or interpreting invalid search JSON as a transform. Transform
 never loads scoring resources. Production search dispatch validates and binds
-resources and finalizes eligibility/count/budget preflight before HC/PE execution;
+resources and finalizes eligibility/count preflight before HC/PE execution;
 failures remain seq1-only errors. Legacy search retains its unsupported result after
 resource validation. Activation changes no resource contract; signals/control files,
 hold and checkpoints remain deferred.

@@ -313,7 +313,7 @@ never loads resources; its grammar and events are unchanged.
 
 [Task 11](search-passes.md) adds strict attack dispatch when
 `job.space.plugboard.kind` is `"attack"`, still with `job.kind = "search"`.
-The CLI loads and binds resources and checks eligibility, counts and budgets before
+The CLI loads and binds resources and checks eligibility and counts before
 execution. Structural, loading, model-binding and eligibility failures emit only a
 seq1 `error`, without work events. Missing or other discriminators retain legacy
 search validation and unsupported execution. HC/PE evaluation, seed exhaustion and
@@ -359,7 +359,7 @@ default. Example location: `/job/configuration/slots/1/position`. Error codes in
 `invalid_plugboard`, `invalid_slot`, `invalid_rule`, `invalid_search_space`,
 `unsupported_job`,
 `unsupported_pass`, `unsupported_measure`, `unsupported_resource`, `invalid_text`,
-`unsupported_topology`, `resource_limit` (including pre-execution count/budget bounds),
+`unsupported_topology`, `resource_limit` (including pre-execution count/resource bounds),
 and `internal_error`. `internal_error` is reserved for an
 internal runtime failure after `started` (including evaluation, resolution or counter
 invariants); it is never a request-validation failure.
@@ -378,7 +378,7 @@ empty hold. Each view borrows its best payload and entry-specific stage history.
 Core provides pure progress and result
 wire projections from `AttackProgress`/`AttackResult` and caller-supplied elapsed
 milliseconds, decimal-string counters, indices, Q32 units and elapsed time, and all
-four `DoneReason` mappings. Result preserves the complete initial winning key,
+three `DoneReason` mappings. Result preserves the complete initial winning key,
 mutable remainder, final score and independent flags; genuine absence is null.
 `Event::runtime_error` projects a borrowed failure into a result/error pair with
 optional boxed context. Malformed retained best fails with `RuntimeProjectionError`,
@@ -391,7 +391,7 @@ followed by the executable [Task 13 chained stages](search-passes.md#9-chained-s
 mixed/deferred/legacy rejection is unchanged. `result.stages` is live: it lists the
 started stages in pipeline order (§9.6 there), empty when none started.
 
-After all parsing, resource loading/binding, eligibility and count/budget validation,
+After all parsing, resource loading/binding, eligibility and count validation,
 emit `started`, initial/cadence/terminal `progress`, one `result`, then exactly one terminal
 `done` or runtime `error`. Preflight failures retain the existing seq1 `error` only.
 Task12.8 exposes Core HC; Task12.9c adds Core PE through the same synchronous API.
@@ -410,7 +410,7 @@ Payloads below supplement the existing event envelope; `done` stays reason-only:
 | --- | --- |
 | `progress` | `counters`, `elapsed_ms` |
 | `result` | `stages`, `best` (object or null), `hold` (Task 14 array), `counters`, `elapsed_ms` |
-| `done` | `reason`: `completed`, `outer_slice_end`, `evaluation_budget`, or `cancelled` |
+| `done` | `reason`: `completed`, `outer_slice_end`, or `cancelled` |
 | Runtime `error` | Existing `code`, `message`, `location`; additionally `context` |
 
 `counters` has exactly `evaluations_admitted`, `evaluations_completed`,
@@ -464,10 +464,10 @@ No clock or I/O enters the private evaluator.
 
 Map established exhaustion of a nonempty requested slice to `completed`; an empty
 slice to `outer_slice_end`, not legacy `offset_end`/`limit_reached`. When work remains,
-map safe cancellation to `cancelled`, otherwise allowance stop to
-`evaluation_budget`. Errors dominate cancellation; exhaustion > cancellation >
-budget. Required reserved final rescoring must succeed before an interrupted current
-board is eligible; failed rescoring is error, never a provisional best or cancellation.
+map safe cancellation to `cancelled`. Precedence is errors > exhaustion >
+cancellation. Required final rescoring, when the final score is absent, must succeed
+before an interrupted current board is eligible; failed rescoring is error, never a
+provisional best or cancellation.
 
 Runtime `context` has exactly `outer_index`, `start_index` (nullable when unavailable),
 `evaluations_used`, `counters`, and `source`. `source` has `kind`, `message`, and
@@ -495,7 +495,7 @@ ordering applies only while delivery succeeds, including final result write/flus
 | Cancel (first HC/PE release) | `--cancel-file <path>` marker or a platform signal (`SIGINT`/`SIGTERM`/`SIGHUP`, Windows Ctrl+C/Break); both shipped | Cooperative safe-stop, final `result`, then `done` with `reason: "cancelled"`; retained `result.hold` per Task 14; no checkpoint promise |
 | Pause/resume live job | Not in Stage 1 | Future extension |
 | Resume dead job | `--resume <checkpoint>` | Search only; see §6 |
-| Bound HC/PE search | `space.offset`/`space.limit`, `attack.evaluation_budget` | §4.1 slice/exhaustion/budget reasons; no new `--max-keys` attack control |
+| Bound HC/PE search | `space.offset`/`space.limit` and cancellation | §4.1 slice/exhaustion/cancellation reasons; slices bound outer keys only; no new `--max-keys` attack control |
 | Other future bounded search | Planned `--max-keys` | Legacy planned `limit_reached`/`offset_end`, not HC/PE mappings |
 
 Transform has no search progress, cancellation, hold, or checkpoint contract in v1.
@@ -503,9 +503,12 @@ Transform has no search progress, cancellation, hold, or checkpoint contract in 
 [Task 12 private integration](search-passes.md#61-private-progress-and-cancellation--task-12)
 implements shared accounting, counter-only snapshots and cooperative cancellation
 for private HC climbs/outer scheduling and PE seeds/resolved owners/outer scheduling.
-Admitted evaluations are nonpreemptive; established exhaustion wins over cancellation,
-which wins over budget. Stops retain committed results and required reserved final
-rescoring; original errors and charged usage are preserved, not masked by cancellation.
+Admitted evaluations are nonpreemptive; errors > established exhaustion > cancellation.
+Stops retain committed results and required final rescoring when the final score is
+absent; original errors and charged usage are preserved, not masked by cancellation.
+Searches are finite (strict ascent, finite neighborhoods, seeds and outer keys), but
+not necessarily short. Use offset/limit to bound outer keys or cancellation to stop
+remaining work.
 Core runtime, fallible JSONL projections and the synchronous HC/PE adapter ship in the
 production CLI (§4.1), including the final retained hold. Live hold events and
 checkpoint cadence remain unimplemented.
@@ -599,8 +602,8 @@ state. Holds order by `(score desc, enumeration index asc)`; for attacks the ind
 (outer, start) and stages re-rank per
 [search-passes §10](search-passes.md#10-hold-list--task-14). These obligations apply
 only to implemented search jobs. The planned Task 11 attack branch retains the
-per-slot order but slices outer scramblers only; seed/action indices and evaluation
-budgets are separate, as specified in [attack order](search-passes.md#3-pre-execution-gates-and-outer-order).
+per-slot order but slices outer scramblers only; seed/action indices are separate,
+as specified in [attack order](search-passes.md#3-pre-execution-gates-and-outer-order).
 This does not change legacy subset enumeration or define cross-pass holds.
 
 ## 8. Local listener (Stage 2)

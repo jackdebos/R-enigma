@@ -12,19 +12,19 @@ domain's ordered alphabet, plus typed partial-exhaustion `empty_single` all/touc
 seed policies. Task 11.2c adds `AttackGate::check` over a borrowed resource-bound
 `SearchRequest` and explicit typed domain/settings. It rechecks compatibility and
 returns privately constructed full/sliced outer and per-outer start counts, not an
-executable request or evaluation reservation. Counts do not truncate to the budget.
+executable request. Counts describe the full selected work.
 Task 11.2d.5 exposes `ParsedAttackRequest::parse_json` and supplied-content binding,
 plus resource-free `AttackRequest::parse_json`. Both promotion routes check eligibility
 before returning privately owned inputs, retained models and counts. Owned result
 carriers and the HC facade are exposed; raw candidate APIs remain private. Public root dispatch selects this owner only when
 `job.space.plugboard.kind` is `"attack"`, with wire kind still `"search"`.
-The CLI loads resources once, binds and checks eligibility/counts/budgets before
+The CLI loads resources once, binds and checks eligibility/counts before
 HC/PE execution through §6.2; failures remain seq1-only errors.
-Task 11.4a adds private budget-aware complete-neighborhood best-improvement selection only.
-Task 11.4b.1 adds a private bound scoring lifecycle: start-phase selection, shared final-score
-reservation, committed-board objective switching and once-only finalization, without an ascent loop.
+Task 11.4a adds private complete-neighborhood best-improvement selection only.
+Task 11.4b.1 adds a private bound scoring lifecycle: start-phase selection,
+committed-board objective switching and once-only finalization, without an ascent loop.
 Task 11.4b.2 adds a private single-climb driver repeating complete strict-improvement scans,
-with final-scored committed outcomes on completion or budget interruption. Interrupted scans
+with final-scored committed outcomes on completion or cancellation. Interrupted scans
 never commit provisional winners; final rescoring alone does not count as final-objective ascent.
 Task 11.5a adds private lazy empty/single mutable seed generation with dense local indices.
 Task 11.5b adds private ordered independent known-scrambler seed climbs with one shared
@@ -57,7 +57,7 @@ original causes and separate malformed-best errors. Public HC is unchanged;
 Task 12.9c exposes these PE projections through the same public run facade.
 
 For this settings fragment, malformed raw JSON (including duplicate keys, trailing
-input and nonobjects), missing fields and invalid kind/objectives/budget use
+input and nonobjects), missing fields and invalid kind/objectives use
 `invalid_request`; unknown fields use `unknown_field` with escaped JSON Pointers.
 Known branch-forbidden members and malformed policy shape/kind/selection use
 `invalid_request`; malformed touching masks use `invalid_search_space` at the
@@ -104,7 +104,7 @@ All objects reject unknown and duplicate keys at every depth. The two branches
 are exclusive: `candidates`/`size` cannot coexist with attack fields. No aliases,
 normalization, wildcard, omitted unknown domain, or inferred key defaults exist.
 Integer fields reject fractional values, negatives and values outside their stated
-bounds; budget is unsigned 64-bit, outer offsets/limits retain existing types.
+bounds; outer offsets/limits retain existing types.
 
 `configuration.plugboard` remains required fixed knowledge. Its disjoint pairs
 are immutable throughout every climb, not mutable initial guesses. `symbols`
@@ -137,12 +137,14 @@ requires exactly one identifier, `hill_climb` or `partial_exhaustion`. Add requi
 | `final_measure` | Declared `job.measures` identifier |
 | `switch_pairs` | Integer in [0, C], total board cardinality threshold |
 | `backtrack_pairs` | Integer in [0, C], total board cardinality threshold |
-| `evaluation_budget` | Positive unsigned 64-bit integer, whole request run |
 | `progress_every` | Optional positive `u64` integer, default 100000; global completed-evaluation interval |
 | `start` | Required only for direct `hill_climb`; array of mutable pairs |
 | `seeds` | Required only for `partial_exhaustion`; strict object below |
 
-All listed common fields are mandatory. No heuristic defaults: reference
+`job.attack.evaluation_budget` is rejected as `unknown_field` at
+`/job/attack/evaluation_budget`; it is not silently ignored.
+
+All listed common fields except `progress_every` are mandatory. No heuristic defaults: reference
 floor(N × .3)/floor(N × .2) gives 7/5 for 26 symbols, but users choose thresholds
 explicitly. Thresholds may exceed `max_pairs`: switching then may never occur;
 backtracking then may remain unavailable. No ordering relation between thresholds
@@ -175,7 +177,7 @@ allowed, but Task 11 need not evaluate them for its internal result.
 ## 3. Pre-execution gates and outer order
 
 Before the first evaluation, validate strict syntax, full coverage, starts/seeds,
-all topology and scoring/resource compatibility, integer/count bounds and budget.
+all topology and scoring/resource compatibility, and integer/count bounds.
 Task 11 supports decrypting any topology already resolvable by the universal
 engine under its existing resource limits: one or more rotors, optional leftmost
 reflector, fixed/movable slots and validated declarative stepping. There is **no
@@ -195,14 +197,18 @@ fastest**, with domain-array order preserved. Do not adopt bomm's global nesting
 All fixed slot choices yield one outer candidate (index 0). `space.offset` and
 `space.limit` slice outer candidates, not seeds, neighbors, score calls or climbs.
 Outer indices are absolute unsliced indices. Each selected outer candidate runs
-all seeds in order before advancing the outer tuple, unless budget ends the run.
+all seeds in order before advancing the outer tuple, unless cancellation stops the run.
 Legacy subset indices/order remain unchanged in their own branch.
 
 An empty outer slice returns no best candidate with termination `outer_slice_end`.
 Otherwise normal exhaustion of the requested slice is `completed`; completion is
 only of that slice, never a claim of all mathematical plugboards being exhausted.
-Execution is sequential in this contract; parallelism must preserve identical
-budget allocation and result order if separately introduced.
+Execution is sequential in this contract; parallelism must preserve deterministic
+result order if separately introduced.
+
+Searches are finite: strict ascent over finite boards and neighborhoods, finite
+seed sets and finite outer keys. Finite does not mean short. Use offset/limit to
+bound outer keys only, or cancellation to stop remaining work.
 
 ## 4. Empty and single-pair seed exhaustion
 
@@ -229,8 +235,8 @@ and local to each outer candidate. No duet, quartet, recursive generation, or DF
 Each seed invokes exactly the same hill routine independently. Restore fixed
 knowledge, selected seed, initial objective phase and initial machine positions;
 never carry a previous climb's board or stepped state into the next seed. Two
-seeds may converge to the same result; do not deduplicate climbs or redistribute
-budget. Direct hill climb instead uses its explicit `start`, with start index 0.
+seeds may converge to the same result; do not deduplicate climbs.
+Direct hill climb instead uses its explicit `start`, with start index 0.
 
 ## 5. Deterministic constrained neighborhood
 
@@ -264,7 +270,7 @@ the first pair/action. Apply one winner only after the entire legal neighborhood
 has been evaluated. No plateau move, random restart, worsening move, first
 improvement, recursive depth or undocumented pruning is permitted.
 
-## 6. Adaptive hill routine and bounded evaluations
+## 6. Adaptive hill routine and evaluation accounting
 
 At climb start, actual pair count includes fixed plus seed/start pairs. Use final
 objective immediately if count >= `switch_pairs`; otherwise use initial objective.
@@ -284,37 +290,24 @@ One evaluation is one fresh full-message decryption plus **one** objective score
 Count initial scores, every legal trial (including repeated boards), objective
 remeasurements and final rescoring. Cached plaintext/score must not evade counts.
 Filtering invalid actions, resolving candidates and comparing scores cost zero
-budget evaluations. All calls share the one request budget; no per-seed reset.
+evaluations. All calls share whole-request checked accounting; no per-seed reset.
 Fresh engine state means initial outer positions, before the first keypress;
 precomputation is permitted only if equivalent to this decrypt-and-score result.
 
-Reserve one evaluation for final rescoring whenever the current committed board
-has no known final score and objectives differ. Before starting a climb require
-its initial score plus that reserve; otherwise stop without starting that climb.
-Before each trial or objective switch, require its cost plus any still-needed
-reserve. Switching consumes the reserve to establish the final score. At budget
-stop, use the reserved call to final-score the committed board; never report an
-unscored board as a competitive winner. If a final score already exists, no
-reserve is needed. Counts include the reserved call when actually performed.
-
-If budget prevents finishing a neighborhood, discard its provisional winner,
-leave P committed unchanged, and terminate the run as `evaluation_budget`.
-Trial scores from that incomplete neighborhood are not eligible result boards.
-Never apply a partial best-neighborhood winner as “best improvement”. If a
-complete neighborhood can commit its winner but the next required operation
-cannot fit, retain that committed board and terminate with its final score.
-A zero-cost completion takes precedence over budget termination when there is
-no remaining work (including an empty legal neighborhood). No evaluation beyond
-the budget or timeout heuristic is specified; cancellation is governed by §6.1 and
-planned public events by [protocol §4.1](protocol.md#41-planned-hcpe-search-events--task-127).
+Final rescoring is required whenever the committed board has no known final score,
+including after cancellation. Reuse an existing final score without evaluation;
+otherwise count the fresh final-objective call normally. Never report an unscored
+board as a competitive winner; failed final rescoring remains an error.
+Cancellation discards an unfinished neighborhood's provisional winner and retains
+only the committed board (§6.1). Public events are specified by
+[protocol §4.1](protocol.md#41-planned-hcpe-search-events--task-127).
 
 ### 6.1 Private progress and cancellation — Task 12
 
 **Core HC and PE execution is publicly available through `AttackRequest::run` (§6.2).**
 Single climbs, HC outer scheduling, PE seeds/resolved owners and PE outer scheduling
 share checked accounting, counter snapshots and cooperative cancellation.
-Budget-only callers retain Task 11 behavior; both controlled paths use fresh
-per-invocation control and evaluation allowances.
+Both controlled paths use fresh per-invocation control and evaluation accounting.
 Fallible JSONL projections and the shared synchronous HC/PE adapter ship in the CLI.
 The CLI `--cancel-file` marker (Task12.12) and platform signals (Task12.13) are
 the external cancellation sources; checkpoint cadence remains deferred.
@@ -338,8 +331,8 @@ counter overflow, used may exceed admitted. Preserve both factual values, withou
 refunds or fabricated increments.
 Initial, trial, objective-switch and final evaluations all follow these rules.
 Failed evaluations remain admitted but not completed; there are no refunds.
-Reservations protect required final scoring; only an actually admitted call is charged.
-Cancelled or budget-interrupted climbs and their unfinished outers are not completed.
+Only an actually admitted call is charged, including required final rescoring.
+Cancelled climbs and their unfinished outers are not completed.
 Before initial success there is no current climb result; retain any earlier aggregate.
 
 #### Sticky safe-stop and committed results
@@ -350,8 +343,9 @@ Once observed, abandon any unfinished scan and its provisional winner; preserve
 only the previously committed board. No optimization follows observation: no new
 trial, winner commit, objective-switch ascent or next climb/outer may begin.
 
-The sole evaluation exception is one already-required, reserved, charged final-
-objective rescore of that committed board, only if its final score is absent.
+The sole evaluation exception is one already-required final-objective rescore of
+that committed board, only if its final score is absent; it is admitted and charged
+normally.
 If a final score already exists, reuse it without evaluation. This exception retains
 an eligible valid result, never promotes a provisional winner or resumes ascent.
 Failure of this final rescore remains an error, not a cancelled result.
@@ -365,8 +359,9 @@ wall-clock bound or compliance claim for the public progress interval.
 An encountered evaluation, resolution or invariant error remains an error;
 cancellation must not mask it or erase charged usage. Already-established zero-cost
 or natural exhaustion remains complete (an empty outer slice is `outer_slice_end`).
-When work remains, cancellation precedes budget termination. Do not perform an extra
-evaluation to probe exhaustion, and do not cancel retroactively after completion.
+When work remains, safe cancellation stops it. Precedence is errors > exhaustion >
+cancellation. Do not perform an extra evaluation to probe exhaustion, and do not
+cancel retroactively after completion.
 
 Preserve deterministic pair/action and outer/seed tie order, immutable fixed pairs,
 and final-score eligibility. Winning-result flags (final-objective ascent and fully
@@ -415,7 +410,7 @@ fn run(&self, observe: impl FnMut(AttackProgress),
 Each invocation creates fresh whole-run control/allowance and reuses the controlled
 same-owner lazy HC or PE scheduler with absolute outer indices and dense PE seed
 indices. It never rereads resources or accepts caller-supplied raw outer candidates.
-PE cancellation and budget stops retain eligible final-scored seed winners; winner
+PE cancellation retains eligible final-scored seed winners; winner
 incompleteness is independent of whole-run termination.
 Callbacks are synchronous; observation is infallible and counter-only, cancellation
 is polled separately and latched. Repeated runs start fresh. No public exports of
@@ -433,7 +428,7 @@ CLI/resource preflight still completes before `started`; Core parsing stays pure
 PE `SeedBest` projection reuses that owned key validation. Its key combines resolved slot facts with fixed plus winning mutable
 pairs; never report the owner's initial fixed-only board as the winning complete key.
 Flags are `incomplete`, `final_objective_ascent`, `neighborhood_exhausted`; direct
-HC interruption derives from its cancellation/budget flags, PE from its seed winner.
+HC interruption derives from its cancellation/incomplete flags, PE from its seed winner.
 PE seed incompleteness is independent of whole-run termination; failure indices never
 replace the retained winner's outer/seed indices. No ascent is implied merely by final
 scoring. Tie order and eligibility remain §3–6.
@@ -454,9 +449,9 @@ Preserve nested source access and diagnostics,
 not just a formatted string or sentinel result. Result/best/progress/error fields use
 the wire names in protocol §4.1; Core replaces `elapsed_ms` with transport ownership,
 Q32 strings with `FixedScore` values and null with `Option`. `AttackTermination`
-variants are `Completed`, `OuterSliceEnd`, `EvaluationBudget`, `Cancelled`.
+variants are `Completed`, `OuterSliceEnd`, `Cancelled`.
 
-`completed`, `outer_slice_end`, `evaluation_budget`, `cancelled` have exactly the
+`completed`, `outer_slice_end`, `cancelled` have exactly the
 [wire stop meanings](protocol.md#41-planned-hcpe-search-events--task-127). The public
 facade and production CLI use the corresponding controlled HC/PE path.
 No current-climb result exists before initial success; a failed final rescore cannot
@@ -473,12 +468,12 @@ separately unstarted under [protocol control](protocol.md#5-control); none is sh
 
 ## 7. Minimal core result, examples and limits
 
-The budget-only internal run result contains termination (`completed`, `outer_slice_end`,
-or `evaluation_budget`); controlled HC/PE also supports `cancelled`. It carries
+The HC/PE run result contains termination (`completed`, `outer_slice_end`,
+or `cancelled`). It carries
 evaluations used, outer candidates completed, climbs started
 and completed, and an optional best committed board with resolved initial slot
 key, plaintext, final measured/ranking score, absolute outer index and seed/start
-index. A climb interrupted by budget is not completed. An outer candidate is
+index. A cancelled climb is not completed. An outer candidate is
 completed only after all its climbs finish. Eligible final-scored committed boards
 include the interrupted climb's board, marked incomplete; ties select lowest
 (outer index, seed/start index). §10 generalizes this best to a top-N hold; the public
@@ -506,7 +501,7 @@ implemented; public HC/PE runs through Core and the production CLI adapter.
   "space": {"plugboard": {"kind":"attack","symbols":["C","D","E","F"],"max_pairs":3}},
   "passes": ["partial_exhaustion"],
   "attack": {"kind":"partial_exhaustion","initial_measure":"ic","final_measure":"entropy",
-    "switch_pairs":2,"backtrack_pairs":1,"evaluation_budget":1000,
+    "switch_pairs":2,"backtrack_pairs":1,
     "seeds":{"kind":"empty_single","selection":"touching","symbols":["E"]}}
 }
 ```
@@ -516,7 +511,7 @@ The seeds are `[]`, CE, DE, EF; AB stays fixed. For direct hill climb, replace
 `seeds` with `"start":[["C","E"]]`; all other fields are unchanged and valid.
 For outer search, remove the right slot's fixed `position` and add
 `space.slots: [{"id":"right","positions":["A","B"]}]`: indices 0/1 select A/B,
-with the same local seed sequence for each, subject to the shared budget.
+with the same local seed sequence for each, subject to cancellation.
 
 ## 8. Reference basis and deliberate departures
 
@@ -532,7 +527,7 @@ with the same local seed sequence for each, subject to the shared budget.
 Adaptations are intentional: protect true fixed pairs (reference does not), use
 actual board cardinality rather than reference `num_plugs=0` net-change counter,
 retain our per-slot outer order, explicit domains/starts/objectives/thresholds,
-checked Q32 scoring, no-reflector decrypt support and deterministic shared budget.
+checked Q32 scoring, no-reflector decrypt support and checked shared accounting.
 No floating-point score/trajectory parity or guaranteed key recovery is promised.
 Duet/quartet, DFS, mutable fixed facts and additional attacks remain out of scope.
 Public lifecycle/result transport is frozen above and implemented in the production
@@ -615,8 +610,8 @@ holds (a winning pure removal shrinks it by one); the §5 backtrack/switch thres
 do not apply. Like pinned bomm, the identity and pure-removal trials are evaluated
 and counted.
 
-Decision (Task 13.3b): a started reswapping stage that stops early (budget,
-cancellation or evaluation error) reports the committed S as its history `score`;
+Decision (Task 13.3b): a started reswapping stage that stops early (cancellation
+or evaluation error) reports the committed S as its history `score`;
 the score is `null` only when its initial evaluation fails, and best then stays as
 before the stage.
 
@@ -635,24 +630,22 @@ come from a different measure; the sum is defined but
 not comparable across measures. Otherwise scores of different measures remain
 incomparable, including across stages.
 
-### 9.5 Budget, safe stop, termination and errors
+### 9.5 Safe stop, termination and errors
 
-Stages share the single `evaluation_budget` and §6.1 counters; each evaluation above
-is admitted, charged and completed exactly as there. HC/PE does not reserve budget
-for stages. Stage scores are always known for the committed key, so no final-rescore
-reserve exists. Before each evaluation require one unit; if absent, stop with
-`evaluation_budget`. A reswapping scan interrupted by budget or cancellation discards
-its provisional winner; earlier applied reswaps remain committed. Climb and outer
-counters never change during stages.
+Stages share the §6.1 checked counters; each evaluation above is admitted, charged
+and completed exactly as there. Stage scores are always known for the committed
+key, so no final rescore is needed. A reswapping scan interrupted by cancellation
+discards its provisional winner; earlier applied reswaps remain committed.
+Climb and outer counters never change during stages.
 
 Cancellation is polled before each stage, before each admission and after each
 evaluation before a reswap commit; once observed no further stage evaluation runs.
 A cancellation pending after the final no-improvement scan therefore leaves the
 reswapping stage `completed`: no commit, hence no poll, follows that scan.
 Run termination: the HC/PE termination if not `completed` (stages never start);
-otherwise `completed` only when every listed stage completed, else `cancelled` or
-`evaluation_budget` with §6.1 precedence (errors > exhaustion > cancellation >
-budget). A stage error is a runtime `error` whose result best is the last committed
+otherwise `completed` only when every listed stage completed, else `cancelled`
+with §6.1 precedence (errors > exhaustion > cancellation).
+A stage error is a runtime `error` whose result best is the last committed
 key and score, with HC/PE indices and `source.kind` `evaluation`.
 
 ### 9.6 Result projection
@@ -664,7 +657,7 @@ evaluation. `result` gains an additive `stages` array (empty for HC/PE-only runs
 with one entry per started stage, in order, each exactly `pass`, `measure`,
 `base_measure` (trie only, else `null`), `score` (§4.1 score object or `null`),
 `evaluations_used` (decimal string) and `completed` (boolean). Unstarted stages have
-no entry: a stage starts at its first evaluation admission, so budget or cancellation
+no entry: a stage starts at its first evaluation admission, so cancellation
 preventing that admission leaves no history entry. Core mirrors this on `AttackResult`.
 
 ## 10. Hold list — Task 14
@@ -687,22 +680,22 @@ Pinned bomm basis: `src/hold.c` (`bomm_hold_add`), `src/attack.c` and `src/query
 | `hold` | Integer in [1, 1000]: hold capacity N | 100 |
 
 A present value that is not an integer, is fractional, or lies outside [1, 1000]
-is `invalid_request` at `/job/attack/hold`, like `evaluation_budget`; `null` is not
-omission. `hold` is parsed in the §2 settings fragment at its exact-field/type step
+is `invalid_request` at `/job/attack/hold`; `null` is not omission.
+`hold` is parsed in the §2 settings fragment at its exact-field/type step
 (after raw validation, unknown-member and alphabet checks), so it fails before the
-§3 gate counts and budget, resource binding and `started`, as a seq1-only `error`.
+§3 gate counts, resource binding and `started`, as a seq1-only `error`.
 The upper bound caps retained memory and the final `result` line: each entry owns a
 full plaintext of `job.text`, so output grows as N × text length. 1000 is ten times
 the bomm default. A capacity above the number of climbs is valid; the hold is then
-simply shorter. The hold never changes enumeration, budget or counters.
+simply shorter. The hold never changes HC/PE enumeration or accounting rules.
 
 ### 10.2 Entry rule
 
 The HC/PE schedulers offer the hold exactly the candidates they compare against the
 single best today (§7, §6.2): once per climb (direct start or PE seed), at its end,
 the climb's committed board with its required final score, in enumeration order.
-This includes budget- or cancellation-interrupted climbs (flag `incomplete`), whose
-reserved final rescore succeeded. Provisional scan winners, failed climbs, failed
+This includes cancellation-interrupted climbs (flag `incomplete`), whose required
+final score was established successfully. Provisional scan winners, failed climbs, failed
 final rescores and climbs that never obtained an initial score offer nothing; a
 §6.1 safe stop offers no further climb. On a runtime error the hold keeps exactly
 the earlier offers that the Task 12.9a/b retention rules keep for the single best
@@ -739,9 +732,8 @@ Stages run only when the HC/PE run terminated `completed` with a nonempty hold (
 Finalists are processed one at a time, best-first by their pre-stage order; each runs
 the complete §9 pipeline in `job.passes` order from its own committed key and score,
 exactly as §9.2–§9.4 define for one key, keeping its own indices and HC/PE flags.
-All finalists share the one `evaluation_budget`, §6.1 counters and cancellation
-(§9.5); no budget is reserved per finalist. Cancellation is also polled before each
-finalist. After a stop no further stage evaluation runs for any finalist.
+All finalists share the §6.1 checked counters and cancellation (§9.5).
+Cancellation is also polled before each finalist. After a stop no further stage evaluation runs for any finalist.
 
 Each entry ends in one state:
 
@@ -762,18 +754,16 @@ stays); removed slots are not refilled. With no listed stages every entry is
 trivially polished and the pre-stage order stands.
 
 Termination: the HC/PE termination if not `completed`; otherwise `completed` only
-when every finalist is polished, else `cancelled` or `evaluation_budget` with §9.5
+when every finalist is polished, else `cancelled` with §9.5
 precedence. A stage error is a runtime `error` (§9.5): its finalist keeps its last
 committed key and score as the partial entry; the hold is retained.
 
-### 10.6 Budget, cancellation and errors
+### 10.6 Cancellation and errors
 
-A stop or error never discards held entries: budget and cancellation return the
-retained hold (§10.2 during HC/PE, §10.5 states during stages) in the final
-`result`; a runtime error returns it in the error's `result`. Errors dominate
-cancellation, which dominates budget (§6.1). Stage cost grows with N: with listed
-stages a request that completed under Task 13 may now stop with
-`evaluation_budget`; `hold: 1` keeps the Task 13 cost.
+A stop or error never discards held entries: cancellation returns the retained hold
+(§10.2 during HC/PE, §10.5 states during stages) in the final `result`; a runtime
+error returns it in the error's `result`. Precedence is errors > exhaustion >
+cancellation (§6.1). Stage cost grows with N; `hold: 1` keeps the Task 13 cost.
 
 ### 10.7 Result and wire projection
 
