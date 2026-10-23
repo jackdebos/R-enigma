@@ -589,9 +589,9 @@ then the plugboard remainder change fastest. A dimension that is structurally fi
 has a single-value domain contributes one value and does not vary. The plugboard
 remainder enumerates the `size`-element combinations of `candidates` in increasing
 candidate-index order, lexicographically. `offset` skips that many candidates and
-`limit` caps how many are produced, both counted in this one flat order. Variant
-selection, formerly reserved for Task 14, is deferred to a later unassigned task; it
-may nest outside this base order but must not change the order within a variant.
+`limit` caps how many are produced, both counted in this one flat order. Multi-variant
+search (several machine definitions in one request) is not planned: to try another
+machine, run a separate request with that machine's definition.
 Scoring uses integer/fixed-point arithmetic where floating point
 could vary, otherwise results are bit-identical. Unordered reductions do not affect
 scores; each candidate is scored independently. Stochastic passes record seed and RNG

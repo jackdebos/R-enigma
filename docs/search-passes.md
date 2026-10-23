@@ -78,7 +78,7 @@ control contract in §6.1 and public Core HC/PE facade in §6.2;
 [protocol §4.1](protocol.md#41-planned-hcpe-search-events--task-127) defines first-release
 lifecycle/results/progress, now delivered by the CLI for HC/PE. Chained stages are
 specified in [§9](#9-chained-stages--task-13) and the hold list in [§10](#10-hold-list--task-14);
-checkpoints and variants remain separate work.
+checkpoints remain separate work; multi-variant search is not planned.
 
 ## 1. Two domain branches, no implicit unknown key
 
@@ -672,8 +672,8 @@ preventing that admission leaves no history entry. Core mirrors this on `AttackR
 Status: **implemented in Core and the CLI.** A run keeps the top-N committed
 candidates instead of one best, polishes them with the §9 stages and delivers them
 once, in the final `result`. §1–§9 stay normative except where this section extends
-them. Scope is the hold list only: multi-variant search is deferred to a later,
-unassigned task; live `hold` events and parallelism are out of scope (§10.8).
+them. Scope is the hold list only: multi-variant search is not planned (one request
+per machine definition); live `hold` events and parallelism are out of scope (§10.8).
 Pinned bomm basis: `src/hold.c` (`bomm_hold_add`), `src/attack.c` and `src/query.c`
 (`--num-hold`, default 100) at commit `aeb2f2bf`.
 
@@ -792,8 +792,9 @@ the hold ([protocol §6](protocol.md#6-checkpoint-and-resume-record-schema-defer
 
 ### 10.8 Non-goals and departures from bomm
 
-Not in Task 14: multi-variant search (deferred, unassigned), live or periodic `hold`
-events, threads or a shared concurrent hold, and checkpointing (Task 16).
+Not in Task 14: multi-variant search (not planned; run one request per machine),
+live or periodic `hold` events, threads or a shared concurrent hold, and
+checkpointing (Task 16).
 
 Deliberate departures from pinned bomm:
 
