@@ -219,13 +219,22 @@ impl NgramModel {
             .ok_or(ScoreError::Overflow)?;
         let width = self.alphabet.len();
         // Dense dimensions bound every radix key; indices are already validated.
-        let mut key = indices
-            .by_ref()
-            .take(self.order)
-            .fold(0, |key, index| key * width + index as usize);
+        // A power-of-two ring longer than every order (1..=6): masked positions
+        // need no bounds checks or wrap branches.
+        const RING: usize = 8;
+        let mut ring = [0_usize; RING];
+        let mut key = 0;
+        for (slot, index) in ring.iter_mut().zip(indices.by_ref().take(self.order)) {
+            *slot = index as usize;
+            key = key * width + *slot;
+        }
         let mut sum = dense.weights[key];
-        for incoming in indices {
-            key = (key % dense.suffix_modulus) * width + incoming as usize;
+        for (written, incoming) in (self.order..).zip(indices) {
+            let outgoing = ring[(written - self.order) & (RING - 1)];
+            let incoming = incoming as usize;
+            // Remove the highest radix digit before shifting; the key stays bounded.
+            key = (key - outgoing * dense.high) * width + incoming;
+            ring[written & (RING - 1)] = incoming;
             sum = sum.checked_add(dense.weights[key])?;
         }
         let divisor = i128::try_from(windows).map_err(|_| ScoreError::Overflow)?;
@@ -273,15 +282,15 @@ const DENSE_DATA_LIMIT: usize = 4 * 1024 * 1024;
 #[derive(Debug)]
 struct DenseWeights {
     weights: Vec<FixedScore>,
-    suffix_modulus: usize,
+    high: usize,
 }
 
 fn dense_dimensions(width: usize, order: usize) -> Option<(usize, usize)> {
     let exponent = u32::try_from(order.checked_sub(1)?).ok()?;
-    let suffix_modulus = width.checked_pow(exponent)?;
-    let entries = suffix_modulus.checked_mul(width)?;
+    let high = width.checked_pow(exponent)?;
+    let entries = high.checked_mul(width)?;
     (entries.checked_mul(std::mem::size_of::<FixedScore>())? <= DENSE_DATA_LIMIT)
-        .then_some((entries, suffix_modulus))
+        .then_some((entries, high))
 }
 
 impl DenseWeights {
@@ -292,7 +301,7 @@ impl DenseWeights {
         unseen: FixedScore,
         deny_reservation: bool,
     ) -> Option<Self> {
-        let (entries, suffix_modulus) = dense_dimensions(alphabet.len(), order)?;
+        let (entries, high) = dense_dimensions(alphabet.len(), order)?;
         let mut weights = Vec::new();
         if deny_reservation || weights.try_reserve_exact(entries).is_err() {
             return None;
@@ -304,10 +313,7 @@ impl DenseWeights {
             });
             weights[key] = weight;
         }
-        Some(Self {
-            weights,
-            suffix_modulus,
-        })
+        Some(Self { weights, high })
     }
 }
 
@@ -529,6 +535,51 @@ mod tests {
                                 symbol: 'X',
                                 scalar_index: text.chars().count() - 1,
                             })
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rolling_scores_match_sparse_at_width_and_ring_boundaries() {
+        for width in [1, 5, 256] {
+            let symbols: Vec<_> = (0..width)
+                .map(|i| char::from_u32(0x400 + i as u32).unwrap())
+                .collect();
+            for order in 1..=6 {
+                let mut entries = vec![(vec![symbols[0]; order], u64::MAX)];
+                if width > 1 {
+                    entries.push((vec![symbols[width - 1]; order], 3));
+                    if order > 1 {
+                        entries.push(((0..order).map(|i| symbols[i % width]).collect(), 7));
+                    }
+                }
+                let model =
+                    NgramModel::new(Alphabet::new(symbols.clone()).unwrap(), order, entries)
+                        .unwrap();
+                let admitted = dense_dimensions(width, order).is_some();
+                assert_eq!(model.dense.is_some(), admitted);
+                for length in [0, order - 1, order, order + 1, 7 * order + 3, 521] {
+                    for pattern in [
+                        vec![0],
+                        vec![(width - 1) as u32],
+                        (0..width as u32).collect(),
+                        vec![0, (width - 1) as u32, 0, 0, (width - 1) as u32],
+                        pseudo_random_indices(width, 31, 17),
+                    ] {
+                        let indices: Vec<_> = pattern.into_iter().cycle().take(length).collect();
+                        let text: String = indices.iter().map(|&i| symbols[i as usize]).collect();
+                        let expected = model.score(&text);
+                        SPARSE_LOOKUPS.with(|count| count.set(0));
+                        let streamed = model.score_index_iter(indices.iter().copied());
+                        assert_eq!(streamed, admitted.then(|| expected.clone()));
+                        SPARSE_LOOKUPS.with(|count| assert_eq!(count.get(), 0));
+                        assert_eq!(
+                            model.score_indices(&text, &indices),
+                            expected,
+                            "width {width}, order {order}, length {length}"
                         );
                     }
                 }
