@@ -395,9 +395,10 @@ mod tests {
         assert_eq!(result["elapsed_ms"], (clock.get() - 17).to_string());
         assert_eq!(events[events.len() - 3]["elapsed_ms"], "34");
         assert_eq!(clock.get(), 68); // entry, initial, terminal, result: no per-trial reads
-        assert_eq!(result["counters"]["evaluations_completed"], "2");
+        assert_eq!(result["counters"]["evaluations_completed"], "3");
         assert_eq!(result["best"]["score"]["measure"], "entropy");
-        assert_eq!(events.last().unwrap()["reason"], "cancelled");
+        assert_eq!(events.last().unwrap()["reason"], "completed");
+        assert_eq!(polls.get(), 1);
     }
 
     #[test]
@@ -446,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn external_cancellation_after_entry_does_not_wait_for_cadence() {
+    fn external_cancellation_after_last_block_does_not_override_exhaustion() {
         let mut output = Vec::new();
         let polls = Cell::new(0);
         run(
@@ -462,7 +463,8 @@ mod tests {
         )
         .unwrap();
         let events = lines(&output);
-        assert_eq!(events.last().unwrap()["reason"], "cancelled");
+        assert_eq!(events.last().unwrap()["reason"], "completed");
+        assert_eq!(polls.get(), 1);
         assert_eq!(
             events
                 .iter()
@@ -529,9 +531,9 @@ mod tests {
     }
 
     #[test]
-    fn latched_transport_cancellation_permits_required_final_rescore() {
-        // Fail the first completed-evaluation cadence delivery (X = 1).
-        // Required finalization must still finish after cancellation is latched.
+    fn latched_transport_failure_after_block_preserves_final_rescore_and_exhaustion() {
+        // Fail the first block-boundary cadence delivery (X = 1).
+        // The block's required final rescoring is already complete.
         struct FailAfterAdmission {
             last: Cell<u64>,
             writes: Cell<usize>,
@@ -540,8 +542,8 @@ mod tests {
             fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
                 self.writes.set(self.writes.get() + 1);
                 let event: Value = serde_json::from_slice(bytes).unwrap();
-                if event["counters"]["evaluations_admitted"] == "1" {
-                    self.last.set(1);
+                if event["counters"]["evaluations_admitted"] == "3" {
+                    self.last.set(3);
                     return Err(io::Error::other("injected admitted-progress failure"));
                 }
                 Ok(bytes.len())
@@ -569,13 +571,13 @@ mod tests {
         )
         .unwrap_err();
         assert!(failure.transport.is_some());
-        assert_eq!(writer.last.get(), 1);
+        assert_eq!(writer.last.get(), 3);
         // No further progress clock reads or writes after delivery failure.
         assert_eq!(clock.get() / 250, 4); // entry, initial, failed cadence, result
         assert_eq!(writer.writes.get(), 3);
 
-        // Real Core evidence: cancellation after completion still completes the required
-        // initial/final evaluation and retains the committed winner, never a trial.
+        // A stop requested by the final block snapshot cannot override exhaustion.
+        // All initial/trial/final scoring finishes and the committed winner survives.
         let admitted = Cell::new(false);
         let result = request_with_progress(false, true, 1)
             .run(
@@ -585,9 +587,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             result.termination(),
-            enigma_core::AttackTermination::Cancelled
+            enigma_core::AttackTermination::Completed
         );
-        assert_eq!(result.counters().evaluations_completed(), 2);
+        assert_eq!(result.counters().evaluations_completed(), 3);
         assert!(result.best().is_some());
     }
 

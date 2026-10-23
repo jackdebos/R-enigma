@@ -446,16 +446,22 @@ change; strings are used consistently even inside the safe JSON integer range.
 
 Elapsed time is monotonic whole milliseconds since execution entry after preflight,
 not RFC3339 wall-clock subtraction; terminal values include final rescoring.
-Core owns the snapshot stream: one initial snapshot, one at each globally completed
-evaluation count X, 2X, ..., and one terminal snapshot on success, cooperative
-cancellation or returned error. Optional `job.attack.progress_every` sets X (default
+Core owns the snapshot stream: one initial snapshot, block-boundary snapshots during
+the outer phase, cadence snapshots during chained stages, and one terminal snapshot
+on success, cooperative cancellation or returned error. Optional
+`job.attack.progress_every` sets X (default
 **100000**); it must be a positive JSON `u64` integer. Zero, negative values
 (including `-0`), decimal/exponent forms, wrong types, null and overflow are
 `invalid_request` at `/job/attack/progress_every`; unknown-member validation retains
 precedence. HC and Partial Exhaustion (PE) share this grammar.
-The grid never resets across outers, seeds, objective changes, stages or held
-finalists. Failed evaluations and winner plaintext replay do not advance it.
-Admissions and internal boundaries do not notify. Initial and terminal observations
+The outer phase runs selected outer keys in fixed blocks of 128 consecutive keys in
+key order ([search-passes §6.1](search-passes.md#61-private-progress-and-cancellation--task-12)).
+After a block's work is committed, Core emits one snapshot if at least X evaluations
+completed since the previously emitted snapshot (the initial one counts as 0), even
+when the block crossed several multiples of X; nothing is emitted inside a block.
+Chained stages keep the global grid: one snapshot at each completed count that is a
+multiple of X. Failed evaluations and winner plaintext replay do not advance
+completed counts. Admissions and internal boundaries do not notify. Initial and terminal observations
 are retained even when equal to each other or to a cadence snapshot.
 The CLI forwards Core snapshots without a second gate, using monotonic elapsed
 and UTC event clocks only at the transport boundary. Delivery is synchronous
@@ -470,6 +476,15 @@ cancellation. Required final rescoring, when the final score is absent, must suc
 before an interrupted current board is eligible; failed rescoring is error, never a
 provisional best or cancellation.
 
+During the outer phase, cancellation is polled only before a block starts. A stop
+requested while a block runs lets that block finish, including every climb's final
+scoring, and commits it; the next block is not started and the run ends `cancelled`
+with the hold, winner and counters of committed blocks. If that block was the last
+one of the slice, established exhaustion wins (`completed`). A stop requested before
+the first block yields no outer work. An evaluation error stops its block at the
+failing evaluation; work before it is committed and no later block starts. Chained
+stages keep their per-trial polling.
+
 Runtime `context` has exactly `outer_index`, `start_index` (nullable when unavailable),
 `evaluations_used`, `counters`, and `source`. `source` has `kind`, `message`, and
 `diagnostics` (array, empty unless resolution diagnostics exist). Kinds distinguish
@@ -482,8 +497,8 @@ stable codes. Charged failed calls remain admitted, never completed or refunded.
 
 An infallible observer cannot return a write/flush error through the evaluator.
 The adapter latches the first transport failure, stops further writes and requests
-cooperative cancellation independently of progress cadence. It still permits required
-final rescoring and retains any runtime error and charged usage. Report transport
+cooperative cancellation independently of progress cadence; Core observes it at the
+next block boundary or stage poll. It still permits required final rescoring and retains any runtime error and charged usage. Report transport
 failure on stderr and exit nonzero; retain runtime failure as primary when both occur.
 Never retry a partially written JSONL line or promise `result`/terminal delivery on
 failed transport. On a healthy stream flush each emitted line; exactly-one-terminal
@@ -535,7 +550,8 @@ new run. Once observed, cancellation stays set even if the marker disappears.
 Validate the request and resources before initial marker inspection and before
 `started`; initial inspection errors prevent execution, writing only a stderr
 diagnostic with exit 2 and empty stdout. During execution, inspect
-at every Core cancellation callback, independently of progress cadence, until
+at every Core cancellation callback (before each outer block, then at stage polls,
+§4.1), independently of progress cadence, until
 cancellation or error is latched. No clock, timer thread or hard latency guarantee
 is introduced. A runtime inspection error latches the first error and requests safe
 stop; it remains inspectable even after the adapter stops polling. Report it on
@@ -582,9 +598,10 @@ option an attack uses half the logical CPUs reported by the platform, at least o
 
 Status: the option is parsed, validated and passed to Core, but the worker pool is
 not implemented yet, so attacks still run on one thread whatever `<n>` is. The
-paragraphs below are the contract that implementation must meet.
+paragraphs below are the contract that implementation must meet; the block-boundary
+progress and cancellation they describe already apply on that one thread.
 
-Outer keys are split into fixed blocks in key order that worker threads take as they
+Outer keys are split into fixed blocks of 128 keys in key order that worker threads take as they
 become free. Block outcomes are merged in key order, so hold ranking, duplicate
 payloads, winners, errors and counters match a one-thread run; chained stages then
 run on one thread. A completed run therefore writes the same events, exit code and

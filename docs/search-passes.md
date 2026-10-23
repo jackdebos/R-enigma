@@ -203,8 +203,8 @@ Legacy subset indices/order remain unchanged in their own branch.
 An empty outer slice returns no best candidate with termination `outer_slice_end`.
 Otherwise normal exhaustion of the requested slice is `completed`; completion is
 only of that slice, never a claim of all mathematical plugboards being exhausted.
-Execution is sequential in this contract; parallelism must preserve deterministic
-result order if separately introduced.
+Selected outer keys run in fixed blocks of 128 consecutive keys (§6.1), committed
+in key order; parallel execution must preserve that deterministic result order.
 
 Searches are finite: strict ascent over finite boards and neighborhoods, finite
 seed sets and finite outer keys. Finite does not mean short. Use offset/limit to
@@ -335,13 +335,25 @@ Only an actually admitted call is charged, including required final rescoring.
 Cancelled climbs and their unfinished outers are not completed.
 Before initial success there is no current climb result; retain any earlier aggregate.
 
+The outer phase runs blocks of `OUTER_BLOCK_KEYS` = 128 consecutive selected outer
+keys. A block runner shares only the immutable request, bound resources and outer
+plan; it owns its scrambler preparation and local counters, and calls no observer
+or cancellation callback. It returns its per-outer outcomes in key order, its local
+counters and its first error, with the work before that error. The coordinator adds
+each block's counters to the run totals in key order (checked; an overflow discards
+that block and reports its first key as `outer_index`), then offers its outcomes to
+the hold and strict winner in key order. The first error in key order stops the run.
+
 #### Sticky safe-stop and committed results
 
-Cancellation observation is sticky. Poll before the next climb or outer, before
-trial admission, and after evaluation before the next trial or scan-winner commit.
-Once observed, abandon any unfinished scan and its provisional winner; preserve
-only the previously committed board. No optimization follows observation: no new
-trial, winner commit, objective-switch ascent or next climb/outer may begin.
+Cancellation observation is sticky. In the outer phase it is polled only before a
+block starts; nothing inside a block polls, so a stop requested mid-block lets that
+block finish (all climbs, seeds and final scores) and be committed, and no later
+block starts. A stop before the first block yields no outer work. Chained stages
+poll before trial admission and after evaluation before the next trial or
+scan-winner commit. Once a stage observes a stop, it abandons any unfinished scan and
+its provisional winner and preserves only the previously committed board. No
+optimization follows observation: no new trial, winner commit or later stage begins.
 
 The sole evaluation exception is one already-required final-objective rescore of
 that committed board, only if its final score is absent; it is admitted and charged
@@ -351,8 +363,10 @@ an eligible valid result, never promotes a provisional winner or resumes ascent.
 Failure of this final rescore remains an error, not a cancelled result.
 
 Each admitted full-message decryption plus score is cooperative and nonpreemptible;
-it may finish before cancellation is observed. There is no immediate-interruption,
-wall-clock bound or compliance claim for the public progress interval.
+an outer block runs to its end before cancellation is observed. Blocks are sized to
+last about a second or less in typical searches, but there is no
+immediate-interruption, wall-clock bound or compliance claim for the public progress
+interval.
 
 #### Stop precedence and determinism
 
@@ -360,7 +374,8 @@ An encountered evaluation, resolution or invariant error remains an error;
 cancellation must not mask it or erase charged usage. Already-established zero-cost
 or natural exhaustion remains complete (an empty outer slice is `outer_slice_end`).
 When work remains, safe cancellation stops it. Precedence is errors > exhaustion >
-cancellation. Do not perform an extra evaluation to probe exhaustion, and do not
+cancellation: a stop observed after the last block cannot turn the slice into
+`cancelled`. Do not perform an extra evaluation to probe exhaustion, and do not
 cancel retroactively after completion.
 
 Preserve deterministic pair/action and outer/seed tie order, immutable fixed pairs,
@@ -371,18 +386,21 @@ final rescoring nor an earlier completed winner makes a cancelled run complete.
 #### Counter-only observation boundary
 
 The Core observer is synchronous and infallible and receives immutable counters
-only: once initially, at completed evaluation counts X, 2X, ..., and once on
-terminal success, cooperative cancellation or returned error. X is the positive
-`job.attack.progress_every` (default **100000**), shared across the entire HC or
-Partial Exhaustion (PE) attack, including outers, seeds, objectives, stages and held
-finalists. Admission and internal boundaries update counters without notifying.
+only: once initially, after committed outer blocks, at stage cadence points, and
+once on terminal success, cooperative cancellation or returned error. X is the
+positive `job.attack.progress_every` (default **100000**), shared across the entire
+HC or Partial Exhaustion (PE) attack. After each committed block, one snapshot is
+emitted if at least X evaluations completed since the previous emitted snapshot,
+however many multiples of X the block crossed. Chained stages and held finalists
+keep the global grid: one snapshot at each completed count X, 2X, ... reached during
+the stages. Admission and internal boundaries update counters without notifying.
 Failed evaluations retain admission but do not advance cadence; winner plaintext
 replay is not an evaluation. Threshold overflow ends cadence without wrapping or
 repeating; existing checked counter overflow remains an error.
 
 Keep terminal observations even when equal to an initial or cadence snapshot.
-No callback runs mid-evaluation; cancellation polling is independent of observer
-cadence. The CLI forwards every Core snapshot directly, reads the progress elapsed
+No callback runs mid-evaluation or inside an outer block; cancellation polling is
+independent of observer cadence. The CLI forwards every Core snapshot directly, reads the progress elapsed
 clock only for delivery, flushes each line and latches output failures into
 independently polled cancellation. Broken output or hard process exit can prevent
 terminal delivery. No timer thread or wall-clock delivery bound is promised.
@@ -407,9 +425,9 @@ fn run(&self, observe: impl FnMut(AttackProgress),
     -> Result<AttackResult, AttackRunError>;
 ```
 
-Each invocation creates fresh whole-run control/allowance and reuses the controlled
-same-owner lazy HC or PE scheduler with absolute outer indices and dense PE seed
-indices. It never rereads resources or accepts caller-supplied raw outer candidates.
+Each invocation creates fresh whole-run control/allowance and runs the same-owner
+HC or PE block runner over the lazy outer plan (§6.1) with absolute outer indices
+and dense PE seed indices. It never rereads resources or accepts caller-supplied raw outer candidates.
 PE cancellation retains eligible final-scored seed winners; winner
 incompleteness is independent of whole-run termination.
 Callbacks are synchronous; observation is infallible and counter-only, cancellation

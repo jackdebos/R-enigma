@@ -40,6 +40,7 @@ pub(super) struct AttackControl {
     cancelled: bool,
     progress_every: u64,
     next: Option<u64>,
+    last_emitted: u64,
 }
 
 impl Default for AttackControl {
@@ -56,6 +57,7 @@ impl AttackControl {
             cancelled: false,
             progress_every,
             next: Some(progress_every),
+            last_emitted: 0,
         }
     }
 
@@ -70,9 +72,43 @@ impl AttackControl {
                 .counters
                 .evaluations_completed
                 .checked_add(self.progress_every);
+            self.last_emitted = self.counters.evaluations_completed;
             self.notify(observer);
         }
         Ok(())
+    }
+
+    /// Merge a finished worker block without observing intermediate evaluations.
+    pub(super) fn merge_block(&mut self, local: CounterSnapshot) -> Result<(), CounterOverflow> {
+        let mut merged = self.counters;
+        macro_rules! add {
+            ($field:ident, $error:ident) => {
+                merged.$field = merged
+                    .$field
+                    .checked_add(local.$field)
+                    .ok_or(CounterOverflow::$error)?;
+            };
+        }
+        add!(evaluations_admitted, EvaluationsAdmitted);
+        add!(evaluations_completed, EvaluationsCompleted);
+        add!(climbs_started, ClimbsStarted);
+        add!(climbs_completed, ClimbsCompleted);
+        add!(outers_completed, OutersCompleted);
+        self.counters = merged;
+        let completed = merged.evaluations_completed;
+        // Skip the grid points inside this block. Stages retain their original
+        // global multiples, rather than rebasing their cadence onto a block edge.
+        self.next = completed.checked_add(self.progress_every - completed % self.progress_every);
+        Ok(())
+    }
+
+    /// One outer-phase notification at most, measured from the previous emission.
+    pub(super) fn block_progress(&mut self, observer: &mut impl CounterObserver) {
+        let completed = self.counters.evaluations_completed;
+        if completed - self.last_emitted >= self.progress_every {
+            self.last_emitted = completed;
+            self.notify(observer);
+        }
     }
 
     #[cfg(test)]
@@ -155,6 +191,58 @@ mod tests {
         fn observe(&mut self, snapshot: CounterSnapshot) {
             self.0.push(snapshot);
         }
+    }
+
+    #[test]
+    fn block_progress_uses_last_emission_and_stages_keep_the_global_grid() {
+        let mut control = AttackControl::with_progress_every(3);
+        let mut observer = Recorder::default();
+        for count in [2, 2, 2, 1] {
+            control
+                .merge_block(CounterSnapshot {
+                    evaluations_admitted: count,
+                    evaluations_completed: count,
+                    ..Default::default()
+                })
+                .unwrap();
+            control.block_progress(&mut observer);
+        }
+        assert_eq!(
+            observer
+                .0
+                .iter()
+                .map(|s| s.evaluations_completed)
+                .collect::<Vec<_>>(),
+            [4, 7]
+        );
+        control.complete(&mut observer).unwrap(); // 8: not a stage grid point.
+        control.complete(&mut observer).unwrap(); // 9: original stage cadence.
+        assert_eq!(
+            observer
+                .0
+                .iter()
+                .map(|s| s.evaluations_completed)
+                .collect::<Vec<_>>(),
+            [4, 7, 9]
+        );
+    }
+
+    #[test]
+    fn block_merge_overflow_is_transactional() {
+        let counters = CounterSnapshot {
+            evaluations_admitted: u64::MAX,
+            ..Default::default()
+        };
+        let mut control = AttackControl::with_counters(counters);
+        assert_eq!(
+            control.merge_block(CounterSnapshot {
+                evaluations_admitted: 1,
+                evaluations_completed: 1,
+                ..Default::default()
+            }),
+            Err(CounterOverflow::EvaluationsAdmitted)
+        );
+        assert_eq!(control.snapshot(), counters);
     }
 
     #[test]

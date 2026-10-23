@@ -125,6 +125,7 @@ impl DirectAcceptance {
         }
     }
 
+    #[cfg(test)]
     fn finish(
         self,
         run: Result<DirectRunOutcome, Box<ControlledDirectError>>,
@@ -209,43 +210,13 @@ impl crate::AttackRequest {
         let mut observer = ProgressObserver(observe);
         observed_run(&mut control, &mut observer, |control, observer| {
             let preparation = RunPreparation::new(self);
-            let result = if self.settings().kind() == crate::AttackKind::PartialExhaustion {
-                match self.schedule_partial_blocks(
-                    &preparation,
-                    &mut allowance,
-                    control,
-                    observer,
-                    &mut cancel_requested,
-                    self.settings().hold_capacity(),
-                ) {
-                    Ok(outcome) => outcome.project_public(
-                        control.snapshot(),
-                        self.domain(),
-                        self.settings().final_measure(),
-                    ),
-                    Err(error) => {
-                        Err(error.project(self.domain(), self.settings().final_measure()))
-                    }
-                }
-            } else {
-                let mut acceptance = DirectAcceptance::new(self.settings().hold_capacity());
-                let run = self.schedule_direct_blocks(
-                    &preparation,
-                    &mut allowance,
-                    control,
-                    observer,
-                    &mut cancel_requested,
-                    |outcome| {
-                        acceptance.accept(outcome, self.domain(), self.settings().final_measure())
-                    },
-                );
-                acceptance.finish(
-                    run,
-                    control.snapshot(),
-                    self.domain(),
-                    self.settings().final_measure(),
-                )
-            }?;
+            let result = self.run_block_phase(
+                &preparation,
+                &mut allowance,
+                control,
+                observer,
+                &mut cancel_requested,
+            )?;
             let mut result = result;
             let completed = crate::AttackTermination::Completed;
             let staged = !self.settings().stages().is_empty();
@@ -559,8 +530,11 @@ pub(crate) enum DirectRunTermination {
 #[derive(Debug)]
 pub(crate) struct DirectRunOutcome {
     pub(crate) termination: DirectRunTermination,
+    #[cfg(test)]
     pub(crate) outer_completed: u128,
+    #[cfg(test)]
     pub(crate) climbs_started: u128,
+    #[cfg(test)]
     pub(crate) climbs_completed: u128,
     pub(crate) evaluations_used: u64,
     /// Owns initial fixed facts and the final-scored committed board with its flags.
@@ -572,6 +546,7 @@ pub(crate) enum DirectRunError {
     Resolution(Vec<crate::SearchDiagnostic>),
     Climb(DirectClimbError),
     Counter(CounterOverflow),
+    #[cfg(test)]
     MissingOuter,
     Projection(ProjectionError),
 }
@@ -587,6 +562,7 @@ impl From<ObservedClimbError> for DirectRunError {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct IndexedDirectRunError {
     /// None only for fail-closed pass rejection before enumeration.
@@ -714,6 +690,7 @@ fn merge_held(
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 enum ControlledPartialTermination {
     OuterSliceEnd,
@@ -721,6 +698,7 @@ enum ControlledPartialTermination {
     Cancelled,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct ControlledPartialRun {
     termination: ControlledPartialTermination,
@@ -736,6 +714,7 @@ struct ControlledPartialRun {
 enum ControlledPartialRunSource {
     Resolution(Vec<crate::SearchDiagnostic>),
     Climb(ControlledPartialSource),
+    #[cfg(test)]
     MissingOuter,
 }
 
@@ -787,6 +766,7 @@ impl ControlledPartialOutcome {
     }
 }
 
+#[cfg(test)]
 impl ControlledPartialRun {
     fn project_public(
         self,
@@ -839,6 +819,7 @@ impl ControlledPartialRunError {
             ControlledPartialRunSource::Resolution(diagnostics) => {
                 RunPayload::Resolution(diagnostics)
             }
+            #[cfg(test)]
             ControlledPartialRunSource::MissingOuter => {
                 RunPayload::Invariant("missing selected outer")
             }
@@ -907,6 +888,7 @@ impl crate::AttackRequest {
         )
     }
 
+    #[cfg(test)]
     fn schedule_partial_blocks(
         &self,
         preparation: &RunPreparation<'_>,
@@ -1240,6 +1222,7 @@ impl crate::AttackRequest {
         )
     }
 
+    #[cfg(test)]
     fn schedule_direct_blocks(
         &self,
         preparation: &RunPreparation<'_>,
@@ -1446,6 +1429,7 @@ fn schedule_controlled_partial<O: CounterObserver, F: FnMut() -> bool>(
     )
 }
 
+#[cfg(test)]
 fn schedule_controlled_partial_prepared<O: CounterObserver, F: FnMut() -> bool>(
     owner: &crate::AttackRequest,
     preparation: &RunPreparation<'_>,
@@ -1481,6 +1465,7 @@ fn schedule_controlled_partial_prepared<O: CounterObserver, F: FnMut() -> bool>(
     )
 }
 
+#[cfg(test)]
 fn schedule_controlled_partial_with_climb<O: CounterObserver, F: FnMut() -> bool>(
     selected: u128,
     mut outers: impl Iterator<
@@ -1651,7 +1636,9 @@ impl ControlledDirectError {
     fn project(self, domain: &AttackPlugboardDomain, measure: MeasureId) -> crate::AttackRunError {
         use crate::attack_result::RunPayload;
         let start_index = match &self.source {
-            DirectRunError::Resolution(_) | DirectRunError::MissingOuter => None,
+            DirectRunError::Resolution(_) => None,
+            #[cfg(test)]
+            DirectRunError::MissingOuter => None,
             _ => self.outer_index.map(|_| 0),
         };
         let mut projection_error = None;
@@ -1663,6 +1650,7 @@ impl ControlledDirectError {
             DirectRunError::Resolution(diagnostics) => RunPayload::Resolution(diagnostics),
             DirectRunError::Climb(DirectClimbError::Evaluation(source)) => source.into(),
             DirectRunError::Counter(source) => RunPayload::Counter(source),
+            #[cfg(test)]
             DirectRunError::MissingOuter => RunPayload::Invariant("missing selected outer"),
             DirectRunError::Climb(DirectClimbError::MissingStart) => {
                 RunPayload::Invariant("missing direct start")
@@ -1691,6 +1679,7 @@ impl ControlledDirectError {
     }
 }
 
+#[cfg(test)]
 fn schedule_controlled_direct<O: CounterObserver, F: FnMut() -> bool>(
     selected: u128,
     mut outers: impl Iterator<
@@ -2016,8 +2005,6 @@ impl SeedAccounting for BlockAccounting {
     }
 }
 
-// Standalone worker seam; the next slice wires coordinator D1/D2 reduction.
-#[allow(dead_code)]
 #[derive(Debug)]
 enum BlockFailure<E> {
     Resolution(Vec<crate::SearchDiagnostic>),
@@ -2027,14 +2014,12 @@ enum BlockFailure<E> {
 
 /// Every successful outer, in key order, followed by the first failure (if any).
 /// Error accounting includes the failing admission but no failed completion.
-#[allow(dead_code)] // Coordinator integration follows in the next slice.
 struct BlockOutcome<T, E> {
     outers: Vec<T>,
     error: Option<(u128, BlockFailure<E>)>,
     accounting: BlockAccounting,
 }
 
-#[allow(dead_code)] // Coordinator integration follows in the next slice.
 fn run_worker_block<T, E>(
     keys: impl Iterator<
         Item = (
@@ -2072,8 +2057,172 @@ fn run_worker_block<T, E>(
     outcome
 }
 
-#[allow(dead_code)] // Coordinator integration follows in the next slice.
 impl crate::AttackRequest {
+    /// Serial coordinator. No observer or stop callback reaches worker code.
+    fn run_block_phase(
+        &self,
+        preparation: &RunPreparation<'_>,
+        allowance: &mut EvaluationAllowance,
+        control: &mut AttackControl,
+        observer: &mut impl CounterObserver,
+        requested: &mut impl FnMut() -> bool,
+    ) -> Result<crate::AttackResult, crate::AttackRunError> {
+        let plan = self.outer_plan();
+        let measure = self.settings().final_measure();
+        let mut acceptance = DirectAcceptance::new(self.settings().hold_capacity());
+        let mut best = None;
+        let mut termination = DirectRunTermination::OuterSliceEnd;
+        let run = (|| {
+            for block in plan.blocks() {
+                if control.poll_cancellation(requested()) {
+                    termination = DirectRunTermination::Cancelled;
+                    break;
+                }
+                let (accounting, candidates, error) = if self.settings().kind()
+                    == crate::AttackKind::PartialExhaustion
+                {
+                    let outcome = self.run_partial_block(preparation, &plan, block);
+                    let mut candidates = Vec::new();
+                    for mut outer in outcome.outers {
+                        merge_held(&mut acceptance.0, outer.held.take());
+                        candidates.push(outer.into_direct());
+                    }
+                    let error = outcome.error.map(|(index, error)| {
+                        let (seed_index, source, retained, held) = match error {
+                            BlockFailure::Resolution(source) => (
+                                None,
+                                ControlledPartialRunSource::Resolution(source),
+                                None,
+                                None,
+                            ),
+                            BlockFailure::Climb(error) => {
+                                debug_assert_eq!(error.outer_index, index);
+                                (
+                                    error.seed_index,
+                                    ControlledPartialRunSource::Climb(error.source),
+                                    error.best,
+                                    error.held,
+                                )
+                            }
+                            BlockFailure::Counter(source) => (
+                                None,
+                                ControlledPartialRunSource::Climb(ControlledPartialSource::Climb(
+                                    source,
+                                )),
+                                None,
+                                None,
+                            ),
+                        };
+                        (index, seed_index, source, retained, held)
+                    });
+                    (outcome.accounting, candidates, error.map(Err))
+                } else {
+                    let outcome = self.run_direct_block(preparation, &plan, block);
+                    let error = outcome.error.map(|(index, error)| {
+                        let source = match error {
+                            BlockFailure::Resolution(source) => DirectRunError::Resolution(source),
+                            BlockFailure::Climb(source) => source,
+                            BlockFailure::Counter(source) => DirectRunError::from(source),
+                        };
+                        Ok((index, source))
+                    });
+                    (outcome.accounting, outcome.outers, error)
+                };
+                let merged = allowance
+                    .used
+                    .checked_add(accounting.used)
+                    .ok_or(CounterOverflow::EvaluationsAdmitted)
+                    .and_then(|used| {
+                        control.merge_block(accounting.control.snapshot())?;
+                        allowance.used = used;
+                        Ok(())
+                    });
+                if let Err(source) = merged {
+                    return Err(ControlledDirectError {
+                        outer_index: Some(block.start),
+                        evaluations_used: allowance.used,
+                        source: DirectRunError::Counter(source),
+                        best: best.take(),
+                        counters: control.snapshot(),
+                    }
+                    .project(self.domain(), measure));
+                }
+                for candidate in candidates {
+                    if candidate.climb.current.is_none() {
+                        continue;
+                    }
+                    let index = candidate.outer_index;
+                    // PE has already projected its seed offers into the local hold.
+                    let candidate =
+                        if self.settings().kind() == crate::AttackKind::PartialExhaustion {
+                            Some(candidate)
+                        } else {
+                            acceptance
+                                .accept(candidate, self.domain(), measure)
+                                .map_err(|source| {
+                                    ControlledDirectError {
+                                        outer_index: Some(index),
+                                        evaluations_used: allowance.used,
+                                        source: DirectRunError::Projection(source),
+                                        best: best.take(),
+                                        counters: control.snapshot(),
+                                    }
+                                    .project(self.domain(), measure)
+                                })?
+                        };
+                    if let Some(candidate) = candidate {
+                        keep_strict_best(&mut best, candidate);
+                    }
+                }
+                control.block_progress(observer);
+                if let Some(error) = error {
+                    return Err(match error {
+                        Ok((index, source)) => ControlledDirectError {
+                            outer_index: Some(index),
+                            evaluations_used: allowance.used,
+                            source,
+                            best: best.take(),
+                            counters: control.snapshot(),
+                        }
+                        .project(self.domain(), measure),
+                        Err((index, seed_index, source, retained, held)) => {
+                            if let Some(retained) = retained {
+                                let (initial, seed) = *retained;
+                                keep_strict_best(&mut best, seed.into_direct(initial, index));
+                            }
+                            merge_held(&mut acceptance.0, held.map(|held| *held));
+                            ControlledPartialRunError {
+                                outer_index: Some(index),
+                                seed_index,
+                                evaluations_used: allowance.used,
+                                source,
+                                best: best.take(),
+                                counters: control.snapshot(),
+                                held: None,
+                            }
+                            .project(self.domain(), measure)
+                        }
+                    });
+                }
+                termination = DirectRunTermination::Completed;
+            }
+            let counters = control.snapshot();
+            DirectRunOutcome {
+                termination,
+                #[cfg(test)]
+                outer_completed: counters.outers_completed,
+                #[cfg(test)]
+                climbs_started: counters.climbs_started,
+                #[cfg(test)]
+                climbs_completed: counters.climbs_completed,
+                evaluations_used: allowance.used,
+                best: best.take(),
+            }
+            .project_public(counters, self.domain(), measure)
+        })();
+        attach_held(run, acceptance.0)
+    }
+
     /// `preparation` belongs to this worker and is reused between its blocks;
     /// neither the coordinator nor another worker borrows its mutable cells.
     fn run_direct_block(
@@ -2120,15 +2269,36 @@ impl crate::AttackRequest {
     }
 }
 
+fn keep_strict_best(best: &mut Option<DirectOuterOutcome>, candidate: DirectOuterOutcome) {
+    let score = |outcome: &DirectOuterOutcome| {
+        outcome
+            .climb
+            .current
+            .as_ref()
+            .expect("scored candidate")
+            .score
+            .ranking()
+            .units()
+    };
+    if best
+        .as_ref()
+        .is_none_or(|prior| score(&candidate) > score(prior))
+    {
+        *best = Some(candidate);
+    }
+}
+
 /// A one-outer worker's owned outcome, including accounting on the first error.
 /// The serial adapter seeds cumulative facts to preserve overflow, cadence and
 /// cancellation semantics. Future workers can start from fresh local accounting.
+#[cfg(test)]
 struct OuterExecution<T, E> {
     result: Result<T, E>,
     allowance: EvaluationAllowance,
     control: AttackControl,
 }
 
+#[cfg(test)]
 impl<T, E> OuterExecution<T, E> {
     fn commit<O>(self, accounting: &mut ObservedAccounting<'_, O>) -> Result<T, E> {
         *accounting.allowance = self.allowance;
@@ -2140,6 +2310,7 @@ impl<T, E> OuterExecution<T, E> {
 /// All evaluation mutations stay local until ordered commit. Callbacks remain
 /// synchronous in this serial adapter: buffering them would change cancellation
 /// when a progress callback requests a stop (T6/T7 change those boundaries).
+#[cfg(test)]
 fn execute_outer<T, E, O: CounterObserver>(
     mut allowance: EvaluationAllowance,
     mut control: AttackControl,
@@ -2166,8 +2337,6 @@ const _: fn() = || {
     assert_sync::<crate::NgramModel>();
     assert_sync::<crate::TrieModel>();
     assert_sync::<crate::attack_blocks::OuterPlan<'_>>();
-    assert_send::<OuterExecution<DirectOuterOutcome, DirectRunError>>();
-    assert_send::<OuterExecution<ControlledPartialOutcome, ControlledPartialError>>();
     assert_send::<BlockOutcome<DirectOuterOutcome, DirectRunError>>();
     assert_send::<BlockOutcome<ControlledPartialOutcome, ControlledPartialError>>();
 };
@@ -2200,11 +2369,13 @@ impl<O: CounterObserver> EvaluationAccounting for ObservedAccounting<'_, O> {
 }
 
 /// Request polling is independent of counter notification and sticks in the control.
+#[cfg(test)]
 struct CancellableAccounting<'a, 'b, O, F> {
     observed: &'a mut ObservedAccounting<'b, O>,
     requested: F,
 }
 
+#[cfg(test)]
 impl<O: CounterObserver, F: FnMut() -> bool> EvaluationAccounting
     for CancellableAccounting<'_, '_, O, F>
 {
@@ -2452,6 +2623,7 @@ impl<'a> BoundClimbScoring<'a> {
         self.climb_accounted(board, backtrack_pairs, allowance)
     }
 
+    #[cfg(test)]
     fn climb_cancellable(
         &self,
         board: MutableBoard,
@@ -2964,12 +3136,152 @@ mod tests {
                     let mut events = Vec::new();
                     let result = request.run(|p| events.push(p), || false);
                     assert_eq!(
-                        (format!("{result:?}"), events),
-                        expected,
+                        format!("{result:?}"),
+                        expected.0,
                         "pe={pe}, hold={hold}, staged={staged}"
+                    );
+                    let per_outer = if pe { 67 } else { 7 };
+                    let outer_end = 200 * per_outer;
+                    let mut counts = vec![0, 128 * per_outer, outer_end];
+                    if staged {
+                        counts.extend(
+                            (outer_end + 1..=outer_end + hold).filter(|count| count % 3 == 0),
+                        );
+                    }
+                    counts.push(outer_end + if staged { hold } else { 0 });
+                    assert_eq!(
+                        events
+                            .iter()
+                            .map(|p| p.evaluations_completed())
+                            .collect::<Vec<_>>(),
+                        counts
+                    );
+                    for every in [1, 100_000] {
+                        value["job"]["attack"]["progress_every"] = serde_json::json!(every);
+                        let request = crate::AttackRequest::parse_json(&value.to_string()).unwrap();
+                        let mut snapshots = Vec::new();
+                        let completed = request.run(|p| snapshots.push(p), || false).unwrap();
+                        let mut counts = vec![0];
+                        if every == 1 {
+                            counts.extend([128 * per_outer, outer_end]);
+                            if staged {
+                                counts.extend(outer_end + 1..=outer_end + hold);
+                            }
+                        }
+                        counts.push(outer_end + if staged { hold } else { 0 });
+                        assert_eq!(
+                            snapshots
+                                .iter()
+                                .map(|p| p.evaluations_completed())
+                                .collect::<Vec<_>>(),
+                            counts
+                        );
+                        assert_eq!(format!("Ok({completed:?})"), expected.0);
+                        let mut polls = 0;
+                        let stopped = request
+                            .run(
+                                |_| {},
+                                || {
+                                    polls += 1;
+                                    polls == 2
+                                },
+                            )
+                            .unwrap();
+                        assert_eq!(polls, 2);
+                        assert_eq!(stopped.termination(), crate::AttackTermination::Cancelled);
+                        assert_eq!(
+                            stopped.counters().0,
+                            crate::attack_control::CounterSnapshot {
+                                evaluations_admitted: 128 * per_outer,
+                                evaluations_completed: 128 * per_outer,
+                                climbs_started: 128 * if pe { 7 } else { 1 },
+                                climbs_completed: 128 * if pe { 7 } else { 1 },
+                                outers_completed: 128,
+                            }
+                        );
+                        assert!(stopped
+                            .hold()
+                            .all(|entry| !entry.best().incomplete() && entry.stages().is_empty()));
+                        let before = request.run(|_| {}, || true).unwrap();
+                        assert_eq!(before.termination(), crate::AttackTermination::Cancelled);
+                        assert_eq!(before.counters().0, Default::default());
+                        assert!(before.best().is_none());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn public_completed_pe_blocks_pin_final_counts_and_seeds() {
+        for distinct in [false, true] {
+            for touching in [false, true] {
+                for multiple in [false, true] {
+                    let request = direct_request_with(
+                        serde_json::json!([]),
+                        distinct,
+                        true,
+                        |job| {
+                            if touching {
+                                job["attack"]["seeds"] = serde_json::json!({"kind":"empty_single","selection":"touching","symbols":["C"]});
+                            }
+                            if multiple {
+                                job["configuration"]["slots"][0]
+                                    .as_object_mut()
+                                    .unwrap()
+                                    .remove("position");
+                                job["space"]["slots"] =
+                                    serde_json::json!([{"id":"r","positions":["A","B","C"]}]);
+                            }
+                        },
+                    );
+                    let result = request.run(|_| {}, || false).unwrap();
+                    let used = match (distinct, touching, multiple) {
+                        (false, false, false) => 32,
+                        (false, false, true) => 96,
+                        (false, true, false) => 21,
+                        (false, true, true) => 73,
+                        (true, false, false) => 28,
+                        (true, false, true) => 84,
+                        (true, true, false) => 17,
+                        (true, true, true) => 61,
+                    };
+                    let climbs = if touching { 3 } else { 4 } * if multiple { 3 } else { 1 };
+                    public_pe_facts(
+                        &result,
+                        crate::AttackTermination::Completed,
+                        (used, climbs, climbs, if multiple { 3 } else { 1 }),
+                        Some((0, u128::from(distinct), "CB", 2, false, true, true)),
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn public_outer_phase_observes_only_finished_blocks() {
+        for pe in [false, true] {
+            let request = hold_stages_request(pe, &[], 5);
+            let mut events = Vec::new();
+            let mut polls = 0;
+            let result = request
+                .run(
+                    |p| events.push(p),
+                    || {
+                        polls += 1;
+                        polls > 1
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                polls, 1,
+                "exhaustion prevents a speculative final stop poll"
+            );
+            assert_eq!(result.termination(), crate::AttackTermination::Completed);
+            assert_eq!(
+                events,
+                vec![crate::AttackProgress(Default::default()), result.counters()]
+            );
         }
     }
 
@@ -3876,6 +4188,20 @@ mod tests {
                     }
                 });
                 for cancel in [false, true] {
+                    let plan = request.outer_plan();
+                    let block = plan.blocks().next().unwrap();
+                    let preparation = RunPreparation::new(&request);
+                    let outer_completed = if pe {
+                        request
+                            .run_partial_block(&preparation, &plan, block)
+                            .accounting
+                            .used
+                    } else {
+                        request
+                            .run_direct_block(&preparation, &plan, block)
+                            .accounting
+                            .used
+                    };
                     let mut snapshots = Vec::new();
                     let mut polls = 0;
                     let result = request
@@ -3889,7 +4215,12 @@ mod tests {
                         .unwrap();
                     let completed = result.counters().evaluations_completed();
                     let mut expected = vec![0];
-                    expected.extend((1..=completed).filter(|count| count % every == 0));
+                    if outer_completed >= every {
+                        expected.push(outer_completed);
+                    }
+                    expected.extend(
+                        (outer_completed + 1..=completed).filter(|count| count % every == 0),
+                    );
                     expected.push(completed);
                     assert_eq!(
                         snapshots
@@ -3989,13 +4320,11 @@ mod tests {
 
     #[test]
     fn request_bound_partial_later_interrupted_winner_and_dense_mask_index() {
-        for (selection, symbols, index, plaintext, weight) in [
-            ("all", vec![], 1, "AC", 1),
-            ("touching", vec!["C"], 1, "CB", 2),
-        ] {
+        for (selection, symbols, used, climbs) in
+            [("all", vec![], 28, 4), ("touching", vec!["C"], 17, 3)]
+        {
             let request = direct_request_with(serde_json::json!([]), true, true, |job| {
-                // IC ties all two-distinct-letter outputs. Empty completes without
-                // ascent; the next seed's committed final score wins while interrupted.
+                // A mid-seed stop is not observed until this block is finished.
                 job["attack"]["seeds"]["selection"] = serde_json::json!(selection);
                 if selection == "touching" {
                     job["attack"]["seeds"]["symbols"] = serde_json::json!(symbols);
@@ -4004,9 +4333,9 @@ mod tests {
             let run = public_pe_probe(&request, |p| p.evaluations_completed() >= 7);
             public_pe_facts(
                 &run,
-                crate::AttackTermination::Cancelled,
-                (7, 2, 1, 0),
-                Some((0, index, plaintext, weight, true, false, false)),
+                crate::AttackTermination::Completed,
+                (used, climbs, climbs, 1),
+                Some((0, 1, "CB", 2, false, true, true)),
             );
         }
     }
@@ -4668,7 +4997,8 @@ mod tests {
                 },
             )
             .expect("public PE executes");
-        assert_eq!(result.counters().0, control.snapshot());
+        // The legacy pulse may occur inside a block; the public runner cannot
+        // observe it there and established block exhaustion wins.
         assert_eq!(last, Some(result.counters()));
         assert_eq!(
             result.evaluations_used(),
@@ -4726,7 +5056,7 @@ mod tests {
 
     #[test]
     fn public_pe_seed_winner_order_and_interruption() {
-        use crate::AttackTermination::{Cancelled, Completed};
+        use crate::AttackTermination::Completed;
         for (distinct, touching, cancel_after, termination, counts, seed, text, score, flags) in [
             (
                 false,
@@ -4743,23 +5073,23 @@ mod tests {
                 true,
                 false,
                 7,
-                Cancelled,
-                (7, 2, 1, 0),
+                Completed,
+                (28, 4, 4, 1),
                 1,
-                "AC",
-                1,
-                (true, false, false),
+                "CB",
+                2,
+                (false, true, true),
             ),
             (
                 true,
                 true,
                 7,
-                Cancelled,
-                (7, 2, 1, 0),
+                Completed,
+                (17, 3, 3, 1),
                 1,
                 "CB",
                 2,
-                (true, false, false),
+                (false, true, true),
             ),
         ] {
             let request = direct_request_with(serde_json::json!([]), distinct, true, |job| {
@@ -4776,18 +5106,14 @@ mod tests {
                 counts,
                 Some((0, seed, text, score, flags.0, flags.1, flags.2)),
             );
-            let pair = if touching || !distinct {
-                ('A', 'C')
-            } else {
-                ('A', 'B')
-            };
+            let pair = ('A', 'C');
             assert_eq!(result.best().unwrap().mutable_plugboard(), &[pair]);
         }
     }
 
     #[test]
     fn public_pe_outer_winner_order_and_interruption() {
-        use crate::AttackTermination::{Cancelled, Completed};
+        use crate::AttackTermination::Completed;
         for (
             distinct,
             text,
@@ -4829,8 +5155,8 @@ mod tests {
                 "CB",
                 5,
                 0,
-                Cancelled,
-                (4, 2, 2, 2),
+                Completed,
+                (6, 3, 3, 3),
                 1,
                 "BA",
                 2,
@@ -4843,7 +5169,7 @@ mod tests {
                 job["space"]["plugboard"]["max_pairs"] = serde_json::json!(0);
             });
             let result = public_pe_probe(&request, |p| {
-                termination == Cancelled && p.evaluations_completed() >= cancel_after - 1
+                cancel_after == 5 && p.evaluations_completed() >= cancel_after - 1
             });
             public_pe_facts(
                 &result,
@@ -4882,16 +5208,14 @@ mod tests {
         );
         public_pe_facts(
             &later,
-            crate::AttackTermination::Cancelled,
-            (10, 3, 2, 1),
-            Some((1, 0, "BA", 2, true, false, false)),
+            crate::AttackTermination::Completed,
+            (16, 4, 4, 2),
+            Some((1, 0, "BA", 2, false, true, true)),
         );
-        // The completed A outer establishes an eligible aggregate winner. The B
-        // outer is stopped after its empty seed starts, before any climb completes.
-        // Its required final rescore still makes that unfinished seed eligible.
+        // Both outers finish before the block-boundary stop check; B wins strictly.
         for (result, position, evaluations, flags) in [
             (&earlier, 'A', 8, (false, true, true)),
-            (&later, 'B', 10, (true, false, false)),
+            (&later, 'B', 16, (false, true, true)),
         ] {
             let best = result.best().unwrap();
             assert_eq!(
@@ -4917,32 +5241,30 @@ mod tests {
         assert_eq!(later_best.start_index(), 0);
         assert_eq!(later_best.plaintext(), "BA");
         assert_eq!(later_best.score().ranking().units(), 2_i128 << 32);
-        // Eight evaluations belonged to the completed outer; the interrupted
-        // empty seed admitted its initial score and one required final rescore.
-        assert_eq!(later.evaluations_used() - earlier.evaluations_used(), 2);
-        assert_eq!(later.counters().climbs_started(), 3);
-        assert_eq!(later.counters().climbs_completed(), 2);
-        assert_eq!(later.counters().outers_completed(), 1);
+        assert_eq!(later.evaluations_used() - earlier.evaluations_used(), 8);
+        assert_eq!(later.counters().climbs_started(), 4);
+        assert_eq!(later.counters().climbs_completed(), 4);
+        assert_eq!(later.counters().outers_completed(), 2);
     }
 
     #[test]
     fn public_pe_observation_cancellation_boundaries() {
         let request = partial_scheduler_request(true, |_| {});
-        // An interrupted later outer must not replace the earlier eligible winner.
+        // A stop inside a later outer cannot interrupt the single block.
         let interrupted_outer = public_pe_probe(&request, |p| {
             p.outers_completed() == 1 && p.climbs_started() == 5
         });
         public_pe_facts(
             &interrupted_outer,
-            crate::AttackTermination::Cancelled,
-            (30, 5, 4, 1),
+            crate::AttackTermination::Completed,
+            (84, 12, 12, 3),
             Some((0, 1, "CB", 2, false, true, true)),
         );
         for (boundary, counts, winner) in [
             (0, (0, 0, 0, 0), None),
-            (1, (32, 4, 4, 1), Some((0, 0, "CB", 2, false, true, true))),
-            (2, (9, 1, 1, 0), Some((0, 0, "CB", 2, false, true, true))),
-            (3, (2, 1, 0, 0), Some((0, 0, "CA", 0, true, false, false))),
+            (1, (96, 12, 12, 3), Some((0, 0, "CB", 2, false, true, true))),
+            (2, (96, 12, 12, 3), Some((0, 0, "CB", 2, false, true, true))),
+            (3, (96, 12, 12, 3), Some((0, 0, "CB", 2, false, true, true))),
         ] {
             let request = partial_scheduler_request(false, |_| {});
             let result = public_pe_probe(&request, |p| match boundary {
@@ -4951,16 +5273,21 @@ mod tests {
                 2 => p.climbs_completed() == 1,
                 _ => p.evaluations_completed() >= 2,
             });
-            public_pe_facts(&result, crate::AttackTermination::Cancelled, counts, winner);
+            let termination = if boundary == 0 {
+                crate::AttackTermination::Cancelled
+            } else {
+                crate::AttackTermination::Completed
+            };
+            public_pe_facts(&result, termination, counts, winner);
         }
-        // Distinct objectives require the final rescore after cancellation.
+        // Distinct objectives also finish all required final rescoring in-block.
         let request = partial_scheduler_request(true, |_| {});
         let result = public_pe_probe(&request, |p| p.evaluations_completed() >= 2);
         public_pe_facts(
             &result,
-            crate::AttackTermination::Cancelled,
-            (3, 1, 0, 0),
-            Some((0, 0, "CA", 0, true, false, false)),
+            crate::AttackTermination::Completed,
+            (84, 12, 12, 3),
+            Some((0, 1, "CB", 2, false, true, true)),
         );
     }
 
@@ -4982,9 +5309,9 @@ mod tests {
                 true,
                 0,
                 false,
-                Cancelled,
-                (2, 1, 0, 0),
-                Some((0, 0, "CA", 0, true, false, false)),
+                Completed,
+                (28, 4, 4, 1),
+                Some((0, 1, "CB", 2, false, true, true)),
             ),
         ] {
             let request = partial_scheduler_request(distinct, |job| {
@@ -4992,7 +5319,7 @@ mod tests {
                 job["space"]["limit"] = serde_json::json!(1);
             });
             let result = public_pe_probe(&request, |p| {
-                cancel || (termination == Cancelled && p.evaluations_completed() >= 1)
+                cancel || (distinct && p.evaluations_completed() >= 1)
             });
             public_pe_facts(&result, termination, counts, winner);
         }
@@ -5715,7 +6042,7 @@ mod tests {
         let outer = ties.best.unwrap();
         assert_eq!(outer.outer_index, 1); // Earliest SELECTED absolute outer.
         assert_eq!(outer.seeds.best.unwrap().current.score.ranking().units(), 0);
-        for (selection, plaintext, rank) in [("all", "AC", 1), ("touching", "CB", 2)] {
+        for (selection, used, climbs) in [("all", 84, 12), ("touching", 61, 9)] {
             let request = partial_scheduler_request(true, |job| {
                 job["attack"]["seeds"]["selection"] = serde_json::json!(selection);
                 if selection == "touching" {
@@ -5725,9 +6052,9 @@ mod tests {
             let run = public_pe_probe(&request, |p| p.evaluations_completed() >= 7);
             public_pe_facts(
                 &run,
-                crate::AttackTermination::Cancelled,
-                (7, 2, 1, 0),
-                Some((0, 1, plaintext, rank, true, false, false)),
+                crate::AttackTermination::Completed,
+                (used, climbs, climbs, 3),
+                Some((0, 1, "CB", 2, false, true, true)),
             );
         }
     }
@@ -6249,18 +6576,14 @@ mod tests {
 
     #[test]
     fn hc_hold_capacity_one_matches_raw_observation_and_polling() {
-        for stop in [usize::MAX, 3, 10] {
+        for stop in [usize::MAX, 1, 3, 10] {
             let request = direct_request_with(serde_json::json!([]), false, false, |job| {
                 job["attack"]["hold"] = serde_json::json!(1);
             });
             let mut control = AttackControl::default();
             let mut observer = Recorder::default();
-            let mut expected_polls = 0;
             let raw = request
-                .schedule_direct_outers_controlled(&mut control, &mut observer, || {
-                    expected_polls += 1;
-                    expected_polls == stop
-                })
+                .schedule_direct_outers_controlled(&mut control, &mut observer, || stop == 1)
                 .unwrap();
             let expected = raw
                 .project_public(
@@ -6283,7 +6606,7 @@ mod tests {
             assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
             assert!(observer.0.is_empty());
             assert_eq!(snapshots, [Default::default(), control.snapshot()]);
-            assert_eq!(polls, expected_polls);
+            assert_eq!(polls, 1);
         }
     }
 
@@ -6534,7 +6857,7 @@ mod tests {
 
     #[test]
     fn pe_hold_capacity_one_raw_equivalence_and_interrupted_offers() {
-        for stop in [usize::MAX, 12, 20] {
+        for stop in [usize::MAX, 1, 12, 20] {
             let observe = |hold: u64| {
                 let request = partial_scheduler_request(false, |job| {
                     job["attack"]["hold"] = serde_json::json!(hold);
@@ -6554,37 +6877,33 @@ mod tests {
             let (request, raw, snapshots, polls) = observe(1);
             let mut control = AttackControl::default();
             let mut observer = Recorder::default();
-            let mut expected_polls = 0;
             let expected = request
-                .schedule_partial_outers_controlled(&mut control, &mut observer, || {
-                    expected_polls += 1;
-                    expected_polls == stop
-                })
+                .schedule_partial_outers_controlled(&mut control, &mut observer, || stop == 1)
                 .unwrap()
                 .project_public(control.snapshot(), request.domain(), MeasureId::Trie)
                 .unwrap();
             assert_eq!(format!("{raw:?}"), format!("{expected:?}"));
             assert!(observer.0.is_empty());
             assert_eq!(snapshots, [Default::default(), control.snapshot()]);
-            assert_eq!(polls, expected_polls);
-            // Larger capacities add no evaluation or polling; scored stops still offer.
+            assert_eq!(polls, 1);
+            // Larger capacities add no evaluation or boundary polling.
             let (_, held, held_snapshots, held_polls) = observe(1000);
             assert_eq!((held_snapshots, held_polls), (snapshots, polls));
             assert_eq!(held.termination, raw.termination);
             assert_eq!(format!("{:?}", held.best), format!("{:?}", raw.best));
-            assert_eq!(held.best.as_ref().unwrap().incomplete, stop == 12);
+            assert!(!held.best.as_ref().is_some_and(|best| best.incomplete));
             let tail: Vec<_> = (held.held_tail.iter())
                 .map(|e| (e.outer_index, e.start_index, e.incomplete))
                 .collect();
             let expected_tail: &[_] = match stop {
-                usize::MAX => &[
+                1 => &[],
+                _ => &[
                     (0, 3, false),
                     (1, 0, false),
                     (1, 2, false),
                     (2, 0, false),
                     (2, 3, false),
                 ],
-                _ => &[],
             };
             assert_eq!(tail, expected_tail);
         }
@@ -10244,11 +10563,12 @@ mod tests {
                     polls == stop
                 };
                 let (domain, measure) = (request.domain(), request.settings().final_measure());
+                assert!(!requested()); // One pre-block poll; no interior outer polls.
                 let mut expected = if pe {
                     let run = request.schedule_partial_outers_controlled(
                         &mut control,
                         &mut observer,
-                        &mut requested,
+                        || false,
                     );
                     run.unwrap()
                         .project_public(control.snapshot(), domain, measure)
@@ -10256,7 +10576,7 @@ mod tests {
                     let run = request.schedule_direct_outers_controlled(
                         &mut control,
                         &mut observer,
-                        &mut requested,
+                        || false,
                     );
                     run.unwrap()
                         .project_public(control.snapshot(), domain, measure)
