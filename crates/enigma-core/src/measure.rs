@@ -96,12 +96,54 @@ impl MeasuredScore {
     }
 }
 
+/// Widest alphabet counted on the stack. Zeroing the array costs every call, so
+/// it stays small: a 256-entry array measured 3% slower than the heap path.
+const STACK_WIDTH: usize = 32;
+
+// Keep small alphabets inline: boxing this variant would allocate on the hot path.
+#[allow(clippy::large_enum_variant)]
+enum MonogramCounts {
+    Stack {
+        counts: [usize; STACK_WIDTH],
+        width: usize,
+    },
+    Heap(Vec<usize>),
+}
+
+impl MonogramCounts {
+    fn new(width: usize) -> Self {
+        if width <= STACK_WIDTH {
+            Self::Stack {
+                counts: [0; STACK_WIDTH],
+                width,
+            }
+        } else {
+            Self::Heap(vec![0; width])
+        }
+    }
+
+    fn as_slice(&self) -> &[usize] {
+        match self {
+            Self::Stack { counts, width } => &counts[..*width],
+            Self::Heap(counts) => counts,
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [usize] {
+        match self {
+            Self::Stack { counts, width } => &mut counts[..*width],
+            Self::Heap(counts) => counts,
+        }
+    }
+}
+
 fn monograms(
     alphabet: &Alphabet,
     text: &str,
     required: u128,
-) -> Result<(Vec<u128>, u128), MeasureError> {
-    let mut counts = vec![0_u128; alphabet.len()];
+) -> Result<(MonogramCounts, u128), MeasureError> {
+    let mut counts = MonogramCounts::new(alphabet.len());
+    let counters = counts.as_mut_slice();
     let mut length = 0_u128;
     for (scalar_index, symbol) in text.chars().enumerate() {
         let index = alphabet
@@ -110,7 +152,7 @@ fn monograms(
                 symbol,
                 scalar_index,
             })?;
-        counts[index] = counts[index].checked_add(1).ok_or(ScoreError::Overflow)?;
+        counters[index] = counters[index].checked_add(1).ok_or(ScoreError::Overflow)?;
         length = length.checked_add(1).ok_or(ScoreError::Overflow)?;
     }
     sufficient(counts, length, required)
@@ -121,21 +163,22 @@ fn index_monograms<I: ExactSizeIterator<Item = u32>>(
     width: usize,
     indices: I,
     required: u128,
-) -> Result<(Vec<u128>, u128), MeasureError> {
-    // The exact length bounds every count by `usize::MAX`, so no u128 count overflows.
+) -> Result<(MonogramCounts, u128), MeasureError> {
+    // The exact length bounds every count by `usize::MAX`.
     let length = u128::try_from(indices.len()).map_err(|_| ScoreError::Overflow)?;
-    let mut counts = vec![0_u128; width];
+    let mut counts = MonogramCounts::new(width);
+    let counters = counts.as_mut_slice();
     for index in indices {
-        counts[index as usize] += 1;
+        counters[index as usize] += 1;
     }
     sufficient(counts, length, required)
 }
 
 fn sufficient(
-    counts: Vec<u128>,
+    counts: MonogramCounts,
     length: u128,
     required: u128,
-) -> Result<(Vec<u128>, u128), MeasureError> {
+) -> Result<(MonogramCounts, u128), MeasureError> {
     if length < required {
         return Err(MeasureError::InsufficientSamples {
             required,
@@ -153,7 +196,7 @@ pub fn index_of_coincidence(
     text: &str,
 ) -> Result<MeasuredScore, MeasureError> {
     let (counts, length) = monograms(alphabet, text, 2)?;
-    coincidence(alphabet.len(), counts, length)
+    coincidence(alphabet.len(), counts.as_slice(), length)
 }
 
 /// [`index_of_coincidence`] over prevalidated indices of an alphabet of `width` symbols.
@@ -170,16 +213,17 @@ pub(crate) fn index_coincidence_iter<I: ExactSizeIterator<Item = u32>>(
     indices: I,
 ) -> Result<MeasuredScore, MeasureError> {
     let (counts, length) = index_monograms(width, indices, 2)?;
-    coincidence(width, counts, length)
+    coincidence(width, counts.as_slice(), length)
 }
 
 fn coincidence(
     width: usize,
-    counts: Vec<u128>,
+    counts: &[usize],
     length: u128,
 ) -> Result<MeasuredScore, MeasureError> {
     let mut pairs = 0_u128;
-    for count in counts.into_iter().filter(|&count| count > 0) {
+    for &count in counts.iter().filter(|&&count| count > 0) {
+        let count = count as u128;
         let previous = count.checked_sub(1).ok_or(ScoreError::Overflow)?;
         let contribution = count.checked_mul(previous).ok_or(ScoreError::Overflow)?;
         pairs = pairs
@@ -211,7 +255,7 @@ fn coincidence(
 /// Ranking negates the positive measured value only after Q32 quantization.
 pub fn shannon_entropy(alphabet: &Alphabet, text: &str) -> Result<MeasuredScore, MeasureError> {
     let (counts, length) = monograms(alphabet, text, 1)?;
-    entropy(counts, length)
+    entropy(counts.as_slice(), length)
 }
 
 /// [`shannon_entropy`] over prevalidated indices of an alphabet of `width` symbols.
@@ -225,13 +269,14 @@ pub(crate) fn index_entropy_iter<I: ExactSizeIterator<Item = u32>>(
     indices: I,
 ) -> Result<MeasuredScore, MeasureError> {
     let (counts, length) = index_monograms(width, indices, 1)?;
-    entropy(counts, length)
+    entropy(counts.as_slice(), length)
 }
 
-fn entropy(counts: Vec<u128>, length: u128) -> Result<MeasuredScore, MeasureError> {
+fn entropy(counts: &[usize], length: u128) -> Result<MeasuredScore, MeasureError> {
     let log_length = integer_log2_q48(length)?;
     let mut numerator = 0_i128;
-    for count in counts.into_iter().filter(|&count| count > 0) {
+    for &count in counts.iter().filter(|&&count| count > 0) {
+        let count = count as u128;
         let difference = log_length
             .checked_sub(integer_log2_q48(count)?)
             .ok_or(ScoreError::Overflow)?;
@@ -418,7 +463,7 @@ mod tests {
 
     #[test]
     fn iterator_kernels_match_slice_and_text_scores_and_sample_errors() {
-        for width in [1, 2, 7, 26] {
+        for width in [1, 2, 7, 26, 255, 256, 257] {
             let symbols: Vec<char> = (0..width)
                 .map(|i| char::from_u32(0x3b1 + i as u32).unwrap())
                 .collect();
@@ -455,6 +500,75 @@ mod tests {
                     } else {
                         assert!(coincidence.is_ok());
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn monogram_storage_uses_stack_through_32_and_heap_above() {
+        for width in [1, 2, 26, 31, 32, 33, 255, 256, 257] {
+            let indices = [0, (width - 1) as u32, 0];
+            let (counts, length) = index_monograms(width, indices.into_iter(), 1).unwrap();
+            assert_eq!(length, 3);
+            match &counts {
+                MonogramCounts::Stack { .. } => assert!(width <= 32, "{width}"),
+                MonogramCounts::Heap(_) => assert!(width > 32, "{width}"),
+            }
+            assert_eq!(counts.as_slice().len(), width);
+            assert_eq!(counts.as_slice().iter().sum::<usize>(), 3);
+            assert_eq!(counts.as_slice()[0], if width == 1 { 3 } else { 2 });
+            assert_eq!(counts.as_slice()[width - 1], if width == 1 { 3 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn dominant_monograms_match_character_scores_at_storage_boundary() {
+        for width in [1, 2, 26, 31, 32, 33, 255, 256, 257] {
+            let symbols: Vec<char> = (0..width)
+                .map(|i| char::from_u32(0x3b1 + i as u32).unwrap())
+                .collect();
+            let alphabet = Alphabet::new(symbols.clone()).unwrap();
+            for length in [0, 1, 2, 513] {
+                let mut indices = vec![0; length];
+                if length > 2 {
+                    indices[length - 1] = (width - 1) as u32;
+                }
+                let text: String = indices.iter().map(|&i| symbols[i as usize]).collect();
+                let ic = index_coincidence(width, &indices);
+                let entropy = index_entropy(width, &indices);
+                assert_eq!(ic, index_of_coincidence(&alphabet, &text));
+                assert_eq!(entropy, shannon_entropy(&alphabet, &text));
+                if length < 2 {
+                    assert_eq!(
+                        ic,
+                        Err(MeasureError::InsufficientSamples {
+                            required: 2,
+                            actual: length as u128,
+                        })
+                    );
+                } else {
+                    assert!(ic.is_ok());
+                }
+                if length == 0 {
+                    assert_eq!(
+                        entropy,
+                        Err(MeasureError::InsufficientSamples {
+                            required: 1,
+                            actual: 0,
+                        })
+                    );
+                } else {
+                    assert!(entropy.is_ok());
+                }
+                for scorer in [index_of_coincidence, shannon_entropy] {
+                    assert_eq!(
+                        scorer(&alphabet, "!"),
+                        Err(MeasureError::InvalidSymbol {
+                            symbol: '!',
+                            scalar_index: 0,
+                        })
+                    );
                 }
             }
         }
