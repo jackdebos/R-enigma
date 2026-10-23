@@ -1,4 +1,4 @@
-//! Indexed outer-key projection for the later dynamic worker pool.
+//! Indexed outer-key projection for the dynamic worker pool.
 
 use crate::candidate::CandidatePlan;
 use crate::{AttackGate, ResolvedConfiguration, SearchDiagnostic, SearchRequest};
@@ -75,6 +75,10 @@ impl<'a> OuterPlan<'a> {
 
     pub(crate) fn blocks(&self) -> OuterBlocks {
         OuterBlocks::new(self.start, self.len)
+    }
+
+    pub(crate) fn block_count(&self) -> u128 {
+        self.len.div_ceil(OUTER_BLOCK_KEYS)
     }
 
     /// Resolves a block lazily with the precomputed plan, preserving resolution errors.
@@ -186,6 +190,10 @@ mod tests {
             }
             assert_eq!(actual, serial);
             assert_eq!(actual.len() as u128, request.gate().outer_selected());
+            assert_eq!(
+                projection.block_count(),
+                projection.blocks().count() as u128
+            );
         }
     }
 }

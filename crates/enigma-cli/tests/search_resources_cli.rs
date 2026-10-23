@@ -590,13 +590,49 @@ fn timeless(events: Vec<Value>) -> Vec<Value> {
         .collect()
 }
 
+/// Three fixed slots of 16 settings each, limited to 1,100 outer keys: nine blocks
+/// of 128 that several worker threads share.
+fn multi_block_attack(pass: &str) -> Value {
+    let mut r = attack(pass, "all", &["ic"]);
+    let ids = ["x", "y", "z"];
+    r["machine"]["definition"]["value"] = json!({"alphabet":["A","B","C","D"],
+        "wheels":[{"name":"r","wiring":["B","C","D","A"],"turnovers":[]}],
+        "slots":ids.map(|id| json!({"id":id,"role":"rotor","movement":"fixed","wheel":"r"})),
+        "stepping":{"rules":[]}});
+    r["job"]["configuration"] = json!({"slots":[],"plugboard":[]});
+    r["job"]["text"] = json!("ABACAD");
+    r["job"]["space"] = json!({"limit":1100,
+        "slots":ids.map(|id| json!({"id":id,"positions":["D","B","A","C"],"rings":["A","B","C","D"]})),
+        "plugboard":{"kind":"attack","symbols":["A","B","C","D"],"max_pairs":1}});
+    r["job"]["attack"]["hold"] = json!(5);
+    r["job"]["attack"]["progress_every"] = json!(500);
+    r
+}
+
 #[test]
 fn threads_option_keeps_attack_output_identical() {
     let f = Fixture::new();
-    for pass in ["hill_climb", "partial_exhaustion"] {
-        let request = attack(pass, "all", &["ic"]);
+    for (pass, multi_block) in [
+        ("hill_climb", false),
+        ("partial_exhaustion", false),
+        ("hill_climb", true),
+        ("partial_exhaustion", true),
+    ] {
+        let request = if multi_block {
+            multi_block_attack(pass)
+        } else {
+            attack(pass, "all", &["ic"])
+        };
         f.write("request.json", request.to_string());
         let plain = timeless(attack_events(&f.stdin(&request)));
+        if multi_block {
+            let progress = plain.iter().filter(|e| e["event"] == "progress").count();
+            assert!(progress > 3, "{pass}: block progress between start and end");
+            assert_eq!(
+                plain[plain.len() - 2]["counters"]["outers_completed"],
+                "1100"
+            );
+        }
         for threads in ["1", "2", "8", "256"] {
             for output in [
                 f.stdin_with(&request, &["--threads", threads]),

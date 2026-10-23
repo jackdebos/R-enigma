@@ -344,12 +344,23 @@ each block's counters to the run totals in key order (checked; an overflow disca
 that block and reports its first key as `outer_index`), then offers its outcomes to
 the hold and strict winner in key order. The first error in key order stops the run.
 
+With `ExecutionOptions` above one thread and more than one block, `run_with` runs
+block runners on up to that many scoped worker threads, each with its own
+preparation. Workers take the next block in key order, at most twice the worker
+count ahead of the next block to commit; the coordinator (the calling thread)
+buffers finished blocks, commits them in key order and alone calls the observer and
+the cancellation callback. Results of completed runs are therefore independent of
+the thread count. Stages run afterwards on the calling thread; they use the run's
+preparation only as a cache, so its contents never change their results.
+
 #### Sticky safe-stop and committed results
 
-Cancellation observation is sticky. In the outer phase it is polled only before a
-block starts; nothing inside a block polls, so a stop requested mid-block lets that
-block finish (all climbs, seeds and final scores) and be committed, and no later
-block starts. A stop before the first block yields no outer work. Chained stages
+Cancellation observation is sticky. In the outer phase it is polled only at block
+boundaries (before each block on one thread; before the first block and after each
+finished block with workers); nothing inside a block polls, so a stop requested
+mid-block lets every started block finish (all climbs, seeds and final scores) and
+be committed, and no later block starts. A stop before the first block yields no
+outer work. Chained stages
 poll before trial admission and after evaluation before the next trial or
 scan-winner commit. Once a stage observes a stop, it abandons any unfinished scan and
 its provisional winner and preserves only the previously committed board. No

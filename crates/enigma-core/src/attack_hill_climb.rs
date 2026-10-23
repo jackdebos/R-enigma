@@ -1,5 +1,6 @@
 //! Private complete-neighborhood strict ascent with bound scoring and shared accounting.
 
+use crate::attack_blocks::OuterBlock;
 use crate::attack_control::{AttackControl, CounterObserver, CounterOverflow};
 use crate::attack_evaluator::{
     validated_trial_board, RunPreparation, TrialEvaluationError, TrialEvaluator,
@@ -13,6 +14,7 @@ use crate::{
     ResolvedConfiguration,
 };
 use std::ops::ControlFlow;
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
 type MutableBoard = Vec<(char, char)>;
 
@@ -197,11 +199,23 @@ impl crate::AttackRequest {
     /// [`run`](Self::run) under host `options`; the public outcome of a completed run
     /// does not depend on them.
     ///
-    /// Not yet parallel: `options` is accepted for the CLI contract, but the outer
-    /// phase still runs on the calling thread until the worker pool lands.
+    /// With more than one thread the outer blocks run on scoped worker threads, each
+    /// with its own preparation; `observe` and `cancel_requested` are still called
+    /// only on the calling thread, which merges finished blocks in key order. Stages
+    /// run afterwards on the calling thread.
     pub fn run_with(
         &self,
-        _options: crate::ExecutionOptions,
+        options: crate::ExecutionOptions,
+        observe: impl FnMut(crate::AttackProgress),
+        cancel_requested: impl FnMut() -> bool,
+    ) -> Result<crate::AttackResult, crate::AttackRunError> {
+        self.run_pooled(options, &PoolHooks::default(), observe, cancel_requested)
+    }
+
+    fn run_pooled(
+        &self,
+        options: crate::ExecutionOptions,
+        hooks: &PoolHooks,
         observe: impl FnMut(crate::AttackProgress),
         mut cancel_requested: impl FnMut() -> bool,
     ) -> Result<crate::AttackResult, crate::AttackRunError> {
@@ -209,8 +223,12 @@ impl crate::AttackRequest {
         let mut control = AttackControl::with_progress_every(self.settings().progress_every());
         let mut observer = ProgressObserver(observe);
         observed_run(&mut control, &mut observer, |control, observer| {
+            // The serial outer phase fills this preparation; pool workers own theirs.
+            // Stages only reuse it as a cache, so their results do not depend on it.
             let preparation = RunPreparation::new(self);
             let result = self.run_block_phase(
+                options,
+                hooks,
                 &preparation,
                 &mut allowance,
                 control,
@@ -2057,10 +2075,245 @@ fn run_worker_block<T, E>(
     outcome
 }
 
+/// A worker's finished block, owned until the coordinator commits it in key order.
+enum PhaseBlock {
+    Direct(BlockOutcome<DirectOuterOutcome, DirectRunError>),
+    Partial(BlockOutcome<ControlledPartialOutcome, ControlledPartialError>),
+}
+
+impl PhaseBlock {
+    fn failed(&self) -> bool {
+        match self {
+            Self::Direct(outcome) => outcome.error.is_some(),
+            Self::Partial(outcome) => outcome.error.is_some(),
+        }
+    }
+}
+
+/// Test seams around each finished block; empty outside tests. `ran` sees a block
+/// before the coordinator can receive it, `sent` after it was handed over.
+#[derive(Default)]
+struct PoolHooks {
+    #[cfg(test)]
+    ran: Option<RanHook>,
+    #[cfg(test)]
+    sent: Option<Box<dyn Fn(usize, OuterBlock) + Send + Sync>>,
+}
+
+#[cfg(test)]
+type RanHook = Box<dyn Fn(usize, OuterBlock, &mut PhaseBlock) + Send + Sync>;
+
+impl PoolHooks {
+    #[cfg_attr(not(test), allow(unused_variables))]
+    fn ran(&self, worker: usize, block: OuterBlock, outcome: &mut PhaseBlock) {
+        #[cfg(test)]
+        if let Some(hook) = &self.ran {
+            hook(worker, block, outcome);
+        }
+    }
+
+    #[cfg_attr(not(test), allow(unused_variables))]
+    fn sent(&self, worker: usize, block: OuterBlock) {
+        #[cfg(test)]
+        if let Some(hook) = &self.sent {
+            hook(worker, block);
+        }
+    }
+}
+
+struct Dispatch {
+    blocks: crate::attack_blocks::OuterBlocks,
+    handed: u128,
+    committed: u128,
+    stop: bool,
+}
+
+/// Blocks are handed out in key order, at most `window` ahead of the next commit,
+/// so the coordinator's reorder buffer stays bounded. Workers touch the lock and
+/// the stop latch only between blocks, never per evaluation.
+struct BlockQueue {
+    state: Mutex<Dispatch>,
+    changed: Condvar,
+    window: u128,
+}
+
+impl BlockQueue {
+    fn lock(&self) -> MutexGuard<'_, Dispatch> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The next block, or `None` once stopped or exhausted.
+    fn take(&self) -> Option<OuterBlock> {
+        let mut state = self.lock();
+        loop {
+            if state.stop {
+                return None;
+            }
+            if state.handed < state.committed.saturating_add(self.window) {
+                let block = state.blocks.next()?;
+                state.handed += 1;
+                return Some(block);
+            }
+            state = (self.changed.wait(state)).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    fn update(&self, change: impl FnOnce(&mut Dispatch)) {
+        change(&mut self.lock());
+        self.changed.notify_all();
+    }
+}
+
+/// A panicking worker releases the others instead of leaving them waiting for a
+/// block that will never be committed; the scope then propagates the panic.
+struct StopOnPanic<'a>(&'a BlockQueue);
+
+impl Drop for StopOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.update(|state| state.stop = true);
+        }
+    }
+}
+
 impl crate::AttackRequest {
-    /// Serial coordinator. No observer or stop callback reaches worker code.
+    /// Runs the outer blocks and commits each one in key order through `commit` on
+    /// the calling thread. One thread (or a single block) keeps the serial loop.
+    #[allow(clippy::too_many_arguments)]
+    fn drive_blocks(
+        &self,
+        options: crate::ExecutionOptions,
+        hooks: &PoolHooks,
+        preparation: &RunPreparation<'_>,
+        plan: &crate::attack_blocks::OuterPlan<'_>,
+        control: &mut AttackControl,
+        requested: &mut impl FnMut() -> bool,
+        commit: &mut impl FnMut(
+            &mut AttackControl,
+            OuterBlock,
+            PhaseBlock,
+        ) -> Result<(), crate::AttackRunError>,
+    ) -> Result<DirectRunTermination, crate::AttackRunError> {
+        let blocks = usize::try_from(plan.block_count()).unwrap_or(usize::MAX);
+        let workers = options.threads().get().min(blocks);
+        if workers > 1 {
+            return self.drive_pool(workers, hooks, plan, control, requested, commit);
+        }
+        let mut termination = DirectRunTermination::OuterSliceEnd;
+        for block in plan.blocks() {
+            if control.poll_cancellation(requested()) {
+                return Ok(DirectRunTermination::Cancelled);
+            }
+            let mut outcome = self.run_phase_block(preparation, plan, block);
+            hooks.ran(0, block, &mut outcome);
+            commit(control, block, outcome)?;
+            hooks.sent(0, block);
+            termination = DirectRunTermination::Completed;
+        }
+        Ok(termination)
+    }
+
+    /// Worker pool. Each worker owns its preparation and pulls the next block in key
+    /// order; the coordinator (this thread) buffers finished blocks, commits them in
+    /// key order, emits progress and polls cancellation. A stop or a known error ends
+    /// the hand-out; every block already handed out still finishes and, up to the
+    /// first error, is committed, so a stop always keeps a key-order prefix.
+    fn drive_pool(
+        &self,
+        workers: usize,
+        hooks: &PoolHooks,
+        plan: &crate::attack_blocks::OuterPlan<'_>,
+        control: &mut AttackControl,
+        requested: &mut impl FnMut() -> bool,
+        commit: &mut impl FnMut(
+            &mut AttackControl,
+            OuterBlock,
+            PhaseBlock,
+        ) -> Result<(), crate::AttackRunError>,
+    ) -> Result<DirectRunTermination, crate::AttackRunError> {
+        if control.poll_cancellation(requested()) {
+            return Ok(DirectRunTermination::Cancelled);
+        }
+        let count = plan.block_count();
+        let queue = BlockQueue {
+            state: Mutex::new(Dispatch {
+                blocks: plan.blocks(),
+                handed: 0,
+                committed: 0,
+                stop: false,
+            }),
+            changed: Condvar::new(),
+            window: 2 * workers as u128,
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut next = 0;
+        std::thread::scope(|scope| {
+            for worker in 0..workers {
+                let (queue, sender) = (&queue, sender.clone());
+                scope.spawn(move || {
+                    let _release = StopOnPanic(queue);
+                    let preparation = RunPreparation::new(self);
+                    while let Some(block) = queue.take() {
+                        let mut outcome = self.run_phase_block(&preparation, plan, block);
+                        hooks.ran(worker, block, &mut outcome);
+                        if outcome.failed() {
+                            queue.update(|state| state.stop = true);
+                        }
+                        if sender.send((block, outcome)).is_err() {
+                            break;
+                        }
+                        hooks.sent(worker, block);
+                    }
+                });
+            }
+            drop(sender);
+            let mut pending = std::collections::BTreeMap::new();
+            let mut cancelled = false;
+            for (block, outcome) in &receiver {
+                pending.insert(block.index, (block, outcome));
+                while let Some((block, outcome)) = pending.remove(&next) {
+                    if let Err(error) = commit(control, block, outcome) {
+                        queue.update(|state| state.stop = true);
+                        return Err(error);
+                    }
+                    next += 1;
+                    queue.update(|state| state.committed = next);
+                }
+                if !cancelled && next < count && control.poll_cancellation(requested()) {
+                    cancelled = true;
+                    queue.update(|state| state.stop = true);
+                }
+            }
+            Ok(())
+        })?;
+        Ok(if next == count {
+            DirectRunTermination::Completed
+        } else {
+            DirectRunTermination::Cancelled
+        })
+    }
+
+    fn run_phase_block(
+        &self,
+        preparation: &RunPreparation<'_>,
+        plan: &crate::attack_blocks::OuterPlan<'_>,
+        block: OuterBlock,
+    ) -> PhaseBlock {
+        if self.settings().kind() == crate::AttackKind::PartialExhaustion {
+            PhaseBlock::Partial(self.run_partial_block(preparation, plan, block))
+        } else {
+            PhaseBlock::Direct(self.run_direct_block(preparation, plan, block))
+        }
+    }
+
+    /// Ordered reduction: block counters merge checked (an overflow discards the
+    /// whole block, reported at its first key), hold and winner offers follow key
+    /// order, and the first error in key order ends the run.
+    #[allow(clippy::too_many_arguments)]
     fn run_block_phase(
         &self,
+        options: crate::ExecutionOptions,
+        hooks: &PoolHooks,
         preparation: &RunPreparation<'_>,
         allowance: &mut EvaluationAllowance,
         control: &mut AttackControl,
@@ -2071,62 +2324,58 @@ impl crate::AttackRequest {
         let measure = self.settings().final_measure();
         let mut acceptance = DirectAcceptance::new(self.settings().hold_capacity());
         let mut best = None;
-        let mut termination = DirectRunTermination::OuterSliceEnd;
         let run = (|| {
-            for block in plan.blocks() {
-                if control.poll_cancellation(requested()) {
-                    termination = DirectRunTermination::Cancelled;
-                    break;
-                }
-                let (accounting, candidates, error) = if self.settings().kind()
-                    == crate::AttackKind::PartialExhaustion
-                {
-                    let outcome = self.run_partial_block(preparation, &plan, block);
-                    let mut candidates = Vec::new();
-                    for mut outer in outcome.outers {
-                        merge_held(&mut acceptance.0, outer.held.take());
-                        candidates.push(outer.into_direct());
+            let mut commit = |control: &mut AttackControl, block: OuterBlock, outcome| {
+                let (accounting, candidates, error) = match outcome {
+                    PhaseBlock::Partial(outcome) => {
+                        let mut candidates = Vec::new();
+                        for mut outer in outcome.outers {
+                            merge_held(&mut acceptance.0, outer.held.take());
+                            candidates.push(outer.into_direct());
+                        }
+                        let error = outcome.error.map(|(index, error)| {
+                            let (seed_index, source, retained, held) = match error {
+                                BlockFailure::Resolution(source) => (
+                                    None,
+                                    ControlledPartialRunSource::Resolution(source),
+                                    None,
+                                    None,
+                                ),
+                                BlockFailure::Climb(error) => {
+                                    debug_assert_eq!(error.outer_index, index);
+                                    (
+                                        error.seed_index,
+                                        ControlledPartialRunSource::Climb(error.source),
+                                        error.best,
+                                        error.held,
+                                    )
+                                }
+                                BlockFailure::Counter(source) => (
+                                    None,
+                                    ControlledPartialRunSource::Climb(
+                                        ControlledPartialSource::Climb(source),
+                                    ),
+                                    None,
+                                    None,
+                                ),
+                            };
+                            (index, seed_index, source, retained, held)
+                        });
+                        (outcome.accounting, candidates, error.map(Err))
                     }
-                    let error = outcome.error.map(|(index, error)| {
-                        let (seed_index, source, retained, held) = match error {
-                            BlockFailure::Resolution(source) => (
-                                None,
-                                ControlledPartialRunSource::Resolution(source),
-                                None,
-                                None,
-                            ),
-                            BlockFailure::Climb(error) => {
-                                debug_assert_eq!(error.outer_index, index);
-                                (
-                                    error.seed_index,
-                                    ControlledPartialRunSource::Climb(error.source),
-                                    error.best,
-                                    error.held,
-                                )
-                            }
-                            BlockFailure::Counter(source) => (
-                                None,
-                                ControlledPartialRunSource::Climb(ControlledPartialSource::Climb(
-                                    source,
-                                )),
-                                None,
-                                None,
-                            ),
-                        };
-                        (index, seed_index, source, retained, held)
-                    });
-                    (outcome.accounting, candidates, error.map(Err))
-                } else {
-                    let outcome = self.run_direct_block(preparation, &plan, block);
-                    let error = outcome.error.map(|(index, error)| {
-                        let source = match error {
-                            BlockFailure::Resolution(source) => DirectRunError::Resolution(source),
-                            BlockFailure::Climb(source) => source,
-                            BlockFailure::Counter(source) => DirectRunError::from(source),
-                        };
-                        Ok((index, source))
-                    });
-                    (outcome.accounting, outcome.outers, error)
+                    PhaseBlock::Direct(outcome) => {
+                        let error = outcome.error.map(|(index, error)| {
+                            let source = match error {
+                                BlockFailure::Resolution(source) => {
+                                    DirectRunError::Resolution(source)
+                                }
+                                BlockFailure::Climb(source) => source,
+                                BlockFailure::Counter(source) => DirectRunError::from(source),
+                            };
+                            Ok((index, source))
+                        });
+                        (outcome.accounting, outcome.outers, error)
+                    }
                 };
                 let merged = allowance
                     .used
@@ -2204,8 +2453,17 @@ impl crate::AttackRequest {
                         }
                     });
                 }
-                termination = DirectRunTermination::Completed;
-            }
+                Ok(())
+            };
+            let termination = self.drive_blocks(
+                options,
+                hooks,
+                preparation,
+                &plan,
+                control,
+                requested,
+                &mut commit,
+            )?;
             let counters = control.snapshot();
             DirectRunOutcome {
                 termination,
@@ -3282,6 +3540,300 @@ mod tests {
                 events,
                 vec![crate::AttackProgress(Default::default()), result.counters()]
             );
+        }
+    }
+
+    /// Three fixed slots of 16 settings each: 4,096 outer keys, 32 blocks.
+    fn pool_request(
+        pe: bool,
+        hold: u64,
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) -> crate::AttackRequest {
+        let ids = ["x", "y", "z"];
+        let machine_slots = ids
+            .map(|id| serde_json::json!({"id":id,"role":"rotor","movement":"fixed","wheel":"r"}));
+        let space_slots = ids.map(|id| {
+            serde_json::json!({"id":id,"positions":["D","B","A","C"],"rings":["A","B","C","D"]})
+        });
+        let kind = if pe {
+            "partial_exhaustion"
+        } else {
+            "hill_climb"
+        };
+        let mut value = serde_json::json!({"protocol_version":1,
+            "machine":{"definition":{"kind":"custom","value":{
+                "alphabet":["A","B","C","D"],
+                "wheels":[{"name":"r","wiring":["B","C","D","A"],"turnovers":[]}],
+                "slots":machine_slots,
+                "stepping":{"rules":[]}}}},
+            "job":{"kind":"search","configuration":{"slots":[],"plugboard":[]},
+                "text":"ABACAD","passes":[kind],"measures":["ic"],
+                "space":{"slots":space_slots,
+                    "plugboard":{"kind":"attack","symbols":["A","B","C","D"],"max_pairs":1}},
+                "attack":{"kind":kind,"initial_measure":"ic","final_measure":"ic",
+                    "switch_pairs":1,"backtrack_pairs":0,"hold":hold}}});
+        let attack = &mut value["job"]["attack"];
+        if pe {
+            attack["seeds"] = serde_json::json!({"kind":"empty_single","selection":"all"});
+        } else {
+            attack["start"] = serde_json::json!([]);
+        }
+        edit(&mut value["job"]);
+        crate::AttackRequest::parse_json(&value.to_string()).unwrap()
+    }
+
+    fn pooled(
+        request: &crate::AttackRequest,
+        threads: usize,
+        hooks: &PoolHooks,
+        cancel: impl FnMut() -> bool,
+    ) -> (String, Vec<crate::AttackProgress>) {
+        let options = crate::ExecutionOptions::with_threads(threads).unwrap();
+        let mut events = Vec::new();
+        let result = request.run_pooled(options, hooks, |p| events.push(p), cancel);
+        (format!("{result:?}"), events)
+    }
+
+    /// Waits on `condvar` until `ready`; a timeout fails the calling worker instead
+    /// of hanging the test when the expected concurrency never happens.
+    fn wait_for<'a, T>(
+        condvar: &std::sync::Condvar,
+        guard: std::sync::MutexGuard<'a, T>,
+        what: &str,
+        mut ready: impl FnMut(&T) -> bool,
+    ) -> std::sync::MutexGuard<'a, T> {
+        let timeout = std::time::Duration::from_secs(30);
+        let (guard, wait) = condvar
+            .wait_timeout_while(guard, timeout, |state| !ready(state))
+            .unwrap();
+        assert!(!wait.timed_out(), "timed out waiting for {what}");
+        guard
+    }
+
+    #[test]
+    fn pool_workers_run_blocks_concurrently() {
+        use std::sync::{Arc, Condvar, Mutex};
+        for threads in [2, 4, 8] {
+            let limit = 2 * threads as u64 * 128;
+            let request = pool_request(false, 1, |job| job["space"]["limit"] = limit.into());
+            let seen = Arc::new((
+                Mutex::new(std::collections::BTreeSet::new()),
+                Condvar::new(),
+            ));
+            let state = Arc::clone(&seen);
+            // Every worker holds its first block until all `threads` workers hold
+            // one: this only completes when that many workers run at once.
+            let hooks = PoolHooks {
+                ran: Some(Box::new(move |worker, _, _| {
+                    let (lock, condvar) = &*state;
+                    let mut workers = lock.lock().unwrap();
+                    if workers.insert(worker) {
+                        condvar.notify_all();
+                        let what = format!("{threads} concurrent workers");
+                        drop(wait_for(condvar, workers, &what, |w| w.len() >= threads));
+                    }
+                })),
+                sent: None,
+            };
+            let parallel = pooled(&request, threads, &hooks, || false);
+            assert_eq!(
+                *seen.0.lock().unwrap(),
+                (0..threads).collect(),
+                "{threads} distinct workers"
+            );
+            assert_eq!(
+                parallel,
+                pooled(&request, 1, &PoolHooks::default(), || false)
+            );
+        }
+    }
+
+    #[test]
+    fn pool_reduction_ignores_block_completion_order() {
+        use std::sync::{Arc, Condvar, Mutex};
+        for pe in [false, true] {
+            for hold in [1, 5] {
+                for threads in [2, 4] {
+                    // Seven blocks; the last group of the permutation is partial.
+                    let request = pool_request(pe, hold, |job| {
+                        job["space"]["limit"] = (7 * 128 - 5).into();
+                        job["attack"]["progress_every"] = 3.into();
+                    });
+                    // Blocks reach the coordinator in reversed groups of `threads`.
+                    let order: Vec<u128> = (0..7u128)
+                        .collect::<Vec<_>>()
+                        .chunks(threads)
+                        .flat_map(|group| group.iter().rev().copied().collect::<Vec<_>>())
+                        .collect();
+                    let sent = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+                    let (ran_state, sent_state) = (Arc::clone(&sent), Arc::clone(&sent));
+                    let expected = order.clone();
+                    let hooks = PoolHooks {
+                        ran: Some(Box::new(move |_, block, _| {
+                            let (lock, condvar) = &*ran_state;
+                            let sent = lock.lock().unwrap();
+                            drop(wait_for(condvar, sent, "send turn", |sent: &Vec<u128>| {
+                                expected[sent.len()] == block.index
+                            }));
+                        })),
+                        sent: Some(Box::new(move |_, block| {
+                            let (lock, condvar) = &*sent_state;
+                            lock.lock().unwrap().push(block.index);
+                            condvar.notify_all();
+                        })),
+                    };
+                    let shuffled = pooled(&request, threads, &hooks, || false);
+                    assert_eq!(*sent.0.lock().unwrap(), order);
+                    let serial = pooled(&request, 1, &PoolHooks::default(), || false);
+                    assert_eq!(shuffled, serial, "pe={pe}, hold={hold}, threads={threads}");
+                    assert!(serial.0.starts_with("Ok("));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pool_matches_serial_matrix() {
+        type Edit = fn(&mut serde_json::Value);
+        let cases: [(Edit, bool); 3] = [
+            (|job| job["space"]["limit"] = 1000.into(), false),
+            (
+                |job| {
+                    job["space"]["offset"] = 3.into();
+                    job["space"]["limit"] = 700.into();
+                    job["attack"]["progress_every"] = 1.into();
+                    job["passes"].as_array_mut().unwrap().push("measure".into());
+                    job["attack"]["measure"] = serde_json::json!({"measure":"ic"});
+                },
+                true,
+            ),
+            (
+                |job| {
+                    job["space"]["offset"] = 130.into();
+                    job["space"]["limit"] = 900.into();
+                    job["attack"]["progress_every"] = 3.into();
+                },
+                false,
+            ),
+        ];
+        for pe in [false, true] {
+            for hold in [1, 5] {
+                for (case, (edit, staged)) in cases.iter().enumerate() {
+                    let request = pool_request(pe, hold, edit);
+                    let mut variants = vec![("plain", PoolHooks::default())];
+                    if case == 0 {
+                        // A later block fails at its fourth key, in every thread count.
+                        variants.push((
+                            "error",
+                            PoolHooks {
+                                ran: Some(Box::new(|_, block, outcome| {
+                                    fn fail<T, E>(
+                                        block: OuterBlock,
+                                        outcome: &mut BlockOutcome<T, E>,
+                                    ) {
+                                        outcome.outers.truncate(3);
+                                        outcome.error = Some((
+                                            block.start + 3,
+                                            BlockFailure::Resolution(vec![]),
+                                        ));
+                                    }
+                                    if block.index == 3 {
+                                        match outcome {
+                                            PhaseBlock::Direct(outcome) => fail(block, outcome),
+                                            PhaseBlock::Partial(outcome) => fail(block, outcome),
+                                        }
+                                    }
+                                })),
+                                sent: None,
+                            },
+                        ));
+                        if !pe {
+                            // Every outer reports the first key's slots, so equal
+                            // boards from different blocks are duplicate offers.
+                            let first = request.outer_candidates().next().unwrap().1.unwrap();
+                            variants.push((
+                                "duplicates",
+                                PoolHooks {
+                                    ran: Some(Box::new(move |_, _, outcome| {
+                                        if let PhaseBlock::Direct(outcome) = outcome {
+                                            for outer in &mut outcome.outers {
+                                                outer.initial = first.clone();
+                                            }
+                                        }
+                                    })),
+                                    sent: None,
+                                },
+                            ));
+                        }
+                    }
+                    for (variant, hooks) in &variants {
+                        let serial = pooled(&request, 1, hooks, || false);
+                        assert_eq!(serial.0.starts_with("Err("), *variant == "error");
+                        if *staged {
+                            assert!(serial.0.contains("AttackStageResult"));
+                        }
+                        for threads in [2, 4, 8] {
+                            assert_eq!(
+                                pooled(&request, threads, hooks, || false),
+                                serial,
+                                "pe={pe}, hold={hold}, case={case}, {variant}, threads={threads}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pool_cancellation_commits_a_key_order_prefix() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for pe in [false, true] {
+            let request = pool_request(pe, 5, |job| job["space"]["limit"] = (12 * 128).into());
+            for threads in [2, 4] {
+                let ran = std::sync::Arc::new(AtomicUsize::new(0));
+                let counted = std::sync::Arc::clone(&ran);
+                let hooks = PoolHooks {
+                    ran: Some(Box::new(move |_, _, _| {
+                        counted.fetch_add(1, Ordering::Relaxed);
+                    })),
+                    sent: None,
+                };
+                let before = pooled(&request, threads, &hooks, || true);
+                assert_eq!(before, pooled(&request, 1, &PoolHooks::default(), || true));
+                assert_eq!(ran.load(Ordering::Relaxed), 0, "no outer work");
+
+                let options = crate::ExecutionOptions::with_threads(threads).unwrap();
+                let mut polls = 0;
+                let stopped = request
+                    .run_with(
+                        options,
+                        |_| {},
+                        || {
+                            polls += 1;
+                            polls == 2
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(stopped.termination(), crate::AttackTermination::Cancelled);
+                let outers = stopped.counters().outers_completed();
+                let blocks = outers / 128;
+                assert_eq!(outers % 128, 0, "only whole blocks are committed");
+                assert!(
+                    (1..12).contains(&blocks),
+                    "pe={pe}, threads={threads}: {blocks}"
+                );
+                // The serial run stopped before block `blocks` holds exactly those blocks.
+                let mut serial_polls = 0;
+                let prefix = request.run(
+                    |_| {},
+                    || {
+                        serial_polls += 1;
+                        serial_polls == blocks + 1
+                    },
+                );
+                assert_eq!(format!("{:?}", Ok::<_, ()>(stopped)), format!("{prefix:?}"));
+            }
         }
     }
 

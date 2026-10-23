@@ -476,14 +476,16 @@ cancellation. Required final rescoring, when the final score is absent, must suc
 before an interrupted current board is eligible; failed rescoring is error, never a
 provisional best or cancellation.
 
-During the outer phase, cancellation is polled only before a block starts. A stop
-requested while a block runs lets that block finish, including every climb's final
-scoring, and commits it; the next block is not started and the run ends `cancelled`
-with the hold, winner and counters of committed blocks. If that block was the last
-one of the slice, established exhaustion wins (`completed`). A stop requested before
-the first block yields no outer work. An evaluation error stops its block at the
-failing evaluation; work before it is committed and no later block starts. Chained
-stages keep their per-trial polling.
+During the outer phase, cancellation is polled only at block boundaries: before the
+first block, then before each later block on one thread, or after each finished block
+with several worker threads (§5). A stop lets every block already started finish,
+including every climb's final scoring, and commits them; no further block is started
+and the run ends `cancelled` with the hold, winner and counters of committed blocks,
+always a key-order prefix. If those blocks complete the slice, established exhaustion
+wins (`completed`). A stop requested before the first block yields no outer work. An
+evaluation error stops its block at the failing evaluation; work before it is
+committed, and later blocks are neither started nor committed. Chained stages keep
+their per-trial polling.
 
 Runtime `context` has exactly `outer_index`, `start_index` (nullable when unavailable),
 `evaluations_used`, `counters`, and `source`. `source` has `kind`, `message`, and
@@ -509,7 +511,7 @@ ordering applies only while delivery succeeds, including final result write/flus
 | Action | Mechanism | Result |
 | --- | --- | --- |
 | Cancel (first HC/PE release) | `--cancel-file <path>` marker or a platform signal (`SIGINT`/`SIGTERM`/`SIGHUP`, Windows Ctrl+C/Break); both shipped | Cooperative safe-stop, final `result`, then `done` with `reason: "cancelled"`; retained `result.hold` per Task 14; no checkpoint promise |
-| Parallel HC/PE outer keys | `--threads <n>`, default half the logical CPUs; parsed and validated, worker pool not implemented yet | Same public output as one thread for completed runs; see the `--threads` contract below |
+| Parallel HC/PE outer keys | `--threads <n>`, default half the logical CPUs; outer-key blocks run on that many worker threads | Same public output as one thread for completed runs; see the `--threads` contract below |
 | Pause/resume live job | Not in Stage 1 | Future extension |
 | Resume dead job | `--resume <checkpoint>` | Search only; see §6 |
 | Bound HC/PE search | `space.offset`/`space.limit` and cancellation | §4.1 slice/exhaustion/cancellation reasons; slices bound outer keys only; no new `--max-keys` attack control |
@@ -550,7 +552,7 @@ new run. Once observed, cancellation stays set even if the marker disappears.
 Validate the request and resources before initial marker inspection and before
 `started`; initial inspection errors prevent execution, writing only a stderr
 diagnostic with exit 2 and empty stdout. During execution, inspect
-at every Core cancellation callback (before each outer block, then at stage polls,
+at every Core cancellation callback (at outer block boundaries, then at stage polls,
 §4.1), independently of progress cadence, until
 cancellation or error is latched. No clock, timer thread or hard latency guarantee
 is introduced. A runtime inspection error latches the first error and requests safe
@@ -596,13 +598,12 @@ like `--cancel-file`, with a seq 1 `unsupported_job` error at `/job/kind`, the m
 when both options are present the `--cancel-file` message is reported. Without the
 option an attack uses half the logical CPUs reported by the platform, at least one.
 
-Status: the option is parsed, validated and passed to Core, but the worker pool is
-not implemented yet, so attacks still run on one thread whatever `<n>` is. The
-paragraphs below are the contract that implementation must meet; the block-boundary
-progress and cancellation they describe already apply on that one thread.
-
-Outer keys are split into fixed blocks of 128 keys in key order that worker threads take as they
-become free. Block outcomes are merged in key order, so hold ranking, duplicate
+Outer keys are split into fixed blocks of 128 keys in key order. Up to `<n>` worker
+threads (never more than there are blocks) take the next block as they become free,
+at most twice the worker count ahead of the oldest unmerged block; each worker keeps
+its own scoring preparation. With `<n>` = 1 or a single block the attack runs on the
+calling thread. Progress, cancellation inspection and all output stay on the calling
+thread, which merges finished blocks. Block outcomes are merged in key order, so hold ranking, duplicate
 payloads, winners, errors and counters match a one-thread run; chained stages then
 run on one thread. A completed run therefore writes the same events, exit code and
 stderr for every thread count, apart from `ts` and `elapsed_ms`. Progress is emitted
