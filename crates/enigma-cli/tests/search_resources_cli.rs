@@ -577,6 +577,57 @@ fn missing_cancel_file_runs_attacks_normally() {
     }
 }
 
+/// Events without the wall-clock fields `ts` and `elapsed_ms`.
+fn timeless(events: Vec<Value>) -> Vec<Value> {
+    events
+        .into_iter()
+        .map(|mut event| {
+            let object = event.as_object_mut().unwrap();
+            object.remove("ts");
+            object.remove("elapsed_ms");
+            event
+        })
+        .collect()
+}
+
+#[test]
+fn threads_option_keeps_attack_output_identical() {
+    let f = Fixture::new();
+    for pass in ["hill_climb", "partial_exhaustion"] {
+        let request = attack(pass, "all", &["ic"]);
+        f.write("request.json", request.to_string());
+        let plain = timeless(attack_events(&f.stdin(&request)));
+        for threads in ["1", "2", "8", "256"] {
+            for output in [
+                f.stdin_with(&request, &["--threads", threads]),
+                f.file_with("request.json", &["--threads", threads]),
+            ] {
+                assert!(output.stderr.is_empty(), "{pass}/{threads}");
+                assert_eq!(timeless(attack_events(&output)), plain, "{pass}/{threads}");
+            }
+        }
+    }
+}
+
+#[test]
+fn threads_option_is_rejected_for_search_jobs_after_validation() {
+    let f = Fixture::new();
+    let event = error(
+        f.stdin_with(&request(&["ic"]), &["--threads", "2"]),
+        "unsupported_job",
+        "/job/kind",
+    );
+    assert_eq!(
+        event["message"],
+        "--threads is supported only for hill_climb and partial_exhaustion attacks"
+    );
+    error(
+        f.stdin_with(&request(&["trie"]), &["--threads", "2"]),
+        "unsupported_resource",
+        "/job/resources/trie/path",
+    );
+}
+
 #[test]
 fn cancel_file_inspection_follows_request_and_resource_validation() {
     let f = Fixture::new();

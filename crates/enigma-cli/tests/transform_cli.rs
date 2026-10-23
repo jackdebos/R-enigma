@@ -241,6 +241,87 @@ fn cancel_file_is_accepted_before_or_after_input_but_rejected_for_transform() {
 }
 
 #[test]
+fn threads_is_accepted_before_or_after_input_but_rejected_for_transform() {
+    for (args, flag) in [
+        (&["--threads", "2", "--request", "-"][..], "--threads"),
+        (&["--request", "-", "--threads", "2"][..], "--threads"),
+        // Both options in either position: `--cancel-file` is reported first.
+        (
+            &["--threads", "2", "--request", "-", "--cancel-file", "m"][..],
+            "--cancel-file",
+        ),
+        (
+            &["--cancel-file", "m", "--threads", "2", "--request", "-"][..],
+            "--cancel-file",
+        ),
+        (
+            &["--request", "-", "--threads", "2", "--cancel-file", "m"][..],
+            "--cancel-file",
+        ),
+    ] {
+        let output = run_with_args(args, &valid_request());
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        let events = json_lines(&output.stdout);
+        assert_eq!(events.len(), 1, "events: {events:?}");
+        assert_eq!(events[0]["event"], json!("error"));
+        assert_eq!(events[0]["seq"], json!(1));
+        assert_eq!(events[0]["code"], json!("unsupported_job"));
+        assert_eq!(events[0]["location"], json!("/job/kind"));
+        assert_eq!(
+            events[0]["message"],
+            json!(format!(
+                "{flag} is supported only for hill_climb and partial_exhaustion attacks"
+            )),
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn invalid_threads_values_fail_before_the_request_is_read() {
+    for value in [
+        "0",
+        "257",
+        "abc",
+        "-1",
+        "+2",
+        "1.5",
+        " 2",
+        "",
+        "99999999999999999999",
+    ] {
+        // The request path does not exist: the option error wins before any read.
+        let output = run_with_args(&["--threads", value, "missing.json"], &valid_request());
+        assert_eq!(output.status.code(), Some(2), "{value:?}");
+        assert!(output.stdout.is_empty(), "{value:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!("error: --threads expects an integer from 1 to 256, got {value:?}\n")
+        );
+    }
+}
+
+#[test]
+fn malformed_threads_arguments_are_usage_errors() {
+    for args in [
+        &["--request", "-", "--threads"][..],
+        &["--threads", "--request", "-"][..],
+        &["--request", "-", "--threads", "--cancel-file"][..],
+        &["--threads", "2", "--threads", "3", "--request", "-"][..],
+        &["--threads", "2", "--request", "-", "--threads", "3"][..],
+        &["--threads", "2"][..],
+        &["--threads", "2", "--cancel-file", "m"][..],
+    ] {
+        let output = run_with_args(args, &valid_request());
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("Usage:"), "stderr: {stderr}");
+        assert!(stderr.contains("--threads <n>"), "stderr: {stderr}");
+    }
+}
+
+#[test]
 fn malformed_cancel_file_arguments_are_usage_errors() {
     for args in [
         &["--request", "-", "--cancel-file"][..],

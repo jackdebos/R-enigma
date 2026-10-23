@@ -37,9 +37,10 @@ search support.
 
 `stdout` contains one JSON object per line (JSONL), without embedded newlines.
 Diagnostics go to `stderr`. Stage 1 accepts a positional request file path,
-`--request <path>` for a file, or `--request -` for stdin. One optional
-`--cancel-file <path>` pair may precede or follow that input form (§5); a duplicate
-pair, missing value or `--`-prefixed value is a usage error. A future Stage 2 listener
+`--request <path>` for a file, or `--request -` for stdin. Optional
+`--cancel-file <path>` (§5) and `--threads <n>` (§5) pairs may precede or follow that
+input form, in any order; a duplicate pair, missing value or `--`-prefixed value is a
+usage error. A future Stage 2 listener
 carries the same messages. No UI is part of Stage 1.
 
 ## 3. Request
@@ -493,6 +494,7 @@ ordering applies only while delivery succeeds, including final result write/flus
 | Action | Mechanism | Result |
 | --- | --- | --- |
 | Cancel (first HC/PE release) | `--cancel-file <path>` marker or a platform signal (`SIGINT`/`SIGTERM`/`SIGHUP`, Windows Ctrl+C/Break); both shipped | Cooperative safe-stop, final `result`, then `done` with `reason: "cancelled"`; retained `result.hold` per Task 14; no checkpoint promise |
+| Parallel HC/PE outer keys | `--threads <n>`, default half the logical CPUs | Same public output as one thread for completed runs; see the `--threads` contract below |
 | Pause/resume live job | Not in Stage 1 | Future extension |
 | Resume dead job | `--resume <checkpoint>` | Search only; see §6 |
 | Bound HC/PE search | `space.offset`/`space.limit` and cancellation | §4.1 slice/exhaustion/cancellation reasons; slices bound outer keys only; no new `--max-keys` attack control |
@@ -565,6 +567,33 @@ macOS behavior relies on the `ctrlc` crate and is not verified by tests here.
 Live hold events remain deferred, not removed from eventual Stage 1 goals; cancellation
 retains the final `result.hold` (search-passes §10.6); it writes no
 checkpoint. Checkpoint/resume remains Task 16 under §6.
+
+### `--threads <n>` contract
+
+The option applies to validated HC/PE attacks and is host configuration, never a
+request field (§11). `<n>` is ASCII decimal digits naming an integer from 1 to 256;
+any other value fails before the request is read, writing only
+`error: --threads expects an integer from 1 to 256, got "<value>"` to stderr with
+exit 2 and empty stdout. Transform and unsupported search jobs reject the option
+like `--cancel-file`, with a seq 1 `unsupported_job` error at `/job/kind`, the message
+`--threads is supported only for hill_climb and partial_exhaustion attacks` and exit 1;
+when both options are present the `--cancel-file` message is reported. Without the
+option an attack uses half the logical CPUs reported by the platform, at least one.
+
+Outer keys are split into fixed blocks in key order that worker threads take as they
+become free. Block outcomes are merged in key order, so hold ranking, duplicate
+payloads, winners, errors and counters match a one-thread run; chained stages then
+run on one thread. A completed run therefore writes the same events, exit code and
+stderr for every thread count, apart from `ts` and `elapsed_ms`. Progress is emitted
+only at block boundaries in key order, so its positions depend on the block layout,
+never on the thread count.
+
+A stop request (marker or first signal) is observed at block boundaries: every worker
+finishes the block it holds, finished blocks are merged, then the run delivers `result`
+and `done` with `reason: "cancelled"` as above. Blocks are sized to last about a
+second or less in typical searches, so stopping may take that long; a second signal
+still exits immediately with code 130. Which blocks finish before a stop depends on
+timing, so cancelled runs are not promised to match across thread counts.
 
 ## 6. Checkpoint and resume (record schema deferred)
 

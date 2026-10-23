@@ -188,6 +188,17 @@ impl crate::AttackRequest {
     pub fn run(
         &self,
         observe: impl FnMut(crate::AttackProgress),
+        cancel_requested: impl FnMut() -> bool,
+    ) -> Result<crate::AttackResult, crate::AttackRunError> {
+        self.run_with(crate::ExecutionOptions::serial(), observe, cancel_requested)
+    }
+
+    /// [`run`](Self::run) under host `options`; the public outcome of a completed run
+    /// does not depend on them.
+    pub fn run_with(
+        &self,
+        _options: crate::ExecutionOptions,
+        observe: impl FnMut(crate::AttackProgress),
         mut cancel_requested: impl FnMut() -> bool,
     ) -> Result<crate::AttackResult, crate::AttackRunError> {
         let mut allowance = EvaluationAllowance { used: 0 };

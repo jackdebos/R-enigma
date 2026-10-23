@@ -47,12 +47,14 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 mod attack_control;
 mod attack_evaluator;
+mod attack_execution;
 mod attack_gate;
 mod attack_hill_climb;
 mod attack_hold;
 mod attack_neighborhood;
 mod attack_result;
 mod attack_reswapping;
+pub use attack_execution::ExecutionOptions;
 pub use attack_gate::AttackGate;
 pub use attack_result::{
     AttackBest, AttackCounterOverflow, AttackHoldEntry, AttackProgress, AttackResult,

@@ -21,7 +21,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use cancel_file::CancelFile;
 use enigma_core::{
-    encode, rfc3339_utc, DoneReason, Event, ParsedAttackRequest, ParsedRequest,
+    encode, rfc3339_utc, DoneReason, Event, ExecutionOptions, ParsedAttackRequest, ParsedRequest,
     ParsedSearchRequest, TransformRequest, MAX_REQUEST_BYTES,
 };
 
@@ -34,17 +34,20 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let resolved = split_cancel_file(&args).and_then(|(input, cancel_file)| {
-        let cancel_file = cancel_file.map(|path| cwd.join(path));
-        resolve_input(input, &cwd).map(|(bytes, origin)| (bytes, origin, cancel_file))
+    let resolved = split_options(&args).and_then(|(input, options)| {
+        let cancel_file = options.cancel_file.map(|path| cwd.join(path));
+        resolve_input(input, &cwd)
+            .map(|(bytes, origin)| (bytes, origin, cancel_file, options.threads))
     });
     match resolved {
-        Ok((bytes, origin, cancel_file)) => run(bytes, &origin, cancel_file.as_deref()),
+        Ok((bytes, origin, cancel_file, threads)) => {
+            run(bytes, &origin, cancel_file.as_deref(), threads)
+        }
         Err(InputError::Usage) => {
             print_usage();
             ExitCode::from(2)
         }
-        Err(InputError::Io(message)) => {
+        Err(InputError::Io(message) | InputError::InvalidOption(message)) => {
             eprintln!("error: {message}");
             ExitCode::from(2)
         }
@@ -66,25 +69,78 @@ enum InputError {
     Usage,
     /// The selected input source could not be read.
     Io(String),
+    /// An option value is outside its accepted domain.
+    InvalidOption(String),
     /// The request exceeds `MAX_REQUEST_BYTES` and was rejected before parsing.
     ResourceLimit,
 }
 
-/// Splits one optional `--cancel-file <path>` pair from before or after the input form.
+/// Options accepted before or after the input form.
+#[derive(Default)]
+struct Options<'a> {
+    /// Unresolved `--cancel-file` path; the caller joins it to the invocation cwd.
+    cancel_file: Option<&'a str>,
+    /// Validated `--threads` value.
+    threads: Option<ExecutionOptions>,
+}
+
+const CANCEL_FILE: &str = "--cancel-file";
+const THREADS: &str = "--threads";
+
+/// Splits optional `--cancel-file <path>` and `--threads <n>` pairs from before or
+/// after the input form.
 ///
-/// A duplicate pair, a missing value or a `--`-prefixed value is a usage error. The
-/// path is returned unresolved; the caller joins it to the invocation cwd.
-fn split_cancel_file(args: &[String]) -> Result<(&[String], Option<&str>), InputError> {
-    let (input, value) = match args {
-        [flag, value, input @ ..] | [input @ .., flag, value] if flag == "--cancel-file" => {
-            (input, value)
+/// A duplicate pair, a missing value or a `--`-prefixed value is a usage error; a
+/// `--threads` value other than a decimal integer in `1..=MAX_THREADS` is an
+/// invalid option. Both are reported before the request is read.
+fn split_options(args: &[String]) -> Result<(&[String], Options<'_>), InputError> {
+    let is_option = |arg: &String| arg == CANCEL_FILE || arg == THREADS;
+    let mut options = Options::default();
+    let mut input = args;
+    loop {
+        let (flag, value) = match input {
+            [flag, value, rest @ ..] if is_option(flag) => {
+                input = rest;
+                (flag, value)
+            }
+            [rest @ .., flag, value] if is_option(flag) => {
+                input = rest;
+                (flag, value)
+            }
+            _ => break,
+        };
+        if value.starts_with("--") {
+            return Err(InputError::Usage);
         }
-        _ => return Ok((args, None)),
-    };
-    if value.starts_with("--") || input.iter().any(|arg| arg == "--cancel-file") {
+        let duplicate = if flag == CANCEL_FILE {
+            options.cancel_file.replace(value).is_some()
+        } else {
+            options.threads.replace(parse_threads(value)?).is_some()
+        };
+        if duplicate {
+            return Err(InputError::Usage);
+        }
+    }
+    if input.iter().any(is_option) {
         return Err(InputError::Usage);
     }
-    Ok((input, Some(value)))
+    Ok((input, options))
+}
+
+/// Accepts only ASCII decimal digits naming a count in `1..=MAX_THREADS`.
+fn parse_threads(value: &str) -> Result<ExecutionOptions, InputError> {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then(|| value.parse::<usize>().ok())
+        .flatten()
+        .and_then(ExecutionOptions::with_threads)
+        .ok_or_else(|| {
+            InputError::InvalidOption(format!(
+                "{THREADS} expects an integer from 1 to {}, got {value:?}",
+                ExecutionOptions::MAX_THREADS
+            ))
+        })
 }
 
 /// Resolves the accepted argument shapes into raw request bytes.
@@ -149,6 +205,8 @@ fn print_usage() {
     eprintln!("Options (before or after the request form):");
     eprintln!("  --cancel-file <path>   cancel a hill_climb/partial_exhaustion attack");
     eprintln!("                         once <path> exists as a regular file");
+    eprintln!("  --threads <n>          worker threads for a hill_climb/partial_exhaustion");
+    eprintln!("                         attack, 1 to 256 (default: half the logical CPUs)");
     eprintln!();
     eprintln!("One JSON event is written per line to stdout; diagnostics go to stderr.");
     eprintln!("See docs/protocol.md for the contract and odd/tasks/enigma-engine.md for the plan.");
@@ -158,8 +216,36 @@ fn print_usage() {
 const CANCEL_FILE_UNSUPPORTED: &str =
     "--cancel-file is supported only for hill_climb and partial_exhaustion attacks";
 
+/// Rejection message for `--threads` on jobs without parallel execution.
+const THREADS_UNSUPPORTED: &str =
+    "--threads is supported only for hill_climb and partial_exhaustion attacks";
+
+/// The option message for a job that accepts neither option; `--cancel-file` wins.
+fn unsupported_option(cancel_file: bool, threads: bool) -> Option<&'static str> {
+    if cancel_file {
+        Some(CANCEL_FILE_UNSUPPORTED)
+    } else if threads {
+        Some(THREADS_UNSUPPORTED)
+    } else {
+        None
+    }
+}
+
+/// Default `--threads`: half the logical CPUs, or one when they cannot be counted.
+fn default_execution() -> ExecutionOptions {
+    std::thread::available_parallelism()
+        .map(ExecutionOptions::half_of)
+        .unwrap_or_else(|_| ExecutionOptions::serial())
+}
+
 /// Decodes input as UTF-8, parses and validates the request, and runs the transport.
-fn run(bytes: Vec<u8>, origin: &Path, cancel_file: Option<&Path>) -> ExitCode {
+fn run(
+    bytes: Vec<u8>,
+    origin: &Path,
+    cancel_file: Option<&Path>,
+    threads: Option<ExecutionOptions>,
+) -> ExitCode {
+    let unsupported = unsupported_option(cancel_file.is_some(), threads.is_some());
     let json = match String::from_utf8(bytes) {
         Ok(json) => json,
         Err(error) => {
@@ -173,15 +259,16 @@ fn run(bytes: Vec<u8>, origin: &Path, cancel_file: Option<&Path>) -> ExitCode {
     };
 
     match ParsedRequest::parse_json(&json) {
-        Ok(ParsedRequest::Transform(_)) if cancel_file.is_some() => {
-            search_error("unsupported_job", CANCEL_FILE_UNSUPPORTED, "/job/kind")
-        }
-        Ok(ParsedRequest::Transform(request)) => run_transform(request),
-        Ok(ParsedRequest::Search(request)) => run_search(request, origin, cancel_file.is_some()),
+        Ok(ParsedRequest::Transform(request)) => match unsupported {
+            Some(message) => search_error("unsupported_job", message, "/job/kind"),
+            None => run_transform(request),
+        },
+        Ok(ParsedRequest::Search(request)) => run_search(request, origin, unsupported),
         Ok(ParsedRequest::Attack(request)) => run_attack(
             request,
             origin,
             cancel_file,
+            threads.unwrap_or_else(default_execution),
             signals::install,
             &mut io::stdout().lock(),
         ),
@@ -203,7 +290,11 @@ fn run(bytes: Vec<u8>, origin: &Path, cancel_file: Option<&Path>) -> ExitCode {
 
 /// Load owned UTF-8 once, then borrow it into the pure core binding boundary.
 /// Successful binding is not execution: never enumerate candidates or emit work.
-fn run_search(request: ParsedSearchRequest, origin: &Path, cancel_file: bool) -> ExitCode {
+fn run_search(
+    request: ParsedSearchRequest,
+    origin: &Path,
+    unsupported_option: Option<&str>,
+) -> ExitCode {
     let contents = match resource_loader::load(request.resources(), origin) {
         Ok(contents) => contents,
         Err(error) => return search_error(error.code, &error.message, &error.location),
@@ -214,11 +305,7 @@ fn run_search(request: ParsedSearchRequest, origin: &Path, cancel_file: bool) ->
         .collect();
     match request.bind_resources(&supplied) {
         Ok(_validated) => {
-            let message = if cancel_file {
-                CANCEL_FILE_UNSUPPORTED
-            } else {
-                "search execution is not implemented"
-            };
+            let message = unsupported_option.unwrap_or("search execution is not implemented");
             search_error("unsupported_job", message, "/job/kind")
         }
         Err(diagnostics) => {
@@ -238,6 +325,7 @@ fn run_attack<'s>(
     request: ParsedAttackRequest,
     origin: &Path,
     cancel_file: Option<&Path>,
+    execution: ExecutionOptions,
     install_signals: impl FnOnce() -> Result<&'s AtomicBool, String>,
     out: &mut impl Write,
 ) -> ExitCode {
@@ -276,6 +364,7 @@ fn run_attack<'s>(
             let entry = Instant::now();
             let status = match attack_transport::run(
                 &validated,
+                execution,
                 out,
                 || entry.elapsed(),
                 now_ts,
@@ -419,6 +508,7 @@ mod attack_tests {
 
     /// A signal flag that is never raised; no real handler is installed in tests.
     static IDLE: AtomicBool = AtomicBool::new(false);
+    const SERIAL: ExecutionOptions = ExecutionOptions::serial();
 
     fn request() -> Value {
         json!({"protocol_version":1,"machine":{"definition":{"kind":"custom","value":{
@@ -436,7 +526,7 @@ mod attack_tests {
         let parsed = ParsedAttackRequest::parse_json(&value.to_string()).unwrap();
         let mut output = Vec::new();
         assert_eq!(
-            run_attack(parsed, origin, None, || Ok(&IDLE), &mut output),
+            run_attack(parsed, origin, None, SERIAL, || Ok(&IDLE), &mut output),
             ExitCode::FAILURE
         );
         let text = String::from_utf8(output).unwrap();
@@ -487,7 +577,7 @@ mod attack_tests {
         let parsed = ParsedAttackRequest::parse_json(&value.to_string()).unwrap();
         let mut output = Vec::new();
         assert_eq!(
-            run_attack(parsed, origin, None, || Ok(&IDLE), &mut output),
+            run_attack(parsed, origin, None, SERIAL, || Ok(&IDLE), &mut output),
             ExitCode::SUCCESS
         );
         let events: Vec<Value> = String::from_utf8(output)
@@ -709,7 +799,7 @@ mod attack_tests {
             // Valid structure, deterministic eligibility failure before any work events.
             let parsed = ParsedAttackRequest::parse_json(&outer(8).to_string()).unwrap();
             assert_eq!(
-                run_attack(parsed, Path::new("."), None, || Ok(&IDLE), &mut out),
+                run_attack(parsed, Path::new("."), None, SERIAL, || Ok(&IDLE), &mut out),
                 ExitCode::FAILURE
             );
             assert_eq!(out.flushes, usize::from(!fail_write));
@@ -763,7 +853,14 @@ mod attack_tests {
                 );
                 let parsed = ParsedAttackRequest::parse_json(&value.to_string()).unwrap();
                 assert_eq!(
-                    run_attack(parsed, Path::new("."), Some(&path), || Ok(&IDLE), &mut out),
+                    run_attack(
+                        parsed,
+                        Path::new("."),
+                        Some(&path),
+                        SERIAL,
+                        || Ok(&IDLE),
+                        &mut out
+                    ),
                     exit
                 );
                 assert_cancelled(out.1);
@@ -795,7 +892,14 @@ mod attack_tests {
                 let parsed = ParsedAttackRequest::parse_json(&value.to_string()).unwrap();
                 let cancel_file = marker.then_some(path.as_path());
                 assert_eq!(
-                    run_attack(parsed, Path::new("."), cancel_file, || Ok(&flag), &mut out),
+                    run_attack(
+                        parsed,
+                        Path::new("."),
+                        cancel_file,
+                        SERIAL,
+                        || Ok(&flag),
+                        &mut out
+                    ),
                     exit,
                     "preset {preset}, marker {marker}"
                 );

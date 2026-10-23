@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::io::{self, Write};
 use std::time::Duration;
 
-use enigma_core::{encode, AttackProgress, AttackRequest, Event};
+use enigma_core::{encode, AttackProgress, AttackRequest, Event, ExecutionOptions};
 
 /// No clock or I/O enters Core. Both clocks are supplied by the CLI boundary.
 struct Transport<W, M, U> {
@@ -101,6 +101,7 @@ impl<W: Write, M: FnMut() -> Duration, U: FnMut() -> String> Transport<W, M, U> 
 /// External cancellation is independently polled and sticky, as is delivery failure.
 pub(super) fn run(
     request: &AttackRequest,
+    options: ExecutionOptions,
     writer: impl Write,
     monotonic: impl FnMut() -> Duration,
     utc: impl FnMut() -> String,
@@ -109,7 +110,8 @@ pub(super) fn run(
     let transport = RefCell::new(Transport::new(writer, monotonic, utc));
     let cancelled = Cell::new(false);
     transport.borrow_mut().emit(Event::Started);
-    let result = request.run(
+    let result = request.run_with(
+        options,
         |progress| transport.borrow_mut().observe(progress),
         || {
             cancelled
@@ -265,6 +267,7 @@ mod tests {
             let wall = Cell::new(0);
             run(
                 &request,
+                ExecutionOptions::serial(),
                 &mut writer,
                 || Duration::from_secs(50),
                 || {
@@ -316,6 +319,7 @@ mod tests {
                 let mut output = Vec::new();
                 run(
                     &request,
+                    ExecutionOptions::serial(),
                     &mut output,
                     || {
                         clock_calls.set(clock_calls.get() + 1);
@@ -369,6 +373,7 @@ mod tests {
         let mut output = Vec::new();
         run(
             &request,
+            ExecutionOptions::serial(),
             &mut output,
             || {
                 let now = clock.get();
@@ -415,6 +420,7 @@ mod tests {
                 };
                 let failure = run(
                     &request(false),
+                    ExecutionOptions::serial(),
                     &mut writer,
                     || Duration::ZERO,
                     || "UTC".into(),
@@ -445,6 +451,7 @@ mod tests {
         let polls = Cell::new(0);
         run(
             &request(false),
+            ExecutionOptions::serial(),
             &mut output,
             || Duration::ZERO,
             || "UTC".into(),
@@ -478,6 +485,7 @@ mod tests {
         };
         let failure = run(
             &request(true),
+            ExecutionOptions::serial(),
             &mut writer,
             || Duration::ZERO,
             || "UTC".into(),
@@ -498,6 +506,7 @@ mod tests {
             let polls = Cell::new(0);
             run(
                 &request(pe),
+                ExecutionOptions::serial(),
                 &mut output,
                 || Duration::ZERO,
                 || "UTC".into(),
@@ -548,6 +557,7 @@ mod tests {
         let clock = Cell::new(0);
         let failure = run(
             &request_with_progress(false, true, 1),
+            ExecutionOptions::serial(),
             &writer,
             || {
                 let now = clock.get();
