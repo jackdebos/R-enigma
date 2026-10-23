@@ -74,7 +74,11 @@ and the full attack, checks every output, and writes a new untracked JSON file
 under its `results/`. Per-evaluation search time is
 `(median full - median startup) / 8456`. There are no timing thresholds.
 
-### Design B: unknown middle/right positions
+### Design A2: unknown middle/right positions
+
+A2 is a step between design A (1 key) and the planned design B (all three
+rotating positions unknown, 17,576 keys; Task 17.7).
+
 
 `m4-u264-attack-positions` is A with only middle/right positions unknown:
 `*` in bomm, A–Z domains in our request, for 676 outer keys. All wheels, rings,
