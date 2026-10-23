@@ -203,7 +203,7 @@ impl NgramModel {
     fn score_dense<I: ExactSizeIterator<Item = u32>>(
         &self,
         dense: &DenseWeights,
-        mut indices: I,
+        indices: I,
     ) -> Result<MeasuredScore, MeasureError> {
         let length = u128::try_from(indices.len()).map_err(|_| ScoreError::Overflow)?;
         let required = u128::try_from(self.order).map_err(|_| ScoreError::Overflow)?;
@@ -217,6 +217,23 @@ impl NgramModel {
             .checked_sub(required)
             .and_then(|n| n.checked_add(1))
             .ok_or(ScoreError::Overflow)?;
+        // Narrow sums are exact only while every partial sum provably fits i64.
+        let sum = if fits_i64(windows, dense.max_abs) {
+            self.sum_dense::<i64, _>(dense, indices)?
+        } else {
+            self.sum_dense::<i128, _>(dense, indices)?
+        };
+        let divisor = i128::try_from(windows).map_err(|_| ScoreError::Overflow)?;
+        let measured = FixedScore::from_units(floor_div(sum, divisor)?);
+        Ok(MeasuredScore::higher_is_better(measured))
+    }
+
+    /// Sum every window weight of at least `order` streamed indices, in Q32 units.
+    fn sum_dense<A: WindowSum, I: Iterator<Item = u32>>(
+        &self,
+        dense: &DenseWeights,
+        mut indices: I,
+    ) -> Result<i128, ScoreError> {
         let width = self.alphabet.len();
         // Dense dimensions bound every radix key; indices are already validated.
         // A power-of-two ring longer than every order (1..=6): masked positions
@@ -228,18 +245,16 @@ impl NgramModel {
             *slot = index as usize;
             key = key * width + *slot;
         }
-        let mut sum = dense.weights[key];
+        let mut sum = A::start(dense.weights[key]);
         for (written, incoming) in (self.order..).zip(indices) {
             let outgoing = ring[(written - self.order) & (RING - 1)];
             let incoming = incoming as usize;
             // Remove the highest radix digit before shifting; the key stays bounded.
             key = (key - outgoing * dense.high) * width + incoming;
             ring[written & (RING - 1)] = incoming;
-            sum = sum.checked_add(dense.weights[key])?;
+            sum = sum.add(dense.weights[key])?;
         }
-        let divisor = i128::try_from(windows).map_err(|_| ScoreError::Overflow)?;
-        let measured = FixedScore::from_units(floor_div(sum.units(), divisor)?);
-        Ok(MeasuredScore::higher_is_better(measured))
+        Ok(sum.units())
     }
 
     fn score_windows(&self, text: &str, length: u128) -> Result<MeasuredScore, MeasureError> {
@@ -277,14 +292,58 @@ impl NgramModel {
     }
 }
 
+/// Whether `windows` weights of magnitude at most `max_abs` sum within i64.
+fn fits_i64(windows: u128, max_abs: u64) -> bool {
+    u128::from(max_abs)
+        .checked_mul(windows)
+        .is_some_and(|bound| bound <= i64::MAX as u128)
+}
+
+/// Window-weight accumulator; the narrow kernel relies on [`fits_i64`].
+trait WindowSum: Sized {
+    fn start(weight: i64) -> Self;
+    fn add(self, weight: i64) -> Result<Self, ScoreError>;
+    fn units(self) -> i128;
+}
+
+impl WindowSum for i64 {
+    fn start(weight: i64) -> Self {
+        weight
+    }
+    fn add(self, weight: i64) -> Result<Self, ScoreError> {
+        // Unchecked by design: the caller proved windows * max_abs <= i64::MAX.
+        Ok(self + weight)
+    }
+    fn units(self) -> i128 {
+        i128::from(self)
+    }
+}
+
+impl WindowSum for i128 {
+    fn start(weight: i64) -> Self {
+        i128::from(weight)
+    }
+    fn add(self, weight: i64) -> Result<Self, ScoreError> {
+        self.checked_add(i128::from(weight))
+            .ok_or(ScoreError::Overflow)
+    }
+    fn units(self) -> i128 {
+        self
+    }
+}
+
 const DENSE_DATA_LIMIT: usize = 4 * 1024 * 1024;
 
 #[derive(Debug)]
 struct DenseWeights {
-    weights: Vec<FixedScore>,
+    weights: Vec<i64>,
+    /// Largest weight magnitude, the per-call bound input for [`fits_i64`].
+    max_abs: u64,
     high: usize,
 }
 
+/// Admission is sized by `FixedScore` entries, so narrowing the stored weights
+/// to i64 does not change which models get a dense table.
 fn dense_dimensions(width: usize, order: usize) -> Option<(usize, usize)> {
     let exponent = u32::try_from(order.checked_sub(1)?).ok()?;
     let high = width.checked_pow(exponent)?;
@@ -302,6 +361,10 @@ impl DenseWeights {
         deny_reservation: bool,
     ) -> Option<Self> {
         let (entries, high) = dense_dimensions(alphabet.len(), order)?;
+        // Any weight outside i64 keeps the model on exact sparse scoring.
+        let narrow = |weight: FixedScore| i64::try_from(weight.units()).ok();
+        let unseen = narrow(unseen)?;
+        let mut max_abs = unseen.unsigned_abs();
         let mut weights = Vec::new();
         if deny_reservation || weights.try_reserve_exact(entries).is_err() {
             return None;
@@ -311,9 +374,15 @@ impl DenseWeights {
             let key = gram.iter().fold(0, |key, &symbol| {
                 key * alphabet.len() + alphabet.index_of(symbol).expect("validated model gram")
             });
+            let weight = narrow(weight)?;
+            max_abs = max_abs.max(weight.unsigned_abs());
             weights[key] = weight;
         }
-        Some(Self { weights, high })
+        Some(Self {
+            weights,
+            max_abs,
+            high,
+        })
     }
 }
 
@@ -683,6 +752,78 @@ mod tests {
         let sparse = NgramModel::new(alphabet, 4, vec![(vec!['A'; 4], 1)]).unwrap();
         assert!(sparse.dense.is_none());
         assert!(sparse.score_index_iter([0_u32; 8].into_iter()).is_none());
+    }
+
+    #[test]
+    fn narrow_sum_bound_admits_exactly_up_to_i64_max() {
+        let max = i64::MAX as u64;
+        assert!(fits_i64(1, max));
+        assert!(!fits_i64(2, max));
+        assert!(!fits_i64(1, max + 1));
+        assert!(fits_i64(7, max / 7));
+        assert!(!fits_i64(7, max / 7 + 1));
+        assert!(fits_i64(u128::MAX, 0));
+        assert!(!fits_i64(u128::MAX, 1));
+        assert!(fits_i64(0, u64::MAX));
+    }
+
+    #[test]
+    fn dense_table_requires_i64_weights_and_records_their_largest_magnitude() {
+        let alphabet = alphabet();
+        let unseen = FixedScore::from_units(-3);
+        let mut sparse = HashMap::new();
+        sparse.insert(vec!['A'], FixedScore::from_units(i128::from(i64::MIN)));
+        let dense = DenseWeights::new(&alphabet, 1, &sparse, unseen, false).unwrap();
+        assert_eq!(dense.weights, [i64::MIN, -3]);
+        assert_eq!(dense.max_abs, 1 << 63);
+        sparse.insert(vec!['B'], FixedScore::from_units(i128::from(i64::MIN) - 1));
+        assert!(DenseWeights::new(&alphabet, 1, &sparse, unseen, false).is_none());
+        let too_high = FixedScore::from_units(i128::from(i64::MAX) + 1);
+        assert!(DenseWeights::new(&alphabet, 1, &HashMap::new(), too_high, false).is_none());
+        let unseen = FixedScore::from_units(i128::from(i64::MAX));
+        let dense = DenseWeights::new(&alphabet, 1, &HashMap::new(), unseen, false).unwrap();
+        assert_eq!(dense.max_abs, i64::MAX as u64);
+    }
+
+    #[test]
+    fn narrow_and_wide_window_sums_match_an_independent_sparse_sum() {
+        for (width, order) in [(1, 1), (1, 5), (2, 6), (5, 3), (26, 1), (26, 3)] {
+            let symbols: Vec<char> = (0..width)
+                .map(|i| char::from_u32(0x5d0 + i as u32).unwrap())
+                .collect();
+            let entries: Vec<(Vec<char>, u64)> = (0..width.min(40) as u64)
+                .map(|seed| {
+                    let gram = pseudo_random_indices(width, order, seed + 5);
+                    let gram = gram.iter().map(|&i| symbols[i as usize]).collect();
+                    (
+                        gram,
+                        if seed % 2 == 0 {
+                            u64::MAX - seed
+                        } else {
+                            seed + 1
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>()
+                .into_iter()
+                .collect();
+            let model =
+                NgramModel::new(Alphabet::new(symbols.clone()).unwrap(), order, entries).unwrap();
+            let dense = model.dense.as_ref().unwrap();
+            for length in [order, order + 1, 64, 301] {
+                let indices = pseudo_random_indices(width, length, 0x51ed);
+                let grams: Vec<char> = indices.iter().map(|&i| symbols[i as usize]).collect();
+                let expected = grams.windows(order).try_fold(0_i128, |sum, gram| {
+                    let weight = model.weights.get(gram).copied().unwrap_or(model.unseen);
+                    sum.checked_add(weight.units())
+                });
+                let expected = expected.unwrap();
+                let narrow = model.sum_dense::<i64, _>(dense, indices.iter().copied());
+                let wide = model.sum_dense::<i128, _>(dense, indices.iter().copied());
+                assert_eq!(narrow, Ok(expected), "{width}, {order}, {length}");
+                assert_eq!(wide, Ok(expected), "{width}, {order}, {length}");
+            }
+        }
     }
 
     #[test]
