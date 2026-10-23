@@ -293,7 +293,7 @@ impl<'a> TrialEvaluator<'a> {
         mapping: &[usize],
         indices: &mut Vec<u32>,
         prepared: Option<&Prepared>,
-        engine: Option<Engine>,
+        engine: Option<&mut Engine>,
     ) -> Result<(Option<String>, MeasuredScore), TrialEvaluationError> {
         if let (Some(prepared), Some(kind)) = (prepared, self.stream_kind()) {
             let width = self.initial.topology().alphabet().len();
@@ -350,7 +350,7 @@ impl<'a> TrialEvaluator<'a> {
             &[usize],
             &mut Vec<u32>,
             Option<&Prepared>,
-            Option<Engine>,
+            Option<&mut Engine>,
         ) -> Result<T, TrialEvaluationError>,
     ) -> Result<T, TrialEvaluationError> {
         self.check_binding()?;
@@ -369,7 +369,7 @@ impl<'a> TrialEvaluator<'a> {
     }
 
     /// Selects the outer's preparation for a bound, valid mapping; `run` receives
-    /// the mapping, index scratch, rows and any leftover fresh Engine.
+    /// the mapping, index scratch, rows and a borrow of any leftover fresh Engine.
     fn with_mapping<T>(
         &self,
         mapping: &[usize],
@@ -378,7 +378,7 @@ impl<'a> TrialEvaluator<'a> {
             &[usize],
             &mut Vec<u32>,
             Option<&Prepared>,
-            Option<Engine>,
+            Option<&mut Engine>,
         ) -> Result<T, TrialEvaluationError>,
     ) -> Result<T, TrialEvaluationError> {
         let latest;
@@ -394,12 +394,19 @@ impl<'a> TrialEvaluator<'a> {
         } else {
             &self.prepared
         };
-        let engine = self.prepare(mapping, prepared)?;
+        // A new evaluator must validate its constructor even when rows are shared.
+        // An initialized None is also warm: retain the remembered fallback policy.
+        if self.engine_validated.get().is_some() {
+            if let Some(prepared) = prepared.get() {
+                return run(mapping, indices, prepared.as_ref(), None);
+            }
+        }
+        let mut engine = self.prepare(mapping, prepared)?;
         run(
             mapping,
             indices,
             prepared.get().expect("prepared above").as_ref(),
-            engine,
+            engine.as_mut(),
         )
     }
 
@@ -472,7 +479,7 @@ impl<'a> TrialEvaluator<'a> {
         mapping: &[usize],
         indices: &mut Vec<u32>,
         prepared: Option<&Prepared>,
-        engine: Option<Engine>,
+        engine: Option<&mut Engine>,
     ) -> Result<(String, MeasuredScore), TrialEvaluationError> {
         #[cfg(test)]
         PLAINTEXT_BUILDS.with(|count| count.set(count.get() + 1));
@@ -491,12 +498,16 @@ impl<'a> TrialEvaluator<'a> {
                 Ok((plaintext, score))
             }
             None => {
-                let mut engine = match engine {
+                let mut fresh;
+                let engine = match engine {
                     Some(engine) => engine,
-                    None => self.fresh_engine(Plugboard::from_validated_mapping(
-                        self.initial.topology().alphabet(),
-                        mapping,
-                    ))?,
+                    None => {
+                        fresh = self.fresh_engine(Plugboard::from_validated_mapping(
+                            self.initial.topology().alphabet(),
+                            mapping,
+                        ))?;
+                        &mut fresh
+                    }
                 };
                 let plaintext = engine
                     .transform(self.input, self.direction)
