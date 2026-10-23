@@ -74,9 +74,7 @@ where
         if self.cancelled() {
             return Ok(Err(AttackTermination::Cancelled));
         }
-        if !self.accounting.admit(0)? {
-            return Ok(Err(AttackTermination::EvaluationBudget));
-        }
+        self.accounting.admit()?;
         let scored = evaluate(self)?;
         self.accounting.complete()?;
         Ok(Ok(scored))
@@ -285,7 +283,7 @@ mod tests {
     use crate::attack_hill_climb::EvaluationAllowance;
     use crate::{AttackBest, AttackResult, FixedScore};
     use std::cell::{Cell, RefCell};
-    use AttackTermination::{Cancelled, Completed, EvaluationBudget};
+    use AttackTermination::{Cancelled, Completed};
 
     struct Recorder;
     impl CounterObserver for Recorder {
@@ -304,7 +302,7 @@ mod tests {
     }
 
     /// Alphabet A–F, fixed F–E, symbols D,A,C,B in source order; prior use 5, prior
-    /// score -100. `stop` is [budget, cancel after, fail at]; the initial board is
+    /// score -100. `stop` is [cancel after, cancel after, fail at]; the initial board is
     /// logged raw, neighbors as canonical boards, all scored by their sorted
     /// symbols (default 0).
     fn run(start: &[(char, char)], scores: &[(&str, i128)], stop: [usize; 3]) -> Run {
@@ -362,15 +360,16 @@ mod tests {
         };
         let tail = crate::attack_hold::tests::snapshot(&result.held_tail);
         let (count, log) = (Cell::new(0), RefCell::new(Vec::new()));
-        // Capped so a non-terminating scan fails fast instead of exhausting memory.
-        let limit = (stop[0] as u64).min(10_000).saturating_add(5);
-        let mut allowance = EvaluationAllowance { used: 5, limit };
+        let mut allowance = EvaluationAllowance { used: 5 };
         let accounting = &mut ObservedAccounting {
             allowance: &mut allowance,
             control: &mut control,
             observer: &mut Recorder,
         };
-        let cancel = || count.get() >= stop[1];
+        let cancel = || {
+            assert!(count.get() < 10_000, "reswapping failed to terminate");
+            count.get() >= stop[0].min(stop[1])
+        };
         let raw = |board: &[(char, char)]| -> String {
             board.iter().flat_map(|&(a, b)| [a, b]).collect()
         };
@@ -486,8 +485,8 @@ mod tests {
     }
 
     #[test]
-    fn refused_initial_admission_or_cancellation_leaves_no_history() {
-        for (stop, expected) in [([0, N, N], EvaluationBudget), ([N, 0, N], Cancelled)] {
+    fn cancellation_before_initial_admission_leaves_no_history() {
+        for (stop, expected) in [([0, N, N], Cancelled), ([N, 0, N], Cancelled)] {
             let (result, log) = ok(run(AB, &[], stop));
             assert!(log.is_empty() && result.stages.is_empty());
             assert_eq!((result.termination, result.evaluations_used), (expected, 5));
@@ -496,10 +495,10 @@ mod tests {
     }
 
     #[test]
-    fn budget_discards_provisional_winner_and_keeps_earlier_commit() {
+    fn cancellation_discards_provisional_winner_and_keeps_earlier_commit() {
         let (result, log) = ok(run(AB_CD, &[("CD", 3), ("AC", 9)], [12, N, N]));
         assert_eq!(log[9..], ["AC", "AD", "BC"]);
-        assert_eq!(summary(&result), (EvaluationBudget, Some(3), 12, false));
+        assert_eq!(summary(&result), (Cancelled, Some(3), 12, false));
         assert_eq!(best(result.best.as_ref().unwrap()).0, CD);
     }
 
@@ -660,9 +659,7 @@ mod tests {
                 if self.cancelled() {
                     return Ok(Err(AttackTermination::Cancelled));
                 }
-                if !self.accounting.admit(0)? {
-                    return Ok(Err(AttackTermination::EvaluationBudget));
-                }
+                self.accounting.admit()?;
                 let (plaintext, score) = (self.evaluate)(board)?;
                 self.accounting.complete()?;
                 let board = board.to_vec();
@@ -892,8 +889,7 @@ mod tests {
                             };
                             let mut control = AttackControl::default();
                             let mut observer = Snapshots::default();
-                            let limit = (limit as u64).saturating_add(5);
-                            let mut allowance = EvaluationAllowance { used: 5, limit };
+                            let mut allowance = EvaluationAllowance { used: 5 };
                             let accounting = &mut ObservedAccounting {
                                 allowance: &mut allowance,
                                 control: &mut control,
@@ -902,7 +898,8 @@ mod tests {
                             let polls = Cell::new(0);
                             let cancel = || {
                                 polls.set(polls.get() + 1);
-                                polls.get() > cancel_at
+                                assert!(polls.get() < 100_000, "reswapping failed to terminate");
+                                polls.get() > cancel_at.min(limit)
                             };
                             builds();
                             fills();

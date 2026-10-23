@@ -6,7 +6,7 @@ use crate::{
 };
 use std::collections::HashSet;
 
-/// Checked eligibility and cardinalities, not an executable request or budget reservation.
+/// Checked eligibility and cardinalities, not an executable request.
 ///
 /// Construction is available only through [`Self::check`] with a bound carrier.
 /// ```compile_fail
@@ -25,7 +25,7 @@ fn failure(code: &'static str, message: &str, path: &str) -> Vec<SearchDiagnosti
 
 impl AttackGate {
     /// Rechecks detached fragments against an immutable, resource-bound search carrier.
-    /// Counts describe work domains, not score calls; even budget one is valid.
+    /// Counts describe work domains, not score calls.
     pub fn check(
         request: &SearchRequest,
         domain: &AttackPlugboardDomain,
@@ -305,7 +305,7 @@ mod tests {
         initialization: Value,
     ) -> AttackSettings {
         let mut value = json!({"kind":kind,"initial_measure":"ic","final_measure":"entropy",
-            "switch_pairs":0,"backtrack_pairs":0,"evaluation_budget":1});
+            "switch_pairs":0,"backtrack_pairs":0});
         value[if kind == "hill_climb" {
             "start"
         } else {
@@ -332,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_no_reflector_unicode_budget_one_and_slicing() {
+    fn fixed_no_reflector_unicode_and_slicing() {
         let mut value = fixture(&['é', '🦀', 'A', 'B']);
         let request = bound(&value);
         let domain = domain(&request, &['é', '🦀'], 1);
@@ -483,7 +483,7 @@ mod tests {
         value["job"]["space"]["plugboard"] =
             json!({"kind":"attack","symbols":["A","B"],"max_pairs":1});
         value["job"]["attack"] = json!({"kind":"hill_climb","initial_measure":"ic","final_measure":"entropy",
-            "switch_pairs":0,"backtrack_pairs":0,"evaluation_budget":1,"start":[],"trie":{"x":1}});
+            "switch_pairs":0,"backtrack_pairs":0,"start":[],"trie":{"x":1}});
         let errors = crate::ParsedAttackRequest::parse_json(&value.to_string()).unwrap_err();
         assert_eq!(
             (errors[0].code(), errors[0].location()),
@@ -539,7 +539,7 @@ mod tests {
             wide.measures(),
             &json!({"kind":"hill_climb","initial_measure":"ic",
                 "final_measure":"entropy","switch_pairs":2,"backtrack_pairs":0,
-                "evaluation_budget":1,"start":[]})
+                "start":[]})
             .to_string(),
         )
         .unwrap();
@@ -595,7 +595,7 @@ mod tests {
         ] {
             let mut fragment = json!({"kind":"hill_climb","initial_measure":"entropy",
                 "final_measure":"entropy","switch_pairs":0,"backtrack_pairs":0,
-                "evaluation_budget":1,"start":[]});
+                "start":[]});
             if !fields.is_null() {
                 fragment[stage] = fields;
             }
@@ -762,7 +762,7 @@ mod tests {
                     &[MeasureId::Ic, MeasureId::Entropy, MeasureId::Trie],
                     &json!({"kind":"hill_climb","initial_measure":"ic",
                         "final_measure":"entropy","switch_pairs":0,"backtrack_pairs":0,
-                        "evaluation_budget":1,"start":[],"measure":{"measure":"trie"}})
+                        "start":[],"measure":{"measure":"trie"}})
                     .to_string(),
                 )
                 .unwrap();

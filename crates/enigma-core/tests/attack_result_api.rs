@@ -6,15 +6,8 @@ use enigma_core::{
 #[test]
 fn hc_pe_runs_have_empty_public_and_wire_stage_histories() {
     for pe in [false, true] {
-        for (budget, offset, cancelled) in [
-            (100, 0, false),
-            (1, 0, false),
-            (1, 1, false),
-            (100, 0, true),
-        ] {
-            let result = fixture(budget, offset, pe)
-                .run(|_| {}, || cancelled)
-                .unwrap();
+        for (offset, cancelled) in [(0, false), (1, false), (0, true)] {
+            let result = fixture(offset, pe).run(|_| {}, || cancelled).unwrap();
             assert!(result.stages().is_empty());
             let wire = serde_json::to_value(enigma_core::Event::result(&result, 0)).unwrap();
             assert_eq!(wire["stages"], serde_json::json!([]));
@@ -43,7 +36,7 @@ fn success_hold_is_borrowed_ordered_and_keeps_entry_histories() {
         entry.best()
     }
     for capacity in [1, 100] {
-        let mut value = fixture_value(100, 0, true);
+        let mut value = fixture_value(0, true);
         value["job"]["attack"]["hold"] = serde_json::json!(capacity);
         let before = enigma_core::AttackRequest::parse_json(&value.to_string())
             .unwrap()
@@ -54,12 +47,29 @@ fn success_hold_is_borrowed_ordered_and_keeps_entry_histories() {
             .unwrap()
             .push(serde_json::json!("measure"));
         value["job"]["attack"]["measure"] = serde_json::json!({"measure": "ic"});
-        value["job"]["attack"]["evaluation_budget"] =
-            serde_json::json!(before.evaluations_used() + 1);
+        let polls = std::cell::Cell::new(0);
+        let prefix = std::cell::Cell::new(0);
+        enigma_core::AttackRequest::parse_json(&value.to_string())
+            .unwrap()
+            .run(
+                |_| {},
+                || {
+                    prefix.set(prefix.get() + 1);
+                    false
+                },
+            )
+            .unwrap();
         let result = enigma_core::AttackRequest::parse_json(&value.to_string())
             .unwrap()
-            .run(|_| {}, || false)
+            .run(
+                |_| {},
+                || {
+                    polls.set(polls.get() + 1);
+                    capacity > 1 && polls.get() == prefix.get()
+                },
+            )
             .unwrap();
+        assert_eq!(result.evaluations_used(), before.evaluations_used() + 1);
         let entries: Vec<_> = result.hold().collect();
         assert_eq!(entries.len(), if capacity == 1 { 1 } else { 2 });
         assert!(std::ptr::eq(client(entries[0]), result.best().unwrap()));
@@ -128,7 +138,7 @@ fn borrowed_projection_error_supports_client_downcast() {
     );
 }
 
-fn fixture_value(budget: u64, offset: u64, pe: bool) -> serde_json::Value {
+fn fixture_value(offset: u64, pe: bool) -> serde_json::Value {
     let alphabet = ["🦀", "é", "Ω", "中"];
     let mut value = serde_json::json!({
         "protocol_version": 1, "machine": {"definition": {"kind": "custom", "value": {
@@ -140,7 +150,7 @@ fn fixture_value(budget: u64, offset: u64, pe: bool) -> serde_json::Value {
                 "plugboard": [["中", "é"]]}, "text": "🦀🦀", "measures": ["ic"], "passes": ["hill_climb"],
             "space": {"offset": offset, "plugboard": {"kind": "attack", "symbols": ["🦀", "Ω"], "max_pairs": 2}},
             "attack": {"kind": "hill_climb", "initial_measure": "ic", "final_measure": "ic",
-                "switch_pairs": 2, "backtrack_pairs": 2, "evaluation_budget": budget, "start": [["Ω", "🦀"]]}
+                "switch_pairs": 2, "backtrack_pairs": 2, "start": [["Ω", "🦀"]]}
         }
     });
     if pe {
@@ -156,8 +166,8 @@ fn fixture_value(budget: u64, offset: u64, pe: bool) -> serde_json::Value {
     value
 }
 
-fn measure_fixture(budget: u64, offset: u64, pe: bool) -> enigma_core::AttackRequest {
-    let mut value = fixture_value(budget, offset, pe);
+fn measure_fixture(offset: u64, pe: bool) -> enigma_core::AttackRequest {
+    let mut value = fixture_value(offset, pe);
     value["job"]["passes"]
         .as_array_mut()
         .unwrap()
@@ -171,9 +181,9 @@ fn measure_fixture(budget: u64, offset: u64, pe: bool) -> enigma_core::AttackReq
 #[test]
 fn measure_rescores_the_same_hc_and_pe_winner_once() {
     for pe in [false, true] {
-        let before = fixture(100, 0, pe).run(|_| {}, || false).unwrap();
+        let before = fixture(0, pe).run(|_| {}, || false).unwrap();
         let mut last = None;
-        let after = measure_fixture(before.evaluations_used() + 1, 0, pe)
+        let after = measure_fixture(0, pe)
             .run(|p| last = Some(p), || false)
             .unwrap();
         assert_eq!(after.termination(), AttackTermination::Completed);
@@ -220,7 +230,7 @@ fn measure_rescores_the_same_hc_and_pe_winner_once() {
 fn measure_starts_only_after_first_admission() {
     for pe in [false, true] {
         let mut prefix_polls = 0;
-        let complete = fixture(100, 0, pe)
+        let complete = fixture(0, pe)
             .run(
                 |_| {},
                 || {
@@ -230,23 +240,20 @@ fn measure_starts_only_after_first_admission() {
             )
             .unwrap();
         let used = complete.evaluations_used();
-        for (budget, offset, cancel, termination) in [
-            (1, 0, false, AttackTermination::EvaluationBudget),
-            (used, 0, false, AttackTermination::EvaluationBudget),
-            (used, 0, true, AttackTermination::Cancelled),
-            (used + 1, 0, true, AttackTermination::Cancelled),
-            (used + 1, 1, true, AttackTermination::OuterSliceEnd),
+        for (offset, termination) in [
+            (0, AttackTermination::Cancelled),
+            (1, AttackTermination::OuterSliceEnd),
         ] {
             let mut polls = 0;
             let mut last = None;
-            let result = measure_fixture(budget, offset, pe)
+            let result = measure_fixture(offset, pe)
                 .run(
                     |p| last = Some(p),
                     // The unstaged run's polling prefix ends with HC/PE.
                     // Its next poll is stage entry, after outer accounting.
                     || {
                         polls += 1;
-                        cancel && polls == prefix_polls + 1
+                        polls == prefix_polls + 1
                     },
                 )
                 .unwrap();
@@ -257,7 +264,7 @@ fn measure_starts_only_after_first_admission() {
             if offset == 1 {
                 assert!(result.best().is_none());
             }
-            if budget >= used && offset == 0 {
+            if offset == 0 {
                 assert_eq!(
                     result.best().unwrap().score(),
                     complete.best().unwrap().score()
@@ -266,7 +273,7 @@ fn measure_starts_only_after_first_admission() {
         }
         // Completion must not add a speculative cancellation poll after the final score.
         let mut polls = 0;
-        let result = measure_fixture(used + 1, 0, pe)
+        let result = measure_fixture(0, pe)
             .run(
                 |_| {},
                 || {
@@ -280,13 +287,12 @@ fn measure_starts_only_after_first_admission() {
 }
 
 fn trie_fixture(
-    budget: u64,
     pe: bool,
     order: &[&str],
     base: Option<&str>,
     weight: i64,
 ) -> enigma_core::AttackRequest {
-    let mut value = fixture_value(budget, 0, pe);
+    let mut value = fixture_value(0, pe);
     value["job"]["text"] = serde_json::json!("🦀éΩ🦀");
     value["job"]["measures"] = serde_json::json!(["ic", "entropy", "trie"]);
     value["job"]["attack"]["initial_measure"] = serde_json::json!("entropy");
@@ -321,13 +327,13 @@ fn trie_composes_rankings_once_on_the_same_hc_and_pe_plaintext() {
     use enigma_core::{index_of_coincidence, shannon_entropy, Alphabet, MeasureId, SCALE};
     let alphabet = Alphabet::new("🦀éΩ中".chars().collect()).unwrap();
     for pe in [false, true] {
-        let before = trie_fixture(100, pe, &[], None, 3)
+        let before = trie_fixture(pe, &[], None, 3)
             .run(|_| {}, || false)
             .unwrap();
         let used = before.evaluations_used();
         for base in [None, Some("ic"), Some("entropy"), Some("trie")] {
             for weight in [-3, 3] {
-                let after = trie_fixture(used + 1, pe, &["trie"], base, weight)
+                let after = trie_fixture(pe, &["trie"], base, weight)
                     .run(|_| {}, || false)
                     .unwrap();
                 assert_eq!(after.termination(), AttackTermination::Completed);
@@ -363,6 +369,7 @@ fn trie_composes_rankings_once_on_the_same_hc_and_pe_plaintext() {
                 assert_eq!(best.score().ranking().units(), base_units + trie);
                 let (a, c, s, f, o) = counts(before.counters());
                 assert_eq!(counts(after.counters()), (a + 1, c + 1, s, f, o));
+                assert_eq!(after.evaluations_used(), used + 1);
                 let wire = serde_json::to_value(enigma_core::Event::result(&after, 0)).unwrap();
                 assert_eq!(
                     wire["stages"][0],
@@ -379,7 +386,7 @@ fn trie_composes_rankings_once_on_the_same_hc_and_pe_plaintext() {
 fn supported_stage_orders_share_allowance_and_cancellation_boundaries() {
     for pe in [false, true] {
         let mut prefix_polls = 0;
-        let before = trie_fixture(100, pe, &[], None, 3)
+        let before = trie_fixture(pe, &[], None, 3)
             .run(
                 |_| {},
                 || {
@@ -390,7 +397,7 @@ fn supported_stage_orders_share_allowance_and_cancellation_boundaries() {
             .unwrap();
         let used = before.evaluations_used();
         let mut polls = 0;
-        let cancelled = trie_fixture(used + 1, pe, &["trie"], None, 3)
+        let cancelled = trie_fixture(pe, &["trie"], None, 3)
             .run(
                 |_| {},
                 || {
@@ -403,11 +410,11 @@ fn supported_stage_orders_share_allowance_and_cancellation_boundaries() {
         assert!(cancelled.stages().is_empty());
         assert_eq!(cancelled.evaluations_used(), used);
         for order in [["measure", "trie"], ["trie", "measure"]] {
-            for extra in 0..=2 {
+            {
                 for cancel in [false, true] {
                     let mut polls = 0;
                     let mut last = None;
-                    let result = trie_fixture(used + extra, pe, &order, None, 3)
+                    let result = trie_fixture(pe, &order, None, 3)
                         .run(
                             |p| last = Some(p),
                             // Each scoring stage has one entry poll. The second
@@ -418,16 +425,14 @@ fn supported_stage_orders_share_allowance_and_cancellation_boundaries() {
                             },
                         )
                         .unwrap();
-                    let stages = if cancel { extra.min(1) } else { extra };
+                    let stages = if cancel { 1 } else { 2 };
                     assert_eq!(result.stages().len() as u64, stages);
                     assert_eq!(result.evaluations_used(), used + stages);
                     assert_eq!(last, Some(result.counters()));
                     assert_eq!(
                         result.termination(),
-                        if cancel && extra > 0 {
+                        if cancel {
                             AttackTermination::Cancelled
-                        } else if extra < 2 {
-                            AttackTermination::EvaluationBudget
                         } else {
                             AttackTermination::Completed
                         }
@@ -457,7 +462,7 @@ fn supported_stage_orders_share_allowance_and_cancellation_boundaries() {
             }
             // A pending cancellation after the final evaluation cannot undo completion.
             let mut polls = 0;
-            let result = trie_fixture(used + 2, pe, &order, None, 3)
+            let result = trie_fixture(pe, &order, None, 3)
                 .run(
                     |_| {},
                     || {
@@ -471,8 +476,8 @@ fn supported_stage_orders_share_allowance_and_cancellation_boundaries() {
     }
 }
 
-fn reswapping_fixture(budget: u64, pe: bool, order: &[&str]) -> enigma_core::AttackRequest {
-    let mut value = fixture_value(budget, 0, pe);
+fn reswapping_fixture(pe: bool, order: &[&str]) -> enigma_core::AttackRequest {
+    let mut value = fixture_value(0, pe);
     let passes = value["job"]["passes"].as_array_mut().unwrap();
     passes.extend(order.iter().map(|stage| serde_json::json!(stage)));
     value["job"]["measures"] = serde_json::json!(["ic", "entropy"]);
@@ -489,11 +494,11 @@ fn reswapping_climbs_the_hc_and_pe_winner_under_shared_accounting() {
     use enigma_core::MeasureId::Entropy;
     let alphabet = enigma_core::Alphabet::new("🦀éΩ中".chars().collect()).unwrap();
     for pe in [false, true] {
-        let before = fixture(100, 0, pe).run(|_| {}, || false).unwrap();
+        let before = fixture(0, pe).run(|_| {}, || false).unwrap();
         let (used, old) = (before.evaluations_used(), before.best().unwrap());
         for order in [&["reswapping"][..], &["measure", "reswapping"]] {
             let mut last = None;
-            let after = reswapping_fixture(used + 20, pe, order)
+            let after = reswapping_fixture(pe, order)
                 .run(|p| last = Some(p), || false)
                 .unwrap();
             assert_eq!(after.termination(), AttackTermination::Completed);
@@ -532,11 +537,11 @@ fn reswapping_climbs_the_hc_and_pe_winner_under_shared_accounting() {
 }
 
 #[test]
-fn reswapping_stops_mid_stage_or_before_start_on_budget_and_cancellation() {
-    use AttackTermination::{Cancelled, Completed, EvaluationBudget};
+fn reswapping_stops_mid_stage_or_before_start_on_cancellation() {
+    use AttackTermination::{Cancelled, Completed};
     for pe in [false, true] {
         let mut prefix_polls = 0;
-        let before = fixture(100, 0, pe)
+        let before = fixture(0, pe)
             .run(
                 |_| {},
                 || {
@@ -546,18 +551,18 @@ fn reswapping_stops_mid_stage_or_before_start_on_budget_and_cancellation() {
             )
             .unwrap();
         let used = before.evaluations_used();
-        let full = reswapping_fixture(used + 20, pe, &["reswapping"])
+        let full = reswapping_fixture(pe, &["reswapping"])
             .run(|_| {}, || false)
             .unwrap();
         let spent = full.stages()[0].evaluations_used();
         for extra in 0..=spent {
-            for cancel in [false, true] {
+            {
+                let cancel = true;
                 let mut polls = 0;
                 // Stage entry precedes all trials; each trial polls once before
                 // admission. Natural final exhaustion adds no speculative poll.
                 let stop_poll = prefix_polls + if extra == 0 { 1 } else { 2 + extra };
-                let budget = if cancel { used + 20 } else { used + extra };
-                let result = reswapping_fixture(budget, pe, &["reswapping"])
+                let result = reswapping_fixture(pe, &["reswapping"])
                     .run(
                         |_| {},
                         || {
@@ -570,8 +575,7 @@ fn reswapping_stops_mid_stage_or_before_start_on_budget_and_cancellation() {
                 if extra == 0 {
                     // Neither stop admits a first evaluation, so the stage never starts.
                     assert!(result.stages().is_empty());
-                    let stop = [EvaluationBudget, Cancelled][usize::from(cancel)];
-                    assert_eq!(result.termination(), stop);
+                    assert_eq!(result.termination(), Cancelled);
                     let score = |run: &AttackResult| run.best().unwrap().score();
                     assert_eq!(score(&result), score(&before));
                     continue;
@@ -583,7 +587,7 @@ fn reswapping_stops_mid_stage_or_before_start_on_budget_and_cancellation() {
                 let termination = match (extra == spent, cancel) {
                     (true, _) => Completed,
                     (_, true) => Cancelled,
-                    (_, false) => EvaluationBudget,
+                    (_, false) => unreachable!(),
                 };
                 assert_eq!(result.termination(), termination);
                 assert_eq!(stage.completed(), termination == Completed);
@@ -595,7 +599,7 @@ fn reswapping_stops_mid_stage_or_before_start_on_budget_and_cancellation() {
 #[test]
 fn reswapping_commits_a_strict_trie_improvement_over_the_hc_winner() {
     // A non-identity wheel makes plaintext board-dependent; IC ties keep the HC start.
-    let mut value = fixture_value(20, 0, false);
+    let mut value = fixture_value(0, false);
     value["machine"]["definition"]["value"]["wheels"][0]["wiring"] =
         serde_json::json!(["é", "🦀", "中", "Ω"]);
     value["job"]["measures"] = serde_json::json!(["ic", "trie"]);
@@ -627,13 +631,13 @@ fn reswapping_commits_a_strict_trie_improvement_over_the_hc_winner() {
     assert_eq!(after.termination(), AttackTermination::Completed);
 }
 
-fn fixture(budget: u64, offset: u64, pe: bool) -> enigma_core::AttackRequest {
-    enigma_core::AttackRequest::parse_json(&fixture_value(budget, offset, pe).to_string()).unwrap()
+fn fixture(offset: u64, pe: bool) -> enigma_core::AttackRequest {
+    enigma_core::AttackRequest::parse_json(&fixture_value(offset, pe).to_string()).unwrap()
 }
 
 #[test]
 fn public_run_preserves_absolute_selected_outer_index() {
-    let mut value = fixture_value(100, 1, false);
+    let mut value = fixture_value(1, false);
     value["job"]["configuration"]["slots"] = serde_json::json!([]);
     value["job"]["space"]["slots"] = serde_json::json!([
         {"id": "r", "positions": ["🦀", "é"], "rings": ["Ω"]}
@@ -662,7 +666,7 @@ fn counts(progress: AttackProgress) -> (u64, u64, u128, u128, u128) {
 
 #[test]
 fn public_run_projects_real_winner_and_terminal_observation() {
-    let request = fixture(100, 0, false);
+    let request = fixture(0, false);
     let mut snapshots = Vec::new();
     let result = request
         .run(|snapshot| snapshots.push(snapshot), || false)
@@ -699,7 +703,7 @@ fn public_run_projects_real_winner_and_terminal_observation() {
 
 #[test]
 fn public_run_restarts_after_cancel_and_after_completion() {
-    let request = fixture(100, 0, false);
+    let request = fixture(0, false);
     let mut last = None;
     let cancelled = request.run(|p| last = Some(p), || true).unwrap();
     assert_eq!(cancelled.termination(), AttackTermination::Cancelled);
@@ -719,9 +723,7 @@ fn public_run_restarts_after_cancel_and_after_completion() {
 #[test]
 fn public_run_empty_slice_beats_cancellation() {
     let mut last = None;
-    let result = fixture(1, 1, false)
-        .run(|p| last = Some(p), || true)
-        .unwrap();
+    let result = fixture(1, false).run(|p| last = Some(p), || true).unwrap();
     assert_eq!(result.termination(), AttackTermination::OuterSliceEnd);
     assert_eq!(counts(result.counters()), (0, 0, 0, 0, 0));
     assert_eq!(result.evaluations_used(), 0);
@@ -730,27 +732,9 @@ fn public_run_empty_slice_beats_cancellation() {
 }
 
 #[test]
-fn public_run_budget_stop_and_exact_budget_completion() {
-    for (budget, termination, expected) in [
-        (1, AttackTermination::EvaluationBudget, (1, 1, 1, 0, 0)),
-        (2, AttackTermination::Completed, (2, 2, 1, 1, 1)),
-    ] {
-        let mut last = None;
-        let result = fixture(budget, 0, false)
-            .run(|p| last = Some(p), || false)
-            .unwrap();
-        assert_eq!(result.termination(), termination);
-        assert_eq!(counts(result.counters()), expected);
-        assert_eq!(result.evaluations_used(), budget);
-        assert_eq!(last, Some(result.counters()));
-        assert_eq!(result.best().unwrap().incomplete(), budget == 1);
-    }
-}
-
-#[test]
 fn public_pe_projects_unicode_mutable_winner() {
     let mut last = None;
-    let mut value = fixture_value(100, 0, true);
+    let mut value = fixture_value(0, true);
     value["machine"]["definition"]["value"]["wheels"][0]["wiring"] =
         serde_json::json!(["é", "🦀", "Ω", "中"]);
     value["job"]["measures"] = serde_json::json!(["trie"]);

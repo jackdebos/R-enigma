@@ -552,7 +552,7 @@ mod tests {
         value["job"]["space"]["plugboard"] =
             json!({"kind":"attack","symbols":["A","B","C","D"],"max_pairs":2});
         value["job"]["attack"] = json!({"kind":pass,"initial_measure":"ic","final_measure":"ic",
-            "switch_pairs":1,"backtrack_pairs":0,"evaluation_budget":1});
+            "switch_pairs":1,"backtrack_pairs":0});
         if pass == "hill_climb" {
             value["job"]["attack"]["start"] = json!([]);
         } else {
@@ -595,7 +595,7 @@ mod tests {
         let base = attack_request("hill_climb", "all");
         for (pointer, replacement) in [
             ("/job/attack/start", json!([["A", "A"]])),
-            ("/job/attack/evaluation_budget", json!(0)),
+            ("/job/attack/switch_pairs", json!(-1)),
             ("/job/text", json!("Z")),
             ("/job/passes", json!(["partial_exhaustion"])),
             ("/job/space/plugboard/symbols", json!(["A", "A"])),

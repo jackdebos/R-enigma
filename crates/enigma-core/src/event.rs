@@ -273,8 +273,6 @@ pub enum DoneReason {
     Completed,
     /// The requested outer slice was empty.
     OuterSliceEnd,
-    /// Evaluation allowance prevented remaining work.
-    EvaluationBudget,
     /// Cooperative cancellation stopped remaining work.
     Cancelled,
 }
@@ -284,7 +282,6 @@ impl From<AttackTermination> for DoneReason {
         match termination {
             AttackTermination::Completed => Self::Completed,
             AttackTermination::OuterSliceEnd => Self::OuterSliceEnd,
-            AttackTermination::EvaluationBudget => Self::EvaluationBudget,
             AttackTermination::Cancelled => Self::Cancelled,
         }
     }
@@ -474,7 +471,7 @@ mod tests {
                     "plugboard": [["中", "é"]]}, "text": "🦀🦀", "measures": ["ic"], "passes": ["hill_climb"],
                 "space": {"offset": offset, "plugboard": {"kind": "attack", "symbols": ["🦀", "Ω"], "max_pairs": 2}},
                 "attack": {"kind": "hill_climb", "initial_measure": "ic", "final_measure": "ic",
-                    "switch_pairs": 2, "backtrack_pairs": 2, "evaluation_budget": 100, "start": [["Ω", "🦀"]]}
+                    "switch_pairs": 2, "backtrack_pairs": 2, "start": [["Ω", "🦀"]]}
             }
         });
         if pe {
@@ -933,11 +930,6 @@ mod tests {
                 AttackTermination::OuterSliceEnd,
                 DoneReason::OuterSliceEnd,
                 "outer_slice_end",
-            ),
-            (
-                AttackTermination::EvaluationBudget,
-                DoneReason::EvaluationBudget,
-                "evaluation_budget",
             ),
             (
                 AttackTermination::Cancelled,

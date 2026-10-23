@@ -429,7 +429,7 @@ mod attack_tests {
                 "plugboard":{"kind":"attack","symbols":["A","B"],"max_pairs":1}},
             "text":"AA","passes":["hill_climb"],"measures":["ic"],"resources":{},
             "attack":{"kind":"hill_climb","initial_measure":"ic","final_measure":"ic",
-                "switch_pairs":1,"backtrack_pairs":0,"evaluation_budget":1,"start":[]}}})
+                "switch_pairs":1,"backtrack_pairs":0,"start":[]}}})
     }
 
     fn check(value: &Value, origin: &Path, code: &str, location: &str) -> Value {
@@ -751,8 +751,7 @@ mod attack_tests {
     #[test]
     fn cancel_marker_is_polled_after_started() {
         let dir = cancel_file::test_support::tempdir().unwrap();
-        for (index, mut value) in [request(), partial("all")].into_iter().enumerate() {
-            value["job"]["attack"]["evaluation_budget"] = json!(100);
+        for (index, value) in [request(), partial("all")].into_iter().enumerate() {
             for (kind, exit) in [("file", ExitCode::SUCCESS), ("dir", ExitCode::FAILURE)] {
                 let path = dir.path().join(format!("{kind}-{index}"));
                 let mut out = Writer(
@@ -775,8 +774,7 @@ mod attack_tests {
     #[test]
     fn signal_flag_requests_the_same_safe_stop() {
         let dir = cancel_file::test_support::tempdir().unwrap();
-        for (index, mut value) in [request(), partial("all")].into_iter().enumerate() {
-            value["job"]["attack"]["evaluation_budget"] = json!(100);
+        for (index, value) in [request(), partial("all")].into_iter().enumerate() {
             // (flag pre-set, marker turned into a directory on first write, exit)
             for (preset, marker, exit) in [
                 (false, false, ExitCode::SUCCESS),

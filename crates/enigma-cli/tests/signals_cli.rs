@@ -26,7 +26,7 @@ fn long_attack() -> Value {
             "plugboard":{"kind":"attack","symbols":alphabet,"max_pairs":10}},
         "text":"QWERTYUIOPASDFGHJKLZXCVBNM".repeat(8),"passes":["hill_climb"],"measures":["ic"],"resources":{},
         "attack":{"kind":"hill_climb","initial_measure":"ic","final_measure":"ic","switch_pairs":10,
-            "backtrack_pairs":0,"evaluation_budget":1_000_000_000_000_u64,"start":[]}}})
+            "backtrack_pairs":0,"start":[]}}})
 }
 
 /// Sends `signal` once `started` is read, then checks the cancelled lifecycle and exit 0.

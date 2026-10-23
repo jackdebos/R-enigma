@@ -387,7 +387,6 @@ pub struct AttackSettings {
     final_measure: MeasureId,
     switch_pairs: usize,
     backtrack_pairs: usize,
-    evaluation_budget: u64,
     progress_every: u64,
     hold_capacity: usize,
     initialization: AttackInitialization,
@@ -400,7 +399,7 @@ impl AttackSettings {
     ///
     /// Supports direct hill-climb starts and partial-exhaustion seed policies only.
     /// This boundary checks neither resources nor text lengths,
-    /// execution eligibility, counts or whether the budget permits a complete run.
+    /// execution eligibility or counts.
     pub fn parse_json(
         alphabet: &Alphabet,
         domain: &AttackPlugboardDomain,
@@ -455,7 +454,6 @@ impl AttackSettings {
                 "final_measure",
                 "switch_pairs",
                 "backtrack_pairs",
-                "evaluation_budget",
                 "progress_every",
                 "hold",
                 "start",
@@ -528,15 +526,6 @@ impl AttackSettings {
                     )]
                 })
         })?;
-        let evaluation_budget = required(settings, "evaluation_budget", PATH)?
-            .as_u64()
-            .filter(|&budget| budget > 0)
-            .ok_or_else(|| {
-                vec![invalid(
-                    "evaluation_budget must be a positive u64 integer",
-                    child(PATH, "evaluation_budget"),
-                )]
-            })?;
         let progress_every = settings
             .get("progress_every")
             .map_or(Ok(100_000), |value| {
@@ -648,7 +637,6 @@ impl AttackSettings {
             final_measure,
             switch_pairs,
             backtrack_pairs,
-            evaluation_budget,
             progress_every,
             hold_capacity,
             initialization,
@@ -682,10 +670,6 @@ impl AttackSettings {
         self.progress_every
     }
 
-    /// Positive whole-run evaluation budget; syntax, not execution feasibility.
-    pub fn evaluation_budget(&self) -> u64 {
-        self.evaluation_budget
-    }
     /// Finalist capacity in [1, 1000], defaulting to 100 when omitted.
     pub fn hold_capacity(&self) -> usize {
         self.hold_capacity
@@ -2115,7 +2099,7 @@ mod tests {
         .unwrap();
         let value = json!({"kind":"hill_climb", "initial_measure":"ic",
             "final_measure":"entropy", "switch_pairs":3, "backtrack_pairs":0,
-            "evaluation_budget":1, "start":[["🦀","é"]]});
+            "start":[["🦀","é"]]});
         (alphabet, domain, value)
     }
 
@@ -2221,7 +2205,6 @@ mod tests {
         assert_eq!(settings.final_measure(), MeasureId::Entropy);
         assert_eq!(settings.switch_pairs(), 3);
         assert_eq!(settings.backtrack_pairs(), 0);
-        assert_eq!(settings.evaluation_budget(), 1);
 
         let (alphabet, domain, mut value) = seed_fixture();
         for (policy, expected) in [
@@ -2508,29 +2491,25 @@ mod tests {
     }
 
     #[test]
-    fn settings_valid_objectives_thresholds_budget_and_order() {
+    fn settings_valid_objectives_thresholds_and_order() {
         let (alphabet, domain, mut value) = settings_fixture();
         for final_measure in ["ic", "entropy"] {
-            for budget in [1, u64::MAX] {
-                value["final_measure"] = json!(final_measure);
-                value["evaluation_budget"] = json!(budget);
-                let settings = AttackSettings::parse_json(
-                    &alphabet,
-                    &domain,
-                    &["hill_climb".to_owned()],
-                    &[MeasureId::Ic, MeasureId::Entropy, MeasureId::Trie],
-                    &value.to_string(),
-                )
-                .unwrap();
-                assert_eq!(settings.kind(), AttackKind::HillClimb);
-                assert_eq!(settings.initial_measure(), MeasureId::Ic);
-                assert_eq!(settings.final_measure().id(), final_measure);
-                assert_eq!(settings.switch_pairs(), 3);
-                assert_eq!(settings.backtrack_pairs(), 0);
-                assert_eq!(settings.evaluation_budget(), budget);
-                assert_eq!(settings.start(), Some(&[('🦀', 'é')][..]));
-                assert_eq!(settings.seed_policy(), None);
-            }
+            value["final_measure"] = json!(final_measure);
+            let settings = AttackSettings::parse_json(
+                &alphabet,
+                &domain,
+                &["hill_climb".to_owned()],
+                &[MeasureId::Ic, MeasureId::Entropy, MeasureId::Trie],
+                &value.to_string(),
+            )
+            .unwrap();
+            assert_eq!(settings.kind(), AttackKind::HillClimb);
+            assert_eq!(settings.initial_measure(), MeasureId::Ic);
+            assert_eq!(settings.final_measure().id(), final_measure);
+            assert_eq!(settings.switch_pairs(), 3);
+            assert_eq!(settings.backtrack_pairs(), 0);
+            assert_eq!(settings.start(), Some(&[('🦀', 'é')][..]));
+            assert_eq!(settings.seed_policy(), None);
         }
         value["start"] = json!([]);
         value["switch_pairs"] = json!(0);
@@ -2554,7 +2533,6 @@ mod tests {
             "final_measure",
             "switch_pairs",
             "backtrack_pairs",
-            "evaluation_budget",
             "start",
         ] {
             let mut value = base.clone();
@@ -2584,21 +2562,8 @@ mod tests {
     #[test]
     fn settings_integer_lexemes_and_start_conflicts() {
         let (alphabet, domain, base) = settings_fixture();
-        for key in ["evaluation_budget", "switch_pairs", "backtrack_pairs"] {
-            let bad = if key == "evaluation_budget" {
-                vec![
-                    "0",
-                    "-1",
-                    "-0",
-                    "1.0",
-                    "1e0",
-                    "true",
-                    "\"1\"",
-                    "18446744073709551616",
-                ]
-            } else {
-                vec!["4", "-1", "-0", "1.0", "1e0", "false", "\"1\""]
-            };
+        for key in ["switch_pairs", "backtrack_pairs"] {
+            let bad = ["4", "-1", "-0", "1.0", "1e0", "false", "\"1\""];
             for literal in bad {
                 let mut value = base.clone();
                 value[key] = json!("REPLACE");
@@ -2611,15 +2576,7 @@ mod tests {
                     &raw,
                 )
                 .unwrap_err();
-                assert_eq!(
-                    errors[0].code(),
-                    if key == "evaluation_budget" {
-                        "invalid_request"
-                    } else {
-                        "invalid_search_space"
-                    },
-                    "{raw}"
-                );
+                assert_eq!(errors[0].code(), "invalid_search_space", "{raw}");
                 assert_eq!(errors[0].location(), format!("/job/attack/{key}"));
             }
         }
@@ -3214,7 +3171,7 @@ mod tests {
             json!({"kind":"attack","symbols":["A","B"],"max_pairs":1});
         assert!(ParsedSearchRequest::parse_json(&value.to_string()).is_err());
         assert!(SearchRequest::parse_json(&value.to_string()).is_err());
-        value["job"]["attack"] = json!({"kind":"hill_climb","initial_measure":"ic","final_measure":"ic","switch_pairs":1,"backtrack_pairs":0,"evaluation_budget":1,"start":[]});
+        value["job"]["attack"] = json!({"kind":"hill_climb","initial_measure":"ic","final_measure":"ic","switch_pairs":1,"backtrack_pairs":0,"start":[]});
         assert!(ParsedSearchRequest::parse_json(&value.to_string()).is_err());
         assert!(SearchRequest::parse_json(&value.to_string()).is_err());
         let json =
@@ -3439,7 +3396,7 @@ mod tests {
             json!({"kind": "attack", "symbols": ["D", "C", "B", "A"], "max_pairs": 2});
         value["job"]["attack"] = json!({
             "kind": "hill_climb", "initial_measure": "ic", "final_measure": "ic",
-            "switch_pairs": 1, "backtrack_pairs": 0, "evaluation_budget": 9,
+            "switch_pairs": 1, "backtrack_pairs": 0,
             "start": [["D", "C"]]
         });
         value
@@ -3450,9 +3407,9 @@ mod tests {
         for (pointer, replacement, expected) in [
             ("/job/text", json!("A"), ("invalid_text", "/job/text")),
             (
-                "/job/attack/evaluation_budget",
+                "/job/attack/progress_every",
                 json!(0),
-                ("invalid_request", "/job/attack/evaluation_budget"),
+                ("invalid_request", "/job/attack/progress_every"),
             ),
             (
                 "/job/resources",
@@ -3519,10 +3476,7 @@ mod tests {
         // PRIVATE evaluator invariant injection: not a valid promoted request.
         request.carrier.parsed.text = "AZ".to_owned();
         let initial = request.outer_candidates().next().unwrap().1.unwrap();
-        let mut allowance = EvaluationAllowance {
-            used: 3,
-            limit: 100,
-        };
+        let mut allowance = EvaluationAllowance { used: 3 };
         let index = u128::from(u64::MAX) + 91;
         let error = request
             .climb_partial_outer(initial, index, &mut allowance)
@@ -3545,10 +3499,7 @@ mod tests {
         let mut request = AttackRequest::parse_json(&attack_request().to_string()).unwrap();
         request.carrier.parsed.text = "AZ".to_owned();
         let initial = request.outer_candidates().next().unwrap().1.unwrap();
-        let mut allowance = EvaluationAllowance {
-            used: 3,
-            limit: 100,
-        };
+        let mut allowance = EvaluationAllowance { used: 3 };
         let error = request
             .climb_direct_outer(initial, 91, &mut allowance)
             .unwrap_err();
@@ -3821,10 +3772,46 @@ mod tests {
     }
 
     #[test]
+    fn public_attack_rejects_removed_evaluation_budget() {
+        for pe in [false, true] {
+            let mut value = attack_request();
+            if pe {
+                value["job"]["passes"] = json!(["partial_exhaustion"]);
+                let attack = value["job"]["attack"].as_object_mut().unwrap();
+                attack.insert("kind".into(), json!("partial_exhaustion"));
+                attack.remove("start");
+                attack.insert(
+                    "seeds".into(),
+                    json!({"kind":"empty_single", "selection":"all"}),
+                );
+            }
+            for budget in [json!(1), json!(u64::MAX), json!(0), json!(null)] {
+                value["job"]["attack"]["evaluation_budget"] = budget;
+                let raw = value.to_string();
+                let parsed = crate::ParsedAttackRequest::parse_json(&raw);
+                assert!(parsed.is_err(), "removed field accepted: {raw}");
+                let errors = parsed.unwrap_err();
+                assert_eq!(errors.len(), 1);
+                assert_eq!(
+                    (errors[0].code(), errors[0].location()),
+                    ("unknown_field", "/job/attack/evaluation_budget"),
+                    "{raw}"
+                );
+                let errors = crate::AttackRequest::parse_json(&raw).unwrap_err();
+                assert_eq!(errors.len(), 1);
+                assert_eq!(
+                    (errors[0].code(), errors[0].location()),
+                    ("unknown_field", "/job/attack/evaluation_budget"),
+                    "{raw}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn public_attack_promotion_and_counts() {
         for (selection, starts) in [(None, 1), (Some("all"), 7), (Some("touching"), 4)] {
             let mut value = attack_request();
-            value["job"]["attack"]["evaluation_budget"] = json!(1);
             if let Some(selection) = selection {
                 value["job"]["passes"] = json!(["partial_exhaustion"]);
                 value["job"]["attack"]
@@ -3861,7 +3848,6 @@ mod tests {
                         ),
                         (4, selected, starts)
                     );
-                    assert_eq!(request.settings().evaluation_budget(), 1);
                     assert!(request.bound_resource(MeasureId::Ic).is_none());
                 }
             }
@@ -4011,7 +3997,7 @@ mod tests {
         }
         for (field, code) in [
             ("switch_pairs", "invalid_search_space"),
-            ("evaluation_budget", "invalid_request"),
+            ("progress_every", "invalid_request"),
         ] {
             let mut value = attack_request();
             value["job"]["attack"][field] = json!(-1);
@@ -4187,7 +4173,6 @@ mod tests {
                     "final_measure",
                     "switch_pairs",
                     "backtrack_pairs",
-                    "evaluation_budget",
                     "start",
                 ][..],
                 "invalid_request",
@@ -4330,12 +4315,12 @@ mod tests {
         );
         value = attack_request();
         value["job"]["resources"] = json!({"ic": {"path": "unused"}});
-        value["job"]["attack"]["evaluation_budget"] = json!(0);
+        value["job"]["attack"]["progress_every"] = json!(0);
         assert_eq!(
             attack_error(&value),
             (
                 "invalid_request".into(),
-                "/job/attack/evaluation_budget".into()
+                "/job/attack/progress_every".into()
             )
         );
     }
@@ -4433,7 +4418,7 @@ mod tests {
         for needle in [
             "\"protocol_version\":1",
             "\"max_pairs\":2",
-            "\"evaluation_budget\":9",
+            "\"switch_pairs\":1",
         ] {
             let duplicate = raw.replace(needle, &format!("{needle},{needle}"));
             let error = ParsedAttackRequest::parse_json(&duplicate)

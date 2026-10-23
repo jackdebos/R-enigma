@@ -97,7 +97,7 @@ impl<W: Write, M: FnMut() -> Duration, U: FnMut() -> String> Transport<W, M, U> 
     }
 }
 
-/// Called only after parsing, binding and all Core eligibility/budget preflight.
+/// Called only after parsing, binding and all Core eligibility preflight.
 /// External cancellation is independently polled and sticky, as is delivery failure.
 pub(super) fn run(
     request: &AttackRequest,
@@ -118,7 +118,7 @@ pub(super) fn run(
         },
     );
     let mut transport = transport.into_inner();
-    // Measure after run: Core's reserved final rescore is included.
+    // Measure after run: Core's required final rescore is included.
     let elapsed = transport.elapsed();
     match result {
         Ok(result) => transport.finish(
@@ -143,20 +143,15 @@ mod tests {
     use super::*;
     use serde_json::{json, Value};
 
-    fn request(pe: bool, budget: u64) -> AttackRequest {
-        request_with_objectives(pe, budget, false)
+    fn request(pe: bool) -> AttackRequest {
+        request_with_objectives(pe, false)
     }
 
-    fn request_with_objectives(pe: bool, budget: u64, rescore: bool) -> AttackRequest {
-        request_with_progress(pe, budget, rescore, 100_000)
+    fn request_with_objectives(pe: bool, rescore: bool) -> AttackRequest {
+        request_with_progress(pe, rescore, 100_000)
     }
 
-    fn request_with_progress(
-        pe: bool,
-        budget: u64,
-        rescore: bool,
-        progress_every: u64,
-    ) -> AttackRequest {
+    fn request_with_progress(pe: bool, rescore: bool, progress_every: u64) -> AttackRequest {
         let mut value = json!({
             "protocol_version": 1,
             "machine": {"definition": {"kind": "custom", "value": {
@@ -170,7 +165,7 @@ mod tests {
                 "configuration": {"slots": [{"id": "r", "position": "A", "ring": "A"}], "plugboard": []},
                 "space": {"plugboard": {"kind": "attack", "symbols": ["A", "B"], "max_pairs": 1}},
                 "attack": {"kind": "hill_climb", "initial_measure": "ic", "final_measure": "ic",
-                    "switch_pairs": 1, "backtrack_pairs": 1, "evaluation_budget": budget, "progress_every": progress_every, "start": []}
+                    "switch_pairs": 1, "backtrack_pairs": 1, "progress_every": progress_every, "start": []}
             }
         });
         if pe {
@@ -191,10 +186,7 @@ mod tests {
     }
 
     fn snapshot() -> AttackProgress {
-        request(false, 100)
-            .run(|_| {}, || false)
-            .unwrap()
-            .counters()
+        request(false).run(|_| {}, || false).unwrap().counters()
     }
 
     fn lines(bytes: &[u8]) -> Vec<Value> {
@@ -267,7 +259,7 @@ mod tests {
     #[test]
     fn real_hc_pe_lifecycle_and_wall_clock_independence() {
         for pe in [false, true] {
-            let request = request(pe, 100);
+            let request = request(pe);
             let expected = request.run(|_| {}, || false).unwrap();
             let mut writer = Writer::default();
             let wall = Cell::new(0);
@@ -316,8 +308,8 @@ mod tests {
     #[test]
     fn core_grid_is_forwarded_exactly_with_one_clock_read_per_progress() {
         for pe in [false, true] {
-            for budget in [1, 3, 6, 100] {
-                let request = request_with_progress(pe, budget, false, 3);
+            for every in [1, 3, 6, 100] {
+                let request = request_with_progress(pe, false, every);
                 let mut core = Vec::new();
                 let expected = request.run(|p| core.push(p), || false).unwrap();
                 let clock_calls = Cell::new(0u64);
@@ -358,7 +350,7 @@ mod tests {
                 if expected
                     .counters()
                     .evaluations_completed()
-                    .is_multiple_of(3)
+                    .is_multiple_of(every)
                 {
                     assert_eq!(
                         core[core.len() - 2].evaluations_completed(),
@@ -372,7 +364,8 @@ mod tests {
     #[test]
     fn terminal_elapsed_is_measured_after_final_rescore() {
         let clock = Cell::new(0);
-        let request = request_with_objectives(false, 2, true);
+        let request = request_with_objectives(false, true);
+        let polls = Cell::new(0);
         let mut output = Vec::new();
         run(
             &request,
@@ -383,7 +376,10 @@ mod tests {
                 Duration::from_millis(now)
             },
             || "UTC".into(),
-            || false,
+            || {
+                polls.set(polls.get() + 1);
+                polls.get() == 3
+            },
         )
         .unwrap();
         let events = lines(&output);
@@ -396,7 +392,7 @@ mod tests {
         assert_eq!(clock.get(), 68); // entry, initial, terminal, result: no per-trial reads
         assert_eq!(result["counters"]["evaluations_completed"], "2");
         assert_eq!(result["best"]["score"]["measure"], "entropy");
-        assert_eq!(events.last().unwrap()["reason"], "evaluation_budget");
+        assert_eq!(events.last().unwrap()["reason"], "cancelled");
     }
 
     #[test]
@@ -418,7 +414,7 @@ mod tests {
                     ..Writer::default()
                 };
                 let failure = run(
-                    &request(false, 100),
+                    &request(false),
                     &mut writer,
                     || Duration::ZERO,
                     || "UTC".into(),
@@ -448,7 +444,7 @@ mod tests {
         let mut output = Vec::new();
         let polls = Cell::new(0);
         run(
-            &request(false, 100),
+            &request(false),
             &mut output,
             || Duration::ZERO,
             || "UTC".into(),
@@ -481,7 +477,7 @@ mod tests {
             ..Writer::default()
         };
         let failure = run(
-            &request(true, 100),
+            &request(true),
             &mut writer,
             || Duration::ZERO,
             || "UTC".into(),
@@ -501,7 +497,7 @@ mod tests {
             let mut output = Vec::new();
             let polls = Cell::new(0);
             run(
-                &request(pe, 100),
+                &request(pe),
                 &mut output,
                 || Duration::ZERO,
                 || "UTC".into(),
@@ -524,9 +520,9 @@ mod tests {
     }
 
     #[test]
-    fn latched_transport_cancellation_permits_reserved_final_rescore() {
+    fn latched_transport_cancellation_permits_required_final_rescore() {
         // Fail the first completed-evaluation cadence delivery (X = 1).
-        // Reserved finalization must still finish after cancellation is latched.
+        // Required finalization must still finish after cancellation is latched.
         struct FailAfterAdmission {
             last: Cell<u64>,
             writes: Cell<usize>,
@@ -551,7 +547,7 @@ mod tests {
         };
         let clock = Cell::new(0);
         let failure = run(
-            &request_with_progress(false, 100, true, 1),
+            &request_with_progress(false, true, 1),
             &writer,
             || {
                 let now = clock.get();
@@ -568,10 +564,10 @@ mod tests {
         assert_eq!(clock.get() / 250, 4); // entry, initial, failed cadence, result
         assert_eq!(writer.writes.get(), 3);
 
-        // Real Core evidence: cancellation after completion still completes the reserved
+        // Real Core evidence: cancellation after completion still completes the required
         // initial/final evaluation and retains the committed winner, never a trial.
         let admitted = Cell::new(false);
-        let result = request_with_progress(false, 100, true, 1)
+        let result = request_with_progress(false, true, 1)
             .run(
                 |progress| admitted.set(progress.evaluations_admitted() > 0),
                 || admitted.get(),
@@ -599,7 +595,7 @@ mod tests {
                 let mut transport = Transport::new(&mut writer, || Duration::ZERO, || "UTC".into());
                 transport.emit(Event::Started);
                 let mut initial = None;
-                let expected = request(false, 100)
+                let expected = request(false)
                     .run(
                         |p| {
                             initial.get_or_insert(p);

@@ -283,7 +283,7 @@ fn complete_attack_routes_before_resource_loading() {
     let mut r = request(&["ic", "trie"]);
     r["job"]["space"]["plugboard"] = json!({"kind":"attack","symbols":["A","B"],"max_pairs":1});
     r["job"]["attack"] = json!({"kind":"hill_climb","initial_measure":"ic","final_measure":"ic",
-        "switch_pairs":1,"backtrack_pairs":0,"evaluation_budget":1,"start":[]});
+        "switch_pairs":1,"backtrack_pairs":0,"start":[]});
     enigma_core::ParsedAttackRequest::parse_json(&r.to_string()).unwrap();
     error(
         f.stdin(&r),
@@ -308,7 +308,7 @@ fn attack(pass: &str, selection: &str, ids: &[&str]) -> Value {
     r["job"]["passes"] = json!([pass]);
     r["job"]["space"]["plugboard"] = json!({"kind":"attack","symbols":["A","B"],"max_pairs":1});
     r["job"]["attack"] = json!({"kind":pass,"initial_measure":ids[0],"final_measure":ids[0],
-        "switch_pairs":1,"backtrack_pairs":0,"evaluation_budget":1});
+        "switch_pairs":1,"backtrack_pairs":0});
     if pass == "hill_climb" {
         r["job"]["attack"]["start"] = json!([]);
     } else {
@@ -417,12 +417,7 @@ fn public_attack_structural_diagnostics_precede_loading() {
         ),
         ("hill_climb", "all", "/job/attack/seeds", json!({})),
         ("hill_climb", "all", "/job/attack/extra", json!(true)),
-        (
-            "hill_climb",
-            "all",
-            "/job/attack/evaluation_budget",
-            json!(0),
-        ),
+        ("hill_climb", "all", "/job/attack/progress_every", json!(0)),
         ("hill_climb", "all", "/job/text", json!("Z")),
         (
             "hill_climb",
@@ -619,7 +614,7 @@ fn cancel_file_inspection_follows_request_and_resource_validation() {
 }
 
 /// Core's chained-stage fixture: HC or PE, then `stages`; the trie dictionary is `words.json`.
-fn staged(budget: u64, pe: bool, stages: &[&str]) -> Value {
+fn staged(pe: bool, stages: &[&str]) -> Value {
     let alphabet = ["🦀", "é", "Ω", "中"];
     let mut r = json!({"protocol_version":1,"machine":{"definition":{"kind":"custom","value":{
         "alphabet":alphabet,"wheels":[{"name":"r","wiring":alphabet,"turnovers":[]}],
@@ -629,7 +624,7 @@ fn staged(budget: u64, pe: bool, stages: &[&str]) -> Value {
         "passes":["hill_climb"],"resources":{"trie":{"path":"words.json"}},
         "space":{"plugboard":{"kind":"attack","symbols":["🦀","Ω"],"max_pairs":2}},
         "attack":{"kind":"hill_climb","initial_measure":"ic","final_measure":"ic","switch_pairs":2,
-        "backtrack_pairs":2,"evaluation_budget":budget,"start":[["Ω","🦀"]]}}});
+        "backtrack_pairs":2,"start":[["Ω","🦀"]]}}});
     if pe {
         r["job"]["passes"] = json!(["partial_exhaustion"]);
         let attack = r["job"]["attack"].as_object_mut().unwrap();
@@ -698,7 +693,7 @@ fn public_staged_pipelines_match_core_projection() {
             &["measure", "trie"],
             &["reswapping"],
         ] {
-            let events = core_match(&f, &staged(100, pe, stages));
+            let events = core_match(&f, &staged(pe, stages));
             let history: Vec<_> = events[events.len() - 2]["stages"]
                 .as_array()
                 .unwrap()
@@ -719,7 +714,7 @@ fn public_hold_staged_capacities_and_default_match_core() {
     for pe in [false, true] {
         let mut default_result = None;
         for capacity in [Some(1), Some(3), None, Some(100)] {
-            let mut request = staged(100, pe, &["measure", "trie"]);
+            let mut request = staged(pe, &["measure", "trie"]);
             request["job"]["configuration"]["slots"][0]
                 .as_object_mut()
                 .unwrap()
@@ -828,7 +823,7 @@ fn public_reswapping_improves_trie_winner_on_the_wire() {
     // Core's strict-improvement case: a non-identity wheel makes plaintext board-dependent.
     let f = Fixture::new();
     f.write("words.json", words("é"));
-    let mut r = staged(20, false, &["reswapping"]);
+    let mut r = staged(false, &["reswapping"]);
     r["machine"]["definition"]["value"]["wheels"][0]["wiring"] = json!(["é", "🦀", "中", "Ω"]);
     r["job"]["text"] = json!("🦀🦀");
     r["job"]["measures"] = json!(["ic", "trie"]);
@@ -845,36 +840,13 @@ fn public_reswapping_improves_trie_winner_on_the_wire() {
 }
 
 #[test]
-fn public_hold_staged_budget_and_cancel_file_boundaries() {
+fn public_hold_staged_cancel_file_boundaries() {
     let f = Fixture::new();
     f.write("words.json", words("🦀"));
     f.write("marker", "");
     let result = |events: &[Value]| events[events.len() - 2].clone();
-    let used = |result: &Value| -> u64 {
-        let text = result["counters"]["evaluations_completed"].as_str();
-        text.unwrap().parse().unwrap()
-    };
-    let base = used(&result(&core_match(&f, &staged(100, false, &[]))));
-    let full = result(&core_match(&f, &staged(100, false, &["reswapping"])));
-    assert!(
-        used(&full) > base + 1,
-        "reswapping needs a mid-stage budget"
-    );
-    // One admitted stage evaluation stops mid-stage with an incomplete history entry.
-    let events = core_match(&f, &staged(base + 1, false, &["reswapping"]));
-    let stage = &result(&events)["stages"][0];
-    assert_eq!(
-        (&stage["evaluations_used"], &stage["completed"]),
-        (&json!("1"), &json!(false))
-    );
-    assert_eq!(events.last().unwrap()["reason"], "evaluation_budget");
     for pe in [false, true] {
-        let base = used(&result(&core_match(&f, &staged(100, pe, &[]))));
-        // An exhausted allowance admits no stage evaluation, so no stage starts.
-        let events = core_match(&f, &staged(base, pe, &["measure", "reswapping"]));
-        assert_eq!(result(&events)["stages"], json!([]));
-        assert_eq!(events.last().unwrap()["reason"], "evaluation_budget");
-        let request = staged(100, pe, &["measure", "reswapping"]);
+        let request = staged(pe, &["measure", "reswapping"]);
         let events = attack_events(&f.stdin_with(&request, &["--cancel-file", "marker"]));
         let cancelled = result(&events);
         assert_eq!(cancelled["hold"], json!([]));
@@ -892,16 +864,16 @@ fn public_staged_preflight_precedence() {
     // Gate-ordering proof: words.json is absent, and every error beats a cancel marker.
     let f = Fixture::new();
     f.write("marker", "");
-    let mut undeclared = staged(100, false, &["reswapping"]);
+    let mut undeclared = staged(false, &["reswapping"]);
     undeclared["job"]["attack"]["reswapping"]["measure"] = json!("sinkov_bigram");
-    let mut defaulted = staged(100, false, &["reswapping"]);
+    let mut defaulted = staged(false, &["reswapping"]);
     defaulted["job"]["attack"]
         .as_object_mut()
         .unwrap()
         .remove("reswapping");
     let mut overflow = outer_attack(8, false);
     overflow["job"]["passes"] = json!(["hill_climb", "measure"]);
-    let mut first = staged(100, false, &["reswapping"]);
+    let mut first = staged(false, &["reswapping"]);
     first["job"]["passes"] = json!(["reswapping", "hill_climb"]);
     // Parse-time rows fail before loading; the others fail in load or bind.
     for (r, parse_time, code, location) in [
@@ -913,7 +885,7 @@ fn public_staged_preflight_precedence() {
         ),
         (&defaulted, true, "invalid_request", "/job/passes/1"),
         (
-            &staged(100, false, &["trie"]),
+            &staged(false, &["trie"]),
             false,
             "unsupported_resource",
             "/job/resources/trie/path",

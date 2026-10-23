@@ -37,8 +37,6 @@ pub enum AttackTermination {
     Completed,
     /// The requested outer slice was empty.
     OuterSliceEnd,
-    /// Allowance prevented remaining work.
-    EvaluationBudget,
     /// Cooperative cancellation stopped remaining work.
     Cancelled,
 }
@@ -611,7 +609,6 @@ pub(crate) mod tests {
         for termination in [
             AttackTermination::Completed,
             AttackTermination::OuterSliceEnd,
-            AttackTermination::EvaluationBudget,
             AttackTermination::Cancelled,
         ] {
             let result = AttackResult {

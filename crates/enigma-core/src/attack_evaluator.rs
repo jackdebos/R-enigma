@@ -2158,7 +2158,7 @@ mod tests {
             "plugboard":[]},"space":{"plugboard":{"kind":"attack","symbols":["A","B","C"],"max_pairs":1}},
             "text":"AA","passes":["hill_climb"],"measures":["ic"],
             "attack":{"kind":"hill_climb","initial_measure":"ic","final_measure":"ic",
-            "switch_pairs":1,"backtrack_pairs":0,"evaluation_budget":100,"start":[]}}});
+            "switch_pairs":1,"backtrack_pairs":0,"start":[]}}});
         crate::ParsedAttackRequest::parse_json(&value.to_string())
             .unwrap()
             .bind_resources(&std::collections::BTreeMap::new())
