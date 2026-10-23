@@ -28,19 +28,38 @@ struct Trial {
     score: MeasuredScore,
 }
 
-struct Reswapper<'s, 'a, O, C, E> {
+/// Scored trial result: plaintext only when a materializing fallback carried it.
+type Scored = (Option<String>, MeasuredScore);
+
+/// One neighbor of the baseline in alphabet indices: sever the pair (i, k), then
+/// link `end` to the free symbol `x` unless they coincide (a pure removal).
+#[derive(Clone, Copy)]
+struct Move {
+    i: usize,
+    k: usize,
+    x: usize,
+    end: usize,
+}
+
+struct Reswapper<'s, 'a, O, C, E, M> {
     alphabet: &'s Alphabet,
-    domain: &'s AttackPlugboardDomain,
     accounting: &'s mut ObservedAccounting<'a, O>,
     cancel_requested: C,
     evaluate: E,
+    evaluate_mapped: M,
+    /// Domain symbols by ascending alphabet index; never fixed endpoints.
+    domain: Vec<usize>,
+    fixed: Vec<bool>,
+    /// Full fixed and mutable involution of the committed board, plus any applied move.
+    map: Vec<usize>,
 }
 
-impl<O, C, E> Reswapper<'_, '_, O, C, E>
+impl<O, C, E, M> Reswapper<'_, '_, O, C, E, M>
 where
     O: CounterObserver,
     C: FnMut() -> bool,
-    E: FnMut(&[(char, char)]) -> Result<(Option<String>, MeasuredScore), RunPayload>,
+    E: FnMut(&[(char, char)]) -> Result<Scored, RunPayload>,
+    M: FnMut(&[usize]) -> Result<Scored, RunPayload>,
 {
     fn cancelled(&mut self) -> bool {
         let requested = (self.cancel_requested)();
@@ -48,24 +67,42 @@ where
     }
 
     /// Poll, admit one shared unit, evaluate and record completion.
-    fn trial(
+    fn admitted(
         &mut self,
-        board: &[(char, char)],
-    ) -> Result<Result<Trial, AttackTermination>, RunPayload> {
+        evaluate: impl FnOnce(&mut Self) -> Result<Scored, RunPayload>,
+    ) -> Result<Result<Scored, AttackTermination>, RunPayload> {
         if self.cancelled() {
             return Ok(Err(AttackTermination::Cancelled));
         }
         if !self.accounting.admit(0)? {
             return Ok(Err(AttackTermination::EvaluationBudget));
         }
-        let (plaintext, score) = (self.evaluate)(board)?;
+        let scored = evaluate(self)?;
         self.accounting.complete()?;
-        let board = board.to_vec();
-        Ok(Ok(Trial {
-            board,
-            plaintext,
-            score,
-        }))
+        Ok(Ok(scored))
+    }
+
+    /// Rewrites the baseline in place; [`Self::restore`] undoes it.
+    fn apply(&mut self, m: Move) {
+        (self.map[m.i], self.map[m.k]) = (m.i, m.k);
+        if m.x != m.end {
+            (self.map[m.end], self.map[m.x]) = (m.x, m.end);
+        }
+    }
+
+    /// `x` was free in the baseline, or is i or k, which the pair rewrites.
+    fn restore(&mut self, m: Move) {
+        self.map[m.x] = m.x;
+        (self.map[m.i], self.map[m.k]) = (m.k, m.i);
+    }
+
+    /// Canonical mutable board: pairs by ascending lower alphabet index, fixed omitted.
+    fn board(&self) -> Vec<(char, char)> {
+        let symbols = &self.alphabet.symbols;
+        (0..self.map.len())
+            .filter(|&i| i < self.map[i] && !self.fixed[i])
+            .map(|i| (symbols[i], symbols[self.map[i]]))
+            .collect()
     }
 
     /// `Ok(None)` is completion; an interrupted scan discards its provisional winner.
@@ -74,49 +111,68 @@ where
         start: &[(char, char)],
         committed: &mut Option<Trial>,
     ) -> Result<Option<AttackTermination>, RunPayload> {
-        let mut current = match self.trial(start)? {
+        // The initial trial validates the start board; neighbors stay within it.
+        let (plaintext, score) = match self.admitted(|this| (this.evaluate)(start))? {
             Ok(initial) => initial,
             Err(stop) => return Ok(Some(stop)),
         };
+        for &(x, y) in start {
+            let (x, y) = (order(self.alphabet, x), order(self.alphabet, y));
+            (self.map[x], self.map[y]) = (y, x);
+        }
+        let mut current = Trial {
+            board: self.board(),
+            plaintext,
+            score,
+        };
         loop {
-            normalize(self.alphabet, &mut current.board);
-            let (pairs, mut bar) = (current.board.clone(), current.score);
+            let mut bar = current.score;
             *committed = Some(current);
             let mut winner = None;
-            for (index, &(i, k)) in pairs.iter().enumerate() {
-                let mut rest = pairs.clone();
-                rest.remove(index);
-                // Fixed endpoints are never domain symbols; free means unpaired.
-                let mut free: Vec<char> = (self.domain.symbols().iter().copied())
-                    .filter(|&x| rest.iter().all(|&(a, b)| a != x && b != x))
-                    .collect();
-                free.sort_by_key(|&x| order(self.alphabet, x));
-                for x in free {
+            // Same order as the board: pairs, free symbols, then endpoints i, k.
+            for i in 0..self.map.len() {
+                let k = self.map[i];
+                if k <= i || self.fixed[i] {
+                    continue;
+                }
+                for d in 0..self.domain.len() {
+                    let x = self.domain[d];
+                    if self.map[x] != x && x != i && x != k {
+                        continue;
+                    }
                     for end in [i, k] {
-                        let mut board = rest.clone();
-                        if x != end {
-                            board.push((end, x));
-                        }
-                        let trial = match self.trial(&board)? {
-                            Ok(trial) => trial,
+                        let m = Move { i, k, x, end };
+                        let scored = self.admitted(|this| {
+                            this.apply(m);
+                            let scored = (this.evaluate_mapped)(&this.map);
+                            this.restore(m);
+                            scored
+                        })?;
+                        let (plaintext, score) = match scored {
+                            Ok(scored) => scored,
                             Err(stop) => return Ok(Some(stop)),
                         };
                         // Strictly greater: a tie (e.g. restoring the pair) would
                         // otherwise win and rescan forever.
-                        if trial.score.ranking().units() > bar.ranking().units() {
-                            bar = trial.score;
-                            winner = Some(trial);
+                        if score.ranking().units() > bar.ranking().units() {
+                            bar = score;
+                            winner = Some((m, plaintext, score));
                         }
                     }
                 }
             }
-            let Some(winner) = winner else {
+            let Some((m, plaintext, score)) = winner else {
                 return Ok(None);
             };
             if self.cancelled() {
                 return Ok(Some(AttackTermination::Cancelled));
             }
-            current = winner;
+            self.apply(m);
+            current = Trial {
+                board: self.board(),
+                plaintext,
+                score,
+            };
         }
     }
 }
@@ -131,20 +187,34 @@ pub(crate) fn reswapping_stage(
     domain: &AttackPlugboardDomain,
     accounting: &mut ObservedAccounting<'_, impl CounterObserver>,
     cancel_requested: impl FnMut() -> bool,
-    (evaluate, replay): (
-        impl FnMut(&[(char, char)]) -> Result<(Option<String>, MeasuredScore), RunPayload>,
+    (evaluate, evaluate_mapped, replay): (
+        impl FnMut(&[(char, char)]) -> Result<Scored, RunPayload>,
+        impl FnMut(&[usize]) -> Result<Scored, RunPayload>,
         impl FnOnce(&[(char, char)]) -> Result<String, RunPayload>,
     ),
 ) -> Result<crate::AttackResult, crate::AttackRunError> {
     let before = accounting.allowance.used;
     let best = result.best.as_mut().expect("completed run has best");
     let mut committed = None;
+    let mut map: Vec<usize> = (0..alphabet.symbols.len()).collect();
+    let mut fixed = vec![false; map.len()];
+    for &(x, y) in domain.fixed_pairs() {
+        let (x, y) = (order(alphabet, x), order(alphabet, y));
+        (map[x], map[y], fixed[x], fixed[y]) = (y, x, true, true);
+    }
+    let mut symbols: Vec<usize> = (domain.symbols().iter())
+        .map(|&x| order(alphabet, x))
+        .collect();
+    symbols.sort_unstable();
     let outcome = Reswapper {
         alphabet,
-        domain,
         accounting: &mut *accounting,
         cancel_requested,
         evaluate,
+        evaluate_mapped,
+        domain: symbols,
+        fixed,
+        map,
     }
     .run(&best.mutable_plugboard.clone(), &mut committed);
     let score = committed.as_ref().map(|key| key.score);
@@ -234,8 +304,9 @@ mod tests {
     }
 
     /// Alphabet A–F, fixed F–E, symbols D,A,C,B in source order; prior use 5, prior
-    /// score -100. `stop` is [budget, cancel after, fail at]; boards are logged raw
-    /// and scored by their sorted symbols (default 0).
+    /// score -100. `stop` is [budget, cancel after, fail at]; the initial board is
+    /// logged raw, neighbors as canonical boards, all scored by their sorted
+    /// symbols (default 0).
     fn run(start: &[(char, char)], scores: &[(&str, i128)], stop: [usize; 3]) -> Run {
         run_with(AttackControl::default(), start, scores, stop, Mode::Stream)
     }
@@ -308,9 +379,8 @@ mod tests {
             key.sort_unstable();
             key.into_iter().collect::<String>()
         };
-        let evaluate = |board: &[(char, char)]| {
+        let score_raw = |raw: String| -> Result<Scored, RunPayload> {
             count.set(count.get() + 1);
-            let raw = raw(board);
             let key = key(&raw);
             log.borrow_mut().push(raw);
             if count.get() == stop[2] {
@@ -319,6 +389,16 @@ mod tests {
             let units = scores.iter().find(|(k, _)| *k == key).map_or(0, |e| e.1);
             let carried = (mode == Mode::Carry).then(|| format!("p{key}"));
             Ok((carried, score(units)))
+        };
+        let evaluate = |board: &[(char, char)]| score_raw(raw(board));
+        // Neighbor mappings log their canonical mutable board; E–F is fixed.
+        let evaluate_mapped = |map: &[usize]| {
+            let symbols = &alphabet.symbols;
+            let board: Vec<(char, char)> = (0..4)
+                .filter(|&i| i < map[i])
+                .map(|i| (symbols[i], symbols[map[i]]))
+                .collect();
+            score_raw(raw(&board))
         };
         let replay = |board: &[(char, char)]| {
             let raw = raw(board);
@@ -338,7 +418,7 @@ mod tests {
             &domain,
             accounting,
             cancel,
-            (evaluate, replay),
+            (evaluate, evaluate_mapped, replay),
         );
         let retained = match &outcome {
             Ok(result) => &result.held_tail[..],
@@ -372,7 +452,7 @@ mod tests {
     #[test]
     fn scan_visits_free_symbols_in_alphabet_order_and_counts_every_trial() {
         let (result, log) = ok(run(&[('B', 'A')], &[], [N, N, N]));
-        assert_eq!(log, ["BA", "", "BA", "AB", "", "AC", "BC", "AD", "BD"]);
+        assert_eq!(log, ["BA", "", "AB", "AB", "", "AC", "BC", "AD", "BD"]);
         assert_eq!(summary(&result), (Completed, Some(0), 9, true));
         assert_eq!(result.evaluations_used, 14);
         assert_eq!(result.counters.evaluations_completed(), 9);
@@ -384,7 +464,7 @@ mod tests {
     #[test]
     fn first_strict_winner_commits_and_restoring_it_never_wins() {
         let (result, log) = ok(run(AB, &[("AC", 5), ("BC", 5)], [N, N, N]));
-        assert_eq!(log[9..], ["", "CA", "AB", "CB", "AC", "", "AD", "CD"]);
+        assert_eq!(log[9..], ["", "AC", "AB", "BC", "AC", "", "AD", "CD"]);
         assert_eq!(summary(&result), (Completed, Some(5), 17, true));
         assert_eq!(best(result.best.as_ref().unwrap()).0, [('A', 'C')]);
     }
@@ -392,7 +472,7 @@ mod tests {
     #[test]
     fn pure_removal_win_shrinks_the_board_and_rescans() {
         let (result, log) = ok(run(AB_CD, &[("CD", 3)], [N, N, N]));
-        assert_eq!(log[1..5], ["CD", "CDBA", "CDAB", "CD"]);
+        assert_eq!(log[1..5], ["CD", "ABCD", "ABCD", "CD"]);
         assert_eq!(summary(&result), (Completed, Some(3), 17, true));
         let expected = (CD, 3, "pCD", &[('C', 'D'), ('E', 'F')][..]);
         assert_eq!(best(result.best.as_ref().unwrap()), expected);
@@ -418,7 +498,7 @@ mod tests {
     #[test]
     fn budget_discards_provisional_winner_and_keeps_earlier_commit() {
         let (result, log) = ok(run(AB_CD, &[("CD", 3), ("AC", 9)], [12, N, N]));
-        assert_eq!(log[9..], ["CA", "DA", "CB"]);
+        assert_eq!(log[9..], ["AC", "AD", "BC"]);
         assert_eq!(summary(&result), (EvaluationBudget, Some(3), 12, false));
         assert_eq!(best(result.best.as_ref().unwrap()).0, CD);
     }
@@ -715,10 +795,11 @@ mod tests {
 
     #[test]
     fn score_only_reswapping_matches_materializing_reference() {
-        use crate::attack_evaluator::{TrialEvaluator, PLAINTEXT_BUILDS};
+        use crate::attack_evaluator::{TrialEvaluator, BOARD_FILLS, PLAINTEXT_BUILDS};
         use crate::{BoundResource, SlotConfiguration, TransformConfiguration};
         use MeasureId::{Entropy, Ic, SinkovBigram, SinkovQuadgram, Trie};
         let builds = || PLAINTEXT_BUILDS.with(|count| count.replace(0));
+        let fills = || BOARD_FILLS.with(|count| count.replace(0));
         let mut improved = 0;
         for symbols in ["ABCDEF", "界éHβAGλ", "ABCDEFGHIJKLMNOPQRSTUVWXYZ"] {
             let s: Vec<char> = symbols.chars().collect();
@@ -824,6 +905,7 @@ mod tests {
                                 polls.get() > cancel_at
                             };
                             builds();
+                            fills();
                             let outcome = if old {
                                 let evaluate = |board: &[(char, char)]| {
                                     evaluator.evaluate(board).map_err(RunPayload::Evaluation)
@@ -838,6 +920,11 @@ mod tests {
                                         .evaluate_score(board)
                                         .map_err(RunPayload::Evaluation)
                                 };
+                                let evaluate_mapped = |mapping: &[usize]| {
+                                    evaluator
+                                        .evaluate_score_mapped(mapping)
+                                        .map_err(RunPayload::Evaluation)
+                                };
                                 let replay = |board: &[(char, char)]| {
                                     evaluator.replay_plaintext(board).map_err(RunPayload::from)
                                 };
@@ -848,10 +935,10 @@ mod tests {
                                     &domain,
                                     accounting,
                                     cancel,
-                                    (evaluate, replay),
+                                    (evaluate, evaluate_mapped, replay),
                                 )
                             };
-                            let builds = builds();
+                            let (builds, fills) = (builds(), fills());
                             let used = allowance.used;
                             (
                                 format!("{outcome:?}"),
@@ -860,6 +947,7 @@ mod tests {
                                 control.snapshot(),
                                 observer.0,
                                 builds,
+                                fills,
                             )
                         };
                         let label = format!("{symbols} {measure:?} {deny} {limit} {cancel_at}");
@@ -878,6 +966,9 @@ mod tests {
                             old.5
                         };
                         assert_eq!(new.5, expected, "{label}");
+                        // Only the initial trial and the commit replay build a board;
+                        // neighbor trials score the in-place index mapping.
+                        assert!(new.6 <= 2, "{label}: {} board fills", new.6);
                         assert_eq!(old.5, usize::try_from(old.2 - 5).unwrap(), "{label}");
                         let board = &result.best.as_ref().unwrap().mutable_plugboard;
                         improved += usize::from(committed && board[..] != start[..]);

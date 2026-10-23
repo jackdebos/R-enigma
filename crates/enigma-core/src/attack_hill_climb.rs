@@ -321,6 +321,15 @@ impl crate::AttackRequest {
                                 .evaluate_score(board)
                                 .map_err(RunPayload::Evaluation)
                         },
+                        // Neighbors of a scored, hence resolved and valid, board.
+                        |mapping| {
+                            initial()?;
+                            scorer
+                                .as_ref()
+                                .expect("resolved stage scorer")
+                                .evaluate_score_mapped(mapping)
+                                .map_err(RunPayload::Evaluation)
+                        },
                         // Only a scored, hence resolved, commit is ever replayed.
                         |board| {
                             let scorer = scorer.as_ref();
