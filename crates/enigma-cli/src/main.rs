@@ -206,7 +206,8 @@ fn print_usage() {
     eprintln!("  --cancel-file <path>   cancel a hill_climb/partial_exhaustion attack");
     eprintln!("                         once <path> exists as a regular file");
     eprintln!("  --threads <n>          worker threads for a hill_climb/partial_exhaustion");
-    eprintln!("                         attack, 1 to 256 (default: half the logical CPUs)");
+    eprintln!("                         attack, 1 to 256 (default: half the logical CPUs);");
+    eprintln!("                         not yet parallel: attacks still run on one thread");
     eprintln!();
     eprintln!("One JSON event is written per line to stdout; diagnostics go to stderr.");
     eprintln!("See docs/protocol.md for the contract and odd/tasks/enigma-engine.md for the plan.");

@@ -195,6 +195,9 @@ impl crate::AttackRequest {
 
     /// [`run`](Self::run) under host `options`; the public outcome of a completed run
     /// does not depend on them.
+    ///
+    /// Not yet parallel: `options` is accepted for the CLI contract, but the outer
+    /// phase still runs on the calling thread until the worker pool lands.
     pub fn run_with(
         &self,
         _options: crate::ExecutionOptions,

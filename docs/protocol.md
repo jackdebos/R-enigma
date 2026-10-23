@@ -494,7 +494,7 @@ ordering applies only while delivery succeeds, including final result write/flus
 | Action | Mechanism | Result |
 | --- | --- | --- |
 | Cancel (first HC/PE release) | `--cancel-file <path>` marker or a platform signal (`SIGINT`/`SIGTERM`/`SIGHUP`, Windows Ctrl+C/Break); both shipped | Cooperative safe-stop, final `result`, then `done` with `reason: "cancelled"`; retained `result.hold` per Task 14; no checkpoint promise |
-| Parallel HC/PE outer keys | `--threads <n>`, default half the logical CPUs | Same public output as one thread for completed runs; see the `--threads` contract below |
+| Parallel HC/PE outer keys | `--threads <n>`, default half the logical CPUs; parsed and validated, worker pool not implemented yet | Same public output as one thread for completed runs; see the `--threads` contract below |
 | Pause/resume live job | Not in Stage 1 | Future extension |
 | Resume dead job | `--resume <checkpoint>` | Search only; see §6 |
 | Bound HC/PE search | `space.offset`/`space.limit` and cancellation | §4.1 slice/exhaustion/cancellation reasons; slices bound outer keys only; no new `--max-keys` attack control |
@@ -579,6 +579,10 @@ like `--cancel-file`, with a seq 1 `unsupported_job` error at `/job/kind`, the m
 `--threads is supported only for hill_climb and partial_exhaustion attacks` and exit 1;
 when both options are present the `--cancel-file` message is reported. Without the
 option an attack uses half the logical CPUs reported by the platform, at least one.
+
+Status: the option is parsed, validated and passed to Core, but the worker pool is
+not implemented yet, so attacks still run on one thread whatever `<n>` is. The
+paragraphs below are the contract that implementation must meet.
 
 Outer keys are split into fixed blocks in key order that worker threads take as they
 become free. Block outcomes are merged in key order, so hold ranking, duplicate
