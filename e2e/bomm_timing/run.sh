@@ -1,7 +1,7 @@
 #!/bin/sh
 # Times U-264 through pinned bomm and writes a new results file.
-# Usage: [ENIGMA_TIMING_CASE=a|positions] [ENIGMA_TIMING_RUNS=N] e2e/bomm_timing/run.sh [BOMM_BIN]
-# Defaults: case a, N=100. Recommended for positions: ENIGMA_TIMING_RUNS=20.
+# Usage: [ENIGMA_TIMING_CASE=a|positions|b] [ENIGMA_TIMING_RUNS=N] e2e/bomm_timing/run.sh [BOMM_BIN]
+# Defaults: case a, N=100. Recommended: positions ENIGMA_TIMING_RUNS=20; b ENIGMA_TIMING_RUNS=3.
 # Run sequentially, never alongside the enigma-rust harness.
 set -eu
 
@@ -28,6 +28,8 @@ results=$script_dir/results
 case_suffix=
 if [ "${ENIGMA_TIMING_CASE-}" = positions ]; then
     case_suffix=-positions
+elif [ "${ENIGMA_TIMING_CASE-}" = b ]; then
+    case_suffix=-b
 fi
 output=$results/$(printf '%s' "$timestamp" | tr -d ':-')-$(git rev-parse --short HEAD)$case_suffix.json
 mkdir -p "$results"

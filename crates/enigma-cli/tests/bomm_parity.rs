@@ -29,6 +29,7 @@ const CASES: &[&str] = &[
     "enigma-m3-two-notch",
     "enigma-m4-thin-c-gamma",
     "m4-u264-attack-board",
+    "m4-u264-attack-design-b",
     "m4-u264-attack-positions",
     "m4-u264-first-break",
     "m4-u264-sinkov-bigram-correct",
@@ -272,6 +273,47 @@ fn historical_positions_fixture_changes_only_the_two_position_domains() {
     assert_eq!(selected["capture"]["exit_code"], 0);
     assert_eq!(selected["capture"]["units"], 676);
     assert_eq!(selected["capture"]["decrypts"], 5_492_071);
+}
+
+#[test]
+fn historical_design_b_fixture_changes_only_three_position_domains_and_budget() {
+    let (mut query, record) = attack_fixture();
+    let case = "m4-u264-attack-design-b";
+    for index in [2, 3, 4] {
+        query["space"]["slots"][index]["positions"] = json!("*");
+    }
+    assert_eq!(load(case, "query.json"), query);
+    let mut engine = record["engine"].clone();
+    for index in [2, 3, 4] {
+        engine["job"]["configuration"]["slots"][index]
+            .as_object_mut()
+            .unwrap()
+            .remove("position");
+    }
+    let alphabet: Vec<_> = ('A'..='Z').map(|c| c.to_string()).collect();
+    engine["job"]["space"]["slots"] = json!([
+        {"id": "left", "positions": alphabet},
+        {"id": "middle", "positions": alphabet},
+        {"id": "right", "positions": alphabet}
+    ]);
+    engine["job"]["attack"]["evaluation_budget"] = json!(200_000_000);
+    let selected = load(case, "case.json");
+    assert_eq!(selected["engine"], engine);
+    for field in [
+        "kind",
+        "resource",
+        "historical_pairs",
+        "plaintext",
+        "observed",
+    ] {
+        assert_eq!(selected[field], record[field], "{field}");
+    }
+    for field in ["bomm_commit", "bomm_sha256"] {
+        assert_eq!(selected["capture"][field], record["capture"][field]);
+    }
+    assert_eq!(selected["capture"]["exit_code"], 0);
+    assert_eq!(selected["capture"]["units"], 17_576);
+    assert_eq!(selected["capture"]["decrypts"], 142_788_085);
 }
 
 /// Exactly one CLI execution with full assertions; timing lives in `case_a_timing.rs`.

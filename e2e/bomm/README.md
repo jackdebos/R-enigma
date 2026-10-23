@@ -76,9 +76,8 @@ under its `results/`. Per-evaluation search time is
 
 ### Design A2: unknown middle/right positions
 
-A2 is a step between design A (1 key) and the planned design B (all three
+A2 is a step between design A (1 key) and design B (all three
 rotating positions unknown, 17,576 keys; Task 17.7).
-
 
 `m4-u264-attack-positions` is A with only middle/right positions unknown:
 `*` in bomm, A–Z domains in our request, for 676 outer keys. All wheels, rings,
@@ -101,7 +100,34 @@ counts differ (5,492,071 decrypts versus 5,372,197 completed evaluations).
 Each harness reports its own actual count and divides by that count for
 per-evaluation timing; no cross-engine count equality is asserted. Each full
 run verifies the historical result; ours also checks N/A and full plaintext.
-B filenames end in `-positions.json`; default A reports remain unchanged.
+A2 filenames end in `-positions.json`; default A reports remain unchanged.
+
+### Design B: all three rotating positions unknown
+
+`m4-u264-attack-design-b` extends A2 by also sweeping the left position:
+left/II, middle/IV and right/I use `*` in bomm and A–Z domains in our
+request, for 26³ = 17,576 outer keys. Wheels, rings, greek position V and
+reflector position A remain fixed; passes, hold and other attack settings match A2.
+Only B raises our evaluation budget to 200,000,000 (A/A2 retain 100,000,000):
+the old budget stopped B after 12,579 outer keys despite recovering the key.
+Default tests verify exactly the three domains plus budget change without an attack.
+
+```sh
+ENIGMA_TIMING_CASE=b ENIGMA_TIMING_RUNS=3 \
+  BOMM_BIN=../bomm-reference/build/bomm e2e/bomm_timing/run.sh
+# Wait for bomm to finish before running ours:
+ENIGMA_TIMING_CASE=b ENIGMA_TIMING_RUNS=3 e2e/enigma_rust_timing/run.sh
+```
+
+The single reference capture recovered VJNA and all ten historical pairs:
+17,576 units, 142,788,085 decrypts, preview and score unchanged from A2.
+This remains outcome-level timing: bomm applies every pass inline to every
+outer key; our engine applies reswapping/measure only to the hold-5 finalists.
+Each harness uses its own observed evaluation count, not a cross-engine total.
+Full runs must recover J/N/A and the historical board; ours also checks the
+full plaintext and completion of all 17,576 outer keys. Results end in `-b.json`
+and identify `case: "m4-u264-attack-design-b"`. A and A2 remain unchanged.
+Use a small run count: even one recorded run includes an unrecorded full warm-up.
 
 ## Frequency tables
 

@@ -24,9 +24,9 @@ ENIGMA_TIMING_CASE=positions ENIGMA_TIMING_RUNS=20 \
   BOMM_BIN=../bomm-reference/build/bomm e2e/bomm_timing/run.sh
 ```
 
-`ENIGMA_TIMING_CASE` accepts `a` (default, unchanged) or `positions`; all other
+`ENIGMA_TIMING_CASE` accepts `a` (default, unchanged), `positions` or `b`; all other
 values are rejected. The latter uses `e2e/bomm/m4-u264-attack-positions/`: design
-B, identical to A except middle/right positions are unknown (`*`, 26 × 26 = 676
+A2, identical to A except middle/right positions are unknown (`*`, 26 × 26 = 676
 outer keys). It verifies the top historical key VJNA and all ten pairs every run.
 Startup remains the fixed design-A one-decrypt probe. Recommend 20 runs rather
 than 100: a manual single run took 5.764 s (not a performance guarantee).
@@ -35,13 +35,35 @@ This is an **outcome-level comparison**, not identical search work. bomm runs
 every pass on every outer key; our engine runs reswapping/measure only on the
 hold-5 finalists. Observed totals were 5,492,071 bomm decrypts versus 5,372,197
 our evaluations. The harness parses each run's actual total and checks stability;
-it never uses A's 8,456 for B. If bomm omits its count, both `evaluations` and
+it never uses A's 8,456 for A2 or B. If bomm omits its count, both `evaluations` and
 `per_evaluation_microseconds` are omitted. Otherwise the latter divides the
 median search time by bomm's own count, in microseconds.
 
-B results use `results/<UTC>-<short commit>-positions.json`, with
+A2 results use `results/<UTC>-<short commit>-positions.json`, with
 `case: "m4-u264-attack-positions"`; A filenames and JSON fields remain unchanged.
 Never run the two harnesses concurrently.
+
+## Select design B: all three rotating positions
+
+```sh
+ENIGMA_TIMING_CASE=b ENIGMA_TIMING_RUNS=3 \
+  BOMM_BIN=../bomm-reference/build/bomm e2e/bomm_timing/run.sh
+```
+
+Design B uses `e2e/bomm/m4-u264-attack-design-b/`: left/II, middle/IV and
+right/I positions are unknown (`*`), giving 26³ = 17,576 outer keys. Wheels,
+rings, greek position V, reflector and attack passes remain fixed as in A2.
+Our counterpart uses a 200,000,000 evaluation budget for B only, rather than
+A/A2's 100,000,000, to complete the entire space. bomm has no such budget flag.
+Every full run verifies historical VJNA and all ten pairs. Startup remains
+the fixed design-A one-decrypt probe. The single capture reported 17,576 units
+and 142,788,085 decrypts; this is not a required cross-engine workload count.
+bomm runs all passes inline on every key, unlike our finalist-only polishing.
+
+Use a small count such as 3: each invocation also runs a full warm-up.
+Results use `results/<UTC>-<short commit>-b.json` and
+`case: "m4-u264-attack-design-b"`, with bomm's own observed count for timing.
+Wait for this harness to finish before running ours. A and A2 are unchanged.
 
 ## One-time reference
 

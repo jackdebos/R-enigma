@@ -1,5 +1,5 @@
-//! Symmetric end-to-end timing harnesses for U-264 designs A and B (positions).
-//! `ENIGMA_TIMING_CASE=a|positions` selects the workload; A remains the default.
+//! Symmetric end-to-end timing harnesses for U-264 designs A, A2 and B.
+//! `ENIGMA_TIMING_CASE=a|positions|b` selects the workload; A remains the default.
 //!
 //! Both ignored tests time real subprocesses with the same clock: `Instant` around
 //! `Command::output()` only. Each runs one unrecorded warm-up of each kind, then per
@@ -32,14 +32,16 @@ const EVALUATIONS: u32 = 8456;
 const BOMM_QUERY: &str = "e2e/bomm/m4-u264-attack-board/query.json";
 const BOMM_STARTUP_QUERY: &str = "e2e/bomm_timing/startup-query.json";
 const POSITIONS_CASE: &str = "m4-u264-attack-positions";
+const DESIGN_B_CASE: &str = "m4-u264-attack-design-b";
 
 fn timing_case(value: Option<&OsStr>) -> Result<&'static str, String> {
     match value {
         None => Ok(ATTACK_CASE),
         Some(value) if value == "a" => Ok(ATTACK_CASE),
         Some(value) if value == "positions" => Ok(POSITIONS_CASE),
+        Some(value) if value == "b" => Ok(DESIGN_B_CASE),
         Some(value) => Err(format!(
-            "ENIGMA_TIMING_CASE must be a or positions, got {value:?}"
+            "ENIGMA_TIMING_CASE must be a, positions or b, got {value:?}"
         )),
     }
 }
@@ -276,7 +278,7 @@ fn enigma_rust_case_a_timing() {
         );
     }
     let (inputs, mut record, mut request) = prepare_attack_inputs("enigma-rust-timing");
-    if settings.case == POSITIONS_CASE {
+    if settings.case != ATTACK_CASE {
         let (query, selected) = selected_fixture(settings.case);
         record = selected;
         let resources = request["job"]["resources"].clone();
@@ -286,7 +288,7 @@ fn enigma_rust_case_a_timing() {
         inputs.write("request.json", &request);
     }
     let evaluations = Cell::new(Some(u64::from(EVALUATIONS)));
-    if settings.case == POSITIONS_CASE {
+    if settings.case != ATTACK_CASE {
         evaluations.set(None);
     }
     // Budget 0 is rejected; 1 keeps startup, binding, row build and one evaluation.
@@ -304,13 +306,18 @@ fn enigma_rust_case_a_timing() {
         || command("request.json"),
         |output| {
             verify_attack_output(output, &record);
-            if settings.case == POSITIONS_CASE {
+            if settings.case != ATTACK_CASE {
                 let events = successful_events(output);
                 let result = events
                     .iter()
                     .find(|event| event["event"] == "result")
                     .unwrap();
-                for (id, position) in [("middle", "N"), ("right", "A")] {
+                let positions: &[(&str, &str)] = if settings.case == DESIGN_B_CASE {
+                    &[("left", "J"), ("middle", "N"), ("right", "A")]
+                } else {
+                    &[("middle", "N"), ("right", "A")]
+                };
+                for &(id, position) in positions {
                     let slot = result["best"]["configuration"]["slots"]
                         .as_array()
                         .unwrap()
@@ -319,7 +326,12 @@ fn enigma_rust_case_a_timing() {
                         .unwrap();
                     assert_eq!(slot["position"], position);
                 }
-                assert_eq!(result["counters"]["outers_completed"], "676");
+                let outers = if settings.case == DESIGN_B_CASE {
+                    "17576"
+                } else {
+                    "676"
+                };
+                assert_eq!(result["counters"]["outers_completed"], outers);
                 let count = result["counters"]["evaluations_completed"]
                     .as_str()
                     .unwrap()
@@ -346,7 +358,12 @@ fn bomm_flags(record: &Value) -> Vec<String> {
         .expect("capture command names the bomm binary");
     let query = tokens.last().expect("capture query path");
     assert!(
-        [BOMM_QUERY, "e2e/bomm/m4-u264-attack-positions/query.json"].contains(query),
+        [
+            BOMM_QUERY,
+            "e2e/bomm/m4-u264-attack-positions/query.json",
+            "e2e/bomm/m4-u264-attack-design-b/query.json",
+        ]
+        .contains(query),
         "capture query path: {query}"
     );
     let flags: Vec<String> = tokens[binary + 1..tokens.len() - 1]
@@ -479,6 +496,18 @@ fn positions_capture_uses_the_same_flags_and_its_own_decrypt_count() {
 }
 
 #[test]
+fn design_b_capture_uses_the_same_flags_and_its_own_decrypt_count() {
+    let (_, record) = selected_fixture(DESIGN_B_CASE);
+    assert_eq!(bomm_flags(&record), ["-q", "-t", "1", "-n", "5"]);
+    let (count, pairs) = bomm_report(
+        "│ UKW-B-thin,beta,II,IV,I aaaav avjna at bl df gj hm nw op qy rz vx │\nNumber of decrypts: 142788085\n",
+        "UKW-B-thin,beta,II,IV,I aaaav avjna",
+    );
+    assert_eq!(count, Some(142_788_085));
+    assert_eq!(pairs, HISTORICAL_PAIRS);
+}
+
+#[test]
 #[should_panic(expected = "top key does not start")]
 fn bomm_rejects_historical_key_below_a_wrong_top_key() {
     bomm_report(
@@ -506,11 +535,24 @@ fn timing_case_defaults_accepts_known_cases_and_rejects_invalid_values() {
         timing_case(Some(OsStr::new("positions"))),
         Ok(POSITIONS_CASE)
     );
-    for value in ["", "A", " positions", "positions ", "unknown"] {
+    assert_eq!(
+        timing_case(Some(OsStr::new("b"))),
+        Ok("m4-u264-attack-design-b")
+    );
+    for value in [
+        "",
+        "A",
+        " positions",
+        "positions ",
+        "B",
+        " b",
+        "b ",
+        "unknown",
+    ] {
         assert_eq!(
             timing_case(Some(OsStr::new(value))),
             Err(format!(
-                "ENIGMA_TIMING_CASE must be a or positions, got {:?}",
+                "ENIGMA_TIMING_CASE must be a, positions or b, got {:?}",
                 OsStr::new(value)
             ))
         );

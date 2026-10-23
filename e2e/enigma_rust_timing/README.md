@@ -22,9 +22,9 @@ and then runs the ignored test `enigma_rust_case_a_timing` in
 ENIGMA_TIMING_CASE=positions ENIGMA_TIMING_RUNS=20 e2e/enigma_rust_timing/run.sh
 ```
 
-`ENIGMA_TIMING_CASE` accepts `a` (default, unchanged) or `positions`; all other
+`ENIGMA_TIMING_CASE` accepts `a` (default, unchanged), `positions` or `b`; all other
 values are rejected. The latter uses `e2e/bomm/m4-u264-attack-positions/`: design
-B, identical to A except middle/right positions sweep A–Z (676 outer keys).
+A2, identical to A except middle/right positions sweep A–Z (676 outer keys).
 Every full run checks the historical ten pairs, positions N/A and all 232
 plaintext letters, plus completion of all 676 keys. Startup uses the selected
 request with budget 1. Recommend 20 runs rather than 100: a manual single run
@@ -38,9 +38,32 @@ counter (stage `evaluations_used` alone is not the total), checked for stability
 on every run and recorded as `evaluations`. `per_evaluation_microseconds` uses
 our own count, never A's 8,456 or bomm's count.
 
-B results use `results/<UTC>-<short commit>-positions.json`, with
+A2 results use `results/<UTC>-<short commit>-positions.json`, with
 `case: "m4-u264-attack-positions"`; A filenames and JSON fields remain unchanged.
 Never run the two harnesses concurrently.
+
+## Select design B: all three rotating positions
+
+```sh
+# Run only after the bomm harness has finished:
+ENIGMA_TIMING_CASE=b ENIGMA_TIMING_RUNS=3 e2e/enigma_rust_timing/run.sh
+```
+
+Design B uses `e2e/bomm/m4-u264-attack-design-b/`: left/II, middle/IV and
+right/I positions sweep A–Z, giving 26³ = 17,576 outer keys. Wheels, rings,
+greek position V, reflector and other attack settings remain fixed as in A2.
+B alone uses a 200,000,000 evaluation budget; A/A2 retain 100,000,000.
+The old budget recovered the key but stopped after 12,579 outer keys.
+Every full run must recover J/N/A, the ten historical pairs and all 232
+plaintext letters, and complete all 17,576 keys. Startup uses this request
+with budget 1. Use a small count such as 3; a full warm-up is also run.
+
+This is outcome-level timing: bomm applies every pass inline to every key;
+ours polishes only the hold-5 finalists with reswapping/measure. Each harness
+reports its own observed evaluation count and uses it for per-evaluation time.
+Results use `results/<UTC>-<short commit>-b.json` and
+`case: "m4-u264-attack-design-b"`. A and A2 behavior remains unchanged.
+Never run the harnesses concurrently.
 
 ## What is measured (default A)
 
