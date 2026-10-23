@@ -7,7 +7,7 @@ mod support;
 
 use support::successful_events;
 
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::process::{Command, Output, Stdio};
 
 use serde_json::{json, Value};
@@ -49,12 +49,15 @@ fn run_with_args(args: &[&str], request: &Value) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("failed to spawn the enigma binary");
-    child
+    let written = child
         .stdin
         .as_mut()
         .expect("stdin was piped")
-        .write_all(request.to_string().as_bytes())
-        .expect("failed to write the request to stdin");
+        .write_all(request.to_string().as_bytes());
+    // A usage or option error exits before reading stdin, which may close the pipe.
+    if let Err(error) = written {
+        assert_eq!(error.kind(), ErrorKind::BrokenPipe, "failed to write stdin");
+    }
     child.wait_with_output().expect("failed to collect output")
 }
 
