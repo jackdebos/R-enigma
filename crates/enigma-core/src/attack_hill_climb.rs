@@ -93,7 +93,7 @@ impl DirectOuterOutcome {
             measure,
             outer_index: self.outer_index,
             start_index: self.start_index,
-            incomplete: self.climb.cancelled || self.climb.budget_stopped,
+            incomplete: self.climb.cancelled || self.climb.incomplete,
             final_objective_ascent: self.climb.final_objective_ascent,
             neighborhood_exhausted: self.climb.neighborhood_exhausted,
             stages: Vec::new(),
@@ -755,7 +755,7 @@ impl SeedBest {
             start_index: self.seed_index,
             climb: ClimbOutcome {
                 current: Some(self.current),
-                budget_stopped: self.incomplete,
+                incomplete: self.incomplete,
                 cancelled: false,
                 final_objective_ascent: self.final_objective_ascent,
                 neighborhood_exhausted: self.neighborhood_exhausted,
@@ -774,7 +774,7 @@ impl ControlledPartialOutcome {
                 start_index: 0,
                 climb: ClimbOutcome {
                     current: None,
-                    budget_stopped: false,
+                    incomplete: false,
                     cancelled: false,
                     final_objective_ascent: false,
                     neighborhood_exhausted: false,
@@ -1372,7 +1372,7 @@ impl crate::AttackRequest {
                     source: DirectRunError::Climb(error.source),
                 })?;
             result.evaluations_used = allowance.used;
-            let interrupted = outcome.climb.budget_stopped;
+            let interrupted = outcome.climb.incomplete;
             if let Some(current) = &outcome.climb.current {
                 result.climbs_started = result
                     .climbs_started
@@ -1770,7 +1770,7 @@ fn schedule_controlled_direct<O: CounterObserver, F: FnMut() -> bool>(
                 source,
             })?;
             let cancelled = outcome.climb.cancelled;
-            let interrupted = outcome.climb.budget_stopped;
+            let interrupted = outcome.climb.incomplete;
             let now = accounting.control.snapshot();
             // These counters only increase; subtraction retains prior caller facts without reset.
             result.climbs_started = now.climbs_started - before.climbs_started;
@@ -1923,13 +1923,16 @@ pub(super) struct EvaluationAllowance {
 }
 
 impl EvaluationAllowance {
-    fn admit(&mut self, reserve: u64) -> bool {
+    fn admit(&mut self, reserve: u64) -> Result<bool, CounterOverflow> {
         // Subtraction avoids overflow even for an unlimited-looking u64 limit.
         if self.limit.saturating_sub(self.used) <= reserve {
-            return false;
+            return Ok(false);
         }
-        self.used += 1;
-        true
+        self.used = self
+            .used
+            .checked_add(1)
+            .ok_or(CounterOverflow::EvaluationsAdmitted)?;
+        Ok(true)
     }
 }
 
@@ -1996,7 +1999,8 @@ pub(super) trait EvaluationAccounting {
 impl EvaluationAccounting for EvaluationAllowance {
     type Error = TrialEvaluationError;
     fn admit(&mut self, reserve: u64) -> Result<bool, Self::Error> {
-        Ok(EvaluationAllowance::admit(self, reserve))
+        // The retained cap makes allowance overflow unreachable in legacy tests.
+        Ok(EvaluationAllowance::admit(self, reserve).expect("capped allowance cannot overflow"))
     }
 }
 
@@ -2009,7 +2013,11 @@ pub(super) struct ObservedAccounting<'a, O> {
 impl<O: CounterObserver> EvaluationAccounting for ObservedAccounting<'_, O> {
     type Error = ObservedClimbError;
     fn admit(&mut self, reserve: u64) -> Result<bool, Self::Error> {
-        if !self.allowance.admit(reserve) {
+        if !self
+            .allowance
+            .admit(reserve)
+            .map_err(ObservedClimbError::Counter)?
+        {
             return Ok(false);
         }
         self.transition(AttackControl::record_evaluation_admitted)?;
@@ -2086,7 +2094,7 @@ struct ScoringState<'c, 'a> {
 #[derive(Debug)]
 pub(crate) struct ClimbOutcome {
     pub(crate) current: Option<ScoredBoard>,
-    pub(crate) budget_stopped: bool,
+    pub(crate) incomplete: bool,
     pub(crate) cancelled: bool,
     pub(crate) final_objective_ascent: bool,
     pub(crate) neighborhood_exhausted: bool,
@@ -2186,7 +2194,7 @@ impl<'a> BoundClimbScoring<'a> {
                         }
                     })?;
                 result.cancelled = outcome.cancelled;
-                result.seeds.budget_stopped = outcome.budget_stopped;
+                result.seeds.budget_stopped = outcome.incomplete;
                 if let Some(current) = outcome.current {
                     result.seeds.climbs_started += 1;
                     if outcome.neighborhood_exhausted {
@@ -2195,7 +2203,7 @@ impl<'a> BoundClimbScoring<'a> {
                     let seed = SeedBest {
                         seed_index,
                         current,
-                        incomplete: outcome.cancelled || outcome.budget_stopped,
+                        incomplete: outcome.cancelled || outcome.incomplete,
                         final_objective_ascent: outcome.final_objective_ascent,
                         neighborhood_exhausted: outcome.neighborhood_exhausted,
                     };
@@ -2212,7 +2220,7 @@ impl<'a> BoundClimbScoring<'a> {
                         ControlFlow::Continue(_) => {}
                     }
                 }
-                if outcome.cancelled || outcome.budget_stopped {
+                if outcome.cancelled || outcome.incomplete {
                     break;
                 }
             }
@@ -2241,7 +2249,7 @@ impl<'a> BoundClimbScoring<'a> {
         };
         for (seed_index, board) in seeds {
             let outcome = self.climb(board, backtrack_pairs, allowance)?;
-            result.budget_stopped = outcome.budget_stopped;
+            result.budget_stopped = outcome.incomplete;
             let Some(current) = outcome.current else {
                 break;
             };
@@ -2251,7 +2259,7 @@ impl<'a> BoundClimbScoring<'a> {
                 .climbs_started
                 .checked_add(1)
                 .expect("scalar seed count fits u128");
-            if outcome.neighborhood_exhausted && !outcome.budget_stopped {
+            if outcome.neighborhood_exhausted && !outcome.incomplete {
                 result.climbs_completed = result
                     .climbs_completed
                     .checked_add(1)
@@ -2263,12 +2271,12 @@ impl<'a> BoundClimbScoring<'a> {
                 result.best = Some(SeedBest {
                     seed_index,
                     current,
-                    incomplete: outcome.budget_stopped,
+                    incomplete: outcome.incomplete,
                     final_objective_ascent: outcome.final_objective_ascent,
                     neighborhood_exhausted: outcome.neighborhood_exhausted,
                 });
             }
-            if outcome.budget_stopped {
+            if outcome.incomplete {
                 break;
             }
         }
@@ -2318,7 +2326,7 @@ impl<'a> BoundClimbScoring<'a> {
         let Some(mut state) = started else {
             return Ok(ClimbOutcome {
                 current: None,
-                budget_stopped: !cancelled,
+                incomplete: !cancelled,
                 cancelled,
                 final_objective_ascent: false,
                 neighborhood_exhausted: false,
@@ -2374,7 +2382,7 @@ impl<'a> BoundClimbScoring<'a> {
         }
         Ok(ClimbOutcome {
             current: Some(current),
-            budget_stopped: !neighborhood_exhausted && !cancelled,
+            incomplete: !neighborhood_exhausted && !cancelled,
             cancelled,
             final_objective_ascent,
             neighborhood_exhausted,
@@ -2710,7 +2718,7 @@ mod tests {
                 if committed { vec![('A', 'C')] } else { vec![] }
             );
             assert!(outcome.cancelled);
-            assert!(!outcome.budget_stopped && !outcome.neighborhood_exhausted);
+            assert!(!outcome.incomplete && !outcome.neighborhood_exhausted);
             assert_eq!(outcome.final_objective_ascent, committed);
             assert_eq!(actual, used);
             assert_eq!(
@@ -2750,7 +2758,7 @@ mod tests {
                 (outcome.cancelled, outcome.neighborhood_exhausted),
                 (cancelled, exhausted)
             );
-            assert_eq!(outcome.budget_stopped, !cancelled && !exhausted);
+            assert_eq!(outcome.incomplete, !cancelled && !exhausted);
             assert_eq!(outcome.current.is_some(), used > 0);
             assert_eq!(actual, used);
             assert_eq!(snapshot.climbs_started, u128::from(used > 0));
@@ -3008,7 +3016,7 @@ mod tests {
             assert_eq!(snapshot.climbs_completed, u128::from(exhausted));
             assert_eq!(snapshot.outers_completed, 0);
             assert_eq!(outcome.neighborhood_exhausted, exhausted);
-            assert_eq!(outcome.budget_stopped, !exhausted);
+            assert_eq!(outcome.incomplete, !exhausted);
             assert_eq!(outcome.final_objective_ascent, expected_ascent);
             if let Some(current) = outcome.current {
                 assert_eq!(
@@ -5551,7 +5559,7 @@ mod tests {
         assert_eq!(current.plaintext, "CB");
         assert_eq!(current.score.ranking().units(), 2i128 << 32);
         assert!(best.climb.neighborhood_exhausted && best.climb.final_objective_ascent);
-        assert!(!best.climb.cancelled && !best.climb.budget_stopped);
+        assert!(!best.climb.cancelled && !best.climb.incomplete);
         let snapshot = control.snapshot();
         assert_eq!(
             (
@@ -5661,7 +5669,7 @@ mod tests {
             );
             assert!(
                 best.climb.cancelled
-                    && !best.climb.budget_stopped
+                    && !best.climb.incomplete
                     && !best.climb.neighborhood_exhausted
             );
             assert_eq!(best.climb.final_objective_ascent, paired);
@@ -5715,7 +5723,7 @@ mod tests {
                     best.climb.final_objective_ascent,
                     expected.climb.final_objective_ascent
                 );
-                assert_eq!(best.climb.budget_stopped, expected.climb.budget_stopped);
+                assert_eq!(best.climb.incomplete, expected.climb.incomplete);
                 assert!(!best.climb.cancelled);
             } else {
                 assert!(expected.best.is_none());
@@ -5879,7 +5887,7 @@ mod tests {
                     } else if fault >= 5 {
                         outcome.climb.neighborhood_exhausted = false;
                         outcome.climb.cancelled = fault == 6;
-                        outcome.climb.budget_stopped = fault != 6;
+                        outcome.climb.incomplete = fault != 6;
                         if fault == 7 {
                             outcome.climb.current = None;
                         }
@@ -6460,7 +6468,7 @@ mod tests {
                 let (request, mut best) = projection_fixture();
                 best.start_index = u128::MAX - 1;
                 best.climb.cancelled = flags & 1 != 0;
-                best.climb.budget_stopped = flags & 2 != 0;
+                best.climb.incomplete = flags & 2 != 0;
                 best.climb.final_objective_ascent = flags & 4 != 0;
                 best.climb.neighborhood_exhausted = flags & 8 != 0;
                 let termination = match expected {
@@ -6905,7 +6913,7 @@ mod tests {
             assert_eq!(best.start_index(), 0);
             assert_eq!(
                 best.incomplete(),
-                expected.climb.cancelled || expected.climb.budget_stopped
+                expected.climb.cancelled || expected.climb.incomplete
             );
             assert_eq!(
                 best.neighborhood_exhausted(),
@@ -7096,7 +7104,7 @@ mod tests {
         assert_eq!(best.start_index, 0);
         assert_eq!(best.initial, expected.initial);
         assert_eq!(best.climb.current, expected.climb.current);
-        assert!(!best.climb.budget_stopped);
+        assert!(!best.climb.incomplete);
     }
 
     #[test]
@@ -7166,7 +7174,7 @@ mod tests {
             ),
             (1, 1, 1, 9)
         );
-        assert!(!next.best.unwrap().climb.budget_stopped);
+        assert!(!next.best.unwrap().climb.incomplete);
         let denied = scheduler_request(1, true, false, 0)
             .schedule_direct_outers()
             .unwrap();
@@ -7192,7 +7200,7 @@ mod tests {
             ),
             (1, 1, 2)
         );
-        assert!(!reserved.best.unwrap().climb.budget_stopped);
+        assert!(!reserved.best.unwrap().climb.incomplete);
     }
 
     #[test]
@@ -7213,7 +7221,7 @@ mod tests {
             assert_eq!(result.evaluations_used, used);
             let best = result.best.unwrap();
             assert_eq!(best.climb.current.unwrap().board, board);
-            assert!(best.climb.budget_stopped);
+            assert!(best.climb.incomplete);
             assert!(!best.climb.neighborhood_exhausted);
         }
         let losing = scheduler_request(10, false, false, 0)
@@ -7230,7 +7238,7 @@ mod tests {
         assert_eq!(losing.termination, DirectRunTermination::EvaluationBudget);
         assert_eq!(losing.best.as_ref().unwrap().outer_index, 0);
         let best = losing.best.unwrap();
-        assert!(!best.climb.budget_stopped);
+        assert!(!best.climb.incomplete);
         assert!(best.climb.neighborhood_exhausted);
         assert!(best.climb.final_objective_ascent);
     }
@@ -7262,7 +7270,7 @@ mod tests {
             assert_eq!(current.board, vec![('A', 'C')]);
             assert_eq!(current.plaintext, "CB");
             assert_eq!(current.score.ranking().units(), 2 * (1i128 << 32));
-            assert!(!result.climb.budget_stopped);
+            assert!(!result.climb.incomplete);
             assert!(result.climb.neighborhood_exhausted);
             assert!(result.climb.final_objective_ascent);
             let initial = request.outer_candidates().next().unwrap().1.unwrap();
@@ -7270,7 +7278,7 @@ mod tests {
                 .climb_direct_outer(initial, index, &mut allowance)
                 .unwrap();
             assert!(denied.climb.current.is_none());
-            assert!(denied.climb.budget_stopped);
+            assert!(denied.climb.incomplete);
             assert!(!denied.climb.neighborhood_exhausted);
             assert_eq!(allowance.used, cost);
         }
@@ -7291,7 +7299,7 @@ mod tests {
                 .climb_direct_outer(initial, 17, &mut allowance)
                 .unwrap();
             assert_eq!(allowance.used, used);
-            assert!(result.climb.budget_stopped);
+            assert!(result.climb.incomplete);
             assert!(!result.climb.neighborhood_exhausted);
             match (board, result.climb.current) {
                 (Some(board), Some(current)) => {
@@ -7699,10 +7707,7 @@ mod tests {
             assert_eq!(best.current.board, expected_current.board);
             assert_eq!(best.current.plaintext, expected_current.plaintext);
             assert_eq!(best.current.score, expected_current.score);
-            assert_eq!(
-                best.incomplete,
-                expected.cancelled || expected.budget_stopped
-            );
+            assert_eq!(best.incomplete, expected.cancelled || expected.incomplete);
             assert_eq!(best.final_objective_ascent, expected.final_objective_ascent);
             assert_eq!(best.neighborhood_exhausted, expected.neighborhood_exhausted);
         }
@@ -8942,7 +8947,7 @@ mod tests {
             assert_eq!(allowance.used, used);
             assert_eq!(result.final_objective_ascent, ascent);
             assert_eq!(result.neighborhood_exhausted, exhausted);
-            assert_eq!(result.budget_stopped, !exhausted);
+            assert_eq!(result.incomplete, !exhausted);
         }
     }
 
@@ -8977,7 +8982,7 @@ mod tests {
             assert_eq!(allowance.used, used);
             assert_eq!(result.final_objective_ascent, ascent);
             assert_eq!(result.neighborhood_exhausted, exhausted);
-            assert_eq!(result.budget_stopped, !exhausted);
+            assert_eq!(result.incomplete, !exhausted);
         }
     }
 
@@ -9001,7 +9006,7 @@ mod tests {
             assert_eq!(result.current.unwrap().board, board);
             assert_eq!(result.final_objective_ascent, ascent);
             assert_eq!(result.neighborhood_exhausted, exhausted);
-            assert_eq!(result.budget_stopped, !exhausted);
+            assert_eq!(result.incomplete, !exhausted);
             assert_eq!(allowance.used, limit);
         }
     }
@@ -9022,7 +9027,7 @@ mod tests {
             let mut allowance = EvaluationAllowance { used: 0, limit };
             let result = context.climb(vec![], 0, &mut allowance).unwrap();
             assert!(result.current.is_none());
-            assert!(result.budget_stopped);
+            assert!(result.incomplete);
             assert!(!result.final_objective_ascent);
             assert!(!result.neighborhood_exhausted);
             assert_eq!(allowance.used, 0);
@@ -9054,7 +9059,7 @@ mod tests {
             assert_eq!(current.plaintext, "CA");
             assert_eq!(current.score.ranking().units(), 0);
             assert_eq!(allowance.used, limit);
-            assert!(!result.budget_stopped);
+            assert!(!result.incomplete);
             assert!(result.neighborhood_exhausted);
             assert_eq!(result.final_objective_ascent, identical);
         }
@@ -9164,7 +9169,7 @@ mod tests {
 
         let mut allowance = EvaluationAllowance { used: 0, limit: 3 };
         let state = context.start(vec![], &mut allowance).unwrap().unwrap();
-        assert!(allowance.admit(state.reserve()));
+        assert!(allowance.admit(state.reserve()).unwrap());
         let (plaintext, score) = context.initial_evaluator.evaluate(&[('A', 'C')]).unwrap();
         let trial = ScoredBoard {
             board: vec![('A', 'C')],
@@ -9319,7 +9324,7 @@ mod tests {
         let mut allowance = EvaluationAllowance { used: 0, limit: 2 };
         let state = context.start(vec![], &mut allowance).unwrap().unwrap();
         assert_eq!(state.reserve(), 0);
-        assert!(allowance.admit(state.reserve()));
+        assert!(allowance.admit(state.reserve()).unwrap());
         let (plaintext, score) = context.initial_evaluator.evaluate(&[('A', 'C')]).unwrap();
         let trial = ScoredBoard {
             board: vec![('A', 'C')],
@@ -9357,7 +9362,7 @@ mod tests {
         let state = context.start(vec![], &mut allowance).unwrap().unwrap();
         assert_eq!(state.reserve(), 1);
         // AC is the initial objective's complete-neighborhood winner (existing fixture).
-        assert!(allowance.admit(state.reserve()));
+        assert!(allowance.admit(state.reserve()).unwrap());
         let (plaintext, score) = context.initial_evaluator.evaluate(&[('A', 'C')]).unwrap();
         assert_eq!(plaintext, "CB");
         assert_eq!(score.ranking().units(), 2 << 32);
@@ -9373,7 +9378,7 @@ mod tests {
         assert_eq!(state.current.score.ranking().units(), 3 << 32);
         assert_eq!(state.reserve(), 0);
         assert_eq!(allowance.used, 6);
-        assert!(allowance.admit(state.reserve()));
+        assert!(allowance.admit(state.reserve()).unwrap());
         let (plaintext, score) = context.final_evaluator.evaluate(&[]).unwrap();
         // Empty board is the final objective's strict complete-neighborhood winner.
         let trial = ScoredBoard {
@@ -9476,7 +9481,7 @@ mod tests {
             let mut allowance = EvaluationAllowance { used: 0, limit: 3 };
             let state = context.start(vec![], &mut allowance).unwrap().unwrap();
             let error = if threshold == 1 {
-                assert!(allowance.admit(state.reserve()));
+                assert!(allowance.admit(state.reserve()).unwrap());
                 let (plaintext, score) = context.initial_evaluator.evaluate(&[('A', 'C')]).unwrap();
                 state
                     .commit_trial(
@@ -9718,15 +9723,62 @@ mod tests {
             Ok(ScanOutcome::Interrupted)
         );
         assert_eq!(allowance.used, 8);
-        assert!(!allowance.admit(0));
+        assert!(!allowance.admit(0).unwrap());
         let mut maximum = EvaluationAllowance {
             used: u64::MAX - 1,
             limit: u64::MAX,
         };
-        assert!(!maximum.admit(1));
-        assert!(maximum.admit(0));
-        assert!(!maximum.admit(0));
-        assert!(!maximum.admit(u64::MAX));
+        assert!(!maximum.admit(1).unwrap());
+        assert_eq!(maximum.used, u64::MAX - 1);
+        assert!(maximum.admit(0).unwrap());
+        assert_eq!(maximum.used, u64::MAX);
+        assert!(!maximum.admit(0).unwrap());
+        assert!(!maximum.admit(u64::MAX).unwrap());
+        assert_eq!(maximum.used, u64::MAX);
+    }
+
+    #[test]
+    fn observed_allowance_maximum_keeps_denial_precedence_and_separate_counters() {
+        use crate::attack_control::CounterSnapshot;
+        let before = CounterSnapshot {
+            evaluations_admitted: u64::MAX - 1,
+            evaluations_completed: u64::MAX - 2,
+            ..CounterSnapshot::default()
+        };
+        let mut allowance = EvaluationAllowance {
+            used: u64::MAX - 1,
+            limit: u64::MAX,
+        };
+        let mut control = AttackControl::with_counters(before);
+        let mut observer = Recorder::default();
+        let mut accounting = ObservedAccounting {
+            allowance: &mut allowance,
+            control: &mut control,
+            observer: &mut observer,
+        };
+        assert_eq!(accounting.admit(1), Ok(false));
+        assert_eq!(accounting.allowance.used, u64::MAX - 1);
+        assert_eq!(accounting.control.snapshot(), before);
+        assert_eq!(accounting.admit(0), Ok(true));
+        let admitted = CounterSnapshot {
+            evaluations_admitted: u64::MAX,
+            ..before
+        };
+        assert_eq!(accounting.allowance.used, u64::MAX);
+        assert_eq!(accounting.control.snapshot(), admitted);
+        // Denial still precedes the now-overflowing admission counter.
+        assert_eq!(accounting.admit(0), Ok(false));
+        assert_eq!(accounting.allowance.used, u64::MAX);
+        assert_eq!(accounting.control.snapshot(), admitted);
+        assert_eq!(accounting.complete(), Ok(()));
+        assert_eq!(
+            accounting.control.snapshot(),
+            CounterSnapshot {
+                evaluations_completed: u64::MAX - 1,
+                ..admitted
+            }
+        );
+        assert!(observer.0.is_empty());
     }
 
     #[test]
@@ -9849,7 +9901,10 @@ mod tests {
             self.polls >= self.stop
         }
         fn admit(&mut self, reserve: u64) -> Result<bool, Self::Error> {
-            Ok(self.allowance.admit(reserve))
+            Ok(self
+                .allowance
+                .admit(reserve)
+                .expect("capped allowance cannot overflow"))
         }
     }
 
