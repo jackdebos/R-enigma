@@ -399,6 +399,7 @@ impl Alphabet {
 #[cfg(test)]
 thread_local! {
     pub(crate) static INDEX_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static WHEEL_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ALPHABET_MAP_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ALPHABET_HASH_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -582,6 +583,8 @@ impl MachineTopology {
 
     /// Looks up a declared wheel by its unique name.
     pub fn wheel(&self, name: &str) -> Option<&Wiring> {
+        #[cfg(test)]
+        WHEEL_LOOKUPS.with(|count| count.set(count.get() + 1));
         self.wheel_indices
             .get(name)
             .map(|&index| &self.wheels[index])

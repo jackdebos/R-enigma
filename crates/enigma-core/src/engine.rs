@@ -11,7 +11,7 @@
 //! reflector the traversal is directional: encrypt walks every slot right-to-left with
 //! forward mappings, decrypt walks every slot left-to-right with reverse mappings.
 
-use crate::{MachineTopology, ModelError, Plugboard, Slot, SlotRole, Stepping};
+use crate::{MachineTopology, ModelError, Plugboard, SlotRole, Stepping};
 
 /// The electrical direction of a [`Engine::transform`] call.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,13 +29,24 @@ pub enum Direction {
 ///
 /// Construction checks the stepping/topology binding. Both are owned, private, and
 /// remain immutable afterward, so per-symbol stepping can skip that binding comparison
-/// while retaining all other planning and advancement checks.
+/// while retaining all other planning and advancement checks. Construction also
+/// resolves every slot's wheel and ring to indices once, so traversal works on
+/// alphabet indices without wheel-name lookups or symbol conversions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Engine {
     topology: MachineTopology,
     stepping: Stepping,
     plugboard: Plugboard,
     positions: Vec<char>,
+    slots: Vec<ResolvedSlot>,
+    has_reflector: bool,
+}
+
+/// One slot's wheel (index into the topology's wheels) and ring (alphabet index).
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedSlot {
+    wheel: usize,
+    ring: usize,
 }
 
 #[cfg(test)]
@@ -66,11 +77,32 @@ impl Engine {
             .collect();
         // Fail closed if the rule set is bound to a different topology.
         stepping.plan(&topology, &positions)?;
+        let slots = topology
+            .slots()
+            .iter()
+            .map(|slot| {
+                let wheel = *topology
+                    .wheel_indices
+                    .get(slot.wheel())
+                    .ok_or_else(|| ModelError::UnknownWheel(slot.wheel().to_string()))?;
+                let ring = topology
+                    .alphabet()
+                    .index_of(slot.ring())
+                    .ok_or(ModelError::UnknownSymbol(slot.ring()))?;
+                Ok(ResolvedSlot { wheel, ring })
+            })
+            .collect::<Result<Vec<_>, ModelError>>()?;
+        let has_reflector = topology
+            .slots()
+            .first()
+            .is_some_and(|slot| slot.role() == SlotRole::Reflector);
         Ok(Self {
             topology,
             stepping,
             plugboard,
             positions,
+            slots,
+            has_reflector,
         })
     }
 
@@ -93,25 +125,19 @@ impl Engine {
         {
             return Err(ModelError::UnknownSymbol(symbol));
         }
+        let mut offsets = vec![0; self.slots.len()];
         let mut output = String::with_capacity(text.len());
         for symbol in text.chars() {
-            self.stepping
-                .advance_prevalidated(&self.topology, &mut self.positions)?;
-            output.push(self.traverse(symbol, direction)?);
+            self.step(&mut offsets)?;
+            let alphabet = self.topology.alphabet();
+            let input = alphabet
+                .index_of(symbol)
+                .ok_or(ModelError::UnknownSymbol(symbol))?;
+            let mapping = &self.plugboard.mapping;
+            let signal = mapping[self.scramble(&offsets, mapping[input], direction)];
+            output.push(alphabet.symbols[signal]);
         }
         Ok(output)
-    }
-
-    /// Applies one electrical traversal to a single alphabet symbol.
-    fn traverse(&self, symbol: char, direction: Direction) -> Result<char, ModelError> {
-        let signal = self
-            .plugboard
-            .map(symbol)
-            .ok_or(ModelError::UnknownSymbol(symbol))?;
-        let signal = self.traverse_scrambler(signal, direction)?;
-        self.plugboard
-            .map(signal)
-            .ok_or(ModelError::UnknownSymbol(signal))
     }
 
     /// Builds board-independent rows of alphabet indices, stepping exactly once before
@@ -124,82 +150,92 @@ impl Engine {
     ) -> Result<(), ModelError> {
         #[cfg(test)]
         ROW_BUILDS.with(|count| count.set(count.get() + 1));
+        let size = self.topology.alphabet().len();
+        let mut offsets = vec![0; self.slots.len()];
         for _ in 0..length {
-            self.stepping
-                .advance_prevalidated(&self.topology, &mut self.positions)?;
-            let alphabet = self.topology.alphabet();
-            for &symbol in &alphabet.symbols {
-                let output = self.traverse_scrambler(symbol, direction)?;
-                let index = alphabet
-                    .index_of(output)
-                    .and_then(|index| u32::try_from(index).ok())
-                    .ok_or(ModelError::UnknownSymbol(output))?;
-                rows.push(index);
+            self.step(&mut offsets)?;
+            for input in 0..size {
+                let output = self.scramble(&offsets, input, direction);
+                rows.push(u32::try_from(output).map_err(|_| {
+                    ModelError::UnknownSymbol(self.topology.alphabet().symbols[output])
+                })?);
             }
         }
         Ok(())
     }
 
-    fn traverse_scrambler(
-        &self,
-        mut signal: char,
-        direction: Direction,
-    ) -> Result<char, ModelError> {
-        let slots = self.topology.slots();
-        let has_reflector = slots
-            .first()
-            .is_some_and(|slot| slot.role() == SlotRole::Reflector);
+    /// Applies one keypress of stepping, then refreshes each slot's electrical offset
+    /// (displayed position minus ring, modulo the alphabet size).
+    fn step(&mut self, offsets: &mut [usize]) -> Result<(), ModelError> {
+        self.stepping
+            .advance_prevalidated(&self.topology, &mut self.positions)?;
+        let alphabet = self.topology.alphabet();
+        let size = alphabet.len();
+        for ((offset, slot), &symbol) in offsets.iter_mut().zip(&self.slots).zip(&self.positions) {
+            let position = alphabet
+                .index_of(symbol)
+                .ok_or(ModelError::UnknownSymbol(symbol))?;
+            *offset = if position >= slot.ring {
+                position - slot.ring
+            } else {
+                size - (slot.ring - position)
+            };
+        }
+        Ok(())
+    }
 
-        if has_reflector {
+    /// Traverses the scrambler (every slot, without the plugboard) on alphabet indices.
+    fn scramble(&self, offsets: &[usize], mut signal: usize, direction: Direction) -> usize {
+        let count = self.slots.len();
+        if self.has_reflector {
             // Forward from the rightmost rotor up to (but excluding) the reflector.
-            for index in (1..slots.len()).rev() {
-                signal = self.map_slot(slots, index, signal, true)?;
+            for index in (1..count).rev() {
+                signal = self.map_slot(offsets, index, signal, true);
             }
             // The reflector is traversed exactly once with its own position and ring.
-            signal = self.map_slot(slots, 0, signal, true)?;
+            signal = self.map_slot(offsets, 0, signal, true);
             // Reverse from the leftmost rotor back down to the rightmost.
-            for index in 1..slots.len() {
-                signal = self.map_slot(slots, index, signal, false)?;
+            for index in 1..count {
+                signal = self.map_slot(offsets, index, signal, false);
             }
         } else {
             match direction {
                 Direction::Encrypt => {
-                    for index in (0..slots.len()).rev() {
-                        signal = self.map_slot(slots, index, signal, true)?;
+                    for index in (0..count).rev() {
+                        signal = self.map_slot(offsets, index, signal, true);
                     }
                 }
                 Direction::Decrypt => {
-                    for index in 0..slots.len() {
-                        signal = self.map_slot(slots, index, signal, false)?;
+                    for index in 0..count {
+                        signal = self.map_slot(offsets, index, signal, false);
                     }
                 }
             }
         }
-
-        Ok(signal)
+        signal
     }
 
-    /// Maps `symbol` through one slot's wheel in the requested electrical direction.
-    fn map_slot(
-        &self,
-        slots: &[Slot],
-        index: usize,
-        symbol: char,
-        forward: bool,
-    ) -> Result<char, ModelError> {
-        let slot = &slots[index];
-        let wheel = self
-            .topology
-            .wheel(slot.wheel())
-            .ok_or_else(|| ModelError::UnknownWheel(slot.wheel().to_string()))?;
-        let position = self.positions[index];
-        let ring = slot.ring();
-        let mapped = if forward {
-            wheel.forward(symbol, position, ring)
+    /// Maps an alphabet index through one slot's wheel in the requested direction.
+    fn map_slot(&self, offsets: &[usize], index: usize, signal: usize, forward: bool) -> usize {
+        let wheel = &self.topology.wheels[self.slots[index].wheel];
+        let table = if forward {
+            &wheel.forward
         } else {
-            wheel.reverse(symbol, position, ring)
+            &wheel.reverse
         };
-        mapped.ok_or(ModelError::UnknownSymbol(symbol))
+        let size = table.len();
+        let offset = offsets[index];
+        let shifted = if signal >= size - offset {
+            signal - (size - offset)
+        } else {
+            signal + offset
+        };
+        let output = table[shifted];
+        if output < offset {
+            size - (offset - output)
+        } else {
+            output - offset
+        }
     }
 }
 
@@ -768,5 +804,251 @@ mod tests {
             without_steps.transform("AA", Direction::Decrypt).unwrap(),
             "BB"
         );
+    }
+
+    /// Deterministic xorshift64 generator for differential machines.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, bound: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % bound as u64) as usize
+        }
+
+        fn permutation(&mut self, symbols: &[char]) -> Vec<char> {
+            let mut out = symbols.to_vec();
+            for index in (1..out.len()).rev() {
+                out.swap(index, self.below(index + 1));
+            }
+            out
+        }
+
+        fn symbol(&mut self, symbols: &[char]) -> char {
+            symbols[self.below(symbols.len())]
+        }
+    }
+
+    fn random_machine(rng: &mut Rng, symbols: &[char]) -> (MachineTopology, Stepping, Plugboard) {
+        let alphabet = Alphabet::new(symbols.to_vec()).unwrap();
+        let mut wheels = Vec::new();
+        let mut slots = Vec::new();
+        if rng.below(2) == 0 {
+            // Involution with possible fixed points: pair a shuffled prefix.
+            let order = rng.permutation(symbols);
+            let mut wiring = symbols.to_vec();
+            let pairs = rng.below(symbols.len() / 2 + 1);
+            for pair in order[..2 * pairs].chunks(2) {
+                let left = alphabet.index_of(pair[0]).unwrap();
+                let right = alphabet.index_of(pair[1]).unwrap();
+                wiring[left] = pair[1];
+                wiring[right] = pair[0];
+            }
+            wheels.push(Wiring::new("ukw", &alphabet, &wiring, &[]).unwrap());
+            slots.push(Slot::new(
+                "ukw",
+                "ukw",
+                SlotRole::Reflector,
+                Movement::Fixed,
+                rng.symbol(symbols),
+                rng.symbol(symbols),
+            ));
+        }
+        let rotors = 1 + rng.below(4);
+        for index in 0..rotors {
+            let name = format!("w{index}");
+            let turnovers: Vec<char> = symbols
+                .iter()
+                .copied()
+                .filter(|_| rng.below(4) == 0)
+                .collect();
+            wheels.push(
+                Wiring::new(&name, &alphabet, &rng.permutation(symbols), &turnovers).unwrap(),
+            );
+            slots.push(Slot::new(
+                format!("s{index}"),
+                name,
+                SlotRole::Rotor,
+                Movement::Movable,
+                rng.symbol(symbols),
+                rng.symbol(symbols),
+            ));
+        }
+        // Wheels are declared in reverse so a wheel's index differs from its slot's.
+        wheels.reverse();
+        let topology = MachineTopology::new(alphabet.clone(), wheels, slots).unwrap();
+        let right = format!("s{}", rotors - 1);
+        let left = "s0".to_string();
+        let stepping = Stepping::new(
+            &topology,
+            vec![
+                StepRule::new(StepCondition::Always, vec![right.clone()]),
+                StepRule::new(
+                    StepCondition::Any(vec![
+                        StepCondition::AtTurnover(right.clone()),
+                        StepCondition::Not(Box::new(StepCondition::AtPosition {
+                            slot: left.clone(),
+                            symbol: rng.symbol(symbols),
+                        })),
+                    ]),
+                    vec![left],
+                ),
+            ],
+        )
+        .unwrap();
+        let order = rng.permutation(symbols);
+        let pairs: Vec<(char, char)> = order[..2 * rng.below(symbols.len() / 2 + 1)]
+            .chunks(2)
+            .map(|pair| (pair[0], pair[1]))
+            .collect();
+        let plugboard = Plugboard::new(&alphabet, &pairs).unwrap();
+        (topology, stepping, plugboard)
+    }
+
+    /// Char-level reference traversal through the public wheel API.
+    fn oracle_scramble(
+        topology: &MachineTopology,
+        positions: &[char],
+        mut signal: char,
+        direction: Direction,
+    ) -> char {
+        let slots = topology.slots();
+        let pass = |signal: char, index: usize, forward: bool| {
+            let slot = &slots[index];
+            let wheel = topology.wheel(slot.wheel()).unwrap();
+            if forward {
+                wheel.forward(signal, positions[index], slot.ring())
+            } else {
+                wheel.reverse(signal, positions[index], slot.ring())
+            }
+            .unwrap()
+        };
+        if slots[0].role() == SlotRole::Reflector {
+            for index in (1..slots.len()).rev() {
+                signal = pass(signal, index, true);
+            }
+            signal = pass(signal, 0, true);
+            for index in 1..slots.len() {
+                signal = pass(signal, index, false);
+            }
+        } else if direction == Direction::Encrypt {
+            for index in (0..slots.len()).rev() {
+                signal = pass(signal, index, true);
+            }
+        } else {
+            for index in 0..slots.len() {
+                signal = pass(signal, index, false);
+            }
+        }
+        signal
+    }
+
+    const DIFFERENTIAL_ALPHABETS: [&str; 3] = ["ABCD", "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "aβγδéZzñ"];
+
+    #[test]
+    fn indexed_traversal_matches_the_char_oracle() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for symbols in DIFFERENTIAL_ALPHABETS {
+            let symbols: Vec<char> = symbols.chars().collect();
+            for _ in 0..40 {
+                let (topology, stepping, plugboard) = random_machine(&mut rng, &symbols);
+                let text: String = (0..3 * symbols.len() + 7)
+                    .map(|_| rng.symbol(&symbols))
+                    .collect();
+                for direction in [Direction::Encrypt, Direction::Decrypt] {
+                    let mut positions: Vec<char> =
+                        topology.slots().iter().map(Slot::position).collect();
+                    let mut expected_text = String::new();
+                    let mut expected_rows = Vec::new();
+                    for symbol in text.chars() {
+                        stepping.advance(&topology, &mut positions).unwrap();
+                        let signal = plugboard.map(symbol).unwrap();
+                        let signal = oracle_scramble(&topology, &positions, signal, direction);
+                        expected_text.push(plugboard.map(signal).unwrap());
+                        for &input in &symbols {
+                            let output = oracle_scramble(&topology, &positions, input, direction);
+                            expected_rows
+                                .push(topology.alphabet().index_of(output).unwrap() as u32);
+                        }
+                    }
+
+                    let engine =
+                        Engine::new(topology.clone(), stepping.clone(), plugboard.clone()).unwrap();
+                    let mut transformed = engine.clone();
+                    assert_eq!(
+                        transformed.transform(&text, direction).unwrap(),
+                        expected_text
+                    );
+                    assert_eq!(transformed.positions(), positions.as_slice());
+                    let mut rows_engine = engine;
+                    let mut rows = Vec::new();
+                    rows_engine
+                        .scrambler_rows(text.chars().count(), direction, &mut rows)
+                        .unwrap();
+                    assert_eq!(rows, expected_rows);
+                    assert_eq!(rows_engine.positions(), positions.as_slice());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn traversal_resolves_wheels_once_and_symbols_once_per_keypress() {
+        let symbols: Vec<char> = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".chars().collect();
+        let alphabet = Alphabet::new(symbols.clone()).unwrap();
+        let wheel = |name: &str| Wiring::new(name, &alphabet, &symbols, &[]).unwrap();
+        let topology = MachineTopology::new(
+            alphabet.clone(),
+            vec![wheel("ukw"), wheel("left"), wheel("right")],
+            vec![
+                Slot::new("ukw", "ukw", SlotRole::Reflector, Movement::Fixed, 'A', 'A'),
+                Slot::new("left", "left", SlotRole::Rotor, Movement::Movable, 'C', 'B'),
+                Slot::new(
+                    "right",
+                    "right",
+                    SlotRole::Rotor,
+                    Movement::Movable,
+                    'Y',
+                    'D',
+                ),
+            ],
+        )
+        .unwrap();
+        // Stepping without turnover conditions: only the traversal is measured here.
+        let stepping = Stepping::new(
+            &topology,
+            vec![
+                StepRule::new(StepCondition::Always, vec!["right".into()]),
+                StepRule::new(
+                    StepCondition::AtPosition {
+                        slot: "right".into(),
+                        symbol: 'Z',
+                    },
+                    vec!["left".into()],
+                ),
+            ],
+        )
+        .unwrap();
+        let mut engine = Engine::new(topology, stepping, identity_plugboard(&alphabet)).unwrap();
+        let length = 40;
+        let slots = 3;
+        crate::WHEEL_LOOKUPS.with(|count| count.set(0));
+        crate::INDEX_LOOKUPS.with(|count| count.set(0));
+        let mut rows = Vec::new();
+        engine
+            .scrambler_rows(length, Direction::Decrypt, &mut rows)
+            .unwrap();
+        assert_eq!(rows.len(), length * symbols.len());
+        assert_eq!(crate::WHEEL_LOOKUPS.with(|count| count.get()), 0);
+        // At most one lookup per slot position and one per stepped slot each keypress.
+        assert!(crate::INDEX_LOOKUPS.with(|count| count.get()) <= length * 2 * slots);
+
+        crate::INDEX_LOOKUPS.with(|count| count.set(0));
+        let text: String = std::iter::repeat_n('Q', length).collect();
+        engine.transform(&text, Direction::Encrypt).unwrap();
+        assert_eq!(crate::WHEEL_LOOKUPS.with(|count| count.get()), 0);
+        // Plus whole-text validation and one input lookup per symbol.
+        assert!(crate::INDEX_LOOKUPS.with(|count| count.get()) <= length * (2 * slots + 2));
     }
 }
