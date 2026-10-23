@@ -127,7 +127,7 @@ struct PlugboardAxes {
 ///
 /// It holds the ordered domain vectors and the mixed-radix radices once, so enumeration
 /// is a pure function of the resolved space: no RNG and no unordered iteration.
-struct CandidatePlan<'a> {
+pub(crate) struct CandidatePlan<'a> {
     definition: &'a Definition,
     slots: Vec<SlotAxes>,
     fixed_plugboard: Vec<(char, char)>,
@@ -137,7 +137,7 @@ struct CandidatePlan<'a> {
 }
 
 impl<'a> CandidatePlan<'a> {
-    fn build(request: &'a SearchRequest) -> Self {
+    pub(crate) fn build(request: &'a SearchRequest) -> Self {
         let definition = request.definition();
         let configuration = request.configuration();
         let space = request.space();
@@ -214,7 +214,10 @@ impl<'a> CandidatePlan<'a> {
         }
     }
 
-    fn resolve(&self, index: u128) -> Result<ResolvedConfiguration, Vec<SearchDiagnostic>> {
+    pub(crate) fn resolve(
+        &self,
+        index: u128,
+    ) -> Result<ResolvedConfiguration, Vec<SearchDiagnostic>> {
         let digits = decompose(index, &self.radices);
 
         let mut slots = Vec::with_capacity(self.slots.len());

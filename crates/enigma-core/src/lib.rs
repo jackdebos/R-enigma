@@ -45,6 +45,7 @@
 /// Must match `docs/protocol.md` §10. A breaking change to the protocol bumps this.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+mod attack_blocks;
 mod attack_control;
 mod attack_evaluator;
 mod attack_execution;

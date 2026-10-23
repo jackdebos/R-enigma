@@ -1126,6 +1126,12 @@ pub struct AttackRequest {
 }
 
 impl AttackRequest {
+    /// Builds one indexed projection after eligibility has checked the full count.
+    #[allow(dead_code)] // Consumed by the worker pool in T5; serial runs stay unchanged.
+    pub(crate) fn outer_plan(&self) -> crate::attack_blocks::OuterPlan<'_> {
+        crate::attack_blocks::OuterPlan::new(&self.carrier, &self.gate)
+    }
+
     /// Lazily projects slot assignments and fixed plugboard facts, not mutable starts.
     /// Indices address the full outer space, including items that fail resolution.
     pub(crate) fn outer_candidates(
