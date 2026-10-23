@@ -29,6 +29,7 @@ const CASES: &[&str] = &[
     "enigma-m3-two-notch",
     "enigma-m4-thin-c-gamma",
     "m4-u264-attack-board",
+    "m4-u264-attack-positions",
     "m4-u264-first-break",
     "m4-u264-sinkov-bigram-correct",
     "m4-u264-sinkov-bigram-wrong",
@@ -227,6 +228,50 @@ fn check(case: &str, kind: Kind) -> (f64, f64) {
 #[test]
 fn historical_attack_fixture_is_consistent() {
     attack_fixture();
+}
+
+#[test]
+fn historical_positions_fixture_changes_only_the_two_position_domains() {
+    let (mut query, record) = attack_fixture();
+    let positions = "m4-u264-attack-positions";
+    query["space"]["slots"][3]["positions"] = json!("*");
+    query["space"]["slots"][4]["positions"] = json!("*");
+    assert_eq!(load(positions, "query.json"), query);
+
+    let mut engine = record["engine"].clone();
+    for index in [3, 4] {
+        engine["job"]["configuration"]["slots"][index]
+            .as_object_mut()
+            .unwrap()
+            .remove("position");
+    }
+    let alphabet: Vec<_> = ('A'..='Z').map(|c| c.to_string()).collect();
+    engine["job"]["space"]["slots"] = json!([
+        {"id": "middle", "positions": alphabet},
+        {"id": "right", "positions": alphabet}
+    ]);
+    let selected = load(positions, "case.json");
+    assert_eq!(selected["engine"], engine);
+    for field in [
+        "kind",
+        "resource",
+        "historical_pairs",
+        "plaintext",
+        "observed",
+    ] {
+        assert_eq!(selected[field], record[field], "{field}");
+    }
+    assert_eq!(
+        selected["capture"]["bomm_commit"],
+        record["capture"]["bomm_commit"]
+    );
+    assert_eq!(
+        selected["capture"]["bomm_sha256"],
+        record["capture"]["bomm_sha256"]
+    );
+    assert_eq!(selected["capture"]["exit_code"], 0);
+    assert_eq!(selected["capture"]["units"], 676);
+    assert_eq!(selected["capture"]["decrypts"], 5_492_071);
 }
 
 /// Exactly one CLI execution with full assertions; timing lives in `case_a_timing.rs`.

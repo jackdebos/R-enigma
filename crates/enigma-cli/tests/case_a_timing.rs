@@ -1,4 +1,5 @@
-//! Symmetric end-to-end timing harnesses for design A (`e2e/bomm/m4-u264-attack-board`).
+//! Symmetric end-to-end timing harnesses for U-264 designs A and B (positions).
+//! `ENIGMA_TIMING_CASE=a|positions` selects the workload; A remains the default.
 //!
 //! Both ignored tests time real subprocesses with the same clock: `Instant` around
 //! `Command::output()` only. Each runs one unrecorded warm-up of each kind, then per
@@ -16,6 +17,7 @@ use common::{
 };
 use support::successful_events;
 
+use std::cell::Cell;
 use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -29,6 +31,45 @@ const DEFAULT_RUNS: usize = 100;
 const EVALUATIONS: u32 = 8456;
 const BOMM_QUERY: &str = "e2e/bomm/m4-u264-attack-board/query.json";
 const BOMM_STARTUP_QUERY: &str = "e2e/bomm_timing/startup-query.json";
+const POSITIONS_CASE: &str = "m4-u264-attack-positions";
+
+fn timing_case(value: Option<&OsStr>) -> Result<&'static str, String> {
+    match value {
+        None => Ok(ATTACK_CASE),
+        Some(value) if value == "a" => Ok(ATTACK_CASE),
+        Some(value) if value == "positions" => Ok(POSITIONS_CASE),
+        Some(value) => Err(format!(
+            "ENIGMA_TIMING_CASE must be a or positions, got {value:?}"
+        )),
+    }
+}
+
+fn selected_fixture(case: &str) -> (Value, Value) {
+    if case == ATTACK_CASE {
+        attack_fixture()
+    } else {
+        (
+            common::load(case, "query.json"),
+            common::load(case, "case.json"),
+        )
+    }
+}
+
+fn evaluation_metrics(startup: Duration, full: Duration, count: Option<u64>) -> Option<f64> {
+    count.map(|count| (full.as_secs_f64() - startup.as_secs_f64()) * 1e6 / count as f64)
+}
+
+/// Reject inconsistent counts rather than silently divide timing by a different run's work.
+fn record_evaluations(observed: &Cell<Option<u64>>, count: Option<u64>) {
+    if let Some(previous) = observed.get() {
+        assert_eq!(
+            count,
+            Some(previous),
+            "evaluation count changed between runs"
+        );
+    }
+    observed.set(count);
+}
 
 /// `ENIGMA_TIMING_RUNS`: absent means 100; otherwise a positive decimal integer.
 fn timing_runs(value: Option<&OsStr>) -> Result<usize, String> {
@@ -100,6 +141,7 @@ fn cpu_model() -> Value {
 
 /// Launcher-supplied settings, read and validated before any measurement.
 struct Settings {
+    case: &'static str,
     runs: usize,
     output: Option<PathBuf>,
     metadata: Map<String, Value>,
@@ -109,13 +151,15 @@ impl Settings {
     fn from_env(program: &str) -> Self {
         let runs = timing_runs(std::env::var_os("ENIGMA_TIMING_RUNS").as_deref())
             .unwrap_or_else(|error| panic!("{error}"));
+        let case = timing_case(std::env::var_os("ENIGMA_TIMING_CASE").as_deref())
+            .unwrap_or_else(|error| panic!("{error}"));
         let output = std::env::var_os("ENIGMA_TIMING_OUTPUT").map(PathBuf::from);
         if let Some(path) = &output {
             assert!(!path.exists(), "{} already exists", path.display());
         }
         let mut metadata = Map::new();
         metadata.insert("program".into(), json!(program));
-        metadata.insert("case".into(), json!(ATTACK_CASE));
+        metadata.insert("case".into(), json!(case));
         metadata.insert("cpu_model".into(), cpu_model());
         for (key, variable) in [
             ("git_commit", "ENIGMA_TIMING_GIT_COMMIT"),
@@ -130,21 +174,31 @@ impl Settings {
             metadata.insert(key.into(), json!(value));
         }
         Settings {
+            case,
             runs,
             output,
             metadata,
         }
     }
 
-    fn finish(self, startup: &[Duration], full: &[Duration]) {
-        let (search, per_evaluation) = search_metrics(median(startup), median(full));
+    fn finish(self, startup: &[Duration], full: &[Duration], evaluations: Option<u64>) {
+        let search = median(full).as_secs_f64() - median(startup).as_secs_f64();
+        let per_evaluation = if self.case == ATTACK_CASE {
+            Some(search_metrics(median(startup), median(full)).1)
+        } else {
+            evaluation_metrics(median(startup), median(full), evaluations)
+        };
         let mut report = self.metadata;
         report.insert("runs".into(), json!(self.runs));
-        report.insert("evaluations".into(), json!(EVALUATIONS));
+        if let Some(count) = evaluations {
+            report.insert("evaluations".into(), json!(count));
+        }
         report.insert("startup".into(), statistics(startup));
         report.insert("full".into(), statistics(full));
         report.insert("search_seconds_median".into(), json!(search));
-        report.insert("per_evaluation_microseconds".into(), json!(per_evaluation));
+        if let Some(metric) = per_evaluation {
+            report.insert("per_evaluation_microseconds".into(), json!(metric));
+        }
         let text = serde_json::to_string_pretty(&report).unwrap() + "\n";
         match &self.output {
             Some(path) => {
@@ -154,7 +208,13 @@ impl Settings {
             }
             None => print!("ENIGMA_TIMING {text}"),
         }
-        println!("ENIGMA_TIMING search_seconds_median={search} per_evaluation_microseconds={per_evaluation}");
+        if let Some(metric) = per_evaluation {
+            println!(
+                "ENIGMA_TIMING search_seconds_median={search} per_evaluation_microseconds={metric}"
+            );
+        } else {
+            println!("ENIGMA_TIMING search_seconds_median={search}");
+        }
     }
 }
 
@@ -215,7 +275,20 @@ fn enigma_rust_case_a_timing() {
             "the measured CLI must be the binary hashed by run.sh"
         );
     }
-    let (inputs, record, mut request) = prepare_attack_inputs("enigma-rust-timing");
+    let (inputs, mut record, mut request) = prepare_attack_inputs("enigma-rust-timing");
+    if settings.case == POSITIONS_CASE {
+        let (query, selected) = selected_fixture(settings.case);
+        record = selected;
+        let resources = request["job"]["resources"].clone();
+        request = record["engine"].clone();
+        request["job"]["text"] = json!(query["ciphertext"].as_str().unwrap().to_ascii_uppercase());
+        request["job"]["resources"] = resources;
+        inputs.write("request.json", &request);
+    }
+    let evaluations = Cell::new(Some(u64::from(EVALUATIONS)));
+    if settings.case == POSITIONS_CASE {
+        evaluations.set(None);
+    }
     // Budget 0 is rejected; 1 keeps startup, binding, row build and one evaluation.
     request["job"]["attack"]["evaluation_budget"] = json!(1);
     inputs.write("startup-request.json", &request);
@@ -229,10 +302,36 @@ fn enigma_rust_case_a_timing() {
         || command("startup-request.json"),
         verify_startup_output,
         || command("request.json"),
-        |output| verify_attack_output(output, &record),
+        |output| {
+            verify_attack_output(output, &record);
+            if settings.case == POSITIONS_CASE {
+                let events = successful_events(output);
+                let result = events
+                    .iter()
+                    .find(|event| event["event"] == "result")
+                    .unwrap();
+                for (id, position) in [("middle", "N"), ("right", "A")] {
+                    let slot = result["best"]["configuration"]["slots"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|slot| slot["id"] == id)
+                        .unwrap();
+                    assert_eq!(slot["position"], position);
+                }
+                assert_eq!(result["counters"]["outers_completed"], "676");
+                let count = result["counters"]["evaluations_completed"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap();
+                assert!(count > 0);
+                record_evaluations(&evaluations, Some(count));
+            }
+        },
     );
     drop(inputs);
-    settings.finish(&startup, &full);
+    settings.finish(&startup, &full, evaluations.get());
 }
 
 /// bomm options recorded in the capture command, between the binary and the query path.
@@ -245,7 +344,11 @@ fn bomm_flags(record: &Value) -> Vec<String> {
         .iter()
         .position(|token| token.ends_with("/bomm"))
         .expect("capture command names the bomm binary");
-    assert_eq!(tokens.last(), Some(&BOMM_QUERY), "capture query path");
+    let query = tokens.last().expect("capture query path");
+    assert!(
+        [BOMM_QUERY, "e2e/bomm/m4-u264-attack-positions/query.json"].contains(query),
+        "capture query path: {query}"
+    );
     let flags: Vec<String> = tokens[binary + 1..tokens.len() - 1]
         .iter()
         .map(|token| token.to_string())
@@ -257,8 +360,8 @@ fn bomm_flags(record: &Value) -> Vec<String> {
     flags
 }
 
-/// `Number of decrypts` when printed, and the pairs of the first key line whose leading
-/// wheels/rings/positions fields equal `key_prefix`, normalized to sorted uppercase.
+/// `Number of decrypts` when printed and the top key's sorted uppercase pairs.
+/// Rejects a nonhistorical top key even if the historical key appears lower down.
 fn bomm_report(stdout: &str, key_prefix: &str) -> (Option<u64>, Vec<String>) {
     let decrypts = stdout.lines().find_map(|line| {
         line.strip_prefix("Number of decrypts:")
@@ -268,12 +371,14 @@ fn bomm_report(stdout: &str, key_prefix: &str) -> (Option<u64>, Vec<String>) {
     let key = stdout
         .lines()
         .map(|line| line.trim_matches(|c: char| c == '│' || c.is_whitespace()))
-        .find(|line| {
-            line.split_whitespace()
-                .take(fields)
-                .eq(key_prefix.split_whitespace())
-        })
-        .unwrap_or_else(|| panic!("no key line starting {key_prefix:?}: {stdout}"));
+        .find(|line| line.starts_with("UKW-"))
+        .unwrap_or_else(|| panic!("no top key line: {stdout}"));
+    assert!(
+        key.split_whitespace()
+            .take(fields)
+            .eq(key_prefix.split_whitespace()),
+        "top key does not start with {key_prefix:?}: {key}"
+    );
     let mut pairs: Vec<String> = key
         .split_whitespace()
         .skip(fields)
@@ -308,7 +413,7 @@ fn bomm_case_a_timing() {
         "BOMM_BIN {} is not a file",
         binary.display()
     );
-    let (_, record) = attack_fixture();
+    let (_, record) = selected_fixture(settings.case);
     if let Some(Value::String(hash)) = settings.metadata.get("binary_sha256") {
         assert_eq!(
             record["capture"]["bomm_sha256"],
@@ -330,6 +435,8 @@ fn bomm_case_a_timing() {
         command.current_dir(&root).args(&flags).arg(query);
         command
     };
+    let query = format!("e2e/bomm/{}/query.json", settings.case);
+    let evaluations = Cell::new(None);
     let (startup, full) = measure(
         settings.runs,
         || command(BOMM_STARTUP_QUERY),
@@ -338,18 +445,76 @@ fn bomm_case_a_timing() {
             assert!(matches!(decrypts, None | Some(1)), "{decrypts:?}");
             assert!(pairs.is_empty(), "startup board must be empty: {pairs:?}");
         },
-        || command(BOMM_QUERY),
+        || command(&query),
         |output| {
             let (decrypts, pairs) = bomm_report(bomm_stdout(output), &key_prefix);
-            assert!(
-                decrypts.is_none_or(|n| n == u64::from(EVALUATIONS)),
-                "{decrypts:?}"
-            );
+            if settings.case == ATTACK_CASE {
+                assert!(
+                    decrypts.is_none_or(|n| n == u64::from(EVALUATIONS)),
+                    "{decrypts:?}"
+                );
+                record_evaluations(&evaluations, Some(u64::from(EVALUATIONS)));
+            } else {
+                // This pinned binary prints a total; if unavailable, omit count-based metrics.
+                assert!(decrypts.is_none_or(|count| count > 0));
+                record_evaluations(&evaluations, decrypts);
+            }
             assert_eq!(pairs, HISTORICAL_PAIRS);
             assert_eq!(record["observed"]["plugboard"], json!(pairs));
         },
     );
-    settings.finish(&startup, &full);
+    settings.finish(&startup, &full, evaluations.get());
+}
+
+#[test]
+fn positions_capture_uses_the_same_flags_and_its_own_decrypt_count() {
+    let (_, record) = selected_fixture(POSITIONS_CASE);
+    assert_eq!(bomm_flags(&record), ["-q", "-t", "1", "-n", "5"]);
+    let (count, pairs) = bomm_report(
+        "│ UKW-B-thin,beta,II,IV,I aaaav avjna at bl df gj hm nw op qy rz vx │\nNumber of decrypts: 5492071\n",
+        "UKW-B-thin,beta,II,IV,I aaaav avjna",
+    );
+    assert_eq!(count, Some(5_492_071));
+    assert_eq!(pairs, HISTORICAL_PAIRS);
+}
+
+#[test]
+#[should_panic(expected = "top key does not start")]
+fn bomm_rejects_historical_key_below_a_wrong_top_key() {
+    bomm_report(
+        "│ UKW-B-thin,beta,II,IV,I aaaav avjnb ab │\n│ UKW-B-thin,beta,II,IV,I aaaav avjna at bl df gj hm nw op qy rz vx │\n",
+        "UKW-B-thin,beta,II,IV,I aaaav avjna",
+    );
+}
+
+#[test]
+fn optional_evaluation_metrics_use_the_selected_engines_count() {
+    let startup = Duration::from_millis(100);
+    let full = Duration::from_millis(946);
+    assert_eq!(evaluation_metrics(startup, full, None), None);
+    for count in [8456, 5_372_197, 5_492_071] {
+        let metric = evaluation_metrics(startup, full, Some(count)).unwrap();
+        assert!((metric - 0.846e6 / count as f64).abs() < 1e-9);
+    }
+}
+
+#[test]
+fn timing_case_defaults_accepts_known_cases_and_rejects_invalid_values() {
+    assert_eq!(timing_case(None), Ok(ATTACK_CASE));
+    assert_eq!(timing_case(Some(OsStr::new("a"))), Ok(ATTACK_CASE));
+    assert_eq!(
+        timing_case(Some(OsStr::new("positions"))),
+        Ok(POSITIONS_CASE)
+    );
+    for value in ["", "A", " positions", "positions ", "unknown"] {
+        assert_eq!(
+            timing_case(Some(OsStr::new(value))),
+            Err(format!(
+                "ENIGMA_TIMING_CASE must be a or positions, got {:?}",
+                OsStr::new(value)
+            ))
+        );
+    }
 }
 
 #[test]

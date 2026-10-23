@@ -1,4 +1,4 @@
-# Design A timing: our release CLI
+# U-264 timing: our release CLI
 
 Measures our `enigma` CLI on design A (`e2e/bomm/m4-u264-attack-board/`) and writes
 one new JSON file per invocation. The bomm counterpart is `e2e/bomm_timing/`, which
@@ -16,7 +16,33 @@ Works from any directory. The script builds `target/release/enigma`, hashes it,
 and then runs the ignored test `enigma_rust_case_a_timing` in
 `crates/enigma-cli/tests/case_a_timing.rs`, which uses that same binary.
 
-## What is measured
+## Select the longer positions case
+
+```sh
+ENIGMA_TIMING_CASE=positions ENIGMA_TIMING_RUNS=20 e2e/enigma_rust_timing/run.sh
+```
+
+`ENIGMA_TIMING_CASE` accepts `a` (default, unchanged) or `positions`; all other
+values are rejected. The latter uses `e2e/bomm/m4-u264-attack-positions/`: design
+B, identical to A except middle/right positions sweep A–Z (676 outer keys).
+Every full run checks the historical ten pairs, positions N/A and all 232
+plaintext letters, plus completion of all 676 keys. Startup uses the selected
+request with budget 1. Recommend 20 runs rather than 100: a manual single run
+took 2.795 s (not a performance guarantee).
+
+This is an **outcome-level comparison**, not identical search work. bomm runs
+every pass on every outer key; our engine runs reswapping/measure only on the
+hold-5 finalists. Observed totals were 5,492,071 bomm decrypts versus 5,372,197
+our evaluations. Our total is parsed from the result's `evaluations_completed`
+counter (stage `evaluations_used` alone is not the total), checked for stability
+on every run and recorded as `evaluations`. `per_evaluation_microseconds` uses
+our own count, never A's 8,456 or bomm's count.
+
+B results use `results/<UTC>-<short commit>-positions.json`, with
+`case: "m4-u264-attack-positions"`; A filenames and JSON fields remain unchanged.
+Never run the two harnesses concurrently.
+
+## What is measured (default A)
 
 | Probe | Request | Checked on every run |
 | --- | --- | --- |

@@ -1,6 +1,8 @@
 #!/bin/sh
-# Times design A through the release enigma CLI and writes a new results file.
-# Usage: [ENIGMA_TIMING_RUNS=N] e2e/enigma_rust_timing/run.sh   (default N: 100)
+# Times U-264 through the release enigma CLI and writes a new results file.
+# Usage: [ENIGMA_TIMING_CASE=a|positions] [ENIGMA_TIMING_RUNS=N] e2e/enigma_rust_timing/run.sh
+# Defaults: case a, N=100. Recommended for positions: ENIGMA_TIMING_RUNS=20.
+# Run sequentially, never alongside the bomm harness.
 set -eu
 
 script_dir=$(CDPATH= cd -P "$(dirname "$0")" && pwd)
@@ -12,7 +14,11 @@ binary=${CARGO_TARGET_DIR:-$repo_root/target}/release/enigma
 
 timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 results=$script_dir/results
-output=$results/$(printf '%s' "$timestamp" | tr -d ':-')-$(git rev-parse --short HEAD).json
+case_suffix=
+if [ "${ENIGMA_TIMING_CASE-}" = positions ]; then
+    case_suffix=-positions
+fi
+output=$results/$(printf '%s' "$timestamp" | tr -d ':-')-$(git rev-parse --short HEAD)$case_suffix.json
 mkdir -p "$results"
 if [ -e "$output" ]; then
     echo "run.sh: $output already exists; not overwriting" >&2

@@ -1,6 +1,8 @@
 #!/bin/sh
-# Times design A through the pinned bomm binary and writes a new results file.
-# Usage: [ENIGMA_TIMING_RUNS=N] e2e/bomm_timing/run.sh [BOMM_BIN]   (default N: 100)
+# Times U-264 through pinned bomm and writes a new results file.
+# Usage: [ENIGMA_TIMING_CASE=a|positions] [ENIGMA_TIMING_RUNS=N] e2e/bomm_timing/run.sh [BOMM_BIN]
+# Defaults: case a, N=100. Recommended for positions: ENIGMA_TIMING_RUNS=20.
+# Run sequentially, never alongside the enigma-rust harness.
 set -eu
 
 bomm_bin=${1:-${BOMM_BIN:-}}
@@ -23,7 +25,11 @@ cd "$repo_root"
 
 timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 results=$script_dir/results
-output=$results/$(printf '%s' "$timestamp" | tr -d ':-')-$(git rev-parse --short HEAD).json
+case_suffix=
+if [ "${ENIGMA_TIMING_CASE-}" = positions ]; then
+    case_suffix=-positions
+fi
+output=$results/$(printf '%s' "$timestamp" | tr -d ':-')-$(git rev-parse --short HEAD)$case_suffix.json
 mkdir -p "$results"
 if [ -e "$output" ]; then
     echo "run.sh: $output already exists; not overwriting" >&2

@@ -74,6 +74,31 @@ and the full attack, checks every output, and writes a new untracked JSON file
 under its `results/`. Per-evaluation search time is
 `(median full - median startup) / 8456`. There are no timing thresholds.
 
+### Design B: unknown middle/right positions
+
+`m4-u264-attack-positions` is A with only middle/right positions unknown:
+`*` in bomm, A–Z domains in our request, for 676 outer keys. All wheels, rings,
+other positions, passes, measures, hold 5, budget and max_pairs remain unchanged.
+A cheap non-ignored parity test verifies those exact fixture differences; the
+attack itself remains opt-in through the timing harnesses:
+
+```sh
+ENIGMA_TIMING_CASE=positions ENIGMA_TIMING_RUNS=20 e2e/enigma_rust_timing/run.sh
+# Run only after the first harness finishes:
+ENIGMA_TIMING_CASE=positions ENIGMA_TIMING_RUNS=20 \
+  BOMM_BIN=../bomm-reference/build/bomm e2e/bomm_timing/run.sh
+```
+
+Both recovered historical VJNA and `AT BL DF GJ HM NW OP QY RZ VX` in manual
+single runs: 2.795 s ours, 5.764 s bomm. These are observations, not guarantees.
+This is outcome-level timing: bomm runs every pass on every outer key, whereas
+our engine runs reswapping/measure only on the hold-5 finalists. The resulting
+counts differ (5,492,071 decrypts versus 5,372,197 completed evaluations).
+Each harness reports its own actual count and divides by that count for
+per-evaluation timing; no cross-engine count equality is asserted. Each full
+run verifies the historical result; ours also checks N/A and full plaintext.
+B filenames end in `-positions.json`; default A reports remain unchanged.
+
 ## Frequency tables
 
 `frequencies/enigma1941-bigram.txt` and `enigma1941-trigram.txt` are byte-for-byte
