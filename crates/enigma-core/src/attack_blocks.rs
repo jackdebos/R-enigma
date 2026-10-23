@@ -1,8 +1,5 @@
 //! Indexed outer-key projection for the later dynamic worker pool.
 
-// T2 deliberately does not wire the projection into the serial schedulers yet.
-#![allow(dead_code)]
-
 use crate::candidate::CandidatePlan;
 use crate::{AttackGate, ResolvedConfiguration, SearchDiagnostic, SearchRequest};
 

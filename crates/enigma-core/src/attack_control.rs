@@ -34,6 +34,7 @@ pub(super) trait CounterObserver {
     fn observe(&mut self, snapshot: CounterSnapshot);
 }
 
+#[derive(Clone)]
 pub(super) struct AttackControl {
     counters: CounterSnapshot,
     cancelled: bool,

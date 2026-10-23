@@ -210,7 +210,7 @@ impl crate::AttackRequest {
         observed_run(&mut control, &mut observer, |control, observer| {
             let preparation = RunPreparation::new(self);
             let result = if self.settings().kind() == crate::AttackKind::PartialExhaustion {
-                match self.schedule_partial_outers_prepared(
+                match self.schedule_partial_blocks(
                     &preparation,
                     &mut allowance,
                     control,
@@ -229,7 +229,7 @@ impl crate::AttackRequest {
                 }
             } else {
                 let mut acceptance = DirectAcceptance::new(self.settings().hold_capacity());
-                let run = self.schedule_direct_outers_prepared(
+                let run = self.schedule_direct_blocks(
                     &preparation,
                     &mut allowance,
                     control,
@@ -897,7 +897,7 @@ impl crate::AttackRequest {
         requested: impl FnMut() -> bool,
         capacity: usize,
     ) -> Result<ControlledPartialRun, Box<ControlledPartialRunError>> {
-        self.schedule_partial_outers_prepared(
+        self.schedule_partial_blocks(
             &RunPreparation::new(self),
             allowance,
             control,
@@ -907,7 +907,7 @@ impl crate::AttackRequest {
         )
     }
 
-    fn schedule_partial_outers_prepared(
+    fn schedule_partial_blocks(
         &self,
         preparation: &RunPreparation<'_>,
         allowance: &mut EvaluationAllowance,
@@ -927,11 +927,12 @@ impl crate::AttackRequest {
                 held: None,
             }))
         } else {
+            let plan = self.outer_plan();
             schedule_controlled_partial_prepared(
                 self,
                 preparation,
                 self.gate().outer_selected(),
-                self.outer_candidates(),
+                plan.blocks().flat_map(|block| plan.keys(block)),
                 &mut ObservedAccounting {
                     allowance,
                     control,
@@ -1227,7 +1228,7 @@ impl crate::AttackRequest {
         requested: impl FnMut() -> bool,
         accept: impl FnMut(DirectOuterOutcome) -> Result<Option<DirectOuterOutcome>, ProjectionError>,
     ) -> Result<DirectRunOutcome, Box<ControlledDirectError>> {
-        self.schedule_direct_outers_prepared(
+        self.schedule_direct_blocks(
             &RunPreparation::new(self),
             allowance,
             control,
@@ -1237,7 +1238,7 @@ impl crate::AttackRequest {
         )
     }
 
-    fn schedule_direct_outers_prepared(
+    fn schedule_direct_blocks(
         &self,
         preparation: &RunPreparation<'_>,
         allowance: &mut EvaluationAllowance,
@@ -1255,9 +1256,10 @@ impl crate::AttackRequest {
                 counters: control.snapshot(),
             }))
         } else {
+            let plan = self.outer_plan();
             schedule_controlled_direct(
                 self.gate().outer_selected(),
-                self.outer_candidates(),
+                plan.blocks().flat_map(|block| plan.keys(block)),
                 &mut ObservedAccounting {
                     allowance,
                     control,
@@ -1536,7 +1538,29 @@ fn schedule_controlled_partial_with_climb<O: CounterObserver, F: FnMut() -> bool
                 counters: accounting.control.snapshot(),
                 held: result.held.take(),
             })?;
-            let mut outcome = climb(initial, index, accounting, requested).map_err(|error| {
+            let execution = execute_outer(
+                accounting.allowance.clone(),
+                accounting.control.clone(),
+                accounting.observer,
+                |local| {
+                    let outcome = climb(initial, index, local, requested)?;
+                    // Only whole seed exhaustion completes an outer, not winner flags.
+                    if !outcome.seeds.cancelled {
+                        local
+                            .transition(AttackControl::record_outer_completed)
+                            .map_err(|source| ControlledPartialError {
+                                outer_index: index,
+                                seed_index: None,
+                                source: ControlledPartialSource::Climb(source),
+                                best: None,
+                                held: None,
+                            })?;
+                    }
+                    Ok::<_, ControlledPartialError>(outcome)
+                },
+            );
+            let outcome = execution.commit(accounting);
+            let mut outcome = outcome.map_err(|error| {
                 let mut best = result
                     .best
                     .take()
@@ -1577,25 +1601,6 @@ fn schedule_controlled_partial_with_climb<O: CounterObserver, F: FnMut() -> bool
                 }
             })?;
             let cancelled = outcome.seeds.cancelled;
-            // Only whole seed-run exhaustion completes an outer, not its winner's flags.
-            if !cancelled {
-                accounting
-                    .transition(AttackControl::record_outer_completed)
-                    .map_err(|source| ControlledPartialRunError {
-                        outer_index: Some(index),
-                        seed_index: None,
-                        evaluations_used: accounting.allowance.used,
-                        source: ControlledPartialRunSource::Climb(ControlledPartialSource::Climb(
-                            source,
-                        )),
-                        best: result
-                            .best
-                            .take()
-                            .map(ControlledPartialOutcome::into_direct),
-                        counters: accounting.control.snapshot(),
-                        held: result.held.take(),
-                    })?;
-            }
             let now = accounting.control.snapshot();
             result.outer_completed = now.outers_completed - before.outers_completed;
             result.climbs_started = now.climbs_started - before.climbs_started;
@@ -1722,21 +1727,28 @@ fn schedule_controlled_direct<O: CounterObserver, F: FnMut() -> bool>(
                 evaluations_used: accounting.allowance.used,
                 source: DirectRunError::MissingOuter,
             })?;
-            let outcome = (|| {
-                let initial = initial.map_err(DirectRunError::Resolution)?;
-                let outcome = climb(initial, index, accounting, requested)?;
-                if outcome.climb.neighborhood_exhausted {
-                    accounting
-                        .transition(AttackControl::record_outer_completed)
-                        .map_err(DirectRunError::from)?;
-                }
-                Ok(outcome)
-            })()
-            .map_err(|source| IndexedDirectRunError {
-                outer_index: Some(index),
-                evaluations_used: accounting.allowance.used,
-                source,
-            })?;
+            let execution = execute_outer(
+                accounting.allowance.clone(),
+                accounting.control.clone(),
+                accounting.observer,
+                |local| {
+                    let initial = initial.map_err(DirectRunError::Resolution)?;
+                    let outcome = climb(initial, index, local, requested)?;
+                    if outcome.climb.neighborhood_exhausted {
+                        local
+                            .transition(AttackControl::record_outer_completed)
+                            .map_err(DirectRunError::from)?;
+                    }
+                    Ok(outcome)
+                },
+            );
+            let outcome = execution
+                .commit(accounting)
+                .map_err(|source| IndexedDirectRunError {
+                    outer_index: Some(index),
+                    evaluations_used: accounting.allowance.used,
+                    source,
+                })?;
             let cancelled = outcome.climb.cancelled;
             let now = accounting.control.snapshot();
             // These counters only increase; subtraction retains prior caller facts without reset.
@@ -1879,7 +1891,7 @@ impl Iterator for SeedCursor<'_> {
 }
 
 /// Checked cumulative admissions, never reset by a scan.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct EvaluationAllowance {
     pub(super) used: u64,
 }
@@ -1955,6 +1967,56 @@ impl EvaluationAccounting for EvaluationAllowance {
             .map_err(|_| TrialEvaluationError::Invariant("evaluation admission counter overflow"))
     }
 }
+
+/// A one-outer worker's owned outcome, including accounting on the first error.
+/// The serial adapter seeds cumulative facts to preserve overflow, cadence and
+/// cancellation semantics. Future workers can start from fresh local accounting.
+struct OuterExecution<T, E> {
+    result: Result<T, E>,
+    allowance: EvaluationAllowance,
+    control: AttackControl,
+}
+
+impl<T, E> OuterExecution<T, E> {
+    fn commit<O>(self, accounting: &mut ObservedAccounting<'_, O>) -> Result<T, E> {
+        *accounting.allowance = self.allowance;
+        *accounting.control = self.control;
+        self.result
+    }
+}
+
+/// All evaluation mutations stay local until ordered commit. Callbacks remain
+/// synchronous in this serial adapter: buffering them would change cancellation
+/// when a progress callback requests a stop (T6/T7 change those boundaries).
+fn execute_outer<T, E, O: CounterObserver>(
+    mut allowance: EvaluationAllowance,
+    mut control: AttackControl,
+    observer: &mut O,
+    run: impl FnOnce(&mut ObservedAccounting<'_, O>) -> Result<T, E>,
+) -> OuterExecution<T, E> {
+    let result = run(&mut ObservedAccounting {
+        allowance: &mut allowance,
+        control: &mut control,
+        observer,
+    });
+    OuterExecution {
+        result,
+        allowance,
+        control,
+    }
+}
+
+const _: fn() = || {
+    fn assert_sync<T: Sync>() {}
+    fn assert_send<T: Send>() {}
+    assert_sync::<crate::AttackRequest>();
+    assert_sync::<crate::BoundResource>();
+    assert_sync::<crate::NgramModel>();
+    assert_sync::<crate::TrieModel>();
+    assert_sync::<crate::attack_blocks::OuterPlan<'_>>();
+    assert_send::<OuterExecution<DirectOuterOutcome, DirectRunError>>();
+    assert_send::<OuterExecution<ControlledPartialOutcome, ControlledPartialError>>();
+};
 
 pub(super) struct ObservedAccounting<'a, O> {
     pub(super) allowance: &'a mut EvaluationAllowance,
@@ -2601,6 +2663,194 @@ mod tests {
         );
         assert_eq!(snapshot.outers_completed, 0);
         (result, snapshot, allowance.used - 7, polls)
+    }
+
+    /// Serial reference retains the former flat projection and run-wide cache.
+    /// Selection, projection and stages deliberately use the production reducers.
+    fn flat_serial_reference(
+        request: &crate::AttackRequest,
+    ) -> (String, Vec<crate::AttackProgress>) {
+        let preparation = RunPreparation::new(request);
+        let mut allowance = EvaluationAllowance { used: 0 };
+        let mut control = AttackControl::with_progress_every(request.settings().progress_every());
+        let mut events = Vec::new();
+        let mut observer = ProgressObserver(|p| events.push(p));
+        let result = observed_run(&mut control, &mut observer, |control, observer| {
+            let accounting = &mut ObservedAccounting {
+                allowance: &mut allowance,
+                control,
+                observer,
+            };
+            let mut requested = || false;
+            let capacity = request.settings().hold_capacity();
+            let mut result = if request.settings().kind() == crate::AttackKind::PartialExhaustion {
+                schedule_controlled_partial_with_climb(
+                    request.gate().outer_selected(),
+                    request.outer_candidates(),
+                    accounting,
+                    &mut requested,
+                    |initial, index, accounting, requested| {
+                        request.climb_partial_outer_prepared(
+                            &preparation,
+                            (initial, index),
+                            accounting,
+                            requested,
+                            capacity,
+                            |scoring, _, board, accounting, requested| {
+                                scoring.climb_cancellable(
+                                    board,
+                                    request.settings().backtrack_pairs(),
+                                    accounting,
+                                    requested,
+                                )
+                            },
+                        )
+                    },
+                )
+                .unwrap()
+                .project_public(
+                    accounting.control.snapshot(),
+                    request.domain(),
+                    request.settings().final_measure(),
+                )?
+            } else {
+                let mut acceptance = DirectAcceptance::new(capacity);
+                let run = schedule_controlled_direct(
+                    request.gate().outer_selected(),
+                    request.outer_candidates(),
+                    accounting,
+                    &mut requested,
+                    |initial, index, accounting, requested| {
+                        let (scoring, start) = request
+                            .direct_scoring(&initial)
+                            .map_err(DirectRunError::Climb)?;
+                        let climb = scoring
+                            .with_preparation(&preparation, index)
+                            .climb_cancellable(
+                                start,
+                                request.settings().backtrack_pairs(),
+                                accounting,
+                                requested,
+                            )
+                            .map_err(DirectRunError::from)?;
+                        Ok(DirectOuterOutcome {
+                            initial,
+                            outer_index: index,
+                            start_index: 0,
+                            climb,
+                        })
+                    },
+                    |outcome| {
+                        acceptance.accept(
+                            outcome,
+                            request.domain(),
+                            request.settings().final_measure(),
+                        )
+                    },
+                );
+                acceptance.finish(
+                    run,
+                    accounting.control.snapshot(),
+                    request.domain(),
+                    request.settings().final_measure(),
+                )?
+            };
+            if !request.settings().stages().is_empty() && result.best.is_some() {
+                result = stages_over_hold(result, |result| {
+                    request.finalist_stages_prepared(
+                        &preparation,
+                        result,
+                        accounting,
+                        &mut requested,
+                    )
+                })?;
+            }
+            Ok(result)
+        });
+        (format!("{result:?}"), events)
+    }
+
+    #[test]
+    fn block_serial_matches_flat_projection_and_run_wide_preparation() {
+        for pe in [false, true] {
+            for hold in [1, 5] {
+                for staged in [false, true] {
+                    let mut value = serde_json::json!({"protocol_version":1,
+                        "machine":{"definition":{"kind":"custom","value":{
+                            "alphabet":["A","B","C","D"],
+                            "wheels":[{"name":"r","wiring":["B","C","D","A"],"turnovers":[]}],
+                            "slots":[{"id":"x","role":"rotor","movement":"fixed","wheel":"r"},
+                                     {"id":"y","role":"rotor","movement":"fixed","wheel":"r"}],
+                            "stepping":{"rules":[]}}}},
+                        "job":{"kind":"search","configuration":{"slots":[],"plugboard":[]},
+                            "text":"ABACAD","passes":[if pe {"partial_exhaustion"} else {"hill_climb"}],
+                            "measures":["ic"],"space":{"offset":3,"limit":200,
+                                "slots":[{"id":"x","positions":["D","B","A","C"],"rings":["A","B","C","D"]},
+                                         {"id":"y","positions":["D","B","A","C"],"rings":["A","B","C","D"]}],
+                                "plugboard":{"kind":"attack","symbols":["A","B","C","D"],"max_pairs":1}},
+                            "attack":{"kind":if pe {"partial_exhaustion"} else {"hill_climb"},
+                                "initial_measure":"ic","final_measure":"ic","switch_pairs":1,
+                                "backtrack_pairs":0,"hold":hold,"progress_every":3}}});
+                    if pe {
+                        value["job"]["attack"]["seeds"] =
+                            serde_json::json!({"kind":"empty_single","selection":"all"});
+                    } else {
+                        value["job"]["attack"]["start"] = serde_json::json!([]);
+                    }
+                    if staged {
+                        value["job"]["passes"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(serde_json::json!("measure"));
+                        value["job"]["attack"]["measure"] = serde_json::json!({"measure":"ic"});
+                    }
+                    let request = crate::AttackRequest::parse_json(&value.to_string()).unwrap();
+                    assert_eq!(request.outer_plan().blocks().count(), 2);
+                    let expected = flat_serial_reference(&request);
+                    let mut events = Vec::new();
+                    let result = request.run(|p| events.push(p), || false);
+                    assert_eq!(
+                        (format!("{result:?}"), events),
+                        expected,
+                        "pe={pe}, hold={hold}, staged={staged}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn outer_execution_returns_owned_accounting_even_on_error() {
+        let mut control = AttackControl::with_progress_every(1);
+        let mut allowance = EvaluationAllowance { used: 7 };
+        let mut observer = Recorder::default();
+        let mut accounting = ObservedAccounting {
+            allowance: &mut allowance,
+            control: &mut control,
+            observer: &mut observer,
+        };
+        let execution = execute_outer(
+            accounting.allowance.clone(),
+            accounting.control.clone(),
+            accounting.observer,
+            |local| {
+                local.admit().unwrap();
+                local.complete().unwrap();
+                local.control.poll_cancellation(true);
+                Err::<(), _>("injected evaluation failure")
+            },
+        );
+        // Nothing is committed until the ordered coordinator folds the outcome.
+        assert_eq!(accounting.allowance.used, 7);
+        assert_eq!(accounting.control.snapshot(), Default::default());
+        assert_eq!(
+            execution.commit(&mut accounting),
+            Err("injected evaluation failure")
+        );
+        assert_eq!(accounting.allowance.used, 8);
+        assert_eq!(accounting.control.snapshot().evaluations_completed, 1);
+        assert!(accounting.control.poll_cancellation(false));
+        assert_eq!(observer.0.len(), 1);
     }
 
     #[test]
