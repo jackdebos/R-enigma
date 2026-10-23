@@ -7,7 +7,7 @@
     "source_values": "UKW: B; W/0: B241; Stecker: ATBLDFGJHMNWOPQYRZVX; Rings: AAAV; Message key: VJNA; ciphertext stripped of indicator groups; plaintext as seen in the server logs",
     "confirmation": "Same page: plaintext confirmed against the U-264 war diary (NARA T1022, Roll 2886), FT 1132/19 from Kptlt. Hartwig Looks",
     "normalization": "Ciphertext and plaintext copied with line breaks removed; ciphertext lowercased for bomm, both uppercased for this engine",
-    "design": "A2: as design A but middle and right positions unknown (676 outer keys). All wheels, rings, other positions, passes, measures, hold 5, max_pairs 13 and budget 100000000 remain unchanged. Outcome-level timing only: bomm runs every pass on every outer key; our engine runs reswapping/measure only on the hold-5 finalists. The harness reports each engine's actual evaluation count, not a shared workload count."
+    "design": "A2: as design A but middle and right positions unknown (676 outer keys). All wheels, rings, other positions, passes, measures, hold 5 and max_pairs 13 remain unchanged. Outcome-level timing only: bomm runs every pass on every outer key; our engine runs reswapping/measure only on the hold-5 finalists. The harness reports each engine's actual evaluation count, not a shared workload count."
   },
   "engine": {
     "protocol_version": 1,
@@ -39,7 +39,7 @@
       "measures": ["ic", "sinkov_trigram"],
       "attack": {
         "kind": "hill_climb", "initial_measure": "ic", "final_measure": "sinkov_trigram",
-        "switch_pairs": 7, "backtrack_pairs": 5, "evaluation_budget": 100000000,
+        "switch_pairs": 7, "backtrack_pairs": 5,
         "start": [], "hold": 5,
         "reswapping": {"measure": "sinkov_trigram"}, "measure": {"measure": "sinkov_trigram"}
       }

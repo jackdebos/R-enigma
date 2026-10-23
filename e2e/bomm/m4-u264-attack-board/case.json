@@ -7,7 +7,7 @@
     "source_values": "UKW: B; W/0: B241; Stecker: ATBLDFGJHMNWOPQYRZVX; Rings: AAAV; Message key: VJNA; ciphertext stripped of indicator groups; plaintext as seen in the server logs",
     "confirmation": "Same page: plaintext confirmed against the U-264 war diary (NARA T1022, Roll 2886), FT 1132/19 from Kptlt. Hartwig Looks",
     "normalization": "Ciphertext and plaintext copied with line breaks removed; ciphertext lowercased for bomm, both uppercased for this engine",
-    "design": "A: fixed historical wheels, rings and positions; unknown plugboard starting empty. IC hill climb switches to Sinkov trigram at 7 pairs, backtracks at 5, then trigram reswapping and measure. Our max_pairs 13 matches bomm's unrestricted board; budget 100000000, hold 5."
+    "design": "A: fixed historical wheels, rings and positions; unknown plugboard starting empty. IC hill climb switches to Sinkov trigram at 7 pairs, backtracks at 5, then trigram reswapping and measure. Our max_pairs 13 matches bomm's unrestricted board; hold 5."
   },
   "engine": {
     "protocol_version": 1,
@@ -39,7 +39,6 @@
         "final_measure": "sinkov_trigram",
         "switch_pairs": 7,
         "backtrack_pairs": 5,
-        "evaluation_budget": 100000000,
         "start": [],
         "hold": 5,
         "reswapping": {"measure": "sinkov_trigram"},

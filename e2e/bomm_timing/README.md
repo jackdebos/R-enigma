@@ -2,7 +2,8 @@
 
 Measures the pinned bomm binary (commit `aeb2f2bf00dfdee68e972f90ae7e83b387b188e9`) on
 design A (`e2e/bomm/m4-u264-attack-board/`) and writes one new JSON file per
-invocation. It mirrors `e2e/enigma_rust_timing/`: same clock, order and statistics.
+invocation. It shares the clock and percentile conventions with
+`e2e/enigma_rust_timing/`, but retains its separate startup probe.
 
 ## Quick path
 
@@ -53,8 +54,8 @@ ENIGMA_TIMING_CASE=b ENIGMA_TIMING_RUNS=3 \
 Design B uses `e2e/bomm/m4-u264-attack-design-b/`: left/II, middle/IV and
 right/I positions are unknown (`*`), giving 26³ = 17,576 outer keys. Wheels,
 rings, greek position V, reflector and attack passes remain fixed as in A2.
-Our counterpart uses a 200,000,000 evaluation budget for B only, rather than
-A/A2's 100,000,000, to complete the entire space. bomm has no such budget flag.
+Our counterpart's evaluation cap has been removed; B needs no raised cap to
+complete the entire finite space, just as bomm has no such cap.
 Every full run verifies historical VJNA and all ten pairs. Startup remains
 the fixed design-A one-decrypt probe. The single capture reported 17,576 units
 and 142,788,085 decrypts; this is not a required cross-engine workload count.
@@ -80,7 +81,7 @@ Both probes use the flags recorded in the case capture (`-q -t 1 -n 5`).
 | full | `e2e/bomm/m4-u264-attack-board/query.json` | ten historical pairs on the top key line, 8,456 decrypts if printed |
 
 - **Startup** = process start, query parsing, trigram table load and one decrypt.
-- **Order and clock**: as in our harness; one unrecorded warm-up per probe, then N
+- **Order and clock**: one unrecorded warm-up per probe, then N
   iterations of startup then full, timed by `Instant` around `Command::output()`.
   bomm's own `Elapsed` display is not used.
 
@@ -88,7 +89,10 @@ Both probes use the flags recorded in the case capture (`-q -t 1 -n 5`).
 
 Files are `results/<UTC yyyymmddTHHMMSSZ>-<short commit>.json` (repository commit);
 name order is time order and files are never overwritten. Results are untracked;
-copy summaries to the task tracker. Fields match our harness
-(see `e2e/enigma_rust_timing/README.md`) plus `bomm_commit`:
-`per_evaluation_microseconds = (full.median - startup.median) / 8456`, with
-nearest-rank percentiles.
+copy summaries to the task tracker. `startup` and `full` contain execution-order
+samples and nearest-rank statistics, with `bomm_commit` recording provenance.
+`search_seconds_median = full.median - startup.median` and
+`per_evaluation_microseconds = search_seconds_median * 1e6 / evaluations`.
+Our harness instead measures startup inside each full run at `started` and reports
+paired search samples (see `e2e/enigma_rust_timing/README.md`). Startup times are
+not comparable; only the search hot-loop comparison remains meaningful.

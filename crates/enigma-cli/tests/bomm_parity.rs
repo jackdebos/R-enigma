@@ -276,7 +276,7 @@ fn historical_positions_fixture_changes_only_the_two_position_domains() {
 }
 
 #[test]
-fn historical_design_b_fixture_changes_only_three_position_domains_and_budget() {
+fn historical_design_b_fixture_changes_only_three_position_domains() {
     let (mut query, record) = attack_fixture();
     let case = "m4-u264-attack-design-b";
     for index in [2, 3, 4] {
@@ -296,7 +296,6 @@ fn historical_design_b_fixture_changes_only_three_position_domains_and_budget() 
         {"id": "middle", "positions": alphabet},
         {"id": "right", "positions": alphabet}
     ]);
-    engine["job"]["attack"]["evaluation_budget"] = json!(200_000_000);
     let selected = load(case, "case.json");
     assert_eq!(selected["engine"], engine);
     for field in [

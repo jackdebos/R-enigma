@@ -29,7 +29,7 @@ than 1 natural-log unit above the wrong key for each order.
 `m4-u264-attack-board` fixes the U-264 wheels, rings and positions but starts
 with an empty, unknown plugboard. Both engines run IC hill climb → Sinkov trigram
 (switch at 7 pairs, backtrack at 5), trigram reswapping, then trigram measure,
-with hold 5. Our config uses `max_pairs: 13` and budget 100,000,000. Its
+with hold 5. Our config uses `max_pairs: 13`. Its
 `historical-attack` case stores the search request under `engine`; the test
 supplies ciphertext from the query and resources via the existing strict table
 converter, writing JSON v1 and the request into a per-process directory under
@@ -62,17 +62,19 @@ There is no trajectory, score or evaluation-count assertion for the attack.
 ### Verify and time case A
 
 The ignored test above runs the CLI exactly once and prints no timing. Timing
-lives in two symmetric harnesses that read this directory's design-A inputs:
+lives in two harnesses that read this directory's design-A inputs:
 
 | Harness | Program | Guide |
 | --- | --- | --- |
 | `e2e/enigma_rust_timing/run.sh` | our release CLI | `e2e/enigma_rust_timing/README.md` |
 | `e2e/bomm_timing/run.sh` | pinned bomm (`BOMM_BIN`) | `e2e/bomm_timing/README.md` |
 
-Each runs `ENIGMA_TIMING_RUNS` (default 100) sequential pairs of a startup probe
-and the full attack, checks every output, and writes a new untracked JSON file
-under its `results/`. Per-evaluation search time is
-`(median full - median startup) / 8456`. There are no timing thresholds.
+Each runs `ENIGMA_TIMING_RUNS` (default 100) sequential full attacks, checks every
+output, and writes a new untracked JSON file under its `results/`. Our startup is
+measured inside each run at `started`; search time is full minus that run's startup.
+bomm retains its separate one-decrypt startup probe and subtracts the medians.
+Startup times are not comparable; the search hot loop remains the comparison.
+Per-evaluation search time divides by each engine's own count. There are no timing thresholds.
 
 ### Design A2: unknown middle/right positions
 
@@ -81,7 +83,7 @@ rotating positions unknown, 17,576 keys; Task 17.7).
 
 `m4-u264-attack-positions` is A with only middle/right positions unknown:
 `*` in bomm, A–Z domains in our request, for 676 outer keys. All wheels, rings,
-other positions, passes, measures, hold 5, budget and max_pairs remain unchanged.
+other positions, passes, measures, hold 5 and max_pairs remain unchanged.
 A cheap non-ignored parity test verifies those exact fixture differences; the
 attack itself remains opt-in through the timing harnesses:
 
@@ -108,9 +110,9 @@ A2 filenames end in `-positions.json`; default A reports remain unchanged.
 left/II, middle/IV and right/I use `*` in bomm and A–Z domains in our
 request, for 26³ = 17,576 outer keys. Wheels, rings, greek position V and
 reflector position A remain fixed; passes, hold and other attack settings match A2.
-Only B raises our evaluation budget to 200,000,000 (A/A2 retain 100,000,000):
-the old budget stopped B after 12,579 outer keys despite recovering the key.
-Default tests verify exactly the three domains plus budget change without an attack.
+The evaluation cap has been removed, so B no longer needs a raised cap to
+complete its finite space. Default tests verify exactly the three position
+domains without running an attack.
 
 ```sh
 ENIGMA_TIMING_CASE=b ENIGMA_TIMING_RUNS=3 \

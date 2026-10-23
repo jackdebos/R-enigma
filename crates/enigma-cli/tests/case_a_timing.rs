@@ -1,10 +1,9 @@
-//! Symmetric end-to-end timing harnesses for U-264 designs A, A2 and B.
+//! End-to-end timing harnesses for U-264 designs A, A2 and B.
 //! `ENIGMA_TIMING_CASE=a|positions|b` selects the workload; A remains the default.
 //!
-//! Both ignored tests time real subprocesses with the same clock: `Instant` around
-//! `Command::output()` only. Each runs one unrecorded warm-up of each kind, then per
-//! iteration a startup probe (startup plus exactly one evaluation) followed by the full
-//! attack, strictly sequentially, asserting every output. Launch them through
+//! Our CLI measures startup from the live `started` event within each full run.
+//! bomm retains a separate one-decrypt startup probe. Both use `Instant`, run an
+//! unrecorded warm-up, and check every output, strictly sequentially. Launch through
 //! `e2e/enigma_rust_timing/run.sh` and `e2e/bomm_timing/run.sh`, which supply metadata and
 //! the results path. Without `ENIGMA_TIMING_OUTPUT` the report is only printed.
 
@@ -19,9 +18,9 @@ use support::successful_events;
 
 use std::cell::Cell;
 use std::ffi::OsStr;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
@@ -183,9 +182,20 @@ impl Settings {
         }
     }
 
-    fn finish(self, startup: &[Duration], full: &[Duration], evaluations: Option<u64>) {
-        let search = median(full).as_secs_f64() - median(startup).as_secs_f64();
-        let per_evaluation = if self.case == ATTACK_CASE {
+    fn finish(
+        self,
+        startup: &[Duration],
+        full: &[Duration],
+        evaluations: Option<u64>,
+        paired: Option<&[Duration]>,
+    ) {
+        let search = paired.map_or_else(
+            || median(full).as_secs_f64() - median(startup).as_secs_f64(),
+            |samples| median(samples).as_secs_f64(),
+        );
+        let per_evaluation = if paired.is_some() {
+            evaluations.map(|count| search * 1e6 / count as f64)
+        } else if self.case == ATTACK_CASE {
             Some(search_metrics(median(startup), median(full)).1)
         } else {
             evaluation_metrics(median(startup), median(full), evaluations)
@@ -197,6 +207,10 @@ impl Settings {
         }
         report.insert("startup".into(), statistics(startup));
         report.insert("full".into(), statistics(full));
+        if let Some(samples) = paired {
+            report.insert("search".into(), statistics(samples));
+            report.insert("startup_measurement".into(), json!("in_run_started_event"));
+        }
         report.insert("search_seconds_median".into(), json!(search));
         if let Some(metric) = per_evaluation {
             report.insert("per_evaluation_microseconds".into(), json!(metric));
@@ -254,15 +268,65 @@ fn measure(
     (startup_samples, full_samples)
 }
 
-fn verify_startup_output(output: &Output) {
-    let events = successful_events(output);
-    let last = events.last().expect("at least one event");
-    assert_eq!(last["event"], json!("done"), "events: {events:?}");
-    assert_eq!(
-        last["reason"],
-        json!("evaluation_budget"),
-        "events: {events:?}"
-    );
+/// Capture stdout unchanged, timestamping `started` before reading the next line.
+fn read_started_stdout(
+    reader: &mut impl BufRead,
+    elapsed: impl Fn() -> Duration,
+) -> (Duration, Vec<u8>) {
+    let mut stdout = Vec::new();
+    let mut startup = None;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader
+            .read_until(b'\n', &mut line)
+            .expect("read CLI stdout")
+            == 0
+        {
+            break;
+        }
+        let event: Value = serde_json::from_slice(&line).expect("CLI event JSON");
+        if event["event"] == "started" {
+            assert!(startup.is_none(), "duplicate started event");
+            startup = Some(elapsed());
+        }
+        stdout.extend_from_slice(&line);
+    }
+    (startup.expect("missing started event"), stdout)
+}
+
+fn paired_search(startup: &[Duration], full: &[Duration]) -> Vec<Duration> {
+    assert_eq!(startup.len(), full.len());
+    full.iter().zip(startup).map(|(f, s)| *f - *s).collect()
+}
+
+/// Drain stderr concurrently so a full pipe cannot block the measured process.
+fn timed_enigma(mut command: Command) -> (Duration, Duration, Output) {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let start = Instant::now();
+    let mut child = command.spawn().expect("spawn measured CLI");
+    let mut stderr = child.stderr.take().unwrap();
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).expect("read CLI stderr");
+        bytes
+    });
+    let (startup, stdout) =
+        read_started_stdout(&mut BufReader::new(child.stdout.take().unwrap()), || {
+            start.elapsed()
+        });
+    let status = child.wait().expect("wait for measured CLI");
+    let full = start.elapsed();
+    let stderr = stderr_reader.join().expect("stderr reader");
+    (
+        startup,
+        full,
+        Output {
+            status,
+            stdout,
+            stderr,
+        },
+    )
 }
 
 #[test]
@@ -291,59 +355,74 @@ fn enigma_rust_case_a_timing() {
     if settings.case != ATTACK_CASE {
         evaluations.set(None);
     }
-    // Budget 0 is rejected; 1 keeps startup, binding, row build and one evaluation.
-    request["job"]["attack"]["evaluation_budget"] = json!(1);
-    inputs.write("startup-request.json", &request);
-    let command = |file: &str| {
+    let command = || {
         let mut command = Command::new(binary);
-        command.current_dir(inputs.path()).arg(file);
+        command.current_dir(inputs.path()).arg("request.json");
         command
     };
-    let (startup, full) = measure(
-        settings.runs,
-        || command("startup-request.json"),
-        verify_startup_output,
-        || command("request.json"),
-        |output| {
-            verify_attack_output(output, &record);
-            if settings.case != ATTACK_CASE {
-                let events = successful_events(output);
-                let result = events
-                    .iter()
-                    .find(|event| event["event"] == "result")
-                    .unwrap();
-                let positions: &[(&str, &str)] = if settings.case == DESIGN_B_CASE {
-                    &[("left", "J"), ("middle", "N"), ("right", "A")]
-                } else {
-                    &[("middle", "N"), ("right", "A")]
-                };
-                for &(id, position) in positions {
-                    let slot = result["best"]["configuration"]["slots"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .find(|slot| slot["id"] == id)
-                        .unwrap();
-                    assert_eq!(slot["position"], position);
-                }
-                let outers = if settings.case == DESIGN_B_CASE {
-                    "17576"
-                } else {
-                    "676"
-                };
-                assert_eq!(result["counters"]["outers_completed"], outers);
-                let count = result["counters"]["evaluations_completed"]
-                    .as_str()
+    let check = |output: &Output| {
+        verify_attack_output(output, &record);
+        if settings.case != ATTACK_CASE {
+            let events = successful_events(output);
+            let result = events
+                .iter()
+                .find(|event| event["event"] == "result")
+                .unwrap();
+            let positions: &[(&str, &str)] = if settings.case == DESIGN_B_CASE {
+                &[("left", "J"), ("middle", "N"), ("right", "A")]
+            } else {
+                &[("middle", "N"), ("right", "A")]
+            };
+            for &(id, position) in positions {
+                let slot = result["best"]["configuration"]["slots"]
+                    .as_array()
                     .unwrap()
-                    .parse::<u64>()
+                    .iter()
+                    .find(|slot| slot["id"] == id)
                     .unwrap();
-                assert!(count > 0);
-                record_evaluations(&evaluations, Some(count));
+                assert_eq!(slot["position"], position);
             }
-        },
-    );
+            let outers = if settings.case == DESIGN_B_CASE {
+                "17576"
+            } else {
+                "676"
+            };
+            assert_eq!(result["counters"]["outers_completed"], outers);
+        }
+        let events = successful_events(output);
+        let result = events
+            .iter()
+            .find(|event| event["event"] == "result")
+            .unwrap();
+        let expected = match settings.case {
+            ATTACK_CASE => u64::from(EVALUATIONS),
+            POSITIONS_CASE => 5_372_197,
+            DESIGN_B_CASE => 139_628_857,
+            _ => unreachable!(),
+        };
+        let count = result["counters"]["evaluations_completed"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert_eq!(count, expected);
+        record_evaluations(&evaluations, Some(count));
+        let done = events.last().unwrap();
+        assert_eq!(done["event"], "done");
+        assert_eq!(done["reason"], "completed");
+    };
+    check(&timed_enigma(command()).2);
+    let mut startup = Vec::with_capacity(settings.runs);
+    let mut full = Vec::with_capacity(settings.runs);
+    for _ in 0..settings.runs {
+        let (started, elapsed, output) = timed_enigma(command());
+        check(&output);
+        startup.push(started);
+        full.push(elapsed);
+    }
+    let search = paired_search(&startup, &full);
     drop(inputs);
-    settings.finish(&startup, &full, evaluations.get());
+    settings.finish(&startup, &full, evaluations.get(), Some(&search));
 }
 
 /// bomm options recorded in the capture command, between the binary and the query path.
@@ -480,7 +559,7 @@ fn bomm_case_a_timing() {
             assert_eq!(record["observed"]["plugboard"], json!(pairs));
         },
     );
-    settings.finish(&startup, &full, evaluations.get());
+    settings.finish(&startup, &full, evaluations.get(), None);
 }
 
 #[test]
@@ -633,6 +712,68 @@ fn search_metrics_subtract_startup_median_and_divide_by_evaluations() {
         search_metrics(Duration::from_millis(30), Duration::from_millis(20));
     assert!((search + 0.010).abs() < 1e-12);
     assert!(per_evaluation < 0.0);
+}
+
+#[test]
+fn started_is_timestamped_while_reading_and_stdout_is_preserved() {
+    let stdout = b"{\"event\":\"progress\"}\n{\"event\":\"started\"}\n{\"event\":\"done\"}\n";
+    struct LiveReader<'a> {
+        inner: std::io::Cursor<&'a [u8]>,
+        timestamped: &'a Cell<bool>,
+    }
+    impl Read for LiveReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+    impl BufRead for LiveReader<'_> {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            if self.inner.position() >= 41 {
+                assert!(
+                    self.timestamped.get(),
+                    "timestamp must precede reading done"
+                );
+            }
+            self.inner.fill_buf()
+        }
+        fn consume(&mut self, amount: usize) {
+            self.inner.consume(amount);
+        }
+    }
+    let timestamped = Cell::new(false);
+    let mut reader = LiveReader {
+        inner: std::io::Cursor::new(stdout.as_slice()),
+        timestamped: &timestamped,
+    };
+    let (startup, captured) = read_started_stdout(&mut reader, || {
+        assert!(!timestamped.replace(true));
+        Duration::from_millis(25)
+    });
+    assert!(timestamped.get());
+    assert_eq!(startup, Duration::from_millis(25));
+    assert_eq!(captured, stdout);
+}
+
+#[test]
+#[should_panic(expected = "missing started event")]
+fn startup_requires_a_started_event() {
+    read_started_stdout(&mut std::io::Cursor::new(b"{\"event\":\"done\"}\n"), || {
+        Duration::ZERO
+    });
+}
+
+#[test]
+fn search_statistics_subtract_each_runs_startup_before_taking_medians() {
+    let startup = [1, 9, 2].map(Duration::from_secs);
+    let full = [6, 10, 5].map(Duration::from_secs);
+    let search = paired_search(&startup, &full);
+    assert_eq!(
+        statistics(&search),
+        json!({
+            "samples_seconds": [5.0, 1.0, 3.0],
+            "min": 1.0, "p10": 1.0, "median": 3.0, "p90": 5.0, "max": 5.0
+        })
+    );
 }
 
 #[test]
