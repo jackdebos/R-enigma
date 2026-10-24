@@ -227,6 +227,15 @@ pub enum Event {
         /// Canonical unsigned decimal milliseconds; no clock is read here.
         elapsed_ms: String,
     },
+    /// A checkpoint successfully persisted by the caller.
+    Checkpoint {
+        /// `outer` or `stages`, matching the saved record.
+        phase: String,
+        /// Canonical unsigned absolute outer cursor.
+        next_outer: String,
+        /// The committed outer-phase counters in the record.
+        counters: ProgressCounters,
+    },
     /// Final committed search winner and factual whole-run snapshot.
     Result {
         /// Final ordered finalists; empty only when no winner is retained.
@@ -288,6 +297,19 @@ impl From<AttackTermination> for DoneReason {
 }
 
 impl Event {
+    /// Projects the saved record without clocks or I/O; emit only after persistence.
+    pub fn checkpoint(record: &crate::CheckpointRecord) -> Self {
+        Self::Checkpoint {
+            phase: match record.phase {
+                crate::checkpoint::record::Phase::Outer => "outer",
+                crate::checkpoint::record::Phase::Stages => "stages",
+            }
+            .into(),
+            next_outer: record.next_outer.0.to_string(),
+            counters: crate::AttackProgress((&record.counters).into()).into(),
+        }
+    }
+
     /// Projects an owned runtime result without clocks, I/O or execution orchestration.
     pub fn result(result: &AttackResult, elapsed_ms: u128) -> Self {
         Self::result_snapshot(

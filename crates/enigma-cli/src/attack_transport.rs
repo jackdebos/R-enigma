@@ -4,6 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::io::{self, Write};
 use std::time::Duration;
 
+use crate::checkpoint_file::CheckpointWriter;
 use enigma_core::{encode, AttackProgress, AttackRequest, Event, ExecutionOptions, ResumedAttack};
 
 /// No clock or I/O enters Core. Both clocks are supplied by the CLI boundary.
@@ -15,6 +16,7 @@ struct Transport<W, M, U> {
     restored_elapsed: u128,
     seq: u64,
     failure: Option<io::Error>,
+    checkpoint_failed: bool,
 }
 
 /// Original runtime failure remains primary; projection and delivery are separate.
@@ -23,6 +25,7 @@ pub(super) struct Failure {
     pub(super) runtime: Option<Box<dyn std::error::Error + Send + Sync>>,
     pub(super) projection: Option<String>,
     pub(super) transport: Option<io::Error>,
+    checkpoint: bool,
 }
 
 impl<W: Write, M: FnMut() -> Duration, U: FnMut() -> String> Transport<W, M, U> {
@@ -36,6 +39,7 @@ impl<W: Write, M: FnMut() -> Duration, U: FnMut() -> String> Transport<W, M, U> 
             restored_elapsed: 0,
             seq: 1,
             failure: None,
+            checkpoint_failed: false,
         }
     }
 
@@ -90,8 +94,12 @@ impl<W: Write, M: FnMut() -> Duration, U: FnMut() -> String> Transport<W, M, U> 
             runtime,
             projection,
             transport: self.failure,
+            checkpoint: self.checkpoint_failed,
         };
-        if failure.runtime.is_some() || failure.projection.is_some() || failure.transport.is_some()
+        if failure.runtime.is_some()
+            || failure.projection.is_some()
+            || failure.transport.is_some()
+            || failure.checkpoint
         {
             Err(failure)
         } else {
@@ -118,7 +126,7 @@ pub(super) fn run(
         monotonic,
         utc,
         cancel_requested,
-        (None, 0),
+        (None, 0, None),
     )
 }
 
@@ -130,7 +138,11 @@ pub(super) fn run_prepared(
     monotonic: impl FnMut() -> Duration,
     utc: impl FnMut() -> String,
     mut cancel_requested: impl FnMut() -> bool,
-    restored: (Option<ResumedAttack<'_>>, u128),
+    restored: (
+        Option<ResumedAttack<'_>>,
+        u128,
+        Option<CheckpointWriter<'_>>,
+    ),
 ) -> Result<(), Failure> {
     let mut transport = Transport::new(writer, monotonic, utc);
     transport.restored_elapsed = restored.1;
@@ -143,11 +155,29 @@ pub(super) fn run_prepared(
             .set(cancelled.get() || transport.borrow().failure.is_some() || cancel_requested());
         cancelled.get()
     };
+    let mut checkpoint = restored.2;
+    let enabled = checkpoint.is_some();
+    let save = |snapshot: enigma_core::CheckpointSnapshot<'_>| {
+        if let Some(writer) = checkpoint.as_mut() {
+            let mut transport = transport.borrow_mut();
+            let now = (transport.monotonic)().saturating_sub(transport.entry);
+            if writer.due(snapshot.reason(), now) {
+                let elapsed = transport.restored_elapsed.saturating_add(now.as_millis());
+                if let Some(event) = writer.write(snapshot, elapsed) {
+                    writer.last_write = (transport.monotonic)().saturating_sub(transport.entry);
+                    transport.emit(event);
+                }
+            }
+        }
+    };
     let result = match restored.0 {
+        Some(resumed) if enabled => resumed.run_with_checkpoints(options, observe, cancel, save),
         Some(resumed) => resumed.run_with(options, observe, cancel),
+        None if enabled => request.run_with_checkpoints(options, observe, cancel, save),
         None => request.run_with(options, observe, cancel),
     };
     let mut transport = transport.into_inner();
+    transport.checkpoint_failed = checkpoint.is_some_and(|writer| writer.failed);
     // Measure after run: Core's required final rescore is included.
     let elapsed = transport.elapsed();
     match result {

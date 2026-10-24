@@ -26,7 +26,15 @@ impl Scratch {
         assert_eq!(std::fs::read_to_string(self.0.join(name)).unwrap(), text);
     }
     fn run(&self, args: &[&str], input: &Value) -> Output {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_enigma"))
+        self.run_interval(args, input, None)
+    }
+    fn run_interval(&self, args: &[&str], input: &Value, interval: Option<&str>) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_enigma"));
+        command.env_remove("ENIGMA_TEST_CHECKPOINT_INTERVAL_MS");
+        if let Some(interval) = interval {
+            command.env("ENIGMA_TEST_CHECKPOINT_INTERVAL_MS", interval);
+        }
+        let mut child = command
             .current_dir(&self.0)
             .args(args)
             .stdin(Stdio::piped())
@@ -75,7 +83,12 @@ fn events(output: &Output) -> Vec<Value> {
     std::str::from_utf8(&output.stdout)
         .unwrap()
         .lines()
-        .map(|line| normalize(serde_json::from_str(line).unwrap()))
+        .enumerate()
+        .map(|(index, line)| {
+            let event: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(event["seq"], index + 1);
+            normalize(event)
+        })
         .collect()
 }
 fn record(value: &Value, resources: &BTreeMap<String, String>) -> String {
@@ -285,7 +298,14 @@ fn valid_resume_and_checkpoint_preserve_normal_results() {
     let fresh = dir.run(&["--checkpoint", "new", "--request", "-"], &value);
     assert_eq!(fresh.status.code(), Some(0));
     assert!(fresh.stderr.is_empty());
-    assert_eq!(events(&fresh), expected);
+    let fresh_events = events(&fresh);
+    let stored: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.0.join("new")).unwrap()).unwrap();
+    let mut with_checkpoint = expected.clone();
+    with_checkpoint.insert(2, checkpoint_event(&stored));
+    assert_eq!(fresh_events, with_checkpoint);
+    assert_eq!(stored["phase"], "stages");
+    assert!(!dir.0.join("new.tmp").exists());
     let saved = record(&value, &BTreeMap::new());
     dir.write("save", &saved);
     let args = ["--request", "-", "--resume", "save", "--threads", "2"];
@@ -294,6 +314,9 @@ fn valid_resume_and_checkpoint_preserve_normal_results() {
     assert!(resumed.stderr.is_empty());
     let mut restored_expected = expected;
     restored_expected[1] = restored_expected[2].clone();
+    let updated: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.0.join("save")).unwrap()).unwrap();
+    restored_expected.insert(2, checkpoint_event(&updated));
     assert_eq!(events(&resumed), restored_expected);
     for line in std::str::from_utf8(&resumed.stdout).unwrap().lines() {
         let event: Value = serde_json::from_str(line).unwrap();
@@ -301,5 +324,169 @@ fn valid_resume_and_checkpoint_preserve_normal_results() {
             assert!(elapsed.parse::<u128>().unwrap() >= 1234);
         }
     }
-    dir.unchanged("save", &saved);
+    assert!(CheckpointRecord::parse_json(&updated.to_string()).is_ok());
+    assert!(!dir.0.join("save.tmp").exists());
+}
+
+fn checkpoint_event(record: &Value) -> Value {
+    json!({"event":"checkpoint","protocol_version":1,"phase":record["phase"],
+        "next_outer":record["next_outer"],"counters":record["counters"]})
+}
+
+#[test]
+fn cancel_checkpoint_then_resume_with_other_threads_matches_uninterrupted() {
+    let dir = Scratch::new();
+    for pe in [false, true] {
+        let mut value = request();
+        if pe {
+            value["job"]["passes"] = json!(["partial_exhaustion"]);
+            let attack = value["job"]["attack"].as_object_mut().unwrap();
+            attack.remove("start");
+            attack.insert("kind".into(), json!("partial_exhaustion"));
+            attack.insert(
+                "seeds".into(),
+                json!({"kind":"empty_single","selection":"all"}),
+            );
+        }
+        let filename = if pe { "pe" } else { "hc" };
+        dir.write("marker", "cancel");
+        let args = ["--request", "-", "--checkpoint", filename];
+        let cancel_args = ["--cancel-file", "marker", "--threads", "1"];
+        let cancelled = dir.run(&[args, cancel_args].concat(), &value);
+        assert_eq!(cancelled.status.code(), Some(0));
+        assert!(cancelled.stderr.is_empty());
+        let text = std::fs::read_to_string(dir.0.join(filename)).unwrap();
+        let saved: Value = serde_json::from_str(&text).unwrap();
+        CheckpointRecord::parse_json(&text).unwrap();
+        assert_eq!(saved["phase"], "outer");
+        assert_eq!(saved["next_outer"], "0");
+        let counters = saved["counters"].clone();
+        let expected = vec![
+            json!({"event":"started","protocol_version":1}),
+            json!({"event":"progress","protocol_version":1,"counters":counters}),
+            checkpoint_event(&saved),
+            json!({"event":"progress","protocol_version":1,"counters":counters}),
+            json!({"event":"result","protocol_version":1,"stages":[],"best":null,"hold":[],"counters":counters}),
+            json!({"event":"done","protocol_version":1,"reason":"cancelled"}),
+        ];
+        assert_eq!(events(&cancelled), expected);
+        dir.unchanged("marker", "cancel");
+        let normal = dir.run(&["--request", "-", "--threads", "1"], &value);
+        let resumed = dir.run(
+            &["--request", "-", "--resume", filename, "--threads", "2"],
+            &value,
+        );
+        assert_eq!(normal.status.code(), Some(0));
+        assert_eq!(resumed.status.code(), Some(0));
+        assert!(normal.stderr.is_empty());
+        assert!(resumed.stderr.is_empty());
+        let baseline = events(&normal);
+        let mut completed: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.0.join(filename)).unwrap()).unwrap();
+        assert_eq!(completed["phase"], "stages");
+        let mut expected = baseline.clone();
+        expected.insert(2, checkpoint_event(&completed));
+        assert_eq!(events(&resumed), expected);
+        // The completed file remains usable; only the stages are replayed.
+        let replay = dir.run(&["--request", "-", "--resume", filename], &value);
+        assert_eq!(replay.status.code(), Some(0));
+        assert!(replay.stderr.is_empty());
+        completed =
+            serde_json::from_str(&std::fs::read_to_string(dir.0.join(filename)).unwrap()).unwrap();
+        expected[1] = expected[3].clone();
+        expected[2] = checkpoint_event(&completed);
+        assert_eq!(events(&replay), expected);
+        assert!(!dir.0.join(format!("{filename}.tmp")).exists());
+    }
+}
+
+#[test]
+fn periodic_writes_and_failed_writes_keep_the_search_running() {
+    let dir = Scratch::new();
+    let mut value = request();
+    let slot = value["machine"]["definition"]["value"]["slots"][0].clone();
+    let ids: Vec<_> = (0..8).map(|i| format!("r{i}")).collect();
+    value["machine"]["definition"]["value"]["slots"] = json!(ids
+        .iter()
+        .map(|id| {
+            let mut slot = slot.clone();
+            slot["id"] = json!(id);
+            slot
+        })
+        .collect::<Vec<_>>());
+    value["job"]["configuration"]["slots"] = json!(ids
+        .iter()
+        .map(|id| json!({"id":id,"ring":"A"}))
+        .collect::<Vec<_>>());
+    value["job"]["space"]["slots"] = json!(ids
+        .iter()
+        .map(|id| json!({"id":id,"positions":["A","B"]}))
+        .collect::<Vec<_>>());
+    let baseline = dir.run(&["--request", "-"], &value);
+    assert_eq!(baseline.status.code(), Some(0));
+    assert!(baseline.stderr.is_empty());
+    let periodic = dir.run_interval(
+        &["--request", "-", "--checkpoint", "periodic"],
+        &value,
+        Some("0"),
+    );
+    assert_eq!(periodic.status.code(), Some(0));
+    assert!(periodic.stderr.is_empty());
+    let text = std::fs::read_to_string(dir.0.join("periodic")).unwrap();
+    CheckpointRecord::parse_json(&text).unwrap();
+    let record: Value = serde_json::from_str(&text).unwrap();
+    let identity = checkpoint_identity(&value.to_string(), &BTreeMap::new()).unwrap();
+    let mut offers = Vec::new();
+    AttackRequest::parse_json(&value.to_string())
+        .unwrap()
+        .run_with_checkpoints(
+            ExecutionOptions::serial(),
+            |_| {},
+            || false,
+            |snapshot| {
+                let text = snapshot.record(identity, 0).unwrap().seal_json().unwrap();
+                offers.push(checkpoint_event(&serde_json::from_str(&text).unwrap()));
+            },
+        )
+        .unwrap();
+    assert_eq!(offers.len(), 3);
+    assert_eq!(offers[0]["phase"], "outer");
+    assert_eq!(offers[0]["next_outer"], "128");
+    assert_eq!(offers.last().unwrap(), &checkpoint_event(&record));
+    let mut expected = events(&baseline);
+    expected.splice(2..2, offers);
+    assert_eq!(events(&periodic), expected);
+    assert!(!dir.0.join("periodic.tmp").exists());
+    let reason = std::fs::File::open(dir.0.join("absent/save.tmp")).unwrap_err();
+    for (interval, attempts) in [(None, 1), (Some("0"), 3)] {
+        let failed = dir.run_interval(
+            &["--request", "-", "--checkpoint", "absent/save"],
+            &value,
+            interval,
+        );
+        assert_eq!(failed.status.code(), Some(1));
+        assert_eq!(events(&failed), events(&baseline));
+        let message = format!("error: cannot write checkpoint \"absent/save\": {reason}\n");
+        assert_eq!(failed.stderr, message.repeat(attempts).as_bytes());
+        assert!(!dir.0.join("absent").exists());
+    }
+    // A partial temporary file from an interrupted write must not block resume.
+    dir.write("periodic.tmp", &"truncated checkpoint".repeat(10_000));
+    let resumed = dir.run_interval(
+        &["--request", "-", "--resume", "periodic"],
+        &value,
+        Some("0"),
+    );
+    assert_eq!(resumed.status.code(), Some(0));
+    assert!(resumed.stderr.is_empty());
+    let saved = std::fs::read_to_string(dir.0.join("periodic")).unwrap();
+    CheckpointRecord::parse_json(&saved).unwrap();
+    let saved: Value = serde_json::from_str(&saved).unwrap();
+    let mut expected = events(&baseline);
+    expected[1] = expected[2].clone();
+    expected.insert(2, checkpoint_event(&saved));
+    assert_eq!(events(&resumed), expected);
+    assert_eq!(saved["phase"], "stages");
+    assert_eq!(saved["counters"], record["counters"]);
+    assert!(!dir.0.join("periodic.tmp").exists());
 }

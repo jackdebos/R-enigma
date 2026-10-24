@@ -375,21 +375,28 @@ fn run_attack<'s>(
         Ok(validated) => {
             let mut resumed = None;
             let mut restored_elapsed = 0;
+            let mut checkpoint_writer = None;
             if let Some((file, json)) = checkpoint {
+                let identity = match enigma_core::checkpoint_identity(json, &contents) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        eprintln!("error: {}", CheckpointFile::invalid(file.label, error));
+                        return ExitCode::from(2);
+                    }
+                };
+                checkpoint_writer = Some(checkpoint_file::CheckpointWriter::new(file, identity));
                 if let Some(record) = &file.record {
-                    let checked = enigma_core::checkpoint_identity(json, &contents)
-                        .map_err(|error| CheckpointFile::invalid(file.label, error))
-                        .and_then(|identity| {
-                            if identity != record.identity() {
-                                return Err(format!(
-                                    "checkpoint {:?} belongs to a different search",
-                                    file.label
-                                ));
-                            }
-                            validated
-                                .resume(record)
-                                .map_err(|error| CheckpointFile::invalid(file.label, error))
-                        });
+                    let checked = (|| {
+                        if identity != record.identity() {
+                            return Err(format!(
+                                "checkpoint {:?} belongs to a different search",
+                                file.label
+                            ));
+                        }
+                        validated
+                            .resume(record)
+                            .map_err(|error| CheckpointFile::invalid(file.label, error))
+                    })();
                     match checked {
                         Ok(attack) => {
                             resumed = Some(attack);
@@ -402,7 +409,6 @@ fn run_attack<'s>(
                     }
                 }
             }
-            // T5b: retain the checkpoint target and write coordinator snapshot offers.
             let marker = cancel_file.map(|path| CancelFile::new(path.to_owned()));
             let mut marker = match marker.transpose() {
                 Ok(marker) => marker,
@@ -427,7 +433,7 @@ fn run_attack<'s>(
                 now_ts,
                 // Poll the marker first so a raised signal never masks its runtime error.
                 || marker.as_mut().is_some_and(CancelFile::poll) || signal.load(Ordering::Relaxed),
-                (resumed, restored_elapsed),
+                (resumed, restored_elapsed, checkpoint_writer),
             ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {

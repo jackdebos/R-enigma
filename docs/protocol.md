@@ -513,7 +513,7 @@ ordering applies only while delivery succeeds, including final result write/flus
 | Cancel (first HC/PE release) | `--cancel-file <path>` marker or a platform signal (`SIGINT`/`SIGTERM`/`SIGHUP`, Windows Ctrl+C/Break); both shipped | Cooperative safe-stop, final `result`, then `done` with `reason: "cancelled"`; retained `result.hold` per Task 14; with `--checkpoint`/`--resume`, a checkpoint is written first (§6.2) |
 | Parallel HC/PE outer keys | `--threads <n>`, default half the logical CPUs; outer-key blocks run on that many worker threads | Same public output as one thread for completed runs; see the `--threads` contract below |
 | Pause/resume live job | Not in Stage 1 | Future extension |
-| Save and resume HC/PE | `--checkpoint <path>`, `--resume <path>` (Task 16, in progress) | Periodic, end-of-outer-phase and cancellation checkpoints; resume with any `--threads`; see §6 |
+| Save and resume HC/PE | `--checkpoint <path>`, `--resume <path>` (Task 16) | Periodic, end-of-outer-phase and cancellation checkpoints; resume with any `--threads`; see §6 |
 | Bound HC/PE search | `space.offset`/`space.limit` and cancellation | §4.1 slice/exhaustion/cancellation reasons; slices bound outer keys only; no new `--max-keys` attack control |
 | Other future bounded search | Planned `--max-keys` | Legacy planned `limit_reached`/`offset_end`, not HC/PE mappings |
 
@@ -619,8 +619,7 @@ timing, so cancelled runs are not promised to match across thread counts.
 
 ## 6. Checkpoint and resume (Task 16)
 
-**Status:** specified; implementation in progress (`odd/tasks/enigma-checkpoints.md`).
-Until it ships, `--checkpoint` and `--resume` are CLI usage errors (exit 2).
+**Status:** shipped for validated HC/PE attacks (`odd/tasks/enigma-checkpoints.md`).
 
 Only a resumable search may write checkpoints. A transform has no Stage 1 checkpoint.
 Checkpoint identity binds a canonical digest of the resolved definition **content**
@@ -677,6 +676,7 @@ resuming it reruns only the stages and gives the same result.
 
 A write goes to `<path>.tmp` in the same directory, is flushed, then renamed over
 `<path>`, so a failed or interrupted write never damages the previous checkpoint.
+An existing `<path>.tmp` left by an interrupted write is replaced.
 After each successful write the CLI emits one `checkpoint` event (§6.5). A failed write
 writes `error: cannot write checkpoint "<path>": <reason>` to stderr, the search
 continues (later writes are still attempted), and the process exits 1 at the end
