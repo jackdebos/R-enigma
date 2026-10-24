@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::io::{self, Write};
 use std::time::Duration;
 
-use enigma_core::{encode, AttackProgress, AttackRequest, Event, ExecutionOptions};
+use enigma_core::{encode, AttackProgress, AttackRequest, Event, ExecutionOptions, ResumedAttack};
 
 /// No clock or I/O enters Core. Both clocks are supplied by the CLI boundary.
 struct Transport<W, M, U> {
@@ -12,6 +12,7 @@ struct Transport<W, M, U> {
     monotonic: M,
     utc: U,
     entry: Duration,
+    restored_elapsed: u128,
     seq: u64,
     failure: Option<io::Error>,
 }
@@ -32,13 +33,15 @@ impl<W: Write, M: FnMut() -> Duration, U: FnMut() -> String> Transport<W, M, U> 
             monotonic,
             utc,
             entry,
+            restored_elapsed: 0,
             seq: 1,
             failure: None,
         }
     }
 
     fn elapsed(&mut self) -> u128 {
-        (self.monotonic)().saturating_sub(self.entry).as_millis()
+        self.restored_elapsed
+            .saturating_add((self.monotonic)().saturating_sub(self.entry).as_millis())
     }
 
     fn emit(&mut self, event: Event) {
@@ -99,26 +102,51 @@ impl<W: Write, M: FnMut() -> Duration, U: FnMut() -> String> Transport<W, M, U> 
 
 /// Called only after parsing, binding and all Core eligibility preflight.
 /// External cancellation is independently polled and sticky, as is delivery failure.
+#[cfg(test)]
 pub(super) fn run(
     request: &AttackRequest,
     options: ExecutionOptions,
     writer: impl Write,
     monotonic: impl FnMut() -> Duration,
     utc: impl FnMut() -> String,
-    mut cancel_requested: impl FnMut() -> bool,
+    cancel_requested: impl FnMut() -> bool,
 ) -> Result<(), Failure> {
-    let transport = RefCell::new(Transport::new(writer, monotonic, utc));
+    run_prepared(
+        request,
+        options,
+        writer,
+        monotonic,
+        utc,
+        cancel_requested,
+        (None, 0),
+    )
+}
+
+/// The resumed handle is validated by the caller before any event is written.
+pub(super) fn run_prepared(
+    request: &AttackRequest,
+    options: ExecutionOptions,
+    writer: impl Write,
+    monotonic: impl FnMut() -> Duration,
+    utc: impl FnMut() -> String,
+    mut cancel_requested: impl FnMut() -> bool,
+    restored: (Option<ResumedAttack<'_>>, u128),
+) -> Result<(), Failure> {
+    let mut transport = Transport::new(writer, monotonic, utc);
+    transport.restored_elapsed = restored.1;
+    let transport = RefCell::new(transport);
     let cancelled = Cell::new(false);
     transport.borrow_mut().emit(Event::Started);
-    let result = request.run_with(
-        options,
-        |progress| transport.borrow_mut().observe(progress),
-        || {
-            cancelled
-                .set(cancelled.get() || transport.borrow().failure.is_some() || cancel_requested());
-            cancelled.get()
-        },
-    );
+    let observe = |progress| transport.borrow_mut().observe(progress);
+    let cancel = || {
+        cancelled
+            .set(cancelled.get() || transport.borrow().failure.is_some() || cancel_requested());
+        cancelled.get()
+    };
+    let result = match restored.0 {
+        Some(resumed) => resumed.run_with(options, observe, cancel),
+        None => request.run_with(options, observe, cancel),
+    };
     let mut transport = transport.into_inner();
     // Measure after run: Core's required final rescore is included.
     let elapsed = transport.elapsed();

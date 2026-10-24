@@ -8,6 +8,7 @@
 
 mod attack_transport;
 mod cancel_file;
+mod checkpoint_file;
 mod resource_loader;
 mod signals;
 
@@ -20,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use cancel_file::CancelFile;
+use checkpoint_file::CheckpointFile;
 use enigma_core::{
     encode, rfc3339_utc, DoneReason, Event, ExecutionOptions, ParsedAttackRequest, ParsedRequest,
     ParsedSearchRequest, TransformRequest, MAX_REQUEST_BYTES,
@@ -35,14 +37,20 @@ fn main() -> ExitCode {
         }
     };
     let resolved = split_options(&args).and_then(|(input, options)| {
+        let checkpoint = CheckpointFile::prepare(&cwd, options.checkpoint, options.resume)
+            .map_err(InputError::InvalidOption)?;
         let cancel_file = options.cancel_file.map(|path| cwd.join(path));
         resolve_input(input, &cwd)
-            .map(|(bytes, origin)| (bytes, origin, cancel_file, options.threads))
+            .map(|(bytes, origin)| (bytes, origin, cancel_file, options.threads, checkpoint))
     });
     match resolved {
-        Ok((bytes, origin, cancel_file, threads)) => {
-            run(bytes, &origin, cancel_file.as_deref(), threads)
-        }
+        Ok((bytes, origin, cancel_file, threads, checkpoint)) => run(
+            bytes,
+            &origin,
+            cancel_file.as_deref(),
+            threads,
+            checkpoint.as_ref(),
+        ),
         Err(InputError::Usage) => {
             print_usage();
             ExitCode::from(2)
@@ -82,19 +90,25 @@ struct Options<'a> {
     cancel_file: Option<&'a str>,
     /// Validated `--threads` value.
     threads: Option<ExecutionOptions>,
+    checkpoint: Option<&'a str>,
+    resume: Option<&'a str>,
 }
 
 const CANCEL_FILE: &str = "--cancel-file";
 const THREADS: &str = "--threads";
 
-/// Splits optional `--cancel-file <path>` and `--threads <n>` pairs from before or
-/// after the input form.
+/// Splits control option pairs from before or after the input form.
 ///
 /// A duplicate pair, a missing value or a `--`-prefixed value is a usage error; a
 /// `--threads` value other than a decimal integer in `1..=MAX_THREADS` is an
 /// invalid option. Both are reported before the request is read.
 fn split_options(args: &[String]) -> Result<(&[String], Options<'_>), InputError> {
-    let is_option = |arg: &String| arg == CANCEL_FILE || arg == THREADS;
+    let is_option = |arg: &String| {
+        matches!(
+            arg.as_str(),
+            CANCEL_FILE | THREADS | "--checkpoint" | "--resume"
+        )
+    };
     let mut options = Options::default();
     let mut input = args;
     loop {
@@ -112,10 +126,11 @@ fn split_options(args: &[String]) -> Result<(&[String], Options<'_>), InputError
         if value.starts_with("--") {
             return Err(InputError::Usage);
         }
-        let duplicate = if flag == CANCEL_FILE {
-            options.cancel_file.replace(value).is_some()
-        } else {
-            options.threads.replace(parse_threads(value)?).is_some()
+        let duplicate = match flag.as_str() {
+            CANCEL_FILE => options.cancel_file.replace(value).is_some(),
+            "--checkpoint" => options.checkpoint.replace(value).is_some(),
+            "--resume" => options.resume.replace(value).is_some(),
+            _ => options.threads.replace(parse_threads(value)?).is_some(),
         };
         if duplicate {
             return Err(InputError::Usage);
@@ -208,6 +223,8 @@ fn print_usage() {
     eprintln!("  --threads <n>          worker threads for a hill_climb/partial_exhaustion");
     eprintln!("                         attack, 1 to 256 (default: half the logical CPUs);");
     eprintln!("                         completed runs write the same output for any <n>");
+    eprintln!("  --checkpoint <path>  save HC/PE checkpoints to a new file");
+    eprintln!("  --resume <path>      resume HC/PE and keep saving to the same file");
     eprintln!();
     eprintln!("One JSON event is written per line to stdout; diagnostics go to stderr.");
     eprintln!("See docs/protocol.md for the contract and odd/tasks/enigma-engine.md for the plan.");
@@ -222,11 +239,13 @@ const THREADS_UNSUPPORTED: &str =
     "--threads is supported only for hill_climb and partial_exhaustion attacks";
 
 /// The option message for a job that accepts neither option; `--cancel-file` wins.
-fn unsupported_option(cancel_file: bool, threads: bool) -> Option<&'static str> {
+fn unsupported_option(cancel_file: bool, threads: bool, checkpoint: bool) -> Option<&'static str> {
     if cancel_file {
         Some(CANCEL_FILE_UNSUPPORTED)
     } else if threads {
         Some(THREADS_UNSUPPORTED)
+    } else if checkpoint {
+        Some("--checkpoint and --resume are supported only for hill_climb and partial_exhaustion attacks")
     } else {
         None
     }
@@ -245,8 +264,13 @@ fn run(
     origin: &Path,
     cancel_file: Option<&Path>,
     threads: Option<ExecutionOptions>,
+    checkpoint: Option<&CheckpointFile<'_>>,
 ) -> ExitCode {
-    let unsupported = unsupported_option(cancel_file.is_some(), threads.is_some());
+    let unsupported = unsupported_option(
+        cancel_file.is_some(),
+        threads.is_some(),
+        checkpoint.is_some(),
+    );
     let json = match String::from_utf8(bytes) {
         Ok(json) => json,
         Err(error) => {
@@ -270,6 +294,7 @@ fn run(
             origin,
             cancel_file,
             threads.unwrap_or_else(default_execution),
+            checkpoint.map(|file| (file, json.as_str())),
             signals::install,
             &mut io::stdout().lock(),
         ),
@@ -327,6 +352,7 @@ fn run_attack<'s>(
     origin: &Path,
     cancel_file: Option<&Path>,
     execution: ExecutionOptions,
+    checkpoint: Option<(&CheckpointFile<'_>, &str)>,
     install_signals: impl FnOnce() -> Result<&'s AtomicBool, String>,
     out: &mut impl Write,
 ) -> ExitCode {
@@ -347,6 +373,36 @@ fn run_attack<'s>(
         .collect();
     match request.bind_resources(&supplied) {
         Ok(validated) => {
+            let mut resumed = None;
+            let mut restored_elapsed = 0;
+            if let Some((file, json)) = checkpoint {
+                if let Some(record) = &file.record {
+                    let checked = enigma_core::checkpoint_identity(json, &contents)
+                        .map_err(|error| CheckpointFile::invalid(file.label, error))
+                        .and_then(|identity| {
+                            if identity != record.identity() {
+                                return Err(format!(
+                                    "checkpoint {:?} belongs to a different search",
+                                    file.label
+                                ));
+                            }
+                            validated
+                                .resume(record)
+                                .map_err(|error| CheckpointFile::invalid(file.label, error))
+                        });
+                    match checked {
+                        Ok(attack) => {
+                            resumed = Some(attack);
+                            restored_elapsed = record.elapsed_ms();
+                        }
+                        Err(message) => {
+                            eprintln!("error: {message}");
+                            return ExitCode::from(2);
+                        }
+                    }
+                }
+            }
+            // T5b: retain the checkpoint target and write coordinator snapshot offers.
             let marker = cancel_file.map(|path| CancelFile::new(path.to_owned()));
             let mut marker = match marker.transpose() {
                 Ok(marker) => marker,
@@ -363,7 +419,7 @@ fn run_attack<'s>(
                 }
             };
             let entry = Instant::now();
-            let status = match attack_transport::run(
+            let status = match attack_transport::run_prepared(
                 &validated,
                 execution,
                 out,
@@ -371,6 +427,7 @@ fn run_attack<'s>(
                 now_ts,
                 // Poll the marker first so a raised signal never masks its runtime error.
                 || marker.as_mut().is_some_and(CancelFile::poll) || signal.load(Ordering::Relaxed),
+                (resumed, restored_elapsed),
             ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
@@ -527,7 +584,15 @@ mod attack_tests {
         let parsed = ParsedAttackRequest::parse_json(&value.to_string()).unwrap();
         let mut output = Vec::new();
         assert_eq!(
-            run_attack(parsed, origin, None, SERIAL, || Ok(&IDLE), &mut output),
+            run_attack(
+                parsed,
+                origin,
+                None,
+                SERIAL,
+                None,
+                || Ok(&IDLE),
+                &mut output
+            ),
             ExitCode::FAILURE
         );
         let text = String::from_utf8(output).unwrap();
@@ -578,7 +643,15 @@ mod attack_tests {
         let parsed = ParsedAttackRequest::parse_json(&value.to_string()).unwrap();
         let mut output = Vec::new();
         assert_eq!(
-            run_attack(parsed, origin, None, SERIAL, || Ok(&IDLE), &mut output),
+            run_attack(
+                parsed,
+                origin,
+                None,
+                SERIAL,
+                None,
+                || Ok(&IDLE),
+                &mut output
+            ),
             ExitCode::SUCCESS
         );
         let events: Vec<Value> = String::from_utf8(output)
@@ -800,7 +873,15 @@ mod attack_tests {
             // Valid structure, deterministic eligibility failure before any work events.
             let parsed = ParsedAttackRequest::parse_json(&outer(8).to_string()).unwrap();
             assert_eq!(
-                run_attack(parsed, Path::new("."), None, SERIAL, || Ok(&IDLE), &mut out),
+                run_attack(
+                    parsed,
+                    Path::new("."),
+                    None,
+                    SERIAL,
+                    None,
+                    || Ok(&IDLE),
+                    &mut out
+                ),
                 ExitCode::FAILURE
             );
             assert_eq!(out.flushes, usize::from(!fail_write));
@@ -859,6 +940,7 @@ mod attack_tests {
                         Path::new("."),
                         Some(&path),
                         SERIAL,
+                        None,
                         || Ok(&IDLE),
                         &mut out
                     ),
@@ -898,6 +980,7 @@ mod attack_tests {
                         Path::new("."),
                         cancel_file,
                         SERIAL,
+                        None,
                         || Ok(&flag),
                         &mut out
                     ),
