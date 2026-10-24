@@ -13,6 +13,7 @@ struct Transport<W, M, U> {
     monotonic: M,
     utc: U,
     entry: Duration,
+    started_at: String,
     restored_elapsed: u128,
     seq: u64,
     failure: Option<io::Error>,
@@ -29,13 +30,15 @@ pub(super) struct Failure {
 }
 
 impl<W: Write, M: FnMut() -> Duration, U: FnMut() -> String> Transport<W, M, U> {
-    fn new(writer: W, mut monotonic: M, utc: U) -> Self {
+    fn new(writer: W, mut monotonic: M, mut utc: U) -> Self {
         let entry = monotonic();
+        let started_at = utc();
         Self {
             writer,
             monotonic,
             utc,
             entry,
+            started_at,
             restored_elapsed: 0,
             seq: 1,
             failure: None,
@@ -148,7 +151,9 @@ pub(super) fn run_prepared(
     transport.restored_elapsed = restored.1;
     let transport = RefCell::new(transport);
     let cancelled = Cell::new(false);
-    transport.borrow_mut().emit(Event::Started);
+    transport
+        .borrow_mut()
+        .emit(Event::attack_started(request.gate().outer_selected()));
     let observe = |progress| transport.borrow_mut().observe(progress);
     let cancel = || {
         cancelled
@@ -180,10 +185,15 @@ pub(super) fn run_prepared(
     transport.checkpoint_failed = checkpoint.is_some_and(|writer| writer.failed);
     // Measure after run: Core's required final rescore is included.
     let elapsed = transport.elapsed();
+    let finished_at = (transport.utc)();
+    let started_at = transport.started_at.clone();
+    let enrich = |event: Event| {
+        event.with_execution_metadata(options.threads().get(), &started_at, &finished_at)
+    };
     match result {
         Ok(result) => transport.finish(
             Ok((
-                Event::result(&result, elapsed),
+                enrich(Event::result(&result, elapsed)),
                 Event::Done {
                     reason: result.termination().into(),
                 },
@@ -192,6 +202,7 @@ pub(super) fn run_prepared(
         ),
         Err(error) => {
             let projected = Event::runtime_error(&error, elapsed)
+                .map(|(result, error)| (enrich(result), error))
                 .map_err(|projection| projection.best_projection().to_string());
             transport.finish(projected, Some(Box::new(error)))
         }
@@ -347,7 +358,10 @@ mod tests {
             assert_eq!(writer.flushes, events.len());
             for (index, event) in events.iter().enumerate() {
                 assert_eq!(event["seq"], index + 1);
-                assert_eq!(event["ts"], format!("UTC-{}", 99 - index));
+                assert_eq!(
+                    event["ts"],
+                    format!("UTC-{}", 98 - index - usize::from(index >= 3))
+                );
             }
             assert_eq!(events[3]["elapsed_ms"], "0");
             assert_eq!(
@@ -358,7 +372,12 @@ mod tests {
             assert_eq!(
                 events[3],
                 serde_json::from_str::<Value>(
-                    &encode(&Event::result(&expected, 0), 4, "UTC-96").unwrap()
+                    &encode(
+                        &Event::result(&expected, 0).with_execution_metadata(1, "UTC-99", "UTC-95"),
+                        4,
+                        "UTC-94"
+                    )
+                    .unwrap()
                 )
                 .unwrap()
             );

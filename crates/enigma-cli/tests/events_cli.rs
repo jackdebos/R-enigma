@@ -104,6 +104,65 @@ fn events_dash_writes_the_jsonl_stream_to_stdout() {
 }
 
 #[test]
+fn attack_additive_execution_data() {
+    let dir = Scratch::new();
+    for pe in [false, true] {
+        for threads in ["1", "2"] {
+            for sliced in [false, true] {
+                let mut request = attack();
+                if pe {
+                    request["job"]["passes"] = json!(["partial_exhaustion"]);
+                    let settings = request["job"]["attack"].as_object_mut().unwrap();
+                    settings.insert("kind".into(), json!("partial_exhaustion"));
+                    settings.remove("start");
+                    settings.insert(
+                        "seeds".into(),
+                        json!({"kind":"empty_single","selection":"all"}),
+                    );
+                }
+                if sliced {
+                    request["job"]["space"]["offset"] = json!(1);
+                    request["job"]["space"]["limit"] = json!(1);
+                }
+                let output = dir.run(
+                    &["--events", "-", "--threads", threads, "--request", "-"],
+                    &request,
+                );
+                assert_eq!(output.status.code(), Some(0));
+                assert_eq!(output.stderr, b"");
+                let wire = events(&output.stdout);
+                assert_eq!(wire[0]["outers_selected"], if sliced { "1" } else { "2" });
+                let result = &wire[wire.len() - 2];
+                assert_eq!(result["threads"], threads);
+                let start = result["started_at"].as_str().unwrap();
+                let finish = result["finished_at"].as_str().unwrap();
+                for timestamp in [start, finish] {
+                    assert_eq!(timestamp.len(), 20);
+                    for (index, byte) in timestamp.bytes().enumerate() {
+                        match index {
+                            4 | 7 => assert_eq!(byte, b'-'),
+                            10 => assert_eq!(byte, b'T'),
+                            13 | 16 => assert_eq!(byte, b':'),
+                            19 => assert_eq!(byte, b'Z'),
+                            _ => assert!(byte.is_ascii_digit()),
+                        }
+                    }
+                }
+                assert!(start <= finish);
+                for candidate in
+                    std::iter::once(&result["best"]).chain(result["hold"].as_array().unwrap())
+                {
+                    for field in ["measured", "ranking"] {
+                        assert_eq!(candidate["score"][format!("{field}_q32")], "8589934592");
+                        assert_eq!(candidate["score"][field], "2.000000");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn human_mode_prints_transform_text_and_no_events() {
     let dir = Scratch::new();
     let output = dir.run(&["--request", "-"], &transform());
@@ -141,6 +200,9 @@ fn events_file_receives_the_same_stream_as_events_dash() {
                 let object = event.as_object_mut().unwrap();
                 object.remove("ts");
                 object.remove("elapsed_ms");
+                for field in ["threads", "started_at", "finished_at"] {
+                    object.remove(field);
+                }
                 event
             })
             .collect()

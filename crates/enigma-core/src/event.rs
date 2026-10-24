@@ -146,6 +146,31 @@ struct WinningScore {
     measure: String,
     measured_q32: String,
     ranking_q32: String,
+    measured: String,
+    ranking: String,
+}
+
+/// Round the fractional magnitude separately: scaling the full i128 would overflow.
+fn decimal_q32(units: i128) -> String {
+    let magnitude = units.unsigned_abs();
+    let whole = magnitude >> 32;
+    let fraction = (((magnitude & 0xffff_ffff) as i128 * 1_000_000 + (1_i128 << 31)) >> 32) as u128;
+    let whole = whole + fraction / 1_000_000;
+    let fraction = fraction % 1_000_000;
+    let sign = if units < 0 && (whole != 0 || fraction != 0) {
+        "-"
+    } else {
+        ""
+    };
+    format!("{sign}{whole}.{fraction:06}")
+}
+
+/// Process-local execution facts supplied by the transport, never read by Core.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ExecutionMetadata {
+    threads: String,
+    started_at: String,
+    finished_at: String,
 }
 
 /// Wire-only history entry for one admitted chained stage.
@@ -169,6 +194,8 @@ impl From<&crate::AttackStageResult> for StageResult {
                 measure: stage.measure().id().to_owned(),
                 measured_q32: score.measured().units().to_string(),
                 ranking_q32: score.ranking().units().to_string(),
+                measured: decimal_q32(score.measured().units()),
+                ranking: decimal_q32(score.ranking().units()),
             }),
             evaluations_used: stage.evaluations_used().to_string(),
             completed: stage.completed(),
@@ -199,6 +226,8 @@ impl From<&AttackBest> for BestResult {
                 measure: best.measure().id().to_owned(),
                 measured_q32: best.score().measured().units().to_string(),
                 ranking_q32: best.score().ranking().units().to_string(),
+                measured: decimal_q32(best.score().measured().units()),
+                ranking: decimal_q32(best.score().ranking().units()),
             },
             outer_index: best.outer_index().to_string(),
             start_index: best.start_index().to_string(),
@@ -215,6 +244,12 @@ impl From<&AttackBest> for BestResult {
 pub enum Event {
     /// Emitted once, first, after validation succeeded and before any work.
     Started,
+    /// Attack-only selected slice total; serializes with the same event name.
+    #[serde(rename = "started")]
+    AttackStarted {
+        /// Canonical decimal number of selected outer keys, including restored work.
+        outers_selected: String,
+    },
     /// Emitted after `started` carrying the transformed text for a `transform` job.
     Output {
         /// The transformed text.
@@ -248,6 +283,9 @@ pub enum Event {
         counters: ProgressCounters,
         /// Caller-supplied canonical unsigned decimal milliseconds.
         elapsed_ms: String,
+        /// Added by the transport via `with_execution_metadata`.
+        #[serde(flatten, skip_serializing_if = "Option::is_none")]
+        execution: Option<ExecutionMetadata>,
     },
     /// The single terminal lifecycle event of a successful job.
     Done {
@@ -297,6 +335,31 @@ impl From<AttackTermination> for DoneReason {
 }
 
 impl Event {
+    /// Projects the validated selected slice size, not the remaining resume work.
+    pub fn attack_started(outers_selected: u128) -> Self {
+        Self::AttackStarted {
+            outers_selected: outers_selected.to_string(),
+        }
+    }
+
+    /// Completes a result projection with caller-supplied process facts.
+    /// Non-result events are returned unchanged; this helper reads no clocks.
+    pub fn with_execution_metadata(
+        mut self,
+        threads: usize,
+        started_at: &str,
+        finished_at: &str,
+    ) -> Self {
+        if let Self::Result { execution, .. } = &mut self {
+            *execution = Some(ExecutionMetadata {
+                threads: threads.to_string(),
+                started_at: started_at.to_owned(),
+                finished_at: finished_at.to_owned(),
+            });
+        }
+        self
+    }
+
     /// Projects the saved record without clocks or I/O; emit only after persistence.
     pub fn checkpoint(record: &crate::CheckpointRecord) -> Self {
         Self::Checkpoint {
@@ -334,6 +397,7 @@ impl Event {
             best: best.map(|best| Box::new(BestResult::from(best))),
             counters: counters.into(),
             elapsed_ms: elapsed_ms.to_string(),
+            execution: None,
         }
     }
 
@@ -520,7 +584,11 @@ mod tests {
     // not evidence that validated public requests naturally fail.
     fn assert_runtime_winner_projection(result: crate::AttackResult) {
         use crate::attack_result::{AttackRunErrorData, AttackRunSource, RunPayload};
-        let expected = encoded(&Event::result(&result, u128::MAX));
+        let expected = encoded(&Event::result(&result, u128::MAX).with_execution_metadata(
+            2,
+            TS,
+            "runtime finish",
+        ));
         let error = crate::AttackRunError::new(AttackRunErrorData {
             held_tail: result.held_tail,
             stages: result.stages,
@@ -532,7 +600,13 @@ mod tests {
             best: Ok(result.best),
         });
         let (projected, terminal) = Event::runtime_error(&error, u128::MAX).unwrap();
-        assert_eq!(encoded(&projected), expected);
+        assert_eq!(
+            encoded(&projected.with_execution_metadata(2, TS, "runtime finish")),
+            expected
+        );
+        assert_eq!(expected["threads"], "2");
+        assert_eq!(expected["started_at"], TS);
+        assert_eq!(expected["finished_at"], "runtime finish");
         assert_eq!(encoded(&terminal)["context"]["source"]["kind"], "invariant");
     }
 
@@ -673,7 +747,7 @@ mod tests {
         assert_eq!(
             wire["best"]["score"],
             json!({"measure": "trie",
-            "measured_q32": "4294967296", "ranking_q32": "4294967296"})
+            "measured_q32": "4294967296", "ranking_q32": "4294967296", "measured": "1.000000", "ranking": "1.000000"})
         );
         assert_eq!(wire["best"]["start_index"], best.start_index().to_string());
         assert_eq!(
@@ -711,7 +785,7 @@ mod tests {
         assert_eq!(
             wire["best"]["score"],
             json!({"measure": "entropy",
-            "measured_q32": "4294967296", "ranking_q32": "-4294967296"})
+            "measured_q32": "4294967296", "ranking_q32": "-4294967296", "measured": "1.000000", "ranking": "-1.000000"})
         );
         assert_eq!(
             wire["best"]["score"]["measured_q32"],
@@ -751,7 +825,9 @@ mod tests {
                         "mutable_plugboard": best.mutable_plugboard(), "plaintext": best.plaintext(),
                         "score": {"measure": best.measure().id(),
                             "measured_q32": best.score().measured().units().to_string(),
-                            "ranking_q32": best.score().ranking().units().to_string()},
+                            "ranking_q32": best.score().ranking().units().to_string(),
+                            "measured": super::decimal_q32(best.score().measured().units()),
+                            "ranking": super::decimal_q32(best.score().ranking().units())},
                         "outer_index": best.outer_index().to_string(), "start_index": best.start_index().to_string(),
                         "incomplete": best.incomplete(), "final_objective_ascent": best.final_objective_ascent(),
                         "neighborhood_exhausted": best.neighborhood_exhausted()
@@ -817,7 +893,9 @@ mod tests {
         let expected = json!([
             {"pass":"trie","measure":"trie","base_measure":"entropy",
              "score":{"measure":"trie","measured_q32":score.measured().units().to_string(),
-                      "ranking_q32":score.ranking().units().to_string()},
+                      "ranking_q32":score.ranking().units().to_string(),
+                      "measured":super::decimal_q32(score.measured().units()),
+                      "ranking":super::decimal_q32(score.ranking().units())},
              "evaluations_used":u64::MAX.to_string(),"completed":true},
             {"pass":"measure","measure":"ic","base_measure":null,"score":null,
              "evaluations_used":"1","completed":false}
@@ -872,7 +950,8 @@ mod tests {
                 wire["score"],
                 json!({"measure": best.measure().id(),
                 "measured_q32": entropy.measured().units().to_string(),
-                "ranking_q32": entropy.ranking().units().to_string()})
+                "ranking_q32": entropy.ranking().units().to_string(),
+                "measured": "1.000000", "ranking": "-1.000000"})
             );
             assert_eq!(wire["incomplete"], mask & 1 != 0);
             assert_eq!(wire["final_objective_ascent"], mask & 2 != 0);
@@ -1289,6 +1368,50 @@ mod tests {
                 assert!(context.get("elapsed_ms").is_none());
             }
         }
+    }
+
+    #[test]
+    fn decimal_q32_boundaries() {
+        for (units, expected) in [
+            (0, "0.000000"),
+            (1_i128 << 32, "1.000000"),
+            (-(1_i128 << 32), "-1.000000"),
+            (-35_790_052_078, "-8.333021"),
+            (33_554_432, "0.007813"),
+            (-33_554_432, "-0.007813"),
+            (33_554_431, "0.007812"),
+            (-33_554_431, "-0.007812"),
+            (-1, "0.000000"),
+            (2147, "0.000000"),
+            (2148, "0.000001"),
+            (i128::MIN, "-39614081257132168796771975168.000000"),
+            (i128::MAX, "39614081257132168796771975168.000000"),
+        ] {
+            assert_eq!(super::decimal_q32(units), expected, "{units}");
+        }
+    }
+
+    #[test]
+    fn execution_metadata_is_caller_supplied_and_started_total_is_full_width() {
+        let result = result_fixture(false, 0);
+        let mut projected = encoded(&Event::result(&result, 23));
+        let mut enriched =
+            encoded(&Event::result(&result, 23).with_execution_metadata(2, TS, "caller finish"));
+        assert_eq!(
+            enriched.as_object_mut().unwrap().remove("threads"),
+            Some(json!("2"))
+        );
+        assert_eq!(
+            enriched.as_object_mut().unwrap().remove("started_at"),
+            Some(json!(TS))
+        );
+        assert_eq!(
+            enriched.as_object_mut().unwrap().remove("finished_at"),
+            Some(json!("caller finish"))
+        );
+        assert_eq!(enriched, projected);
+        projected = encoded(&Event::attack_started(u128::MAX));
+        assert_eq!(projected["outers_selected"], u128::MAX.to_string());
     }
 
     #[test]

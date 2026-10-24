@@ -75,7 +75,14 @@ fn request() -> Value {
         "attack":{"kind":"hill_climb","initial_measure":"ic","final_measure":"ic","switch_pairs":1,"backtrack_pairs":0,"start":[]}}})
 }
 fn normalize(mut value: Value) -> Value {
-    for field in ["ts", "elapsed_ms", "seq"] {
+    for field in [
+        "ts",
+        "elapsed_ms",
+        "seq",
+        "threads",
+        "started_at",
+        "finished_at",
+    ] {
         value.as_object_mut().unwrap().remove(field);
     }
     value
@@ -277,7 +284,9 @@ fn valid_resume_and_checkpoint_preserve_normal_results() {
     assert_eq!(baseline.status.code(), Some(0));
     assert!(baseline.stderr.is_empty());
     let attack = AttackRequest::parse_json(&value.to_string()).unwrap();
-    let mut expected = vec![enigma_core::Event::Started];
+    let mut expected = vec![enigma_core::Event::attack_started(
+        attack.gate().outer_selected(),
+    )];
     let result = attack
         .run(
             |p| expected.push(enigma_core::Event::progress(p, 0)),
@@ -364,7 +373,7 @@ fn cancel_checkpoint_then_resume_with_other_threads_matches_uninterrupted() {
         assert_eq!(saved["next_outer"], "0");
         let counters = saved["counters"].clone();
         let expected = vec![
-            json!({"event":"started","protocol_version":1}),
+            json!({"event":"started","protocol_version":1,"outers_selected":"2"}),
             json!({"event":"progress","protocol_version":1,"counters":counters}),
             checkpoint_event(&saved),
             json!({"event":"progress","protocol_version":1,"counters":counters}),

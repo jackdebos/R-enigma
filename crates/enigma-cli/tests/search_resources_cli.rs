@@ -578,7 +578,7 @@ fn missing_cancel_file_runs_attacks_normally() {
     }
 }
 
-/// Events without the wall-clock fields `ts` and `elapsed_ms`.
+/// Events without the protocol's thread-count equivalence exceptions.
 fn timeless(events: Vec<Value>) -> Vec<Value> {
     events
         .into_iter()
@@ -586,6 +586,9 @@ fn timeless(events: Vec<Value>) -> Vec<Value> {
             let object = event.as_object_mut().unwrap();
             object.remove("ts");
             object.remove("elapsed_ms");
+            for field in ["threads", "started_at", "finished_at"] {
+                object.remove(field);
+            }
             event
         })
         .collect()
@@ -897,6 +900,9 @@ fn public_hold_staged_capacities_and_default_match_core() {
             // Compare only equal capacities: stage costs legitimately vary with N.
             result.as_object_mut().unwrap().remove("ts");
             result.as_object_mut().unwrap().remove("elapsed_ms");
+            for field in ["threads", "started_at", "finished_at"] {
+                result.as_object_mut().unwrap().remove(field);
+            }
             if capacity.is_none() {
                 default_result = Some(result);
             } else if capacity == Some(100) {
