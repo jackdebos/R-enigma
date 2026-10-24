@@ -54,10 +54,30 @@ tables; delete them by hand to rebuild. The Leipzig Corpora Collection is
 Creative Commons licence CC BY-NC" (wortschatz.uni-leipzig.de/en/usage):
 publishing a derived table needs attribution and stays non-commercial.
 
+## Weierud texts
+
+Run `python3 -B e2e/recovery/weierud.py`. Requires Python 3, `/usr/bin/pdftotext`
+and the release Enigma CLI; the script builds the CLI if missing. Existing
+downloads are reused. It decrypts the July 1941 Heeresgruppe Nord messages and
+the messages of the 2017 article with their published keys.
+
+Downloads, extracted text, `plaintexts.json` and `audit.json` stay in git-ignored
+`data/weierud/`. Never commit source keys, ciphertexts or plaintexts.
+
+HTML decryptions are compared with the published raw plaintext. PDF decryptions
+check the published Stop positions (display-notch stepping, including the double
+step) plus German trigram coverage. Incomplete messages are skipped explicitly.
+Verification failures are reported individually and the script exits 1; only
+entries whose `verification.passed` is true may be used as benchmark input. On
+2026-10-24: 53 decrypted, 48 verified (4,916 letters, lengths 18-214), 5 failed
+on source inconsistencies, 16 skipped.
+
 ## Layout and source policy
 
 - `ngrams.py`, `test_ngrams.py`: builder/converter and CLI tests.
 - `fetch_leipzig.sh`: Leipzig download and neutral tables.
+- `weierud.py`, `test_weierud.py`: 1941 plaintext extraction and its tests
+  (synthetic snippets only).
 - `sources.md`: source URLs and attribution; no copied historical texts.
 - `data/` (**git-ignored**): downloaded corpora, ciphertexts, keys, decrypted
   plaintexts and generated tables. Weierud-derived material is never committed;
