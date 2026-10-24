@@ -66,7 +66,8 @@ Downloads, extracted text, `plaintexts.json` and `audit.json` stay in git-ignore
 
 HTML decryptions are compared with the published raw plaintext. PDF decryptions
 check the published Stop positions (display-notch stepping, including the double
-step) plus German trigram coverage. Incomplete messages are skipped explicitly.
+step), the header's cipher length and German trigram coverage; any disagreement
+fails the message. Incomplete messages are skipped explicitly.
 Verification failures are reported individually and the script exits 1; only
 entries whose `verification.passed` is true may be used as benchmark input. On
 2026-10-24: 53 decrypted, 48 verified (4,916 letters, lengths 18-214), 5 failed

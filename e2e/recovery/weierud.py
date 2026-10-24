@@ -261,7 +261,8 @@ def verify(message, plaintext, trigrams):
             'header_cipher_length': message.get('header_cipher_length'),
             'extracted_cipher_length': len(plaintext),
             'header_length_matches': message.get('header_length_matches'), 'reasons': reasons,
-            'passed': (stop is None or actual == stop) and coverage >= 0.65}
+            'passed': ((stop is None or actual == stop) and coverage >= 0.65
+                       and message.get('header_length_matches') is not False)}
 
 
 def run():

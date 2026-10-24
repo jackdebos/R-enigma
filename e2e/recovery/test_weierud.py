@@ -139,6 +139,19 @@ class WeierudTests(unittest.TestCase):
                       ' '.join(result['reasons']))
         self.assertEqual(result['extracted_cipher_length'], 7)
 
+    def test_pdf_header_only_disagreement_fails(self):
+        m = w.parse_pdf(PDF)[0]
+        m['stop'] = w.end_positions(m['key'], 7)
+        m['header_cipher_length'] = 5
+        m['header_length_matches'] = False
+        trigrams = {'ABC', 'BCD', 'CDE', 'DEF', 'EFG'}
+        result = w.verify(m, 'ABCDEFG', trigrams)
+        self.assertTrue(result['stop_matches'])
+        self.assertFalse(result['passed'])
+        self.assertEqual(result['reasons'], [
+            'header expects 5 cipher letters but extracted complete groups contain 7; '
+            'no truncation or padding applied'])
+
     def test_pdf_missing_letters_flagged(self):
         self.assertIn('skip', w.parse_pdf(PDF.replace('ZZZZZ ABCDE FG', 'ZZZZZ AB-DE FG'))[0])
 
