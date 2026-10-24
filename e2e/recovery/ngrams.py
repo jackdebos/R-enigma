@@ -86,12 +86,13 @@ def read_input(name):
 def write_outputs(outputs, force, inputs):
     """Preflight all paths before creating any output, including with --force."""
     seen = set()
-    input_paths = {Path(name).resolve() for name in inputs if name != "-"}
+    input_paths = [Path(name) for name in inputs if name != "-"]
     for path, _ in outputs:
         resolved = path.resolve()
         if resolved in seen:
             raise ValueError(f"duplicate output path: {path}")
-        if resolved in input_paths:
+        # Compare file identity, not names: hard links share one inode.
+        if path.exists() and any(path.samefile(source) for source in input_paths):
             raise ValueError(f"output would replace input: {path}")
         seen.add(resolved)
         if (path.exists() or path.is_symlink()) and not force:

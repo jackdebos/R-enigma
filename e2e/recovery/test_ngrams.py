@@ -138,6 +138,17 @@ class NgramsCLI(unittest.TestCase):
                 self.success(self.run_cli(*args, "--force", text=text))
                 self.assertEqual(json.loads(output.read_text())["entries"][0], {"gram": ["A", "B"], "count": 2})
 
+    def test_force_refuses_hard_linked_input(self):
+        source = self.root / "corpus.txt"
+        source.write_text("ABAB", encoding="utf-8")
+        alias = self.root / "alias.json"
+        alias.hardlink_to(source)
+        result = self.run_cli("build", "--order", 2, "--json-out", alias, "--force", source)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, f"error: output would replace input: {alias}\n")
+        self.assertEqual(source.read_text(encoding="utf-8"), "ABAB")
+
     def test_preflight_all_outputs(self):
         fresh, existing = self.root / "fresh.txt", self.root / "existing.json"
         existing.write_text("sentinel")
