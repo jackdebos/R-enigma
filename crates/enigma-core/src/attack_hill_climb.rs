@@ -2164,8 +2164,9 @@ impl BlockQueue {
     }
 }
 
-/// A panicking worker releases the others instead of leaving them waiting for a
-/// block that will never be committed; the scope then propagates the panic.
+/// A panicking worker or coordinator releases waiting workers instead of leaving
+/// them waiting for a block that will never be committed; the scope propagates
+/// the panic only after all workers have exited.
 struct StopOnPanic<'a>(&'a BlockQueue);
 
 impl Drop for StopOnPanic<'_> {
@@ -2248,6 +2249,7 @@ impl crate::AttackRequest {
         let (sender, receiver) = std::sync::mpsc::channel();
         let mut next = 0;
         std::thread::scope(|scope| {
+            let _release = StopOnPanic(&queue);
             for worker in 0..workers {
                 let (queue, sender) = (&queue, sender.clone());
                 scope.spawn(move || {
@@ -3608,6 +3610,65 @@ mod tests {
             .unwrap();
         assert!(!wait.timed_out(), "timed out waiting for {what}");
         guard
+    }
+
+    fn assert_callback_panic_propagates(observer_panics: bool) {
+        for threads in [1, 2, 4] {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let request = pool_request(false, 1, |job| {
+                    job["attack"]["progress_every"] = 1.into();
+                });
+                let options = crate::ExecutionOptions::with_threads(threads).unwrap();
+                let mut snapshots = 0;
+                let mut polls = 0;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    request.run_with(
+                        options,
+                        |_| {
+                            snapshots += 1;
+                            if observer_panics && snapshots == 3 {
+                                panic!("observer callback panic");
+                            }
+                        },
+                        || {
+                            polls += 1;
+                            if !observer_panics && polls == 3 {
+                                panic!("cancel callback panic");
+                            }
+                            false
+                        },
+                    )
+                }));
+                let payload = result.expect_err("callback panic must reach the caller");
+                sender.send(payload).unwrap();
+            });
+            let payload = receiver
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap_or_else(|error| {
+                    panic!("callback panic did not propagate: observer={observer_panics}, threads={threads}: {error}")
+                });
+            assert_eq!(
+                payload.downcast_ref::<&str>().copied(),
+                Some(if observer_panics {
+                    "observer callback panic"
+                } else {
+                    "cancel callback panic"
+                }),
+                "the original panic must be preserved"
+            );
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn pool_observer_callback_panic_propagates() {
+        assert_callback_panic_propagates(true);
+    }
+
+    #[test]
+    fn pool_cancel_callback_panic_propagates() {
+        assert_callback_panic_propagates(false);
     }
 
     #[test]
