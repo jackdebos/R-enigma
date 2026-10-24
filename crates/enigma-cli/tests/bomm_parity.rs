@@ -30,6 +30,7 @@ const CASES: &[&str] = &[
     "enigma-m4-thin-c-gamma",
     "m4-u264-attack-board",
     "m4-u264-attack-design-b",
+    "m4-u264-attack-design-c",
     "m4-u264-attack-positions",
     "m4-u264-first-break",
     "m4-u264-sinkov-bigram-correct",
@@ -313,6 +314,51 @@ fn historical_design_b_fixture_changes_only_three_position_domains() {
     assert_eq!(selected["capture"]["exit_code"], 0);
     assert_eq!(selected["capture"]["units"], 17_576);
     assert_eq!(selected["capture"]["decrypts"], 142_788_085);
+}
+
+#[test]
+fn historical_design_c_fixture_changes_only_position_and_right_ring_domains() {
+    let (mut query, record) = attack_fixture();
+    let case = "m4-u264-attack-design-c";
+    for index in [2, 3, 4] {
+        query["space"]["slots"][index]["positions"] = json!("*");
+    }
+    query["space"]["slots"][4]["rings"] = json!("*");
+    assert_eq!(load(case, "query.json"), query);
+    let mut engine = record["engine"].clone();
+    for index in [2, 3, 4] {
+        engine["job"]["configuration"]["slots"][index]
+            .as_object_mut()
+            .unwrap()
+            .remove("position");
+    }
+    engine["job"]["configuration"]["slots"][4]
+        .as_object_mut()
+        .unwrap()
+        .remove("ring");
+    let alphabet: Vec<_> = ('A'..='Z').map(|c| c.to_string()).collect();
+    engine["job"]["space"]["slots"] = json!([
+        {"id": "left", "positions": alphabet},
+        {"id": "middle", "positions": alphabet},
+        {"id": "right", "positions": alphabet, "rings": alphabet}
+    ]);
+    let selected = load(case, "case.json");
+    assert_eq!(selected["engine"], engine);
+    for field in [
+        "kind",
+        "resource",
+        "historical_pairs",
+        "plaintext",
+        "observed",
+    ] {
+        assert_eq!(selected[field], record[field], "{field}");
+    }
+    for field in ["bomm_commit", "bomm_sha256"] {
+        assert_eq!(selected["capture"][field], record["capture"][field]);
+    }
+    assert_eq!(selected["capture"]["exit_code"], 0);
+    assert_eq!(selected["capture"]["units"], 456_976);
+    assert_eq!(selected["capture"]["decrypts"], 3_718_611_649_u64);
 }
 
 /// Exactly one CLI execution with full assertions; timing lives in `case_a_timing.rs`.

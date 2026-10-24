@@ -131,6 +131,33 @@ full plaintext and completion of all 17,576 outer keys. Results end in `-b.json`
 and identify `case: "m4-u264-attack-design-b"`. A and A2 remain unchanged.
 Use a small run count: even one recorded run includes an unrecorded full warm-up.
 
+### Design C: positions and the right ring unknown
+
+`m4-u264-attack-design-c` extends B by also sweeping the right-wheel ring:
+right/I uses `"rings": "*"` in bomm and an A–Z `rings` domain in our request,
+for 26 × 26³ = 456,976 outer keys. Wheels, the other rings, greek position V and
+reflector position A remain fixed; passes, hold and other attack settings match B.
+Default tests verify exactly the three position domains plus the right ring
+domain without running an attack.
+
+```sh
+ENIGMA_TIMING_CASE=c ENIGMA_TIMING_THREADS=6 ENIGMA_TIMING_RUNS=1 \
+  BOMM_BIN=../bomm-reference/build/bomm e2e/bomm_timing/run.sh
+# Wait for bomm to finish before running ours:
+ENIGMA_TIMING_CASE=c ENIGMA_TIMING_THREADS=6 ENIGMA_TIMING_RUNS=1 e2e/enigma_rust_timing/run.sh
+```
+
+The single reference capture (`-t 6`, 693.9 s wall) recovered ring V, VJNA and
+all ten historical pairs: 456,976 units, 3,718,611,649 decrypts, preview and score
+unchanged from B. The runners-up are near-equivalent keys that shift the right
+ring and position together with the same board, differing only in middle-wheel
+turnover timing. Our reference run took 404.0 s at 6 threads. Full runs must
+recover ring V, J/N/A and the historical board; ours also checks the full
+plaintext and completion of all 456,976 outer keys. Results end in `-c-tN.json`
+and identify `case: "m4-u264-attack-design-c"`. A, A2 and B remain unchanged.
+Each harness takes minutes per run even at 6 threads, plus an unrecorded full
+warm-up: use one recorded run and never run both harnesses concurrently.
+
 ## Frequency tables
 
 `frequencies/enigma1941-bigram.txt` and `enigma1941-trigram.txt` are byte-for-byte

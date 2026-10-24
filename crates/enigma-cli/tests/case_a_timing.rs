@@ -1,5 +1,5 @@
-//! End-to-end timing harnesses for U-264 designs A, A2 and B.
-//! `ENIGMA_TIMING_CASE=a|positions|b` selects the workload; A remains the default.
+//! End-to-end timing harnesses for U-264 designs A, A2, B and C.
+//! `ENIGMA_TIMING_CASE=a|positions|b|c` selects the workload; A remains the default.
 //!
 //! Our CLI measures startup from the live `started` event within each full run.
 //! bomm retains a separate one-decrypt startup probe. Both use `Instant`, run an
@@ -32,6 +32,7 @@ const BOMM_QUERY: &str = "e2e/bomm/m4-u264-attack-board/query.json";
 const BOMM_STARTUP_QUERY: &str = "e2e/bomm_timing/startup-query.json";
 const POSITIONS_CASE: &str = "m4-u264-attack-positions";
 const DESIGN_B_CASE: &str = "m4-u264-attack-design-b";
+const DESIGN_C_CASE: &str = "m4-u264-attack-design-c";
 
 fn timing_case(value: Option<&OsStr>) -> Result<&'static str, String> {
     match value {
@@ -39,8 +40,9 @@ fn timing_case(value: Option<&OsStr>) -> Result<&'static str, String> {
         Some(value) if value == "a" => Ok(ATTACK_CASE),
         Some(value) if value == "positions" => Ok(POSITIONS_CASE),
         Some(value) if value == "b" => Ok(DESIGN_B_CASE),
+        Some(value) if value == "c" => Ok(DESIGN_C_CASE),
         Some(value) => Err(format!(
-            "ENIGMA_TIMING_CASE must be a, positions or b, got {value:?}"
+            "ENIGMA_TIMING_CASE must be a, positions, b or c, got {value:?}"
         )),
     }
 }
@@ -391,24 +393,30 @@ fn enigma_rust_case_a_timing() {
                 .iter()
                 .find(|event| event["event"] == "result")
                 .unwrap();
-            let positions: &[(&str, &str)] = if settings.case == DESIGN_B_CASE {
-                &[("left", "J"), ("middle", "N"), ("right", "A")]
-            } else {
+            let positions: &[(&str, &str)] = if settings.case == POSITIONS_CASE {
                 &[("middle", "N"), ("right", "A")]
+            } else {
+                &[("left", "J"), ("middle", "N"), ("right", "A")]
             };
-            for &(id, position) in positions {
-                let slot = result["best"]["configuration"]["slots"]
+            let slot = |id: &str| {
+                result["best"]["configuration"]["slots"]
                     .as_array()
                     .unwrap()
                     .iter()
                     .find(|slot| slot["id"] == id)
-                    .unwrap();
-                assert_eq!(slot["position"], position);
+                    .unwrap()
+            };
+            for &(id, position) in positions {
+                assert_eq!(slot(id)["position"], position);
             }
-            let outers = if settings.case == DESIGN_B_CASE {
-                "17576"
-            } else {
-                "676"
+            if settings.case == DESIGN_C_CASE {
+                assert_eq!(slot("right")["ring"], "V");
+            }
+            let outers = match settings.case {
+                POSITIONS_CASE => "676",
+                DESIGN_B_CASE => "17576",
+                DESIGN_C_CASE => "456976",
+                _ => unreachable!(),
             };
             assert_eq!(result["counters"]["outers_completed"], outers);
         }
@@ -421,6 +429,7 @@ fn enigma_rust_case_a_timing() {
             ATTACK_CASE => u64::from(EVALUATIONS),
             POSITIONS_CASE => 5_372_197,
             DESIGN_B_CASE => 139_628_857,
+            DESIGN_C_CASE => 3_636_321_119,
             _ => unreachable!(),
         };
         let count = result["counters"]["evaluations_completed"]
@@ -464,6 +473,7 @@ fn bomm_flags(record: &Value, threads: usize) -> Vec<String> {
             BOMM_QUERY,
             "e2e/bomm/m4-u264-attack-positions/query.json",
             "e2e/bomm/m4-u264-attack-design-b/query.json",
+            "e2e/bomm/m4-u264-attack-design-c/query.json",
         ]
         .contains(query),
         "capture query path: {query}"
@@ -474,8 +484,8 @@ fn bomm_flags(record: &Value, threads: usize) -> Vec<String> {
         .collect();
     let thread_value = flags
         .windows(2)
-        .position(|pair| pair == ["-t", "1"])
-        .unwrap_or_else(|| panic!("capture must contain -t 1: {flags:?}"))
+        .position(|pair| pair[0] == "-t")
+        .unwrap_or_else(|| panic!("capture must contain -t <threads>: {flags:?}"))
         + 1;
     flags[thread_value] = threads.to_string();
     flags
@@ -598,7 +608,7 @@ fn thread_boundaries_and_exact_engine_arguments_preserve_capture_flags() {
             command.get_args().collect::<Vec<_>>(),
             ["--threads", &threads.to_string(), "request.json"].map(OsStr::new)
         );
-        for case in [ATTACK_CASE, POSITIONS_CASE, DESIGN_B_CASE] {
+        for case in [ATTACK_CASE, POSITIONS_CASE, DESIGN_B_CASE, DESIGN_C_CASE] {
             let (_, record) = selected_fixture(case);
             let original = record["capture"]["command"].clone();
             assert_eq!(
@@ -752,6 +762,28 @@ fn design_b_capture_uses_the_same_flags_and_its_own_decrypt_count() {
 }
 
 #[test]
+fn design_c_capture_uses_the_same_flags_and_its_own_decrypt_count() {
+    let (_, record) = selected_fixture(DESIGN_C_CASE);
+    assert_eq!(bomm_flags(&record, 6), ["-q", "-t", "6", "-n", "5"]);
+    assert_eq!(bomm_flags(&record, 1), ["-q", "-t", "1", "-n", "5"]);
+    let (count, pairs) = bomm_report(
+        "│ UKW-B-thin,beta,II,IV,I aaaav avjna at bl df gj hm nw op qy rz vx │\nNumber of decrypts: 3718611649\n",
+        "UKW-B-thin,beta,II,IV,I aaaav avjna",
+    );
+    assert_eq!(count, Some(3_718_611_649));
+    assert_eq!(pairs, HISTORICAL_PAIRS);
+}
+
+#[test]
+#[should_panic(expected = "capture must contain -t <threads>")]
+fn bomm_flags_require_a_thread_flag_in_the_capture() {
+    bomm_flags(
+        &json!({"capture": {"command": "../bomm-reference/build/bomm -q -n 5 e2e/bomm/m4-u264-attack-design-c/query.json"}}),
+        6,
+    );
+}
+
+#[test]
 #[should_panic(expected = "top key does not start")]
 fn bomm_rejects_historical_key_below_a_wrong_top_key() {
     bomm_report(
@@ -783,6 +815,10 @@ fn timing_case_defaults_accepts_known_cases_and_rejects_invalid_values() {
         timing_case(Some(OsStr::new("b"))),
         Ok("m4-u264-attack-design-b")
     );
+    assert_eq!(
+        timing_case(Some(OsStr::new("c"))),
+        Ok("m4-u264-attack-design-c")
+    );
     for value in [
         "",
         "A",
@@ -791,12 +827,15 @@ fn timing_case_defaults_accepts_known_cases_and_rejects_invalid_values() {
         "B",
         " b",
         "b ",
+        "C",
+        " c",
+        "c ",
         "unknown",
     ] {
         assert_eq!(
             timing_case(Some(OsStr::new(value))),
             Err(format!(
-                "ENIGMA_TIMING_CASE must be a, positions or b, got {:?}",
+                "ENIGMA_TIMING_CASE must be a, positions, b or c, got {:?}",
                 OsStr::new(value)
             ))
         );

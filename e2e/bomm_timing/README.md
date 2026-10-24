@@ -33,8 +33,8 @@ ENIGMA_TIMING_CASE=positions ENIGMA_TIMING_RUNS=20 \
   BOMM_BIN=../bomm-reference/build/bomm e2e/bomm_timing/run.sh
 ```
 
-`ENIGMA_TIMING_CASE` accepts `a` (default, unchanged), `positions` or `b`; all other
-values are rejected. The latter uses `e2e/bomm/m4-u264-attack-positions/`: design
+`ENIGMA_TIMING_CASE` accepts `a` (default, unchanged), `positions`, `b` or `c`; all
+other values are rejected. `positions` uses `e2e/bomm/m4-u264-attack-positions/`: design
 A2, identical to A except middle/right positions are unknown (`*`, 26 × 26 = 676
 outer keys). It verifies the top historical key VJNA and all ten pairs every run.
 Startup remains the fixed design-A one-decrypt probe. Recommend 20 runs rather
@@ -80,6 +80,26 @@ Initial comparison uses explicit 1 and 6 threads for both engines, each with one
 unrecorded warm-up per probe and 3 recorded runs. Compare **full-time medians**
 primarily: equal threads do not imply equal evaluation work or startup boundaries.
 The 1/2/4/8 scaling sweep is deferred.
+
+## Select design C: positions and the right ring
+
+```sh
+ENIGMA_TIMING_CASE=c ENIGMA_TIMING_THREADS=6 ENIGMA_TIMING_RUNS=1 \
+  BOMM_BIN=../bomm-reference/build/bomm e2e/bomm_timing/run.sh
+```
+
+Design C uses `e2e/bomm/m4-u264-attack-design-c/`: design B plus the right-wheel
+ring unknown (`"rings": "*"`), giving 26 × 26³ = 456,976 outer keys. Everything
+else remains fixed as in B. Every full run verifies the historical top key
+(ring V, positions VJNA) and all ten pairs. The single capture at `-t 6` took
+693.9 s wall and reported 456,976 units and 3,718,611,649 decrypts; this is not a
+required cross-engine workload count. The capture's `-t 6` is replaced by the
+selected thread count like the other cases' `-t 1`.
+
+Use `ENIGMA_TIMING_THREADS=6 ENIGMA_TIMING_RUNS=1`: each invocation also runs a
+full warm-up, so one recorded run already takes over 20 minutes. Results use
+`results/<UTC>-<short commit>-c-tN.json` and `case: "m4-u264-attack-design-c"`.
+Never run this harness concurrently with ours. A, A2 and B checks are unchanged.
 
 ## One-time reference
 

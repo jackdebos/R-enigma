@@ -30,8 +30,8 @@ Other flags, fixtures, correctness checks and statistics stay unchanged.
 ENIGMA_TIMING_CASE=positions ENIGMA_TIMING_RUNS=20 e2e/enigma_rust_timing/run.sh
 ```
 
-`ENIGMA_TIMING_CASE` accepts `a` (default, unchanged), `positions` or `b`; all other
-values are rejected. The latter uses `e2e/bomm/m4-u264-attack-positions/`: design
+`ENIGMA_TIMING_CASE` accepts `a` (default, unchanged), `positions`, `b` or `c`; all
+other values are rejected. `positions` uses `e2e/bomm/m4-u264-attack-positions/`: design
 A2, identical to A except middle/right positions sweep A–Z (676 outer keys).
 Every full run checks the historical ten pairs, positions N/A and all 232
 plaintext letters, plus completion of all 676 keys. Startup is measured inside
@@ -76,6 +76,25 @@ Never run the harnesses concurrently. Initial comparison uses explicit 1 and 6
 threads for both engines, each with one unrecorded warm-up and 3 recorded runs.
 Compare **full-time medians** primarily: equal threads do not imply equal evaluation
 work or equal startup boundaries. The 1/2/4/8 scaling sweep is deferred.
+
+## Select design C: positions and the right ring
+
+```sh
+# Run only after the bomm harness has finished:
+ENIGMA_TIMING_CASE=c ENIGMA_TIMING_THREADS=6 ENIGMA_TIMING_RUNS=1 e2e/enigma_rust_timing/run.sh
+```
+
+Design C uses `e2e/bomm/m4-u264-attack-design-c/`: design B plus an A–Z `rings`
+domain on the right wheel, giving 26 × 26³ = 456,976 outer keys. Everything else
+remains fixed as in B. Every full run must recover ring V, positions J/N/A, the
+ten historical pairs and all 232 plaintext letters, and complete all 456,976 keys
+(3,636,321,119 evaluations). The reference run took 404.0 s at 6 threads; the
+hold-5 runners-up are near-equivalent right ring/position shifts, as in bomm.
+
+Use `ENIGMA_TIMING_THREADS=6 ENIGMA_TIMING_RUNS=1`: a full warm-up is also run.
+Results use `results/<UTC>-<short commit>-c-tN.json` and
+`case: "m4-u264-attack-design-c"`. A, A2 and B behavior remains unchanged.
+Never run the harnesses concurrently.
 
 ## What is measured (default A)
 
