@@ -101,6 +101,46 @@ levels and tables. Our resource paths are relative to each request; bomm paths
 are relative to the repository root. Generate tables before running attacks;
 case generation only transforms texts and does not load scoring resources.
 
+## Run and summarize recovery
+
+After generating cases and tables, run the base configuration from the repository root:
+
+```sh
+python3 -B e2e/recovery/run.py
+# Only after that finishes, and after granting access to your bomm executable:
+python3 -B e2e/recovery/run.py --configuration bomm --bomm PATH_TO_CONSENTED_BINARY
+```
+
+Defaults are ours, N1, both tables and six threads (allowed range 1–8).
+`--level N2` selects the right-ring search; `--table enigma1941` or `--table leipzig`
+selects one table. `--manifest` and `--engine` override the generated case manifest
+and built Enigma CLI. Each selected case/table runs once, sequentially; never launch
+runner invocations concurrently. This command does not schedule later stages or
+create variants. Prepare a separate manifest/request set for a different attack.
+
+Every invocation creates a unique ignored `results/` directory. `--out` can name a
+new directory beneath it; existing output is never replaced. `summary.json` and
+`summary.md` group successes, misses, errors, success rate and wall seconds by
+length, table and configuration (`ours/N1`, for example). Rates include errors
+in the denominator; misses exclude errors. Numbered artifacts retain each search's
+exact stdout/stderr bytes, exit code, command, working directory and error, if any.
+Provenance includes manifest, binary, request and scoring-resource SHA-256 digests,
+seed, hold and threads. Wall time includes process startup and bomm-key replay.
+
+Our successful exit must also contain a completed terminal done event and a result;
+its best plaintext must match the **entire** original segment exactly. A completed
+nonmatch is a miss, while cancellation, malformed output and nonzero exits are
+errors. Bomm's preview is ignored: the first boxed UKW-B key is parsed (wheel order,
+rings, positions and board), then replayed through the Enigma transform CLI against
+the full ciphertext. Unsupported/missing keys or failed replay are errors. This
+format is documented by the tracked Enigma I bomm fixtures; live validation still
+requires consent to access the external binary.
+
+Exit codes: 0 means all searches completed (possibly with misses), 1 means at least
+one run error, and 2 means invalid input/setup. Setup failures create no output.
+`--help` lists all options. Tests use invented messages and in-project fake tools;
+they do not execute a real recovery benchmark.
+
 ## Layout and source policy
 
 - `ngrams.py`, `test_ngrams.py`: builder/converter and CLI tests.
@@ -109,6 +149,7 @@ case generation only transforms texts and does not load scoring resources.
   (synthetic snippets only).
 - `cases.py`, `test_cases.py`: seeded cases and N1/N2 requests; tests use invented
   texts and the built release CLI, including full encrypt/decrypt round trips.
+- `run.py`, `test_run.py`: sequential search runner, full-text checks and summaries.
 - `sources.md`: source URLs and attribution; no copied historical texts.
 - `data/` (**git-ignored**): downloaded corpora, ciphertexts, keys, decrypted
   plaintexts and generated tables. Weierud-derived material is never committed;
