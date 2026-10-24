@@ -9,12 +9,13 @@
 mod attack_transport;
 mod cancel_file;
 mod checkpoint_file;
+mod progress_bar;
 mod resource_loader;
 mod signals;
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -437,15 +438,19 @@ fn run(
             None => run_transform(request, events),
         },
         Ok(ParsedRequest::Search(request)) => run_search(request, origin, unsupported, events),
-        Ok(ParsedRequest::Attack(request)) => run_attack(
-            request,
-            origin,
-            cancel_file,
-            threads.unwrap_or_else(default_execution),
-            checkpoint.map(|file| (file, json.as_str())),
-            signals::install,
-            events,
-        ),
+        Ok(ParsedRequest::Attack(request)) => {
+            let draw = (events.is_human() && io::stderr().is_terminal())
+                .then(|| request.has_chained_stages());
+            run_attack_presented(
+                request,
+                origin,
+                cancel_file,
+                threads.unwrap_or_else(default_execution),
+                checkpoint.map(|file| (file, json.as_str())),
+                signals::install,
+                (events, draw),
+            )
+        }
         Err(diagnostics) => {
             // Pre-validation failure: exactly one `error` at seq 1, no `started`.
             let first = &diagnostics[0];
@@ -496,6 +501,7 @@ fn run_search(
 /// Binding finalizes eligibility, so no second gate check or resource read is needed.
 /// The cancel marker is first inspected only after load and bind succeed; the signal
 /// handler is installed only after that, still before `started`.
+#[cfg(test)]
 fn run_attack<'s>(
     request: ParsedAttackRequest,
     origin: &Path,
@@ -505,6 +511,27 @@ fn run_attack<'s>(
     install_signals: impl FnOnce() -> Result<&'s AtomicBool, String>,
     out: &mut impl Write,
 ) -> ExitCode {
+    run_attack_presented(
+        request,
+        origin,
+        cancel_file,
+        execution,
+        checkpoint,
+        install_signals,
+        (out, None),
+    )
+}
+
+fn run_attack_presented<'s>(
+    request: ParsedAttackRequest,
+    origin: &Path,
+    cancel_file: Option<&Path>,
+    execution: ExecutionOptions,
+    checkpoint: Option<(&CheckpointFile<'_>, &str)>,
+    install_signals: impl FnOnce() -> Result<&'s AtomicBool, String>,
+    output: (&mut impl Write, Option<bool>),
+) -> ExitCode {
+    let (out, draw) = output;
     let failure = |out: &mut _, code: &str, message: &str, location: &str| {
         if let Err(error) = write_error_line(out, code, message, location, 1) {
             eprintln!("error: failed to write protocol event: {error}");
@@ -582,7 +609,7 @@ fn run_attack<'s>(
                 now_ts,
                 // Poll the marker first so a raised signal never masks its runtime error.
                 || marker.as_mut().is_some_and(CancelFile::poll) || signal.load(Ordering::Relaxed),
-                (resumed, restored_elapsed, checkpoint_writer),
+                (resumed, restored_elapsed, checkpoint_writer, draw),
             ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {

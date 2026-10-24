@@ -98,6 +98,7 @@ fn events_dash_writes_the_jsonl_stream_to_stdout() {
     }
     let output = dir.run(&["--events", "-", "--request", "-"], &attack());
     assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stderr, b"");
     let events = events(&output.stdout);
     assert_eq!(names(&events)[0], "started");
     assert_eq!(names(&events)[events.len() - 2..], ["result", "done"]);
@@ -184,6 +185,28 @@ fn human_mode_attack_writes_no_jsonl_to_stdout() {
     );
     // stderr is not a terminal here, so no progress bar is drawn.
     assert_eq!(output.stderr, b"");
+}
+
+#[test]
+fn piped_human_attack_stderr_is_empty_for_hc_and_pe() {
+    let dir = Scratch::new();
+    let mut request = attack();
+    for pe in [false, true] {
+        if pe {
+            request["job"]["passes"] = json!(["partial_exhaustion"]);
+            let settings = request["job"]["attack"].as_object_mut().unwrap();
+            settings.insert("kind".into(), json!("partial_exhaustion"));
+            settings.remove("start");
+            settings.insert(
+                "seeds".into(),
+                json!({"kind":"empty_single","selection":"all"}),
+            );
+        }
+        let output = dir.run(&["--request", "-", "--no-report"], &request);
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(output.stdout, b""); // T5 supplies the human report.
+        assert_eq!(output.stderr, b"");
+    }
 }
 
 #[test]

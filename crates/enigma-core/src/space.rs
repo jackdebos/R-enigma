@@ -1007,6 +1007,12 @@ pub struct ParsedAttackRequest {
 }
 
 impl ParsedAttackRequest {
+    /// Whether the validated pass list includes work after the outer HC/PE phase.
+    /// This query does not bind resources or enumerate candidates.
+    pub fn has_chained_stages(&self) -> bool {
+        !self.settings.stages().is_empty()
+    }
+
     /// Validated references callers can load without exposing the slot carrier.
     pub fn resources(&self) -> &[ResourceReference] {
         self.carrier.resources()
@@ -4049,6 +4055,19 @@ mod tests {
                     (1u128 << 80, 1)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn parsed_attack_reports_chained_stages_without_binding() {
+        for chained in [false, true] {
+            let mut value = attack_request();
+            if chained {
+                value["job"]["passes"] = json!(["hill_climb", "measure"]);
+                value["job"]["attack"]["measure"] = json!({"measure":"ic"});
+            }
+            let parsed = ParsedAttackRequest::parse_json(&value.to_string()).unwrap();
+            assert_eq!(parsed.has_chained_stages(), chained);
         }
     }
 

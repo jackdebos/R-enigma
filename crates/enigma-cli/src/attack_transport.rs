@@ -18,6 +18,7 @@ struct Transport<W, M, U> {
     seq: u64,
     failure: Option<io::Error>,
     checkpoint_failed: bool,
+    bar: Option<crate::progress_bar::Bar<io::Stderr>>,
 }
 
 /// Original runtime failure remains primary; projection and delivery are separate.
@@ -43,12 +44,17 @@ impl<W: Write, M: FnMut() -> Duration, U: FnMut() -> String> Transport<W, M, U> 
             seq: 1,
             failure: None,
             checkpoint_failed: false,
+            bar: None,
         }
+    }
+
+    fn running(&mut self) -> Duration {
+        (self.monotonic)().saturating_sub(self.entry)
     }
 
     fn elapsed(&mut self) -> u128 {
         self.restored_elapsed
-            .saturating_add((self.monotonic)().saturating_sub(self.entry).as_millis())
+            .saturating_add(self.running().as_millis())
     }
 
     fn emit(&mut self, event: Event) {
@@ -70,7 +76,11 @@ impl<W: Write, M: FnMut() -> Duration, U: FnMut() -> String> Transport<W, M, U> 
 
     fn observe(&mut self, progress: AttackProgress) {
         if self.failure.is_none() {
-            let elapsed = self.elapsed();
+            let running = self.running();
+            let elapsed = self.restored_elapsed.saturating_add(running.as_millis());
+            if let Some(bar) = &mut self.bar {
+                bar.observe(progress, running, elapsed);
+            }
             self.emit(Event::progress(progress, elapsed));
         }
     }
@@ -92,6 +102,9 @@ impl<W: Write, M: FnMut() -> Duration, U: FnMut() -> String> Transport<W, M, U> 
         projected: Result<(Event, Event), String>,
         runtime: Option<Box<dyn std::error::Error + Send + Sync>>,
     ) -> Result<(), Failure> {
+        if let Some(bar) = &mut self.bar {
+            bar.finish();
+        }
         let projection = self.terminal(projected);
         let failure = Failure {
             runtime,
@@ -129,7 +142,7 @@ pub(super) fn run(
         monotonic,
         utc,
         cancel_requested,
-        (None, 0, None),
+        (None, 0, None, None),
     )
 }
 
@@ -145,10 +158,17 @@ pub(super) fn run_prepared(
         Option<ResumedAttack<'_>>,
         u128,
         Option<CheckpointWriter<'_>>,
+        Option<bool>,
     ),
 ) -> Result<(), Failure> {
     let mut transport = Transport::new(writer, monotonic, utc);
     transport.restored_elapsed = restored.1;
+    if restored.3.is_some() {
+        transport.bar = Some(crate::progress_bar::Bar::new(
+            io::stderr(),
+            request.gate().outer_selected(),
+        ));
+    }
     let transport = RefCell::new(transport);
     let cancelled = Cell::new(false);
     transport
@@ -161,13 +181,26 @@ pub(super) fn run_prepared(
         cancelled.get()
     };
     let mut checkpoint = restored.2;
-    let enabled = checkpoint.is_some();
+    let enabled = checkpoint.is_some() || restored.3 == Some(true);
     let save = |snapshot: enigma_core::CheckpointSnapshot<'_>| {
+        // This boundary is exact even when the final outer block did not meet
+        // progress_every. Keep the hook active for TTY stage presentation alone.
+        if restored.3 == Some(true)
+            && snapshot.reason() == enigma_core::CheckpointReason::OuterFinished
+        {
+            if let Some(bar) = &mut transport.borrow_mut().bar {
+                bar.stages();
+            }
+        }
         if let Some(writer) = checkpoint.as_mut() {
             let mut transport = transport.borrow_mut();
             let now = (transport.monotonic)().saturating_sub(transport.entry);
             if writer.due(snapshot.reason(), now) {
                 let elapsed = transport.restored_elapsed.saturating_add(now.as_millis());
+                // CheckpointWriter may diagnose a failed save itself.
+                if let Some(bar) = &mut transport.bar {
+                    bar.clear();
+                }
                 if let Some(event) = writer.write(snapshot, elapsed) {
                     writer.last_write = (transport.monotonic)().saturating_sub(transport.entry);
                     transport.emit(event);
@@ -324,6 +357,25 @@ mod tests {
                 return Err(io::Error::other("injected flush failure"));
             }
             Ok(())
+        }
+    }
+
+    #[test]
+    fn bar_restored_baseline_and_stage_transition_use_process_work() {
+        let restored = snapshot();
+        let selected = restored.outers_completed() * 2;
+        for ms in [1, 100] {
+            let mut bytes = Vec::new();
+            let mut bar = crate::progress_bar::Bar::new(&mut bytes, selected);
+            bar.observe(restored, Duration::ZERO, 65_000);
+            bar.stages();
+            bar.observe(restored, Duration::from_millis(ms), 65_000 + u128::from(ms));
+            bar.finish(); // force a suppressed terminal, never duplicate a drawn one
+            let expected = format!(
+                "\r[############............]  50.0% | {}/{selected} outer keys | 0.00 eval/s | 00:01:05 elapsed | ETA --:--:--\x1b[K\rchained stages | {} evaluations | 0.00 eval/s | 00:01:05 elapsed\x1b[K\r\x1b[K",
+                restored.outers_completed(), restored.evaluations_completed()
+            );
+            assert_eq!(bytes, expected.as_bytes());
         }
     }
 
