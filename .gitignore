@@ -2,6 +2,10 @@
 .atl/
 /.codegraph/
 
+# Go web client build outputs
+/web/enigma-web
+/web/enigma-web.exe
+
 # Rust
 /target/
 **/*.rs.bk

@@ -1,31 +1,75 @@
 # enigma-web
 
-Local web interface for the Enigma engine (Stage 2). It is a separate program from the
-Rust engine: install the `enigma` CLI first, then run `enigma-web` to open the
-interface in your browser. The engine itself has no web code and no listener.
+A separate, local web client for the Rust Enigma engine. **Currently implemented:
+server scaffold, embedded placeholder page and authenticated status route.** Engine
+path/version validation, transform execution and the bilingual machine UI are planned
+in T3–T5 of `odd/tasks/enigma-web-client.md`; this scaffold does not run the engine yet.
 
-## How it works
+## Build and run
 
-- `enigma-web` serves a small page (HTML, CSS and JavaScript embedded in the binary)
-  on `127.0.0.1` only and opens it in your browser.
-- When you press the start button, it builds a protocol request from the form and runs
-  `enigma --events - --request -` as a child process, reading the JSONL events of
-  `docs/protocol.md` §4. It never links the engine library.
-- You enter the path to your `enigma` executable on the page. `enigma-web` runs
-  `enigma --version` and accepts only the engine versions it supports
-  (`docs/protocol.md` §8). A newer or older engine requires a matching `enigma-web`.
-- The interface is available in Spanish and English.
+Requires Go 1.24 or newer; standard library only. From the repository root:
 
-## Security
+```sh
+cd web
+go build -o enigma-web ./cmd/enigma-web
+./enigma-web
+```
 
-The server listens on the loopback address only, requires a random per-run token that
-is part of the URL it opens, and rejects requests whose `Host` or `Origin` is not its
-own loopback address. Other programs and other computers cannot use it.
+The server binds `127.0.0.1`, prints its full token-bearing URL to stdout, then opens
+it in the browser (`xdg-open` on Linux, `open` on macOS, or `rundll32
+url.dll,FileProtocolHandler` on Windows). If opening fails, it prints a manual-open
+hint to stderr and keeps serving. Ctrl+C gracefully stops the server.
 
-## Layout
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `--port <n>` | `0` | Port from 0–65535; 0 selects a free port. |
+| `--no-browser` | off | Print the URL without launching a browser (headless/tests). |
+| `--help` | | Show command help. |
 
-- `web/` Go module for the `enigma-web` server.
-- `web/static/` the embedded page.
+For example: `./enigma-web --no-browser --port 8080`. Open the printed URL manually.
+The executable includes the page; it needs no static files in its working directory.
 
-Routes, build and test commands are documented here as they are implemented
-(`odd/tasks/enigma-web-client.md`).
+## Security and routes
+
+- IPv4 loopback only, never `0.0.0.0`. `Host` must be exactly `127.0.0.1:<port>` or
+  `localhost:<port>`; any other value receives 403.
+- Every non-GET/HEAD request requires an `Origin` exactly equal to
+  `http://127.0.0.1:<port>` or `http://localhost:<port>`. Missing/foreign origins
+  receive 403, before authentication or routing. No cross-origin access is enabled.
+- Each run generates 32 cryptographically random bytes, encoded as hex in the URL.
+  `GET /?token=<correct token>` sets the host-only `enigma_token_<port>` session cookie (the port is in the name because browser cookies ignore ports)
+  (`Path=/`, `HttpOnly`, `SameSite=Strict`) and redirects with 303 to `/`, removing
+  the token from the address bar. The cookie is not `Secure` because this is local
+  HTTP. Invalid tokens do not set a cookie. Bootstrap responses are not cached and
+  responses use `Referrer-Policy: no-referrer`.
+- Every `/api/...` request requires that cookie, checked in constant time, otherwise
+  401 with `{"error":"unauthorized"}`. API responses use JSON and `Cache-Control:
+  no-store`. Static content is public on the allowed hosts.
+- `GET /api/status` returns 200 with `{"ok":true}`. Other methods, after the security
+  checks, receive 405 (`Allow: GET`); unknown authenticated API routes receive 404.
+
+Keep the printed URL private: any local program holding the token can use the API.
+This is a local browser boundary, not isolation from other processes on your machine.
+
+## Test
+
+From `web/`:
+
+```sh
+go vet ./... && go test ./...
+gofmt -l .
+```
+
+The formatting check should print nothing. HTTP tests use `net/http/httptest` without
+opening a browser or network listener.
+
+## Architecture and next steps
+
+- `cmd/enigma-web/`: flags, loopback listener, browser launcher and shutdown.
+- `internal/server/`: testable HTTP security boundary and routes.
+- `static/`: embedded page (currently a placeholder).
+
+The future machine page will build a request only on explicit start and run
+`enigma --events - --request -` as a child process, reading JSONL events from
+`docs/protocol.md` §4. Engine path/version validation will follow §8. The engine stays
+in `crates/`; it has no web listener and is never linked into this Go binary.
