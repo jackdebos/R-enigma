@@ -2,8 +2,8 @@
 
 A separate, local web client for the Rust Enigma engine. **Currently implemented:
 server scaffold, embedded placeholder page, authenticated status route and persisted
-engine path/version validation.** Transform execution and the bilingual machine UI
-remain planned in T4–T5 of `odd/tasks/enigma-web-client.md`.
+engine path/version validation, machine catalog and explicit transform execution.**
+The bilingual machine UI remains planned in T5 of `odd/tasks/enigma-web-client.md`.
 
 ## Build and run
 
@@ -112,7 +112,66 @@ config-file path before launching the binary. This overrides the user config loc
 no new command-line flag is exposed. Tests inject their own config path and create
 fake engines under `t.TempDir()`. The optional real-engine test skips if the release
 binary is absent. `Server.ValidatedEnginePath(ctx)` is the reusable boundary for
-future jobs: it reloads and revalidates, never returning an invalid cached path.
+jobs: it reloads and revalidates, never returning an invalid cached path.
+
+## Machine catalog and transform
+
+These routes use the same cookie authentication and Host/Origin guards:
+
+- `GET /api/machines`: `{"models":[{"id":"enigma-i","definition_id":"enigma-i","reflectors":["B","C"],"slots":[{"id":"left","allowed_wheels":["I","II","III","IV","V"]},...],"plugboard":true},...]}`.
+  Models are `enigma-i`, `enigma-m3`, `enigma-m4`. Slots are in definition order,
+  **excluding the separately selected reflector**: left/middle/right for I and M3;
+  greek/left/middle/right for M4. M3/M4 moving slots admit I–VIII; M4 Greek admits
+  Beta/Gamma and its reflectors are Thin-B/Thin-C. Sources are
+  `docs/historical-catalog.md` and `crates/enigma-core/catalog/*.json`.
+- `POST /api/transform`: explicitly starts one transform; no automatic jobs or
+  persisted machine state. Other methods return 405 with `Allow: GET` or `POST`.
+
+Example body (all members required, no unknown fields, maximum 1 MiB):
+
+```json
+{"model":"enigma-i","reflector":"B","slots":[{"id":"left","wheel":"I","ring":"A","position":"A"},{"id":"middle","wheel":"II","ring":"A","position":"A"},{"id":"right","wheel":"III","ring":"A","position":"A"}],"plugboard":[],"text":"hello"}
+```
+
+Slots must follow catalog order; rings/positions and disjoint plugboard endpoints
+must be uppercase A–Z. The server inserts the reflector slot with ring/position A,
+uses bundled definition IDs and direction `encrypt` (these reflected machines are
+reciprocal, so the same operation also decrypts from the same initial settings).
+It does not impose distinct-wheel or historical operational-key restrictions that
+the engine catalog does not enforce.
+
+**Text rule:** only ASCII `a`–`z` becomes `A`–`Z`. Everything else is sent exactly as
+entered, including spaces, newlines, punctuation and non-ASCII characters. The
+engine rejects any character outside A–Z with `invalid_text`; neither side silently
+drops characters. Remove separators yourself when entering grouped ciphertext.
+Empty text is allowed. Each request starts from the supplied initial positions.
+
+The server revalidates the saved engine before running it directly, without a shell,
+as `enigma --events - --request -`. Transform execution has a ten-second deadline,
+4 MiB stdout and 64 KiB stderr limits, plus a 100 ms inherited-pipe drain limit.
+No report file is produced. Successful responses are HTTP 200:
+
+```json
+{"output":"ILBDA","events":[{"event":"started","protocol_version":1,"seq":1,"ts":"..."},{"event":"output","protocol_version":1,"seq":2,"ts":"...","output":"ILBDA"},{"event":"done","protocol_version":1,"seq":3,"ts":"...","reason":"completed"}]}
+```
+
+Events are retained whole, including any future additional state fields. Current
+protocol v1 transform events expose **no final rotor positions or machine state**.
+The engine is not modified and the server does not simulate stepping.
+
+Failures have `{"error":{"code":"...","message":"..."}}`:
+
+| HTTP | Code | Meaning |
+| --- | --- | --- |
+| 400 | `invalid_request` | Malformed, oversized or incomplete body, wrong types, unknown fields or trailing JSON. |
+| 400 | `unknown_model` | Model is not in the bundled catalog. |
+| 400 | `invalid_component` | Invalid reflector, slot order/count, wheel, ring, position or plugboard. |
+| 409 | `engine_not_configured` | Configure an engine first. |
+| 409 | `engine_incompatible` | Saved executable failed revalidation; message explains why. |
+| 500 | `internal_error` | Configuration could not be read or request could not be built. |
+| 422 | engine code, e.g. `invalid_text` | Engine error code/message passed through verbatim; also includes available location/expected/hint and events. |
+| 502 | `engine_failed` | Failed process, excessive output, invalid JSONL or missing terminal/output events. |
+| 502 | `timeout` | Transform deadline exceeded or request cancelled. |
 
 ## Test
 
@@ -133,7 +192,7 @@ opening a browser or network listener.
 - `internal/engine/`: bounded version probing, exact compatibility gate and atomic config persistence.
 - `static/`: embedded page (currently a placeholder).
 
-The future machine page will build a request only on explicit start and run
-`enigma --events - --request -` as a child process, reading JSONL events from
-`docs/protocol.md` §4. Engine path/version validation follows §8. The engine stays
+The future machine page will call the transform endpoint only on explicit start.
+The server reads JSONL events from `docs/protocol.md` §4; engine path/version
+validation follows §8. The engine stays
 in `crates/`; it has no web listener and is never linked into this Go binary.

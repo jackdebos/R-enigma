@@ -89,6 +89,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			jsonResponse(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}
+		if r.URL.Path == "/api/machines" {
+			s.serveMachines(w, r)
+			return
+		}
+		if r.URL.Path == "/api/transform" {
+			s.serveTransform(w, r)
+			return
+		}
 		if r.URL.Path == "/api/engine" {
 			s.serveEngine(w, r)
 			return
