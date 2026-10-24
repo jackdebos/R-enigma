@@ -18,8 +18,8 @@ validation.
 
 This document marks protocol requirements as normative. Search-space grammar is
 specified in §3.3 and §7; [Scoring and external resources](scoring-resources.md)
-specifies the normative Task 10 measure/resource contract. Pass execution fields and
-checkpoint record layout remain deferred to their implementation tasks.
+specifies the normative Task 10 measure/resource contract. Pass execution fields
+remain deferred to their implementation tasks; the checkpoint record is specified in §6.
 [Core HC API](search-passes.md#62-public-core-hc-api--task-128) freezes the
 first public HC/PE adapter contract; §4.1 specifies its shipped JSONL lifecycle.
 [Task 11 plugboard attacks](search-passes.md) freezes the planned additive attack
@@ -337,8 +337,8 @@ clients. A successful validated job emits one `started` first, then applicable e
 then exactly one terminal `done`; runtime failure emits terminal `error`. Search may
 emit `progress`, `candidate`, `checkpoint`, and `hold` according to job lifecycle.
 The first HC/PE release instead uses only `progress` and final `result` (§4.1);
-`candidate`, `checkpoint` and `hold` remain eventual Stage 1 requirements, not part
-of that release. Task 14 implements the hold delivered once, as the
+`candidate` and `hold` remain eventual Stage 1 requirements, not part
+of that release; `checkpoint` is specified in §6.5 (Task 16). Task 14 implements the hold delivered once, as the
 final `result.hold` array ([search-passes §10](search-passes.md#10-hold-list--task-14));
 no live `hold` event. Transform emits no candidate, hold, or checkpoint event. A validated `transform` job
 emits `started`, then exactly one `output` whose `output` member is the transformed
@@ -510,10 +510,10 @@ ordering applies only while delivery succeeds, including final result write/flus
 
 | Action | Mechanism | Result |
 | --- | --- | --- |
-| Cancel (first HC/PE release) | `--cancel-file <path>` marker or a platform signal (`SIGINT`/`SIGTERM`/`SIGHUP`, Windows Ctrl+C/Break); both shipped | Cooperative safe-stop, final `result`, then `done` with `reason: "cancelled"`; retained `result.hold` per Task 14; no checkpoint promise |
+| Cancel (first HC/PE release) | `--cancel-file <path>` marker or a platform signal (`SIGINT`/`SIGTERM`/`SIGHUP`, Windows Ctrl+C/Break); both shipped | Cooperative safe-stop, final `result`, then `done` with `reason: "cancelled"`; retained `result.hold` per Task 14; with `--checkpoint`/`--resume`, a checkpoint is written first (§6.2) |
 | Parallel HC/PE outer keys | `--threads <n>`, default half the logical CPUs; outer-key blocks run on that many worker threads | Same public output as one thread for completed runs; see the `--threads` contract below |
 | Pause/resume live job | Not in Stage 1 | Future extension |
-| Resume dead job | `--resume <checkpoint>` | Search only; see §6 |
+| Save and resume HC/PE | `--checkpoint <path>`, `--resume <path>` (Task 16, in progress) | Periodic, end-of-outer-phase and cancellation checkpoints; resume with any `--threads`; see §6 |
 | Bound HC/PE search | `space.offset`/`space.limit` and cancellation | §4.1 slice/exhaustion/cancellation reasons; slices bound outer keys only; no new `--max-keys` attack control |
 | Other future bounded search | Planned `--max-keys` | Legacy planned `limit_reached`/`offset_end`, not HC/PE mappings |
 
@@ -529,8 +529,8 @@ Searches are finite (strict ascent, finite neighborhoods, seeds and outer keys),
 not necessarily short. Use offset/limit to bound outer keys or cancellation to stop
 remaining work.
 Core runtime, fallible JSONL projections and the synchronous HC/PE adapter ship in the
-production CLI (§4.1), including the final retained hold. Live hold events and
-checkpoint cadence remain unimplemented.
+production CLI (§4.1), including the final retained hold. Live hold events remain
+unimplemented; checkpoint cadence is specified in §6.2 (Task 16).
 Task12.12 ships `--cancel-file` and Task12.13 platform signals as the external
 cancellation sources, per the contracts below; they combine by OR, both sticky.
 Without either, cancellation stays false. Signal handlers only feed a sticky
@@ -563,8 +563,8 @@ and exit 1.
 Normal cancellation retains eligible results, emits `result` then `done` with
 `reason: "cancelled"`, and exits zero on healthy delivery. Established exhaustion
 and runtime-error precedence remain authoritative (§4.1); observing a marker does
-not override them. No hold, checkpoint, cleanup or marker ownership is added by
-this contract. Core remains clock- and I/O-free.
+not override them. No hold, cleanup or marker ownership is added by this contract;
+checkpoints on cancellation follow §6.2. Core remains clock- and I/O-free.
 
 ### Signal contract
 
@@ -583,8 +583,8 @@ replaces inherited ignored dispositions: under `nohup`, a terminal hangup reques
 safe stop. Use `setsid`, `tmux` or `screen` to outlive the terminal. Windows and
 macOS behavior relies on the `ctrlc` crate and is not verified by tests here.
 Live hold events remain deferred, not removed from eventual Stage 1 goals; cancellation
-retains the final `result.hold` (search-passes §10.6); it writes no
-checkpoint. Checkpoint/resume remains Task 16 under §6.
+retains the final `result.hold` (search-passes §10.6). With `--checkpoint` or
+`--resume`, the first signal also writes a checkpoint before `result` (§6.2).
 
 ### `--threads <n>` contract
 
@@ -617,7 +617,10 @@ second or less in typical searches, so stopping may take that long; a second sig
 still exits immediately with code 130. Which blocks finish before a stop depends on
 timing, so cancelled runs are not promised to match across thread counts.
 
-## 6. Checkpoint and resume (record schema deferred)
+## 6. Checkpoint and resume (Task 16)
+
+**Status:** specified; implementation in progress (`odd/tasks/enigma-checkpoints.md`).
+Until it ships, `--checkpoint` and `--resume` are CLI usage errors (exit 2).
 
 Only a resumable search may write checkpoints. A transform has no Stage 1 checkpoint.
 Checkpoint identity binds a canonical digest of the resolved definition **content**
@@ -629,8 +632,119 @@ identity must capture relevant content, not merely a mutable path. Resume reject
 drift in those inputs before work. The record contains a deterministic structured
 candidate cursor, state digest, completed work units, elapsed time, hold, and RNG state
 when relevant; cursor is not a loop counter. Search ordering is deterministic and
-resume restores the same next candidate. Detailed record fields are deferred to task
-16 and must be finalized before implementation.
+resume restores the same next candidate. The rules below apply to the HC/PE attacks;
+they use no randomness (seeds are enumerated, not drawn), so the record has no RNG state.
+
+### 6.1 Options
+
+- `--checkpoint <path>` saves checkpoints of this run to `<path>`. If `<path>`
+  already exists the CLI writes
+  `error: --checkpoint file already exists, use --resume to continue it: "<path>"`
+  to stderr and exits 2 with empty stdout, before reading the request, so a foreign
+  file is never overwritten.
+- `--resume <path>` loads the checkpoint at `<path>`, checks it against the request
+  (§6.4), continues the search from it and keeps saving checkpoints to the same `<path>`.
+- Both options take one path value with the placement, duplicate and missing-value
+  rules of `--cancel-file`, and combine with `--cancel-file` and `--threads`. Giving
+  both writes `error: --checkpoint and --resume cannot be combined` to stderr, exit 2,
+  empty stdout. Relative paths use the invocation working directory.
+- Transform and unsupported search jobs reject either option with the seq 1
+  `unsupported_job` error at `/job/kind`, the message
+  `--checkpoint and --resume are supported only for hill_climb and partial_exhaustion attacks`
+  and exit 1; a `--cancel-file` or `--threads` message takes precedence.
+- `--threads` is host configuration, not identity: a run may resume with any thread count.
+
+### 6.2 When a checkpoint is written
+
+Only on the calling thread, at a committed outer-block boundary (§5 `--threads`),
+never inside a block or from a worker:
+
+1. **Periodic:** at the first committed block boundary at least 300 seconds
+   (monotonic clock) after the start of this process's execution or the previous
+   successful write.
+2. **End of the outer phase:** once, after the last block is merged and before
+   chained stages start (`phase: "stages"`).
+3. **Cancellation:** after a stop request is observed and in-flight blocks are
+   drained (or, during stages, at the stage poll that observes it), before `result`.
+
+Each write saves the state of every block merged so far. Blocks that were still running
+are not in it; a resume runs them again. A stop during chained stages saves the
+pre-stage state of item 2: resume reruns all stages, and the counters of the discarded
+stage work are dropped. A second signal (exit 130), a kill or a power loss keeps only
+the last successful write. Runtime errors write no new checkpoint; the previous one
+stays. After a completed run the last checkpoint (`phase: "stages"`) stays on disk;
+resuming it reruns only the stages and gives the same result.
+
+A write goes to `<path>.tmp` in the same directory, is flushed, then renamed over
+`<path>`, so a failed or interrupted write never damages the previous checkpoint.
+After each successful write the CLI emits one `checkpoint` event (§6.5). A failed write
+writes `error: cannot write checkpoint "<path>": <reason>` to stderr, the search
+continues (later writes are still attempted), and the process exits 1 at the end
+even when the search completes; runtime-error and transport-failure precedence (§4.1)
+is unchanged.
+
+### 6.3 Record (`checkpoint_version` 1)
+
+One strict JSON object (unknown or duplicate members rejected), UTF-8, written compact.
+Counts, indices and elapsed time use the canonical decimal strings of §4.1.
+
+| Member | Content |
+| --- | --- |
+| `checkpoint_version` | JSON integer `1` |
+| `protocol_version` | JSON integer `1` |
+| `identity` | 64 lowercase hex digits: SHA-256 identity digest (§6.4) |
+| `state_digest` | 64 lowercase hex digits: SHA-256 of the canonical record without this member |
+| `phase` | `"outer"` (outer blocks remain) or `"stages"` (outer phase finished) |
+| `next_outer` | absolute outer index of the first key not yet merged; in `"stages"` the end of the selected range |
+| `counters` | the five §4.1 counters after the merged blocks |
+| `evaluations_used` | charged allowance (§4.1) |
+| `progress_last_emitted` | `evaluations_completed` of the last emitted progress snapshot |
+| `elapsed_ms` | execution time accumulated over every run of this search |
+| `best` | the §4.1 `best` object of the merged blocks, or null |
+| `hold` | the retained hold before stages, in hold order, as §4.1 `best` objects |
+
+`next_outer` addresses the flat outer order of §7 inside the range selected by
+`space.offset`/`space.limit`; it lies on a 128-key block boundary of that range or at
+its end. Merged blocks always form a prefix in key order, so this one index is the whole
+cursor. `best` and `hold` entries carry no stage history, because stages always rerun.
+The canonical record used by `state_digest` is the record with keys sorted and no
+whitespace.
+
+### 6.4 Identity and resume checks
+
+`identity` is the SHA-256 (FIPS 180-4) of this byte sequence: the ASCII line
+`enigma-checkpoint-identity/1\n`; the canonical request (the parsed request JSON
+with object keys sorted, no whitespace, array order kept) followed by `\n`; when the
+definition is bundled, the exact catalog JSON of that alias followed by `\n`; then for
+each loaded resource in ascending measure-ID order, its ID, `\n`, its byte length in
+decimal, `\n` and its exact bytes. The request already carries `protocol_version`, the
+whole job, text and settings; changing any of them, the catalog content or a
+resource byte changes the identity. Reformatting the request does not.
+
+Resume reads and parses the record before the request. An unreadable file, invalid
+JSON, an unknown member, an unsupported `checkpoint_version` or `protocol_version`,
+a malformed field or a `state_digest` mismatch writes
+`error: invalid checkpoint "<path>": <reason>` to stderr and exits 2 with empty stdout.
+After the request and resources are bound, a different `identity` writes
+`error: checkpoint "<path>" belongs to a different search` and exits 2 with empty
+stdout. Before `started`, every `best`/`hold` entry is decrypted and scored again with
+the bound measure (not counted in `counters`); a key, plaintext or score that does not match, a `next_outer`
+outside the selected range or off a block boundary, or entries that break hold order
+or capacity also fail as an invalid checkpoint (exit 2). The checkpoint file is never
+modified by a failed check.
+
+### 6.5 Events and equivalence
+
+A resumed run emits `started`, an initial `progress` with the restored counters, then
+continues the normal lifecycle (§4.1). `checkpoint` events carry `phase`, `next_outer`
+and `counters` (same encodings as the record) and are emitted only after a successful
+write. `elapsed_ms` in `progress` and `result` adds the restored `elapsed_ms` to this
+run's monotonic time.
+
+For completed runs, the `result` and `done` events of a search that was stopped and
+resumed (any number of times, with any thread counts) are equal to those of an
+uninterrupted run, apart from `ts`, `elapsed_ms` and `seq`. `progress` and `checkpoint`
+events depend on where the stops happened and are not part of that promise.
 
 ## 7. Determinism
 
@@ -679,7 +793,7 @@ versions and fields fail before work. Incompatible changes to field meaning,
 validation, traversal, or event ordering after v1 ships require a version bump. Detailed
 pass execution fields other than the [Task 11 contract](search-passes.md)
 (whose HC/PE attacks and [Task 13 chained stages](search-passes.md#9-chained-stages--task-13)
-execute) and checkpoint schemas remain deferred; they must be specified
+execute) remain deferred; the checkpoint record is specified in §6.3. They must be specified
 before their implementation, not presumed executable or imported from `bomm`.
 Search-space and [measure/resource schemas](scoring-resources.md) are specified as
 normative design; that does not assert implemented scoring or search execution.

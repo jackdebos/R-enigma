@@ -806,8 +806,8 @@ first entry's `stages`, so both keep their Task 13 meaning for N = 1. Entries ma
 carry different `score.measure` values; clients must not compare scores across
 measures. Runtime `error` context keeps the §4.1 shape; for a stage error its
 `outer_index`/`start_index` are the failing finalist's. Core mirrors this on
-`AttackResult` with an ordered entry list. Task 16 decides how a checkpoint records
-the hold ([protocol §6](protocol.md#6-checkpoint-and-resume-record-schema-deferred)).
+`AttackResult` with an ordered entry list. A checkpoint records the pre-stage hold
+([protocol §6.3](protocol.md#63-record-checkpoint_version-1)).
 
 ### 10.8 Non-goals and departures from bomm
 
