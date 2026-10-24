@@ -1,6 +1,7 @@
 package server
 
 import (
+	"io"
 	"net/http"
 	"os"
 	"runtime"
@@ -13,7 +14,17 @@ func (s *Server) serveAttackPreview(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodPost) {
 		return
 	}
-	input, problem := attack.Decode(http.MaxBytesReader(w, r.Body, 1<<20))
+	_, plan, problem := buildAttack(http.MaxBytesReader(w, r.Body, 1<<20))
+	if problem != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": problem})
+		return
+	}
+	jsonResponse(w, http.StatusOK, plan)
+}
+
+// Start and preview share all schema, catalog and own-table checks.
+func buildAttack(body io.Reader) (attack.Input, attack.Plan, *attack.Issue) {
+	input, problem := attack.Decode(body)
 	var plan attack.Plan
 	if problem == nil {
 		models := []attack.Model{}
@@ -38,9 +49,5 @@ func (s *Server) serveAttackPreview(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if problem != nil {
-		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": problem})
-		return
-	}
-	jsonResponse(w, http.StatusOK, plan)
+	return input, plan, problem
 }

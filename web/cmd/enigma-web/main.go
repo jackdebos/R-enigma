@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"syscall"
 	"time"
 
 	"criptografia-enigma/web/internal/server"
@@ -25,7 +26,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: enigma-web [--port <0-65535>] [--no-browser]")
 		os.Exit(2)
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx, *port, *noBrowser); err != nil {
 		fmt.Fprintln(os.Stderr, "enigma-web:", err)
@@ -64,6 +65,10 @@ func run(ctx context.Context, port int, noBrowser bool) error {
 	case err := <-done:
 		return err
 	case <-ctx.Done():
+		fmt.Fprintln(os.Stderr, "Stopping enigma-web; waiting for any running attack to checkpoint and exit.")
+		attackCtx, attackCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		attackErr := handler.Shutdown(attackCtx)
+		attackCancel()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
@@ -73,7 +78,7 @@ func run(ctx context.Context, port int, noBrowser bool) error {
 		if err := <-done; !errors.Is(err, http.ErrServerClosed) {
 			return err
 		}
-		return nil
+		return attackErr
 	}
 }
 

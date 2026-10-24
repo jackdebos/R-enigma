@@ -231,8 +231,8 @@ Built-ins supply German 1941 bigrams/trigrams; see `internal/tables/NOTICE.md`
 for provenance and licence. Other Sinkov measures and trie need an own table.
 Own paths must resolve to regular files of at most 64 MiB. Preview checks metadata,
 not table contents. Resources return `own` instead of `builtin` for own sources;
-engine paths remain relative (`own-<measure>.json` or `<builtin id>.json`). Future
-runners must copy/write these resources before execution. Own files must follow
+engine paths remain relative (`own-<measure>.json` or `<builtin id>.json`). The
+attack runner copies/writes these resources before execution. Own files must follow
 [engine JSON v1 scoring resources](../docs/scoring-resources.md); convert n-grams
 with `python3 e2e/recovery/ngrams.py convert --help` from the repository root.
 
@@ -248,6 +248,78 @@ Codes are `invalid_request` (JSON/schema/size), `unknown_model`,
 `invalid_component` (catalog/key facts), `invalid_settings` (advanced settings or
 own-file metadata), `missing_table` (required resource unavailable), and
 `nothing_to_search` (no unknown key dimension).
+
+## Attacks
+
+The attack API runs one background child process at a time, independently of the
+browser tab. Configure a compatible engine first. These JSON routes have the same
+authentication, Host/Origin guards and `Cache-Control: no-store` as other APIs:
+
+| Route | Result |
+| --- | --- |
+| `GET /api/attack` | 200 with `{"attack":null}` or the latest attack view. Poll about once a second. |
+| `POST /api/attack` | The exact preview body; builds and starts an attack, returning 202 with `{"attack":{...}}`. |
+| `POST /api/attack/cancel` | Creates this run's empty cancel marker; 202 with the current view. Cancellation takes effect at an engine safe boundary. |
+| `POST /api/attack/resume` | Continues the latest resumable attack, with a new run number; 202 with the view. |
+
+Wrong methods return 405 with `Allow: GET, POST` for `/api/attack` and `Allow: POST`
+for cancel/resume. Builder rejections match preview (400). Conflicts use 409 codes:
+`attack_running`, `attack_not_running`, `attack_not_resumable`,
+`engine_not_configured` or `engine_incompatible`. Storage failures use 500
+`internal_error`.
+
+The view includes `id`, `status`, `created_at` (UTC), absolute `directory`, original
+`input` object, `outer_keys`, `threads`, `estimate_seconds`, `outers_selected`,
+latest progress `counters` and `elapsed_ms`, complete `result` event, `error`
+(`code`, `message`), `stderr` (at most 64 KiB per run), `resumable` and `runs`.
+Unobserved event fields are null. Engine counter/time fields remain decimal strings.
+States are `running`, `completed` (`completed` or `outer_slice_end`), `cancelled`,
+`failed` (engine error, invalid stream or unsuccessful/incomplete process), and
+`interrupted` (a saved running attack found after restart). Only cancelled or
+interrupted attacks with a regular `checkpoint.json` are resumable. Cancel requests
+do not mark a job cancelled until the engine emits its terminal event and exits.
+
+Storage is an `attacks` directory beside the configured config file (including the
+`ENIGMA_WEB_CONFIG` override), normally `<UserConfigDir>/enigma-web/attacks/`.
+New root/job directories use 0700, web-created files 0600. Each job ID is UTC
+`YYYYMMDDTHHMMSSZ-<8 random hex>` and gets a new, exclusively created directory:
+
+```text
+attacks/<id>/
+  input.json                 exact HTTP request body
+  request.json               exact builder-produced engine request
+  enigma1941-trigram.json     built-in resources, when required
+  own-<measure>.json          own resources copied byte-for-byte (maximum 64 MiB)
+  state.json                 atomically persisted status and metadata
+  events.jsonl               exact stdout JSONL, appended across runs
+  checkpoint.json            engine-owned checkpoint
+  cancel-1                   empty marker, only when cancellation is requested
+  report-1.txt               engine report; later runs use report-2.txt, etc.
+```
+
+The engine runs directly, without a shell or attack deadline, in the job directory:
+`enigma --events - --request request.json --checkpoint checkpoint.json --cancel-file
+cancel-1 --threads <n> --report report-1.txt`. Resume substitutes `--resume` for
+`--checkpoint` and increments the cancel/report numbers, leaving old markers intact.
+Own resources are rechecked during copying; text is never normalized. Stdout lines
+are bounded to 64 MiB; an invalid/excessive stream fails the attack. Restart loads
+the newest readable job ID and rebuilds observations from its log; a saved `running`
+state is persisted as `interrupted`. A newer directory whose `state.json` or
+`input.json` is missing or unreadable (for example one left by a failed start) is
+named on stderr and skipped, never repaired or deleted, so it cannot stop enigma-web
+from starting.
+
+On SIGINT/Ctrl+C or SIGTERM, enigma-web requests cancellation and waits up to 30
+seconds for the attack to checkpoint and exit before shutting down HTTP. On Linux,
+parent death also sends SIGTERM to the child for a safe stop; other platforms have
+no parent-death hook. No hard cancellation latency is promised. Files are never
+deleted by enigma-web: only `state.json` is atomically replaced by the web client;
+the engine updates its own checkpoint as specified in protocol §6. Failed state
+writes may leave `state-*.tmp` artifacts for manual inspection. Remove unwanted
+attack directories manually only when no process is using them.
+
+The machine page does not yet expose attack controls; these routes are the runner
+boundary for the forthcoming attack page.
 
 ## Machine page
 

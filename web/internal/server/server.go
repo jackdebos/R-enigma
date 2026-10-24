@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strings"
 
 	"criptografia-enigma/web/internal/engine"
@@ -24,6 +25,7 @@ type Server struct {
 	defaultPort bool
 	files       http.Handler
 	engines     *engine.Store
+	attacks     *attackRun
 }
 
 // New creates a handler for the actual port selected by the loopback listener.
@@ -44,6 +46,14 @@ func NewWithConfig(port int, configPath string) (*Server, error) {
 	if _, err := rand.Read(secret[:]); err != nil {
 		return nil, fmt.Errorf("generate session token: %w", err)
 	}
+	root, err := filepath.Abs(filepath.Join(filepath.Dir(configPath), "attacks"))
+	if err != nil {
+		return nil, err
+	}
+	attacks := &attackRun{root: root}
+	if err := attacks.load(); err != nil {
+		return nil, fmt.Errorf("load latest attack: %w", err)
+	}
 	return &Server{
 		token: hex.EncodeToString(secret[:]),
 		// Browser cookies ignore ports, so concurrent runs need distinct names.
@@ -52,6 +62,7 @@ func NewWithConfig(port int, configPath string) (*Server, error) {
 		defaultPort: port == 80,
 		files:       http.FileServer(http.FS(static.Files)),
 		engines:     engine.NewStore(configPath),
+		attacks:     attacks,
 	}, nil
 }
 
@@ -95,6 +106,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if r.URL.Path == "/api/machines" {
 			s.serveMachines(w, r)
+			return
+		}
+		if r.URL.Path == "/api/attack" || r.URL.Path == "/api/attack/cancel" || r.URL.Path == "/api/attack/resume" {
+			s.serveAttack(w, r)
 			return
 		}
 		if r.URL.Path == "/api/attack/preview" {

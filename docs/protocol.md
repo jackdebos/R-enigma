@@ -1007,7 +1007,9 @@ the engine. There is no TUI and the engine binary has no listener. `enigma-web` 
 only this CLI's public surface: it runs `enigma` as a child process with
 `--events - --request -`, writes the request to stdin and reads the JSONL events of §4
 from stdout; cancellation uses the cancel file (§5), and checkpoints use the §6 options.
-It never links the engine library.
+It never links the engine library. For attacks, `enigma-web` runs a child with
+`--events - --request request.json`, `--checkpoint`/`--resume` and a per-run cancel
+file, retaining each run's events and report in its attack directory.
 
 Compatibility: `enigma-web` keeps an explicit list of supported engine versions, as
 printed by `--version` (`enigma <version>` and `protocol version <n>`). It refuses any
