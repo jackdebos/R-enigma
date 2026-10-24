@@ -19,7 +19,7 @@ use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 type MutableBoard = Vec<(char, char)>;
 
 /// Owned initial key facts remain separate from the committed mutable remainder.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DirectOuterOutcome {
     pub(crate) initial: ResolvedConfiguration,
     pub(crate) outer_index: u128,
@@ -104,6 +104,7 @@ impl DirectOuterOutcome {
 }
 
 /// Capacity one deliberately keeps raw selection and terminal projection timing.
+#[derive(Clone, Debug)]
 struct DirectAcceptance(Option<crate::attack_hold::AttackHold>);
 
 impl DirectAcceptance {
@@ -158,6 +159,184 @@ fn attach_held(
             Ok(result)
         }
         Err(error) => Err(error.with_held(head, tail)),
+    }
+}
+
+// T4 wires these entry points into the coordinator; no worker or stage state is saved.
+#[allow(dead_code)]
+pub(crate) mod block_snapshot {
+    use super::*;
+    use crate::checkpoint::record::{CheckpointError, CheckpointRecord, Decimal, Entry, Phase};
+
+    #[derive(Debug)]
+    pub(crate) struct BlockPhaseSnapshot {
+        pub(super) next_outer: u128,
+        pub(super) control: AttackControl,
+        pub(super) allowance: EvaluationAllowance,
+        pub(super) best: Option<DirectOuterOutcome>,
+        pub(super) acceptance: DirectAcceptance,
+    }
+
+    impl BlockPhaseSnapshot {
+        pub(super) fn capture(
+            next_outer: u128,
+            control: &AttackControl,
+            allowance: &EvaluationAllowance,
+            best: &Option<DirectOuterOutcome>,
+            acceptance: &DirectAcceptance,
+        ) -> Self {
+            let counters = control.snapshot();
+            let last = control.checkpoint_progress();
+            Self {
+                next_outer,
+                control: AttackControl::from_checkpoint(counters, last, control.progress_every()),
+                allowance: allowance.clone(),
+                best: best.clone(),
+                acceptance: acceptance.clone(),
+            }
+        }
+
+        pub(crate) fn record(
+            &self,
+            request: &crate::AttackRequest,
+            identity: crate::CheckpointIdentity,
+            elapsed_ms: u128,
+        ) -> Result<CheckpointRecord, CheckpointError> {
+            let measure = request.settings().final_measure();
+            let project = |best: DirectOuterOutcome| best.project(request.domain(), measure);
+            let raw = self.best.clone().map(project).transpose();
+            let raw = raw.map_err(|error| CheckpointError(error.to_string()))?;
+            let hold = self.acceptance.0.as_ref();
+            let head = hold.and_then(|hold| hold.entries().first());
+            let best = head.or(raw.as_ref()).map(Entry::capture);
+            let hold = match hold {
+                Some(hold) => hold.entries().iter().map(Entry::capture).collect(),
+                None => best.iter().cloned().collect(),
+            };
+            Ok(CheckpointRecord {
+                checkpoint_version: 1,
+                protocol_version: 1,
+                identity,
+                state_digest: identity,
+                phase: if self.next_outer == range(request).1 {
+                    Phase::Stages
+                } else {
+                    Phase::Outer
+                },
+                next_outer: Decimal(self.next_outer),
+                counters: self.control.snapshot().into(),
+                evaluations_used: Decimal(self.allowance.used),
+                progress_last_emitted: Decimal(self.control.checkpoint_progress()),
+                elapsed_ms: Decimal(elapsed_ms),
+                best,
+                hold,
+            })
+        }
+
+        pub(crate) fn restore(
+            request: &crate::AttackRequest,
+            record: &CheckpointRecord,
+        ) -> Result<Self, CheckpointError> {
+            let fail = |reason: &str| CheckpointError(reason.into());
+            let (start, end) = range(request);
+            let next = record.next_outer.0;
+            let relative = next.saturating_sub(start);
+            let off_grid = next != end && relative % crate::attack_blocks::OUTER_BLOCK_KEYS != 0;
+            if next < start || next > end || off_grid {
+                return Err(fail(
+                    "next_outer is outside the selected range or off a block boundary",
+                ));
+            }
+            if (record.phase == Phase::Stages) != (next == end) {
+                return Err(fail("phase does not match next_outer"));
+            }
+            let capacity = request.settings().hold_capacity();
+            if record.hold.len() > capacity {
+                return Err(fail("hold exceeds request capacity"));
+            }
+            for (i, entry) in record.hold.iter().enumerate() {
+                let duplicate = |prior: &Entry| prior.configuration == entry.configuration;
+                if record.hold[..i].iter().any(duplicate) {
+                    return Err(fail("duplicate hold configuration"));
+                }
+            }
+            // Reuse hold insertion and compare: never silently repair invalid input.
+            let mut hold = crate::attack_hold::AttackHold::new(capacity);
+            for entry in &record.hold {
+                restore_raw(request, entry)?;
+                hold.offer(entry.restore()?);
+            }
+            let ordered: Vec<_> = hold.entries().iter().map(Entry::capture).collect();
+            if ordered != record.hold {
+                return Err(fail("hold is not in canonical rank order"));
+            }
+            if record.best.as_ref() != record.hold.first() {
+                return Err(fail("best differs from hold head"));
+            }
+            if record.progress_last_emitted.0 > record.counters.evaluations_completed.0 {
+                return Err(fail("progress_last_emitted exceeds completed evaluations"));
+            }
+            let best = match record.best.as_ref().filter(|_| capacity == 1) {
+                Some(entry) => Some(restore_raw(request, entry)?),
+                None => None,
+            };
+            let counters = (&record.counters).into();
+            let last = record.progress_last_emitted.0;
+            let every = request.settings().progress_every();
+            Ok(Self {
+                next_outer: next,
+                control: AttackControl::from_checkpoint(counters, last, every),
+                allowance: EvaluationAllowance {
+                    used: record.evaluations_used.0,
+                },
+                best,
+                acceptance: DirectAcceptance((capacity > 1).then_some(hold)),
+            })
+        }
+    }
+
+    fn range(request: &crate::AttackRequest) -> (u128, u128) {
+        request.outer_plan().selected_range()
+    }
+
+    fn restore_raw(
+        request: &crate::AttackRequest,
+        entry: &Entry,
+    ) -> Result<DirectOuterOutcome, CheckpointError> {
+        let best = entry.restore()?;
+        // Initial keys own fixed pairs, not mutable pairs (as in stage restoration).
+        let key = crate::TransformConfiguration::new(
+            best.configuration.slots().to_vec(),
+            request.domain().fixed_pairs().to_vec(),
+        );
+        let initial = key
+            .resolve(request.definition())
+            .map_err(|_| CheckpointError("winning slots failed to resolve".into()))?;
+        let current = ScoredBoard {
+            board: best.mutable_plugboard,
+            plaintext: best.plaintext,
+            score: best.score,
+        };
+        let outcome = DirectOuterOutcome {
+            initial,
+            outer_index: best.outer_index,
+            start_index: best.start_index,
+            climb: ClimbOutcome {
+                current: Some(current),
+                incomplete: best.incomplete,
+                cancelled: false,
+                final_objective_ascent: best.final_objective_ascent,
+                neighborhood_exhausted: best.neighborhood_exhausted,
+            },
+        };
+        let projected = outcome.clone().project(request.domain(), best.measure);
+        let projected = projected.map_err(|error| CheckpointError(error.to_string()))?;
+        if Entry::capture(&projected) != *entry {
+            return Err(CheckpointError(
+                "entry key is not canonical or complete".into(),
+            ));
+        }
+        Ok(outcome)
     }
 }
 
@@ -2671,7 +2850,7 @@ struct BoundClimbScoring<'a> {
     switch_pairs: usize,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ScoredBoard {
     pub(crate) board: MutableBoard,
     pub(crate) plaintext: String,
@@ -2685,7 +2864,7 @@ struct ScoringState<'c, 'a> {
     known_final: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ClimbOutcome {
     pub(crate) current: Option<ScoredBoard>,
     pub(crate) incomplete: bool,
@@ -3543,6 +3722,174 @@ mod tests {
                 vec![crate::AttackProgress(Default::default()), result.counters()]
             );
         }
+    }
+
+    type CheckpointSnapshot = block_snapshot::BlockPhaseSnapshot;
+
+    fn checkpoint_boundaries(
+        pe: bool,
+        capacity: u64,
+    ) -> (crate::AttackRequest, Vec<CheckpointSnapshot>) {
+        let request = pool_request(pe, capacity, |job| {
+            job["space"]["offset"] = serde_json::json!(3);
+            job["space"]["limit"] = serde_json::json!(260);
+            job["configuration"]["plugboard"] = serde_json::json!([["A", "B"]]);
+            job["space"]["plugboard"]["symbols"] = serde_json::json!(["C", "D"]);
+            job["space"]["plugboard"]["max_pairs"] = serde_json::json!(2);
+            job["attack"]["progress_every"] = serde_json::json!(137);
+        });
+        let plan = request.outer_plan();
+        let preparation = RunPreparation::new(&request);
+        let mut control = AttackControl::with_progress_every(137);
+        let mut allowance = EvaluationAllowance { used: 0 };
+        let mut acceptance = DirectAcceptance::new(capacity as usize);
+        let mut best = None;
+        let mut snapshots = Vec::new();
+        for block in plan.blocks() {
+            let outcome = request.run_phase_block(&preparation, &plan, block);
+            let (accounting, candidates) = match outcome {
+                PhaseBlock::Direct(outcome) => {
+                    assert!(outcome.error.is_none());
+                    (outcome.accounting, outcome.outers)
+                }
+                PhaseBlock::Partial(outcome) => {
+                    assert!(outcome.error.is_none());
+                    let candidates = outcome.outers.into_iter().map(|mut outer| {
+                        merge_held(&mut acceptance.0, outer.held.take());
+                        outer.into_direct()
+                    });
+                    let candidates = candidates.collect();
+                    (outcome.accounting, candidates)
+                }
+            };
+            control.merge_block(accounting.control.snapshot()).unwrap();
+            allowance.used += accounting.used;
+            for candidate in candidates {
+                if candidate.climb.current.is_none() {
+                    continue;
+                }
+                let measure = request.settings().final_measure();
+                let candidate = if pe {
+                    Some(candidate)
+                } else {
+                    acceptance
+                        .accept(candidate, request.domain(), measure)
+                        .unwrap()
+                };
+                if let Some(candidate) = candidate {
+                    keep_strict_best(&mut best, candidate);
+                }
+            }
+            control.block_progress(&mut ProgressObserver(|_| {}));
+            snapshots.push(CheckpointSnapshot::capture(
+                block.start + block.len,
+                &control,
+                &allowance,
+                &best,
+                &acceptance,
+            ));
+        }
+        drop(preparation);
+        drop(plan);
+        (request, snapshots)
+    }
+
+    #[test]
+    fn checkpoint_real_block_round_trips_and_preserves_wire_best_and_hold() {
+        use crate::checkpoint::record::CheckpointRecord;
+        let identity = crate::checkpoint_identity("{}", &Default::default()).unwrap();
+        for pe in [false, true] {
+            for capacity in [1, 5] {
+                let (request, snapshots) = checkpoint_boundaries(pe, capacity);
+                for state in snapshots {
+                    let mut record = state.record(&request, identity, 42).unwrap();
+                    assert!(record.best.is_some());
+                    assert_eq!(state.best.is_some(), capacity == 1);
+                    assert_eq!(record.hold.len(), capacity as usize);
+                    let json = record.seal_json().unwrap();
+                    let parsed = CheckpointRecord::parse_json(&json).unwrap();
+                    let restored = CheckpointSnapshot::restore(&request, &parsed).unwrap();
+                    // Resolved topology contains randomized HashMaps: compare structurally.
+                    assert_eq!(state.best, restored.best);
+                    assert_eq!(state.next_outer, restored.next_outer);
+                    assert_eq!(state.allowance.used, restored.allowance.used);
+                    assert_eq!(state.control, restored.control);
+                    let held = |state: &CheckpointSnapshot| format!("{:?}", state.acceptance);
+                    assert_eq!(held(&state), held(&restored));
+                    let project = |state: CheckpointSnapshot| {
+                        let counters = state.control.snapshot();
+                        let run = DirectRunOutcome {
+                            termination: DirectRunTermination::Completed,
+                            outer_completed: state.control.snapshot().outers_completed,
+                            climbs_started: state.control.snapshot().climbs_started,
+                            climbs_completed: state.control.snapshot().climbs_completed,
+                            evaluations_used: state.allowance.used,
+                            best: state.best,
+                        };
+                        let domain = request.domain();
+                        let measure = request.settings().final_measure();
+                        let result = state.acceptance.finish(Ok(run), counters, domain, measure);
+                        let result = result.unwrap();
+                        serde_json::to_value(crate::Event::result(&result, 42)).unwrap()
+                    };
+                    assert_eq!(project(state), project(restored));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn checkpoint_restore_rejects_request_dependent_structure() {
+        use crate::checkpoint::record::{Decimal, Phase};
+        let (request, mut snapshots) = checkpoint_boundaries(false, 5);
+        let state = snapshots.remove(0);
+        let identity = crate::checkpoint_identity("{}", &Default::default()).unwrap();
+        let record = state.record(&request, identity, 0).unwrap();
+        let reject = |record, reason| {
+            let error = CheckpointSnapshot::restore(&request, &record).unwrap_err();
+            assert_eq!(error.to_string(), reason);
+        };
+        for cursor in [2, 4, 264] {
+            let mut bad = record.clone();
+            bad.next_outer = Decimal(cursor);
+            reject(
+                bad,
+                "next_outer is outside the selected range or off a block boundary",
+            );
+        }
+        let mut bad = record.clone();
+        bad.phase = Phase::Stages;
+        reject(bad, "phase does not match next_outer");
+        let mut bad = record.clone();
+        bad.hold.resize(6, bad.hold[0].clone());
+        reject(bad, "hold exceeds request capacity");
+        let mut bad = record.clone();
+        bad.hold.swap(0, 1);
+        reject(bad, "hold is not in canonical rank order");
+        let mut bad = record.clone();
+        bad.hold[1].score.ranking_q32 = Decimal(i128::MAX);
+        reject(bad, "hold is not in canonical rank order");
+        let mut bad = record.clone();
+        bad.hold[1].configuration.plugboard.clear();
+        reject(bad, "entry key is not canonical or complete");
+        let mut bad = record.clone();
+        bad.hold[1] = bad.hold[0].clone();
+        reject(bad, "duplicate hold configuration");
+        let mut bad = record.clone();
+        bad.best = None;
+        reject(bad, "best differs from hold head");
+        let mut bad = record.clone();
+        bad.best.as_mut().unwrap().plaintext.push('A');
+        reject(bad, "best differs from hold head");
+        let mut bad = record.clone();
+        bad.progress_last_emitted = Decimal(u64::MAX);
+        reject(bad, "progress_last_emitted exceeds completed evaluations");
+        let (request, mut snapshots) = checkpoint_boundaries(true, 1);
+        let state = snapshots.pop().unwrap();
+        let mut record = state.record(&request, record.identity, 0).unwrap();
+        record.phase = Phase::Outer;
+        let error = CheckpointSnapshot::restore(&request, &record).unwrap_err();
+        assert_eq!(error.to_string(), "phase does not match next_outer");
     }
 
     /// Three fixed slots of 16 settings each: 4,096 outer keys, 32 blocks.

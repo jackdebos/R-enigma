@@ -34,7 +34,7 @@ pub(super) trait CounterObserver {
     fn observe(&mut self, snapshot: CounterSnapshot);
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct AttackControl {
     counters: CounterSnapshot,
     cancelled: bool,
@@ -59,6 +59,32 @@ impl AttackControl {
             next: Some(progress_every),
             last_emitted: 0,
         }
+    }
+
+    // T4 consumes these at the coordinator's checkpoint boundary, not in workers.
+    #[allow(dead_code)]
+    pub(crate) fn checkpoint_progress(&self) -> u64 {
+        self.last_emitted
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn progress_every(&self) -> u64 {
+        self.progress_every
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn from_checkpoint(
+        counters: CounterSnapshot,
+        last_emitted: u64,
+        progress_every: u64,
+    ) -> Self {
+        let mut control = Self::with_progress_every(progress_every);
+        // Reuse block merging's global-grid reconstruction and checked accounting.
+        control
+            .merge_block(counters)
+            .expect("zero plus checkpoint counters");
+        control.last_emitted = last_emitted;
+        control
     }
 
     /// Only successful evaluations advance the global public cadence.
@@ -225,6 +251,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             [4, 7, 9]
         );
+    }
+
+    #[test]
+    fn checkpoint_progress_rebuilds_grid_and_clears_cancel_latch() {
+        for count in [0, 2, 3, 7, u64::MAX] {
+            let mut original = AttackControl::with_progress_every(3);
+            original
+                .merge_block(CounterSnapshot {
+                    evaluations_completed: count,
+                    ..Default::default()
+                })
+                .unwrap();
+            original.block_progress(&mut Recorder::default());
+            let restored = AttackControl::from_checkpoint(
+                original.snapshot(),
+                original.checkpoint_progress(),
+                3,
+            );
+            assert_eq!(restored, original);
+            original.poll_cancellation(true);
+            assert!(!restored.cancelled);
+        }
     }
 
     #[test]

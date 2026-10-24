@@ -82,7 +82,7 @@ pub fn checkpoint_identity(
     Ok(CheckpointIdentity(hasher.finish()))
 }
 
-// Unused until T3b connects checked scheduler-state conversions.
+// T4 connects the codec and checked conversions to production execution.
 #[allow(dead_code)]
 pub(crate) mod record {
     use super::*;
@@ -222,6 +222,90 @@ pub(crate) mod record {
     impl From<serde_json::Error> for CheckpointError {
         fn from(error: serde_json::Error) -> Self {
             Self(error.to_string())
+        }
+    }
+
+    impl Entry {
+        pub(crate) fn capture(best: &crate::AttackBest) -> Self {
+            Self {
+                configuration: Configuration {
+                    slots: best
+                        .configuration
+                        .slots()
+                        .iter()
+                        .map(|slot| Slot {
+                            id: slot.id().into(),
+                            wheel: slot.wheel().into(),
+                            position: slot.position(),
+                            ring: slot.ring(),
+                        })
+                        .collect(),
+                    plugboard: best.configuration.plugboard().to_vec(),
+                },
+                mutable_plugboard: best.mutable_plugboard.clone(),
+                plaintext: best.plaintext.clone(),
+                score: Score {
+                    measure: best.measure.id().into(),
+                    measured_q32: Decimal(best.score.measured().units()),
+                    ranking_q32: Decimal(best.score.ranking().units()),
+                },
+                outer_index: Decimal(best.outer_index),
+                start_index: Decimal(best.start_index),
+                incomplete: best.incomplete,
+                final_objective_ascent: best.final_objective_ascent,
+                neighborhood_exhausted: best.neighborhood_exhausted,
+            }
+        }
+
+        pub(crate) fn restore(&self) -> Result<crate::AttackBest, CheckpointError> {
+            let measures = std::slice::from_ref(&self.score.measure);
+            let measure = crate::selection::parse_measures(measures)
+                .map_err(|_| CheckpointError("unknown score measure".into()))?[0];
+            let slots = self.configuration.slots.iter().map(|slot| {
+                crate::SlotConfiguration::new(&slot.id, &slot.wheel, slot.position, slot.ring)
+            });
+            let configuration = crate::TransformConfiguration::new(
+                slots.collect(),
+                self.configuration.plugboard.clone(),
+            );
+            let measured = self.score.measured_q32.0;
+            let ranking = self.score.ranking_q32.0;
+            Ok(crate::AttackBest {
+                configuration,
+                mutable_plugboard: self.mutable_plugboard.clone(),
+                plaintext: self.plaintext.clone(),
+                score: crate::MeasuredScore::from_checkpoint_units(measured, ranking),
+                measure,
+                outer_index: self.outer_index.0,
+                start_index: self.start_index.0,
+                incomplete: self.incomplete,
+                final_objective_ascent: self.final_objective_ascent,
+                neighborhood_exhausted: self.neighborhood_exhausted,
+                stages: Vec::new(),
+            })
+        }
+    }
+
+    impl From<crate::attack_control::CounterSnapshot> for Counters {
+        fn from(c: crate::attack_control::CounterSnapshot) -> Self {
+            Self {
+                evaluations_admitted: Decimal(c.evaluations_admitted),
+                evaluations_completed: Decimal(c.evaluations_completed),
+                climbs_started: Decimal(c.climbs_started),
+                climbs_completed: Decimal(c.climbs_completed),
+                outers_completed: Decimal(c.outers_completed),
+            }
+        }
+    }
+    impl From<&Counters> for crate::attack_control::CounterSnapshot {
+        fn from(c: &Counters) -> Self {
+            Self {
+                evaluations_admitted: c.evaluations_admitted.0,
+                evaluations_completed: c.evaluations_completed.0,
+                climbs_started: c.climbs_started.0,
+                climbs_completed: c.climbs_completed.0,
+                outers_completed: c.outers_completed.0,
+            }
         }
     }
 

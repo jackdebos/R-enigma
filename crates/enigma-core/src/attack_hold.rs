@@ -15,6 +15,20 @@ pub(crate) struct AttackHold {
     entries: Vec<AttackBest>,
 }
 
+impl Clone for AttackHold {
+    fn clone(&self) -> Self {
+        let mut copy = Self::new(self.capacity);
+        for entry in &self.entries {
+            let mut best = crate::checkpoint::record::Entry::capture(entry)
+                .restore()
+                .expect("retained entry measure");
+            best.stages = entry.stages.clone();
+            copy.offer(best);
+        }
+        copy
+    }
+}
+
 impl AttackHold {
     pub(crate) fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "attack hold capacity must be positive");
@@ -46,7 +60,6 @@ impl AttackHold {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn entries(&self) -> &[AttackBest] {
         &self.entries
     }

@@ -77,6 +77,15 @@ impl MeasuredScore {
         }
     }
 
+    // T4 re-scores restored entries before authorizing execution.
+    #[allow(dead_code)]
+    pub(crate) const fn from_checkpoint_units(measured: i128, ranking: i128) -> Self {
+        Self {
+            measured: FixedScore::from_units(measured),
+            ranking: FixedScore::from_units(ranking),
+        }
+    }
+
     /// Trie stages retain the trie measurement while adding a base ranking (§9.4).
     pub(crate) fn with_ranking_base(self, base: FixedScore) -> Result<Self, MeasureError> {
         Ok(Self {
