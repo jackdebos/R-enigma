@@ -2,7 +2,7 @@
 use enigma_core::{checkpoint_identity, AttackRequest, CheckpointRecord, ExecutionOptions};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -397,6 +397,86 @@ fn cancel_checkpoint_then_resume_with_other_threads_matches_uninterrupted() {
         expected[2] = checkpoint_event(&completed);
         assert_eq!(events(&replay), expected);
         assert!(!dir.0.join(format!("{filename}.tmp")).exists());
+    }
+}
+
+#[test]
+fn foreign_destination_after_started_survives_cancel_and_reports_exact_failure() {
+    let dir = Scratch::new();
+    let mut value = request();
+    // Enough outer work to allow the parent to place the foreign file after started.
+    let slot = value["machine"]["definition"]["value"]["slots"][0].clone();
+    let ids: Vec<_> = (0..16).map(|i| format!("r{i}")).collect();
+    value["machine"]["definition"]["value"]["slots"] = json!(ids
+        .iter()
+        .map(|id| {
+            let mut slot = slot.clone();
+            slot["id"] = json!(id);
+            slot
+        })
+        .collect::<Vec<_>>());
+    value["job"]["configuration"]["slots"] = json!(ids
+        .iter()
+        .map(|id| json!({"id":id,"ring":"A"}))
+        .collect::<Vec<_>>());
+    value["job"]["space"]["slots"] = json!(ids
+        .iter()
+        .map(|id| json!({"id":id,"positions":["A","B"]}))
+        .collect::<Vec<_>>());
+    value["job"]["text"] = json!("AA".repeat(1024));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_enigma"))
+        .current_dir(&dir.0)
+        .env_remove("ENIGMA_TEST_CHECKPOINT_INTERVAL_MS")
+        .args([
+            "--request",
+            "-",
+            "--checkpoint",
+            "save",
+            "--threads",
+            "1",
+            "--cancel-file",
+            "marker",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(value.to_string().as_bytes())
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut first = String::new();
+    stdout.read_line(&mut first).unwrap();
+    let started: Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(started["event"], "started");
+    let foreign = "valuable foreign data\n\0not a checkpoint";
+    dir.write("save", foreign);
+    dir.write("marker", "cancel");
+    let remaining: Vec<Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
+        .collect();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        output.stderr,
+        b"error: cannot write checkpoint \"save\": destination changed since the last checkpoint\n"
+    );
+    dir.unchanged("save", foreign);
+    dir.unchanged("marker", "cancel");
+    assert!(!dir.0.join("save.tmp").exists());
+    assert!(remaining.iter().any(|event| event["event"] == "result"));
+    assert!(!remaining.iter().any(|event| event["event"] == "checkpoint"));
+    assert_eq!(
+        normalize(remaining.last().unwrap().clone()),
+        json!({"event":"done","protocol_version":1,"reason":"cancelled"})
+    );
+    for (index, event) in remaining.iter().enumerate() {
+        assert_eq!(event["seq"], index + 2);
     }
 }
 

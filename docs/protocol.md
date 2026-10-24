@@ -676,7 +676,7 @@ resuming it reruns only the stages and gives the same result.
 
 A write goes to `<path>.tmp` in the same directory, is flushed, then renamed over
 `<path>`, so a failed or interrupted write never damages the previous checkpoint.
-An existing `<path>.tmp` left by an interrupted write is replaced.
+An existing `<path>.tmp` left by an interrupted write is removed first (a link is removed, never followed), and a new one is created. Before replacing `<path>`, the CLI checks that it still holds this run's last checkpoint (or the one loaded by `--resume`); if another program created or changed it, the write fails as above and `<path>` is left untouched.
 After each successful write the CLI emits one `checkpoint` event (§6.5). A failed write
 writes `error: cannot write checkpoint "<path>": <reason>` to stderr, the search
 continues (later writes are still attempted), and the process exits 1 at the end
