@@ -14,24 +14,37 @@ pub(crate) struct Context<'a> {
 }
 
 pub(crate) fn resume(argv: &[String]) -> String {
-    let mut args = argv.to_vec();
+    let mut args = argv[..argv.len().min(1)].to_vec();
     let mut available = false;
     // Walk option/value pairs so a value named -c is never rewritten.
     let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
+    while i < argv.len() {
+        let pair = argv[i..].iter().take(2).cloned();
+        match argv[i].as_str() {
             "--checkpoint" | "-c" => {
-                args[i] = "--resume".into();
+                args.push("--resume".into());
+                args.extend(argv.get(i + 1).cloned());
                 available = true;
                 i += 2;
             }
             "--resume" | "-r" => {
+                args.extend(pair);
                 available = true;
                 i += 2;
             }
-            "--request" | "-i" | "--events" | "-e" | "--report" | "-o" | "--threads" | "-t"
-            | "--cancel-file" | "-x" => i += 2,
-            _ => i += 1,
+            // Files this run created would make the continuation fail as
+            // already existing; drop them (`--events -` stays).
+            "--events" | "-e" if argv.get(i + 1).is_some_and(|v| v != "-") => i += 2,
+            "--report" | "-o" => i += 2,
+            "--request" | "-i" | "--events" | "-e" | "--threads" | "-t" | "--cancel-file"
+            | "-x" => {
+                args.extend(pair);
+                i += 2;
+            }
+            _ => {
+                args.push(argv[i].clone());
+                i += 1;
+            }
         }
     }
     if !available {
@@ -312,6 +325,29 @@ mod tests {
                 vec!["é".repeat(5); 10].join(" ")
             )
         );
+    }
+    #[test]
+    fn resume_drops_file_outputs_that_would_already_exist() {
+        let args = [
+            "enigma",
+            "r.json",
+            "--events",
+            "run.jsonl",
+            "-o",
+            "mine.txt",
+            "-c",
+            "ck",
+            "-e",
+            "x.jsonl",
+            "--report",
+            "y.txt",
+            "-t",
+            "2",
+        ]
+        .map(str::to_owned);
+        assert_eq!(resume(&args), "enigma r.json --resume ck -t 2");
+        let piped = ["enigma", "-e", "-", "-i", "-", "-r", "ck"].map(str::to_owned);
+        assert_eq!(resume(&piped), "enigma -e - -i - -r ck");
     }
     #[test]
     fn resume_rewrites_and_quotes_posix() {

@@ -35,9 +35,8 @@ search support.
 | `stdio` (default) | TUI, scripts, tests | — | 1 |
 | local listener | web client | `--listen 127.0.0.1:<port>` | 2 (planned) |
 
-**Status:** §2.1-§2.4 and the additive §4.1 fields are specified and being
-implemented (`odd/tasks/enigma-human-output.md`); until that closes, the shipped CLI
-writes JSONL to stdout and accepts only the long options.
+**Status:** §2.1-§2.4 and the additive §4.1 fields ship in the CLI
+(`odd/tasks/enigma-human-output.md`).
 
 Stage 1 is one command-line process (§2.1). By default it runs in **human mode**
 (§2.2): a progress bar on stderr, a readable report at the end and a saved report
@@ -226,7 +225,9 @@ Measure:      ngram
   groups per line; continuation lines are indented to the first group.
 - A `CANCELLED` report ends with a `Resume:` line. When the run used `--checkpoint`
   or `--resume`, it holds the command to continue: the invoked program name and
-  arguments with `--checkpoint`/`-c <path>` replaced by `--resume <path>`, each
+  arguments with `--checkpoint`/`-c <path>` replaced by `--resume <path>` and without
+  the `--events <path>`/`-e <path>` (a file; `-` stays) and `--report`/`-o <name>`
+  pairs, whose files this run already created, each
   argument quoted for a POSIX shell when it contains other than letters, digits or
   `-_./=:`. Otherwise it reads
   `Resume:       not available (run with --checkpoint to make a search resumable)`.
