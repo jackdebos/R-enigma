@@ -82,6 +82,198 @@ pub fn checkpoint_identity(
     Ok(CheckpointIdentity(hasher.finish()))
 }
 
+// Unused until T3b connects checked scheduler-state conversions.
+#[allow(dead_code)]
+pub(crate) mod record {
+    use super::*;
+    use serde::{de::Error, Deserializer, Serialize, Serializer};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct Decimal<T>(pub(crate) T);
+
+    impl<T: fmt::Display> Serialize for Decimal<T> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.serialize_str(&self.0.to_string())
+        }
+    }
+    impl<'de, T: std::str::FromStr + fmt::Display> Deserialize<'de> for Decimal<T> {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            let raw = String::deserialize(deserializer)?;
+            let value = raw
+                .parse::<T>()
+                .map_err(|_| D::Error::custom("decimal out of range"))?;
+            if value.to_string() != raw {
+                return Err(D::Error::custom("non-canonical decimal"));
+            }
+            Ok(Self(value))
+        }
+    }
+
+    mod digest {
+        use super::*;
+        pub(super) fn serialize<S: Serializer>(
+            value: &CheckpointIdentity,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            serializer.serialize_str(&value.to_string())
+        }
+        pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<CheckpointIdentity, D::Error> {
+            let raw = String::deserialize(deserializer)?;
+            let hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+            if raw.len() != 64 || !raw.bytes().all(hex) {
+                return Err(D::Error::custom("expected 64 lowercase hex digits"));
+            }
+            let mut bytes = [0; 32];
+            for (byte, pair) in bytes.iter_mut().zip(raw.as_bytes().chunks_exact(2)) {
+                let digit = |b: u8| if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
+                *byte = digit(pair[0]) * 16 + digit(pair[1]);
+            }
+            Ok(CheckpointIdentity(bytes))
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct CheckpointRecord {
+        pub(crate) checkpoint_version: u8,
+        pub(crate) protocol_version: u8,
+        #[serde(with = "digest")]
+        pub(crate) identity: CheckpointIdentity,
+        #[serde(with = "digest")]
+        pub(crate) state_digest: CheckpointIdentity,
+        pub(crate) phase: Phase,
+        pub(crate) next_outer: Decimal<u128>,
+        pub(crate) counters: Counters,
+        pub(crate) evaluations_used: Decimal<u64>,
+        pub(crate) progress_last_emitted: Decimal<u64>,
+        pub(crate) elapsed_ms: Decimal<u128>,
+        // deserialize_with makes this required even though its value may be null.
+        #[serde(deserialize_with = "Option::deserialize")]
+        pub(crate) best: Option<Entry>,
+        pub(crate) hold: Vec<Entry>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub(crate) enum Phase {
+        Outer,
+        Stages,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct Counters {
+        pub(crate) evaluations_admitted: Decimal<u64>,
+        pub(crate) evaluations_completed: Decimal<u64>,
+        pub(crate) climbs_started: Decimal<u128>,
+        pub(crate) climbs_completed: Decimal<u128>,
+        pub(crate) outers_completed: Decimal<u128>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct Entry {
+        pub(crate) configuration: Configuration,
+        pub(crate) mutable_plugboard: Vec<(char, char)>,
+        pub(crate) plaintext: String,
+        pub(crate) score: Score,
+        pub(crate) outer_index: Decimal<u128>,
+        pub(crate) start_index: Decimal<u128>,
+        pub(crate) incomplete: bool,
+        pub(crate) final_objective_ascent: bool,
+        pub(crate) neighborhood_exhausted: bool,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct Configuration {
+        pub(crate) slots: Vec<Slot>,
+        pub(crate) plugboard: Vec<(char, char)>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct Slot {
+        pub(crate) id: String,
+        pub(crate) wheel: String,
+        pub(crate) position: char,
+        pub(crate) ring: char,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct Score {
+        pub(crate) measure: String,
+        pub(crate) measured_q32: Decimal<i128>,
+        pub(crate) ranking_q32: Decimal<i128>,
+    }
+
+    /// Human reason only; the CLI later supplies the path and diagnostic prefix.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) struct CheckpointError(pub(crate) String);
+    impl fmt::Display for CheckpointError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
+    impl std::error::Error for CheckpointError {}
+    impl From<serde_json::Error> for CheckpointError {
+        fn from(error: serde_json::Error) -> Self {
+            Self(error.to_string())
+        }
+    }
+
+    impl CheckpointRecord {
+        fn validate(&self) -> Result<(), CheckpointError> {
+            for (name, version) in [
+                ("checkpoint_version", self.checkpoint_version),
+                ("protocol_version", self.protocol_version),
+            ] {
+                if version != 1 {
+                    return Err(CheckpointError(format!("unsupported {name} {version}")));
+                }
+            }
+            for entry in self.best.iter().chain(&self.hold) {
+                crate::selection::parse_measures(std::slice::from_ref(&entry.score.measure))
+                    .map_err(|_| CheckpointError("unknown score measure".into()))?;
+            }
+            Ok(())
+        }
+
+        fn digest(&self) -> Result<CheckpointIdentity, CheckpointError> {
+            let mut value = serde_json::to_value(self)?;
+            value
+                .as_object_mut()
+                .expect("record object")
+                .remove("state_digest");
+            let mut hash = Sha256::new();
+            hash.update(value.to_string().as_bytes());
+            Ok(CheckpointIdentity(hash.finish()))
+        }
+
+        /// Seal the record with its digest, then emit sorted, compact JSON.
+        pub(crate) fn seal_json(&mut self) -> Result<String, CheckpointError> {
+            self.validate()?;
+            self.state_digest = self.digest()?;
+            Ok(serde_json::to_value(self)?.to_string())
+        }
+
+        pub(crate) fn parse_json(input: &str) -> Result<Self, CheckpointError> {
+            let mut deserializer = serde_json::Deserializer::from_str(input);
+            let value = StrictValue::deserialize(&mut deserializer)?.into_value();
+            deserializer.end()?;
+            let record: Self = serde_json::from_value(value)?;
+            record.validate()?;
+            if record.digest()? != record.state_digest {
+                return Err(CheckpointError("state_digest mismatch".into()));
+            }
+            Ok(record)
+        }
+    }
+}
+
 /// Streaming SHA-256 (FIPS 180-4).
 pub(crate) struct Sha256 {
     state: [u32; 8],
@@ -189,6 +381,172 @@ impl Sha256 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    use super::record::CheckpointRecord;
+
+    fn record_fixture() -> serde_json::Value {
+        json!({"checkpoint_version":1,"protocol_version":1,"identity":"00".repeat(32),
+            "state_digest":"00".repeat(32),"phase":"outer","next_outer":"0",
+            "counters":{"evaluations_admitted":"0","evaluations_completed":"0",
+                "climbs_started":"0","climbs_completed":"0","outers_completed":"0"},
+            "evaluations_used":"0","progress_last_emitted":"0","elapsed_ms":"0",
+            "best":null,"hold":[]})
+    }
+
+    fn entry() -> serde_json::Value {
+        json!({"configuration":{"slots":[{"id":"r","wheel":"I","position":"A","ring":"B"}],
+            "plugboard":[["A","B"]]},"mutable_plugboard":[["A","B"]],"plaintext":"BA",
+            "score":{"measure":"ic","measured_q32":"-1","ranking_q32":"-1"},
+            "outer_index":(u128::MAX-1).to_string(),"start_index":u128::MAX.to_string(),
+            "incomplete":false,"final_objective_ascent":true,"neighborhood_exhausted":true})
+    }
+
+    fn signed_record(mut value: serde_json::Value) -> String {
+        value.as_object_mut().unwrap().remove("state_digest");
+        value["state_digest"] = json!(sha256(value.to_string().as_bytes()));
+        value.to_string()
+    }
+
+    #[test]
+    fn record_round_trip_preserves_full_width_and_all_payloads() {
+        for count in [0, 1, 2] {
+            let mut value = record_fixture();
+            value["next_outer"] = json!((u128::MAX - 1).to_string());
+            value["elapsed_ms"] = json!(u128::MAX.to_string());
+            value["evaluations_used"] = json!(u64::MAX.to_string());
+            value["counters"]["climbs_started"] = json!(u128::MAX.to_string());
+            value["phase"] = json!("stages");
+            if count > 0 {
+                value["best"] = entry();
+                let mut entries = vec![entry()];
+                if count == 2 {
+                    let mut second = entry();
+                    second["configuration"]["slots"][0]["wheel"] = json!("II");
+                    second["score"]["measured_q32"] = json!(i128::MIN.to_string());
+                    second["score"]["ranking_q32"] = json!(i128::MAX.to_string());
+                    entries.push(second);
+                }
+                value["hold"] = json!(entries);
+            }
+            let wire = signed_record(value);
+            let mut record = CheckpointRecord::parse_json(&wire).unwrap();
+            let encoded = record.seal_json().unwrap();
+            assert_eq!(encoded, wire);
+            assert_eq!(CheckpointRecord::parse_json(&encoded).unwrap(), record);
+        }
+    }
+
+    #[test]
+    fn record_canonical_bytes_and_digest_are_exact() {
+        let body = concat!(
+            r#"{"best":null,"checkpoint_version":1,"counters":{"climbs_completed":"0","climbs_started":"0","evaluations_admitted":"0","evaluations_completed":"0","outers_completed":"0"},"elapsed_ms":"0","evaluations_used":"0","hold":[],"identity":"#,
+            "\"0000000000000000000000000000000000000000000000000000000000000000\"",
+            r#","next_outer":"0","phase":"outer","progress_last_emitted":"0","protocol_version":1}"#
+        );
+        let digest = sha256(body.as_bytes());
+        let expected = format!(
+            "{},\"state_digest\":\"{digest}\"}}",
+            &body[..body.len() - 1]
+        );
+        let mut record = CheckpointRecord::parse_json(&signed_record(record_fixture())).unwrap();
+        assert_eq!(record.seal_json().unwrap(), expected);
+        let mut changed = record_fixture();
+        changed["state_digest"] = json!(digest);
+        let pretty = serde_json::to_string_pretty(&changed).unwrap();
+        assert_eq!(CheckpointRecord::parse_json(&pretty).unwrap(), record);
+    }
+
+    #[test]
+    fn record_rejects_malformed_fields_even_with_a_valid_digest() {
+        let mut variants = vec![];
+        for (pointer, replacement) in [
+            ("/checkpoint_version", json!(2)),
+            ("/protocol_version", json!(2)),
+            ("/checkpoint_version", json!(1.0)),
+            ("/protocol_version", json!("1")),
+            ("/next_outer", json!("01")),
+            ("/next_outer", json!("-0")),
+            ("/next_outer", json!("+1")),
+            ("/next_outer", json!(format!("{}0", u128::MAX))),
+            ("/evaluations_used", json!("18446744073709551616")),
+            ("/identity", json!("ab")),
+            ("/identity", json!("GG".repeat(32))),
+            ("/identity", json!("AA".repeat(32))),
+            ("/phase", json!("done")),
+            ("/hold", json!({})),
+            ("/elapsed_ms", json!(0)),
+            ("/best", json!({})),
+        ] {
+            let mut value = record_fixture();
+            *value.pointer_mut(pointer).unwrap() = replacement;
+            variants.push(value);
+        }
+        let mut base = record_fixture();
+        base["best"] = entry();
+        base["hold"] = json!([entry()]);
+        for (pointer, replacement) in [
+            ("/best/configuration/slots/0/position", json!("AB")),
+            ("/best/configuration/plugboard", json!([["A"]])),
+            ("/hold/0/incomplete", json!(null)),
+            ("/hold/0/score/measure", json!("unknown")),
+        ] {
+            let mut value = base.clone();
+            *value.pointer_mut(pointer).unwrap() = replacement;
+            variants.push(value);
+        }
+        for object in [
+            "",
+            "/counters",
+            "/best",
+            "/best/score",
+            "/best/configuration",
+            "/best/configuration/slots/0",
+            "/hold/0",
+        ] {
+            let fields = base.pointer(object).unwrap().as_object().unwrap();
+            for key in fields.keys().filter(|key| *key != "state_digest") {
+                let mut value = base.clone();
+                let target = value.pointer_mut(object).unwrap().as_object_mut().unwrap();
+                target.remove(key);
+                variants.push(value);
+            }
+            let mut value = base.clone();
+            value.pointer_mut(object).unwrap()["extra"] = json!(0);
+            variants.push(value);
+        }
+        for pointer in ["/score/measured_q32", "/score/ranking_q32"] {
+            for invalid in ["01", "-0", "+1", "170141183460469231731687303715884105728"] {
+                let mut value = record_fixture();
+                value["best"] = entry();
+                *value["best"].pointer_mut(pointer).unwrap() = json!(invalid);
+                variants.push(value);
+            }
+        }
+        for value in variants {
+            let wire = signed_record(value);
+            let error = CheckpointRecord::parse_json(&wire).unwrap_err();
+            assert!(!error.to_string().is_empty(), "{wire}");
+            assert_ne!(error.to_string(), "state_digest mismatch", "{wire}");
+        }
+        let wire = signed_record(record_fixture());
+        let mut missing_digest: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        missing_digest
+            .as_object_mut()
+            .unwrap()
+            .remove("state_digest");
+        for bad in [
+            wire.replace("\"best\":null", "\"best\":null,\"best\":null"),
+            wire[..wire.len() - 1].to_owned(),
+            format!("{wire} null"),
+            wire.replace("\"state_digest\":\"", "\"state_digest\":\"x"),
+            missing_digest.to_string(),
+        ] {
+            assert!(CheckpointRecord::parse_json(&bad).is_err(), "{bad}");
+        }
+        let tampered = wire.replace("\"outer\"", "\"stages\"");
+        let error = CheckpointRecord::parse_json(&tampered).unwrap_err();
+        assert_eq!(error.to_string(), "state_digest mismatch");
+    }
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
