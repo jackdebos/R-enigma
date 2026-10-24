@@ -32,13 +32,15 @@ class NgramsCLI(unittest.TestCase):
 
     def test_militarization(self):
         cases = [
-            ("Größe 12, Übung.", "GROESSEXEINSXZWOXUEBUNG"),
-            (" äöü ÄÖÜ ßẞ!", "AEOEUEXAEOEUEXSSSS"),
+            ("Größe 12, Übung.", "GROESSEXEINSZWOXUEBUNG"),
+            ("An Panz. Gruppe 4", "ANPANZXGRUPPEXVIER"),
+            (" äöü ÄÖÜ ßẞ!", "AEOEUEAEOEUESSSS"),
             ("Café, naïve\n déjà-vu!", "CAFEXNAIVEXDEJAXVU"),
-            ("Cafe\u0301 a\u0308 O\u0308 u\u0308", "CAFEXAEXOEXUE"),
-            ("A0123456789B", "AXNULLXEINSXZWOXDREIXVIERXFUENFXSECHSXSIEBENXACHTXNEUNXB"),
+            ("Cafe\u0301 a\u0308 O\u0308 u\u0308", "CAFEAEOEUE"),
+            ("A0123456789B", "AXNULLEINSZWODREIVIERFUENFSECHSSIEBENACHTNEUNXB"),
+            ("1 2", "EINSXZWO"),
             (" -- A\t...\nB / C -- ", "AXBXC"),
-            ("123", "EINSXZWOXDREI"),
+            ("123", "EINSZWODREI"),
             ("---", ""),
         ]
         for text, expected in cases:

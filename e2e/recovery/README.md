@@ -27,12 +27,15 @@ inputs cannot be overwritten. See `build --help` and `convert --help` for option
 ## Text and table conventions
 
 Uppercase A-Z, umlauts AE/OE/UE and ß SS; other decomposable diacritics fold to
-base letters. Remaining non-letters become separators. Each punctuation/space
-run, line boundary and file boundary becomes one X, without boundary Xs at the
-start or end. ASCII digits expand individually: 0 NULL, 1 EINS, 2 ZWO, 3 DREI,
-4 VIER, 5 FUENF, 6 SECHS, 7 SIEBEN, 8 ACHT, 9 NEUN, each separated from its
-neighbours by X. For example, `Größe 12, Übung.` becomes
-`GROESSEXEINSXZWOXUEBUNG`.
+base letters. Words run together, as 1941 operators wrote them: spaces and tabs
+are dropped. Each run of punctuation, symbols, line boundaries and file
+boundaries becomes one X, without boundary Xs at the start or end. A number is
+spelled digit by digit as one block (0 NULL, 1 EINS, 2 ZWO, 3 DREI, 4 VIER,
+5 FUENF, 6 SECHS, 7 SIEBEN, 8 ACHT, 9 NEUN) with an X on either side. For
+example, `An Panz. Gruppe 4` becomes `ANPANZXGRUPPEXVIER` and
+`Größe 12, Übung.` becomes `GROESSEXEINSZWOXUEBUNG`. On the Leipzig news corpus
+about 10% of trigrams contain X, against 21% in the enigma1941 table (an X
+between every word would give 44%).
 
 Orders 1–6 count overlapping grams across the complete stream, including Xs.
 Built bomm tables use lowercase grams, two spaces plus right-aligned counts,
@@ -40,14 +43,25 @@ sorted by descending count then gram; JSON uses the engine's v1 resource shape.
 Conversion preserves source table order and validates lowercase grams, unique
 entries and positive u64 counts (one gram/count pair per nonblank line).
 
+## Leipzig tables
+
+`e2e/recovery/fetch_leipzig.sh [CORPUS]` (default `deu_news_2010_1M`, a 254 MB
+download of 1,000,000 German news sentences) writes the archive, its sentences
+and `leipzig-{bigram,trigram}.{txt,json}` to `data/leipzig/`, in about two
+minutes. Reruns reuse the archive and sentences and refuse to replace existing
+tables; delete them by hand to rebuild. The Leipzig Corpora Collection is
+"made available free of charge for private and scientific use under the
+Creative Commons licence CC BY-NC" (wortschatz.uni-leipzig.de/en/usage):
+publishing a derived table needs attribution and stays non-commercial.
+
 ## Layout and source policy
 
 - `ngrams.py`, `test_ngrams.py`: builder/converter and CLI tests.
+- `fetch_leipzig.sh`: Leipzig download and neutral tables.
 - `sources.md`: source URLs and attribution; no copied historical texts.
 - `data/` (**git-ignored**): downloaded corpora, ciphertexts, keys, decrypted
   plaintexts and generated tables. Weierud-derived material is never committed;
   Leipzig-derived tables are not committed for now, pending a publication decision.
 - `results/` (**git-ignored**): generated run reports, not source fixtures.
 
-See [sources.md](sources.md) for provenance. Leipzig licensing must be confirmed
-in T2 before corpus acquisition/use; this scaffold downloads nothing.
+See [sources.md](sources.md) for provenance.

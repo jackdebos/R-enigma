@@ -16,20 +16,34 @@ MAX_COUNT = 2**64 - 1
 
 
 def militarize(text):
-    """Fold German/Latin letters and turn non-letter runs into word boundaries."""
+    """Fold German/Latin letters the way 1941 operators wrote plaintext.
+
+    Words run together; punctuation, symbols and line breaks become X; each
+    number is spelled digit by digit as one block with an X on either side.
+    """
     # Compose first so decomposed umlauts retain German AE/OE/UE spelling.
     text = unicodedata.normalize("NFC", text).upper().translate(UMLAUTS)
     text = unicodedata.normalize("NFKD", text)
     pieces = []
+    previous = ""
     for char in text:
         if unicodedata.category(char).startswith("M"):
             continue
         if "A" <= char <= "Z":
+            if previous == "digit":
+                pieces.append(" ")
             pieces.append(char)
+            previous = "letter"
         elif "0" <= char <= "9":
-            pieces.append(" " + DIGITS[int(char)] + " ")
+            if previous != "digit":
+                pieces.append(" ")
+            pieces.append(DIGITS[int(char)])
+            previous = "digit"
+        elif char in " \t" and previous != "digit":
+            continue
         else:
             pieces.append(" ")
+            previous = ""
     return "X".join("".join(pieces).split())
 
 
