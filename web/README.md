@@ -321,8 +321,7 @@ the engine updates its own checkpoint as specified in protocol §6. Failed state
 writes may leave `state-*.tmp` artifacts for manual inspection. Remove unwanted
 attack directories manually only when no process is using them.
 
-The machine page does not yet expose attack controls; these routes are the runner
-boundary for the forthcoming attack page.
+The Attack view below exposes these routes without requiring hand-written JSON.
 
 ## Machine page
 
@@ -352,6 +351,62 @@ boundary for the forthcoming attack page.
   select the result and copy it manually. Engine rejections show a translated
   explanation and the engine's original message; other failures have friendly copy.
 
+## Attack page
+
+Use the **Machine / Máquina** and **Attack / Ataque** header buttons to switch
+views. The selection is saved in localStorage, independently of the language.
+The engine panel and compatibility notice are shared; switching views or languages
+keeps both forms and the machine result intact.
+
+- Choose a model, reflector and each slot's wheel, ring and starting position.
+  **Unknown / No lo sé** sends JSON `null` for that value. Slots follow catalog
+  order, including the Greek wheel on M4. Initially the wheels and A rings are
+  known, positions are unknown, and plugboard search is checked. Add known cable
+  pairs with the same disjoint-letter editor as the machine page; **Search the
+  rest of the plugboard** keeps those pairs fixed and searches the free letters.
+- Paste ciphertext exactly as published. Offending characters and their 1-based
+  Unicode positions are listed immediately; Start is disabled until they are
+  resolved. **Convert to uppercase** changes the text only when pressed. No
+  trimming, automatic uppercasing, removal or normalization occurs.
+- Changes request a preview after roughly 300 ms, never starting the engine.
+  The preview shows grouped outer-key counts and an approximate duration in
+  seconds, minutes, hours or days, with warnings above one hour and 24 hours.
+  The reference-computer estimate is not a guarantee; the running panel shows
+  observed elapsed time. Unknown wheels include repeats such as I–I–I, with a
+  visible explanation. Errors show translated guidance, server message and field.
+- **Advanced** starts collapsed. Untouched settings are omitted so the server
+  supplies the recommended defaults: hill climb; initial `ic`, final
+  `sinkov_trigram`; reswapping then measure stages on `sinkov_trigram`; 13 maximum
+  pairs, switching 7, backtracking 5, hold 5 and half the logical CPUs. Every
+  parameter has a `?` explanation, including the usually unhelpful left-ring
+  search and how many best candidates hold retains.
+- Advanced exposes HC/PE, PE seeds (all or touching chosen letters), initial/final
+  scores (`ic`, `entropy`, Sinkov monogram through hexagram, `trie`), optional
+  reswapping/measure/dictionary stages and their scores, pair thresholds, hold and
+  threads. Empty numeric fields use defaults. Each table-based score in use gets
+  an absolute own-file path field; bigrams/trigrams have included German 1941
+  tables, other Sinkov scores and trie require own files. Hints explain engine
+  JSON v1 n-gram/dictionary files and `e2e/recovery/ngrams.py convert` for bomm txt
+  n-grams. **Show request JSON** displays the preview request read-only.
+- Only **Start attack** posts to `/api/attack`. It is disabled for invalid text,
+  preview errors, pending estimates, unavailable engine or an already running
+  attack. Opening the page or Attack view fetches the latest attack once. While
+  running, the visible Attack view polls every second; switching away or hiding
+  the browser tab stops polling. The engine continues independently.
+- The last-attack panel shows translated status, outer-key progress with one
+  decimal percent, completed evaluations, elapsed HH:MM:SS and extrapolated ETA
+  (`--:--:--` until one outer completes). **Cancel** requests a safe stop and
+  checkpoint; cancelled/interrupted attacks with a checkpoint offer **Resume**.
+  Failures include translated guidance, the engine message and collapsible
+  stderr. The report/checkpoint directory is always shown for a saved attack.
+  **Load this setup** explicitly fills the form from the saved original input;
+  it never starts an attack or overwrites the form automatically.
+- Ranked results use `result.hold` (or `best` as fallback), showing measured score
+  and measure ID, full reflector/slot key in configuration order, complete
+  plugboard and plaintext in blocks of five. Each plaintext has a Copy button.
+  Cancelled results are labelled partial. No results are invented before the
+  engine supplies them.
+
 All page copy and hints live in `static/i18n/{es,en}.json` with matching keys.
 `static/logic.js` contains DOM-free validation, request building and dictionary
 lookup with an English fallback. The server embeds only runtime assets; Node test
@@ -380,7 +435,11 @@ node --test web/static/
 `static/package.json` declares ES modules and points the directory runner at
 `logic.test.mjs`; it has no dependencies and is not embedded. The tests cover text
 validation, lowercase detection, disjoint plugboard pairs, unmodified request
-building for each model, language selection and dictionary fallback.
+building for each model, language selection and dictionary fallback. Attack tests
+also cover unknown-to-null conversion, changed-only advanced settings, exact text,
+saved-input round trips, duration unit boundaries, decimal-string progress and
+ETA, hold/best extraction and five-symbol grouping. Browser end-to-end checks are
+separate; Node tests need no DOM, browser, framework or packages.
 
 ## Architecture and next steps
 

@@ -55,6 +55,25 @@ fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
 .lamps { display: flex; flex-wrap: wrap; gap: .4rem; max-width: 42rem; }
 .lamp { display: grid; place-items: center; border-radius: 50%; width: 2rem; height: 2rem; font: bold 1rem ui-monospace, monospace; background: #dce1d5; border: 2px solid #7f8e7e; }
 .lamp.lit { background: #ffe5a0; border-color: #9b6c17; color: #4c3a0c; box-shadow: 0 0 8px #d7ab4a80; }
+header { flex-wrap: wrap; }
+nav, .attack-actions { display: flex; gap: .5rem; flex-wrap: wrap; }
+nav button[aria-pressed="false"] { background: #f4f0de; color: #334b3e; }
+.advanced-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: .8rem; margin: 1rem 0; }
+#attack-settings > fieldset > details { margin: 1.25rem 0; padding: .75rem; border: 1px solid #ced7ca; border-radius: .5rem; }
+#attack-settings summary, #attack-last summary { cursor: pointer; font-weight: 600; }
+#attack-settings input[type="checkbox"] { width: 1.15rem; height: 1.15rem; flex: 0 0 auto; }
+#attack-settings .field > select, #attack-settings .field > input { width: 100%; }
+#attack-text-errors { border: 1px solid #d1a392; border-radius: .4rem; padding: .5rem 1rem; }
+.offending-list { max-height: 15rem; overflow: auto; }
+#attack-preview { margin: 1.25rem 0; }
+.strong-notice { border-color: #993b2b; background: #f9e2d6; font-weight: 600; }
+#attack-last { margin-top: 2rem; border-top: 1px solid #ced7ca; padding-top: 1.5rem; overflow-wrap: anywhere; }
+#attack-last progress { width: 100%; height: 1.5rem; }
+#attack-last pre, #attack-request { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 25rem; overflow: auto; background: #edf0e9; padding: .75rem; font-size: .85rem; }
+.attack-results { padding-left: 1.5rem; }
+.attack-results li { margin-top: 1rem; padding: .75rem; border: 1px solid #ced7ca; border-radius: .5rem; }
+.attack-results p { margin: .5rem 0; }
+.attack-results button { margin-top: .5rem; }
 [hidden] { display: none !important; }
 @media (max-width: 600px) {
   body { padding: .75rem; }

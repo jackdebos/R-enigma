@@ -11,6 +11,7 @@
 <body>
   <header>
     <div><h1 data-i18n="title"></h1><p data-i18n="subtitle"></p></div>
+    <nav><button type="button" id="view-machine" data-i18n="view_machine" aria-pressed="true"></button><button type="button" id="view-attack" data-i18n="view_attack" aria-pressed="false"></button></nav>
     <label><span data-i18n="language"></span>
       <select id="language">
         <option value="es" data-i18n="language_es"></option>
@@ -28,10 +29,11 @@
       </form>
       <p id="engine-status" role="status" aria-live="polite"></p>
     </section>
+    <p id="blocker" class="notice" data-i18n="blocker"></p>
+    <div id="machine-view">
     <section aria-labelledby="machine-title">
       <h2 id="machine-title" data-i18n="machine_title"></h2>
       <p class="hint" data-i18n="machine_intro"></p>
-      <p id="blocker" class="notice" data-i18n="blocker"></p>
       <p id="catalog-error" role="alert" hidden></p>
       <fieldset id="machine" disabled hidden>
         <div class="model-row"><div id="model-field"></div><div id="reflector-field"></div></div>
@@ -62,6 +64,12 @@
         <div id="lamps" class="lamps" aria-hidden="true"></div>
         <p class="hint" data-i18n="lamps_hint"></p>
       </div>
+    </section>
+    </div>
+    <section id="attack-view" aria-labelledby="attack-title" hidden>
+      <h2 id="attack-title" data-i18n="attack_title"></h2>
+      <div id="attack-form"></div>
+      <div id="attack-last" aria-live="polite"></div>
     </section>
   </main>
 </body>

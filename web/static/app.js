@@ -1,4 +1,4 @@
-import { checkText, validatePair, buildRequest, lookup, initialLanguage } from './logic.js';
+import { checkText, validatePair, buildRequest, lookup, initialLanguage, buildAttackBody, parseAttackInput, estimateDuration, progressInfo, holdEntries, groupFive } from './logic.js';
 
 const $ = id => document.getElementById(id);
 const alphabet = Array.from('ABCDEFGHIJKLMNOPQRSTUVWXYZ');
@@ -72,6 +72,7 @@ function updateAvailability() {
   $('path').disabled = working || engineBusy;
   $('text').disabled = working;
   $('uppercase').disabled = working;
+  updateAttackAvailability();
 }
 function showEngine(state) {
   if (state.error) errorMessage('engine-status', { data: state });
@@ -92,7 +93,7 @@ function heading(container, key, hintKey) {
   row.append(element('span', t(key)), help(key, hintKey));
   container.append(row);
 }
-function selectField(container, { id, key, hint, values, value, optionKey, change, disabled = [] }) {
+function selectField(container, { id, key, hint, values, value, optionKey, change, disabled = [], clear = true }) {
   const row = element('div', undefined, 'field-heading');
   const label = element('label', t(key));
   label.htmlFor = id;
@@ -107,7 +108,7 @@ function selectField(container, { id, key, hint, values, value, optionKey, chang
     select.append(option);
   }
   select.value = value;
-  select.addEventListener('change', () => { change(select.value); clearResult(); });
+  select.addEventListener('change', () => { change(select.value); if (clear) clearResult(); });
   container.append(row, select);
   return select;
 }
@@ -202,11 +203,14 @@ function translatePage() {
   renderMachine();
   renderTextCheck();
   updateAvailability();
+  renderAttack();
+  renderAttackLast();
 }
 async function loadCatalog() {
   try {
     models = (await api('/api/machines')).models;
     chooseModel(models[0].id);
+    if (!attackState) { chooseAttackModel(models[0].id); renderAttack(); attackChanged(); }
     $('catalog-error').hidden = true;
   } catch (failure) {
     errorMessage('catalog-error', failure);
@@ -328,6 +332,415 @@ async function init() {
   message('engine-status', 'loading');
   await Promise.all([loadEngine(), loadCatalog()]);
   updateAvailability();
+  initAttack();
+}
+
+// Attack state stays separate from the machine form. Only explicit Start runs an engine.
+const measures = ['ic', 'entropy', 'sinkov_monogram', 'sinkov_bigram', 'sinkov_trigram', 'sinkov_quadgram', 'sinkov_pentagram', 'sinkov_hexagram', 'trie'];
+const defaultStages = [{ pass: 'reswapping', measure: 'sinkov_trigram' }, { pass: 'measure', measure: 'sinkov_trigram' }];
+let attackState = null;
+let attackView = false;
+let preview = null;
+let previewFailure = null;
+let previewTimer;
+let previewVersion = 0;
+let previewPending = true;
+let attackLast = null;
+let attackFailure = null;
+let attackBusy = false;
+let pollTimer;
+let pollInFlight = false;
+let attackVersion = 0;
+let advancedOpen = false;
+let requestOpen = false;
+
+function chooseAttackModel(id) {
+  const model = models.find(item => item.id === id);
+  attackState = {
+    model: id, reflector: model.reflectors[0],
+    slots: model.slots.map((slot, i) => ({ id: slot.id,
+      wheel: slot.allowed_wheels[slot.id === 'greek' ? 0 : i - (model.slots[0].id === 'greek' ? 1 : 0)],
+      ring: 'A', position: '',
+    })), plugboard: [], search: true, text: attackState?.text || '', advanced: {},
+  };
+}
+function attackIssue(failure) {
+  if (failure.network) return t('error_network');
+  if (failure.status === 401) return t('error_unauthorized');
+  const issue = failure.data?.error || failure;
+  const key = `error_${issue.code}`;
+  const engineKey = `engine_error_${issue.code}`;
+  const reason = dictionaries.en[key] ? t(key) : dictionaries.en[engineKey] ? t(engineKey) : t('error_generic');
+  return `${reason} ${issue.message || ''}${issue.field ? ` (${issue.field})` : ''}`;
+}
+function attackSelect(parent, key, values, value, change, { unknown = false, optionKey, hint = `${key}_hint`, id = `attack-${key}` } = {}) {
+  const container = element('div', undefined, 'field');
+  const select = selectField(container, { id, key, hint, values: unknown ? ['', ...values] : values,
+    value: value ?? '', optionKey, clear: false, change });
+  if (unknown) select.options[0].textContent = t('unknown');
+  parent.append(container);
+  return select;
+}
+function attackInput(parent, key, value, change, { type = 'text', placeholder = '', id = `attack-${key}`, hint = `${key}_hint`, min, max } = {}) {
+  const container = element('div', undefined, 'field');
+  const row = element('div', undefined, 'field-heading');
+  const label = element('label', t(key));
+  label.htmlFor = id;
+  row.append(label, help(key, hint));
+  const input = element('input');
+  input.id = id;
+  input.type = type;
+  input.value = value;
+  input.placeholder = placeholder;
+  input.spellcheck = false;
+  if (min !== undefined) input.min = min;
+  if (max !== undefined) input.max = max;
+  input.addEventListener('input', () => change(input.value));
+  container.append(row, input);
+  parent.append(container);
+  return input;
+}
+function attackCheckbox(parent, key, checked, change, id = `attack-${key}`) {
+  const row = element('div', undefined, 'field-heading');
+  const input = element('input');
+  input.type = 'checkbox'; input.id = id; input.checked = checked;
+  const label = element('label', t(key)); label.htmlFor = id;
+  input.addEventListener('change', () => change(input.checked));
+  row.append(input, label, help(key, `${key}_hint`));
+  parent.append(row);
+  return input;
+}
+function attackChanged() {
+  // Resource overrides are meaningful only for measures currently in use.
+  if (attackState.advanced.tables) {
+    const used = attackMeasures();
+    attackState.advanced.tables = Object.fromEntries(Object.entries(attackState.advanced.tables).filter(([measure]) => used.includes(measure)));
+  }
+  previewPending = true;
+  preview = null;
+  previewFailure = null;
+  const version = ++previewVersion;
+  clearTimeout(previewTimer);
+  renderAttackTextCheck();
+  renderAttackPreview();
+  updateAttackAvailability();
+  previewTimer = setTimeout(() => loadAttackPreview(version), 300);
+}
+async function loadAttackPreview(version) {
+  const body = buildAttackBody(attackState);
+  try {
+    const data = await api('/api/attack/preview', body);
+    if (version !== previewVersion) return;
+    preview = data;
+  } catch (failure) {
+    if (version !== previewVersion) return;
+    previewFailure = failure;
+  } finally {
+    if (version === previewVersion) {
+      previewPending = false;
+      renderAttackPreview();
+      updateAttackAvailability();
+    }
+  }
+}
+function attackMeasures() {
+  const settings = attackState.advanced;
+  const used = [settings.initial_measure || 'ic', settings.final_measure || 'sinkov_trigram'];
+  for (const stage of settings.stages ?? defaultStages) {
+    if (stage.pass === 'trie') used.push('trie');
+    if (stage.pass !== 'trie') used.push(stage.measure || (stage.pass === 'reswapping' ? 'sinkov_trigram' : 'ic'));
+    if (stage.base_measure) used.push(stage.base_measure);
+  }
+  return [...new Set(used.filter(measure => measure.startsWith('sinkov_') || measure === 'trie'))];
+}
+function renderAttackAdvanced(parent) {
+  const details = element('details');
+  details.open = advancedOpen;
+  details.append(element('summary', t('advanced')));
+  details.addEventListener('toggle', () => { advancedOpen = details.open; });
+  const fields = element('div', undefined, 'advanced-grid');
+  const settings = attackState.advanced;
+  attackSelect(fields, 'method', ['hill_climb', 'partial_exhaustion'], settings.method || 'hill_climb', value => {
+    settings.method = value; delete settings.seeds;
+    attackChanged(); renderAttack();
+  }, { optionKey: 'method' });
+  if (settings.method === 'partial_exhaustion') {
+    attackSelect(fields, 'seeds', ['all', 'touching'], settings.seeds ? 'touching' : 'all', value => {
+      if (value === 'all') delete settings.seeds;
+      else settings.seeds = [];
+      attackChanged(); renderAttack();
+    }, { optionKey: 'seeds' });
+    if (settings.seeds) attackInput(fields, 'seed_letters', settings.seeds.join(''), value => { settings.seeds = Array.from(value); attackChanged(); });
+  }
+  for (const [key, fallback] of [['initial_measure', 'ic'], ['final_measure', 'sinkov_trigram']]) {
+    attackSelect(fields, key, measures, settings[key] || fallback, value => { settings[key] = value; attackChanged(); renderAttack(); });
+  }
+  const stages = element('div', undefined, 'stage-fields');
+  heading(stages, 'stages', 'stages_hint');
+  for (const pass of ['reswapping', 'measure', 'trie']) {
+    const selected = (settings.stages ?? defaultStages).find(stage => stage.pass === pass);
+    attackCheckbox(stages, `stage_${pass}`, Boolean(selected), checked => {
+      const list = structuredClone(settings.stages ?? defaultStages).filter(stage => stage.pass !== pass);
+      if (checked) list.push(pass === 'trie' ? { pass, base_measure: 'sinkov_trigram' } : { pass, measure: 'sinkov_trigram' });
+      settings.stages = ['reswapping', 'measure', 'trie'].flatMap(name => list.filter(stage => stage.pass === name));
+      attackChanged(); renderAttack();
+    });
+    if (selected) {
+      const key = pass === 'trie' ? 'base_measure' : 'stage_score';
+      const member = pass === 'trie' ? 'base_measure' : 'measure';
+      const values = pass === 'trie' ? ['', ...measures] : measures;
+      const select = attackSelect(stages, key, values, selected[member] ?? (pass === 'trie' ? '' : pass === 'measure' ? 'ic' : 'sinkov_trigram'), value => {
+        const list = structuredClone(settings.stages ?? defaultStages);
+        const stage = list.find(stage => stage.pass === pass);
+        if (value) stage[member] = value; else delete stage[member];
+        settings.stages = list;
+        attackChanged(); renderAttack();
+      }, { id: `attack-${pass}-measure` });
+      if (pass === 'trie') select.options[0].textContent = t('previous_measure');
+    }
+  }
+  details.append(fields, stages);
+  const numbers = element('div', undefined, 'advanced-grid');
+  for (const [key, placeholder, min, max] of [['max_pairs', '13', 0, 13], ['switch_pairs', '7', 0, 13], ['backtrack_pairs', '5', 0, 13], ['hold', '5', 1, 1000], ['threads', t('threads_default'), 1, 256]]) {
+    attackInput(numbers, key, settings[key] ?? '', value => { if (value === '') delete settings[key]; else settings[key] = value; attackChanged(); }, { type: 'number', placeholder, min, max });
+  }
+  details.append(numbers, element('p', t('table_format'), 'hint'));
+  const tables = element('div', undefined, 'advanced-grid');
+  for (const measure of attackMeasures()) {
+    const input = attackInput(tables, 'own_table', settings.tables?.[measure] || '', value => {
+      settings.tables ||= {};
+      settings.tables[measure] = value;
+      attackChanged();
+    }, { id: `attack-table-${measure}`, placeholder: ['sinkov_bigram', 'sinkov_trigram'].includes(measure) ? t('builtin_table') : t('table_required') });
+    input.previousElementSibling.querySelector('label').textContent = `${t('own_table')} · ${measure}`;
+  }
+  details.append(tables);
+  parent.append(details);
+}
+function renderAttack() {
+  if (!attackState) return;
+  const root = $('attack-form');
+  root.replaceChildren();
+  const model = models.find(model => model.id === attackState.model);
+  const form = element('form'); form.id = 'attack-settings';
+  const controls = element('fieldset'); controls.id = 'attack-controls';
+  const modelRow = element('div', undefined, 'model-row');
+  attackSelect(modelRow, 'model', models.map(model => model.id), attackState.model, value => { chooseAttackModel(value); attackChanged(); renderAttack(); }, { optionKey: 'model' });
+  attackSelect(modelRow, 'reflector', model.reflectors, attackState.reflector, value => { attackState.reflector = value; attackChanged(); }, { unknown: true, optionKey: 'reflector' });
+  controls.append(modelRow);
+  const rotors = element('div', undefined, 'rotors');
+  attackState.slots.forEach((slot, i) => {
+    const block = element('div', undefined, 'rotor'); block.append(element('h3', t(`slot_${slot.id}`)));
+    for (const [key, values, optionKey] of [['wheel', model.slots[i].allowed_wheels, 'wheel'], ['ring', alphabet], ['position', alphabet]]) {
+      attackSelect(block, key, values, slot[key], value => { slot[key] = value; attackChanged(); }, {
+        unknown: true, optionKey, id: `attack-${slot.id}-${key}`, hint: key === 'ring' ? 'attack_ring_hint' : `${key}_hint`,
+      });
+    }
+    rotors.append(block);
+  });
+  controls.append(rotors);
+  heading(controls, 'plugboard', 'attack_plugboard_hint');
+  const pairs = element('div'); pairs.id = 'attack-pairs-editor'; controls.append(pairs);
+  attackCheckbox(controls, 'search_plugboard', attackState.search, checked => { attackState.search = checked; attackChanged(); });
+  const textRow = element('div', undefined, 'field-heading');
+  const textLabel = element('label', t('ciphertext')); textLabel.htmlFor = 'attack-text';
+  textRow.append(textLabel, help('ciphertext', 'ciphertext_hint'));
+  const text = element('textarea'); text.id = 'attack-text'; text.rows = 5;
+  text.value = attackState.text; text.spellcheck = false;
+  text.setAttribute('autocapitalize', 'off'); text.autocomplete = 'off';
+  text.addEventListener('input', () => { attackState.text = text.value; attackChanged(); });
+  const errors = element('div'); errors.id = 'attack-text-errors'; errors.setAttribute('role', 'alert');
+  const uppercase = element('button', t('uppercase')); uppercase.type = 'button'; uppercase.id = 'attack-uppercase';
+  uppercase.addEventListener('click', () => { attackState.text = text.value.toUpperCase(); text.value = attackState.text; attackChanged(); });
+  controls.append(textRow, text, errors, uppercase);
+  renderAttackAdvanced(controls);
+  const estimate = element('div'); estimate.id = 'attack-preview'; estimate.setAttribute('aria-live', 'polite');
+  const requestDetails = element('details'); requestDetails.open = requestOpen;
+  requestDetails.append(element('summary', t('show_request')));
+  requestDetails.addEventListener('toggle', () => { requestOpen = requestDetails.open; });
+  const request = element('pre'); request.id = 'attack-request'; request.tabIndex = 0;
+  requestDetails.append(request);
+  const failure = element('p'); failure.id = 'attack-action-error'; failure.setAttribute('role', 'alert');
+  const start = element('button', t('attack_start')); start.id = 'attack-start'; start.type = 'submit';
+  controls.append(estimate, requestDetails, failure, start);
+  form.append(controls);
+  form.addEventListener('submit', event => {
+    event.preventDefault();
+    if (!$('attack-start').disabled) attackAction('/api/attack', buildAttackBody(attackState));
+  });
+  root.append(form);
+  renderAttackPairs(); renderAttackTextCheck(); renderAttackPreview(); updateAttackAvailability();
+}
+function renderAttackPairs() {
+  const root = $('attack-pairs-editor');
+  const previous = [$('attack-first')?.value, $('attack-second')?.value];
+  root.replaceChildren();
+  const row = element('div', undefined, 'pairs-editor');
+  const used = attackState.plugboard.flat();
+  const available = alphabet.filter(letter => !used.includes(letter));
+  ['first', 'second'].forEach((id, index) => {
+    const select = attackSelect(row, `${id}_letter`, alphabet, available.includes(previous[index]) ? previous[index] : available[index] || '', () => {}, { id: `attack-${id}`, hint: 'attack_plugboard_hint' });
+    for (const option of select.options) option.disabled = used.includes(option.value);
+    select.disabled = available.length === 0;
+  });
+  const add = element('button', t('add_pair')); add.type = 'button'; add.disabled = !available.length;
+  const error = element('p'); error.setAttribute('role', 'alert');
+  add.addEventListener('click', () => {
+    const first = $('attack-first').value, second = $('attack-second').value;
+    const issue = validatePair(attackState.plugboard, first, second);
+    if (issue) { error.textContent = t(issue); return; }
+    attackState.plugboard.push([first, second]); attackChanged(); renderAttackPairs();
+  });
+  row.append(add);
+  const list = element('ul', undefined, 'pairs');
+  attackState.plugboard.forEach(([first, second], index) => {
+    const item = element('li'); const remove = element('button', t('remove_pair', { first, second })); remove.type = 'button';
+    remove.addEventListener('click', () => { attackState.plugboard.splice(index, 1); attackChanged(); renderAttackPairs(); });
+    item.append(remove); list.append(item);
+  });
+  root.append(row, error, element('p', t('pair_count', { count: attackState.plugboard.length }), 'hint'), list);
+}
+function renderAttackTextCheck() {
+  if (!$('attack-text-errors')) return;
+  const check = checkText(attackState.text);
+  const errors = $('attack-text-errors'); errors.replaceChildren(); errors.hidden = !check.offending.length;
+  if (check.offending.length) {
+    errors.append(element('p', t('invalid_text_intro')));
+    const list = element('ul', undefined, 'offending-list');
+    for (const { character, position } of check.offending) list.append(element('li', t('offending', { character: characterLabel(character), position })));
+    errors.append(list);
+  }
+  $('attack-uppercase').hidden = !check.hasLowercase;
+}
+function groupedNumber(value) {
+  try { return BigInt(value ?? 0).toLocaleString(language); } catch { return String(value ?? 0); }
+}
+function renderAttackPreview() {
+  if (!$('attack-preview')) return;
+  const root = $('attack-preview'); root.replaceChildren();
+  if (previewPending) root.append(element('p', t('preview_loading'), 'hint'));
+  else if (previewFailure) {
+    const error = element('p', attackIssue(previewFailure)); error.setAttribute('role', 'alert'); root.append(error);
+  } else if (preview) {
+    const duration = estimateDuration(preview.estimate_seconds);
+    root.append(element('p', t('key_count', { count: groupedNumber(preview.outer_keys) })),
+      element('p', t('estimate_time', { value: duration.value.toLocaleString(language), unit: t(`duration_${duration.unit}`) })),
+      element('p', t('estimate_hint'), 'hint'));
+    if (preview.estimate_seconds > 3600) root.append(element('p', t(preview.estimate_seconds > 86400 ? 'estimate_very_long' : 'estimate_long'), preview.estimate_seconds > 86400 ? 'notice strong-notice' : 'notice'));
+  }
+  if (attackState.slots.some(slot => !slot.wheel)) root.append(element('p', t('repeated_wheels'), 'hint'));
+  $('attack-request').textContent = preview ? JSON.stringify(preview.request, null, 2) : '';
+}
+function updateAttackAvailability() {
+  if (!$('attack-start')) return;
+  const ready = Boolean(savedEngine?.configured && savedEngine?.compatible);
+  $('attack-controls').disabled = attackBusy;
+  $('attack-start').disabled = !ready || engineBusy || attackBusy || attackLast?.status === 'running' || previewPending || !preview || Boolean(previewFailure) || checkText(attackState.text).offending.length > 0;
+  $('attack-action-error').textContent = attackFailure ? attackIssue(attackFailure) : '';
+}
+async function attackAction(path, body = {}) {
+  if (attackBusy) return;
+  attackVersion++;
+  attackBusy = true; attackFailure = null; updateAttackAvailability(); renderAttackLast();
+  try {
+    attackLast = (await api(path, body)).attack;
+  } catch (failure) { attackFailure = failure; }
+  finally { attackBusy = false; updateAttackAvailability(); renderAttackLast(); scheduleAttackPoll(); }
+}
+function renderAttackLast() {
+  const root = $('attack-last');
+  if (!root) return;
+  root.replaceChildren();
+  root.append(element('h2', t('last_attack')));
+  if (attackFailure) {
+    const error = element('p', attackIssue(attackFailure)); error.setAttribute('role', 'alert'); root.append(error);
+  }
+  if (!attackLast) { root.append(element('p', t('no_attack'), 'hint')); return; }
+  const attack = attackLast;
+  root.append(element('h3', t(`status_${attack.status}`)), element('p', t('attack_directory', { directory: attack.directory })));
+  const progress = progressInfo(attack);
+  const bar = element('progress'); bar.max = 100; bar.value = Number(progress.percent);
+  bar.setAttribute('aria-label', t('attack_progress')); bar.textContent = `${progress.percent}%`;
+  root.append(bar, element('p', t('progress_counts', { percent: progress.percent, completed: groupedNumber(progress.completed), selected: groupedNumber(progress.selected) })),
+    element('p', t('progress_times', { elapsed: progress.elapsed, eta: progress.eta, evaluations: groupedNumber(progress.evaluations) })));
+  const actions = element('div', undefined, 'attack-actions');
+  function action(key, callback) {
+    const button = element('button', t(key)); button.type = 'button'; button.disabled = attackBusy;
+    button.addEventListener('click', callback); actions.append(button);
+  }
+  if (attack.status === 'running') {
+    action('attack_cancel', () => attackAction('/api/attack/cancel'));
+    root.append(element('p', t('cancel_hint'), 'hint'));
+  }
+  if (['cancelled', 'interrupted'].includes(attack.status) && attack.resumable) action('attack_resume', () => attackAction('/api/attack/resume'));
+  if (attack.input) action('load_setup', () => {
+    attackState = parseAttackInput(attack.input); attackFailure = null; attackChanged(); renderAttack();
+  });
+  root.append(actions);
+  if (attack.error) {
+    const error = element('p', attackIssue(attack.error)); error.setAttribute('role', 'alert'); root.append(error);
+  }
+  if (attack.status === 'failed' || attack.stderr) {
+    const details = element('details'); details.append(element('summary', t('engine_stderr')), element('pre', attack.stderr || t('no_stderr'))); root.append(details);
+  }
+  if (attack.status === 'cancelled') root.append(element('p', t('partial_results'), 'notice'));
+  const list = element('ol', undefined, 'attack-results');
+  for (const entry of holdEntries(attack.result)) {
+    const candidate = entry;
+    const item = element('li');
+    item.append(element('h3', t('candidate_score', { score: candidate.score?.measured ?? '—', measure: candidate.score?.measure ?? '—' })));
+    const slots = candidate.configuration?.slots || [];
+    for (const [key, member] of [['wheels', 'wheel'], ['rings', 'ring'], ['positions', 'position']]) {
+      item.append(element('p', t(`result_${key}`, { value: slots.map(slot => `${t(`slot_${slot.id}`)}: ${slot[member]}`).join(' · ') })));
+    }
+    item.append(element('p', t('result_plugboard', { value: candidate.configuration?.plugboard?.map(pair => pair.join('–')).join(' ') || t('no_pairs') })));
+    const plaintext = element('textarea'); plaintext.readOnly = true; plaintext.rows = 4;
+    plaintext.value = groupFive(candidate.plaintext || ''); plaintext.setAttribute('aria-label', t('plaintext'));
+    const copy = element('button', t('copy')); copy.type = 'button';
+    const status = element('p'); status.setAttribute('role', 'status');
+    copy.addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(plaintext.value); status.textContent = t('copied'); }
+      catch { status.textContent = t('copy_failed'); }
+    });
+    item.append(plaintext, copy, status); list.append(item);
+  }
+  root.append(list);
+}
+function scheduleAttackPoll() {
+  clearTimeout(pollTimer);
+  if (attackView && !document.hidden && attackLast?.status === 'running') pollTimer = setTimeout(loadAttackLast, 1000);
+}
+async function loadAttackLast() {
+  if (pollInFlight) return;
+  pollInFlight = true;
+  const version = attackVersion;
+  try {
+    const data = await api('/api/attack');
+    if (version === attackVersion) { attackLast = data.attack; attackFailure = null; }
+  } catch (failure) { if (version === attackVersion) attackFailure = failure; }
+  finally { pollInFlight = false; renderAttackLast(); updateAttackAvailability(); scheduleAttackPoll(); }
+}
+function selectView(attack, load = true) {
+  attackView = attack;
+  $('machine-view').hidden = attack;
+  $('attack-view').hidden = !attack;
+  $('view-machine').setAttribute('aria-pressed', String(!attack));
+  $('view-attack').setAttribute('aria-pressed', String(attack));
+  try { localStorage.setItem('enigma-view', attack ? 'attack' : 'machine'); } catch { /* Optional preference only. */ }
+  clearTimeout(pollTimer);
+  if (attack && load) loadAttackLast();
+}
+function initAttack() {
+  let saved;
+  try { saved = localStorage.getItem('enigma-view'); } catch { /* Optional preference only. */ }
+  selectView(saved === 'attack', false);
+  $('view-machine').addEventListener('click', () => selectView(false));
+  $('view-attack').addEventListener('click', () => selectView(true));
+  document.addEventListener('visibilitychange', () => {
+    clearTimeout(pollTimer);
+    if (!document.hidden && attackView) loadAttackLast();
+  });
+  loadAttackLast();
 }
 
 await init();
