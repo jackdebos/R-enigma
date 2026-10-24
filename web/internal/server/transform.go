@@ -145,16 +145,11 @@ func (s *Server) serveTransform(w http.ResponseWriter, r *http.Request) {
 		apiIssue(w, status, code, err.Error())
 		return
 	}
-	// Only ASCII case is changed. Whitespace, punctuation and non-ASCII scalars
-	// reach the engine unchanged, which rejects symbols outside its alphabet.
-	text := []byte(*input.Text)
-	for i, b := range text {
-		if b >= 'a' && b <= 'z' {
-			text[i] = b - ('a' - 'A')
-		}
-	}
+	// The text reaches the engine exactly as typed; the engine rejects any
+	// symbol outside its alphabet, including lowercase letters.
+	text := *input.Text
 	slots := append([]transformSlot{{ID: "reflector", Wheel: input.Reflector, Ring: "A", Position: "A"}}, input.Slots...)
-	request := map[string]any{"protocol_version": 1, "machine": map[string]any{"definition": map[string]string{"kind": "bundled", "id": model.DefinitionID}}, "job": map[string]any{"kind": "transform", "direction": "encrypt", "text": string(text), "configuration": map[string]any{"slots": slots, "plugboard": input.Plugboard}}}
+	request := map[string]any{"protocol_version": 1, "machine": map[string]any{"definition": map[string]string{"kind": "bundled", "id": model.DefinitionID}}, "job": map[string]any{"kind": "transform", "direction": "encrypt", "text": text, "configuration": map[string]any{"slots": slots, "plugboard": input.Plugboard}}}
 	data, err := json.Marshal(request)
 	if err != nil {
 		apiIssue(w, 500, "internal_error", "Could not build engine request.")

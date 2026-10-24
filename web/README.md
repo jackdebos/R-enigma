@@ -130,7 +130,7 @@ These routes use the same cookie authentication and Host/Origin guards:
 Example body (all members required, no unknown fields, maximum 1 MiB):
 
 ```json
-{"model":"enigma-i","reflector":"B","slots":[{"id":"left","wheel":"I","ring":"A","position":"A"},{"id":"middle","wheel":"II","ring":"A","position":"A"},{"id":"right","wheel":"III","ring":"A","position":"A"}],"plugboard":[],"text":"hello"}
+{"model":"enigma-i","reflector":"B","slots":[{"id":"left","wheel":"I","ring":"A","position":"A"},{"id":"middle","wheel":"II","ring":"A","position":"A"},{"id":"right","wheel":"III","ring":"A","position":"A"}],"plugboard":[],"text":"HELLO"}
 ```
 
 Slots must follow catalog order; rings/positions and disjoint plugboard endpoints
@@ -140,10 +140,11 @@ reciprocal, so the same operation also decrypts from the same initial settings).
 It does not impose distinct-wheel or historical operational-key restrictions that
 the engine catalog does not enforce.
 
-**Text rule:** only ASCII `a`–`z` becomes `A`–`Z`. Everything else is sent exactly as
-entered, including spaces, newlines, punctuation and non-ASCII characters. The
-engine rejects any character outside A–Z with `invalid_text`; neither side silently
-drops characters. Remove separators yourself when entering grouped ciphertext.
+**Text rule:** the text is sent to the engine exactly as typed; nothing is uppercased,
+removed or replaced. The bundled machines use the 26 uppercase letters A–Z, so the
+engine rejects lowercase letters, spaces, digits, punctuation and any other symbol with
+`invalid_text` before any work starts. Converting text (for example to uppercase) is
+always an explicit user action on the page, never automatic.
 Empty text is allowed. Each request starts from the supplied initial positions.
 
 The server revalidates the saved engine before running it directly, without a shell,

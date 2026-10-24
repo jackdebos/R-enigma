@@ -86,7 +86,7 @@ func TestTransform(t *testing.T) {
 			if err := json.Unmarshal(data, &req); err != nil {
 				t.Fatal(err)
 			}
-			if req.Protocol != 1 || req.Machine.Definition.Kind != "bundled" || req.Machine.Definition.ID != "enigma-i" || req.Job.Kind != "transform" || req.Job.Direction != "encrypt" || req.Job.Text != "AZ é!?\n" || len(req.Job.Configuration.Slots) != 4 || req.Job.Configuration.Slots[0]["wheel"] != "B" || req.Job.Configuration.Slots[0]["position"] != "A" || req.Job.Configuration.Plugboard == nil {
+			if req.Protocol != 1 || req.Machine.Definition.Kind != "bundled" || req.Machine.Definition.ID != "enigma-i" || req.Job.Kind != "transform" || req.Job.Direction != "encrypt" || req.Job.Text != "aZ é!?\n" || len(req.Job.Configuration.Slots) != 4 || req.Job.Configuration.Slots[0]["wheel"] != "B" || req.Job.Configuration.Slots[0]["position"] != "A" || req.Job.Configuration.Plugboard == nil {
 				t.Fatalf("request=%s", data)
 			}
 			if got := engineRequest(t, s, u, c, "GET", "", 200, ""); got.Path != path {
@@ -212,7 +212,7 @@ func TestRealHistoricalTransform(t *testing.T) {
 		text     string
 		status   int
 		expected string
-	}{{body, 200, `"output":"WER"`}, {strings.Replace(body, `"sud"`, `"su d!"`, 1), 422, `"code":"invalid_text"`}} {
+	}{{strings.Replace(body, `"sud"`, `"SUD"`, 1), 200, `"output":"WER"`}, {body, 422, `symbol 's' is not in the machine alphabet`}, {strings.Replace(body, `"sud"`, `"SU D!"`, 1), 422, `"code":"invalid_text"`}} {
 		r := httptest.NewRequest("POST", "/api/transform", strings.NewReader(tc.text))
 		r.Host = u.Host
 		r.Header.Set("Origin", "http://"+u.Host)
