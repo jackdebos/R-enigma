@@ -39,7 +39,13 @@ func run(ctx context.Context, port int, noBrowser bool) error {
 		return err
 	}
 	defer listener.Close()
-	handler, err := server.New(listener.Addr().(*net.TCPAddr).Port)
+	var handler *server.Server
+	// Test aid: avoid reading or writing the real user's engine configuration.
+	if config := os.Getenv("ENIGMA_WEB_CONFIG"); config != "" {
+		handler, err = server.NewWithConfig(listener.Addr().(*net.TCPAddr).Port, config)
+	} else {
+		handler, err = server.New(listener.Addr().(*net.TCPAddr).Port)
+	}
 	if err != nil {
 		return err
 	}
