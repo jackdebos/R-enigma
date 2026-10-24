@@ -35,13 +35,228 @@ search support.
 | `stdio` (default) | TUI, scripts, tests | — | 1 |
 | local listener | web client | `--listen 127.0.0.1:<port>` | 2 (planned) |
 
-`stdout` contains one JSON object per line (JSONL), without embedded newlines.
-Diagnostics go to `stderr`. Stage 1 accepts a positional request file path,
-`--request <path>` for a file, or `--request -` for stdin. Optional
-`--cancel-file <path>` (§5) and `--threads <n>` (§5) pairs may precede or follow that
-input form, in any order; a duplicate pair, missing value or `--`-prefixed value is a
-usage error. A future Stage 2 listener
-carries the same messages. No UI is part of Stage 1.
+**Status:** §2.1-§2.4 and the additive §4.1 fields are specified and being
+implemented (`odd/tasks/enigma-human-output.md`); until that closes, the shipped CLI
+writes JSONL to stdout and accepts only the long options.
+
+Stage 1 is one command-line process (§2.1). By default it runs in **human mode**
+(§2.2): a progress bar on stderr, a readable report at the end and a saved report
+file, with no JSON on stdout. The JSONL event stream (§4), one JSON object per line
+without embedded newlines, is written only when `--events` selects a destination
+(§2.3). Diagnostics always go to `stderr`. A future Stage 2 listener carries the same
+event messages. No UI is part of Stage 1.
+
+### 2.1 Command line
+
+```text
+enigma [options] <request.json>
+enigma [options] --request <path|->
+```
+
+Every option has a long form; all but `--no-report` also have a one-letter short
+form that behaves exactly like it:
+
+| Long | Short | Value | Contract |
+| --- | --- | --- | --- |
+| `--help` | `-h` | — | §2.1 below |
+| `--version` | `-V` | — | §2.1 below |
+| `--request` | `-i` | `<path\|->` | request file, or stdin with `-` |
+| `--events` | `-e` | `<path\|->` | §2.3 |
+| `--report` | `-o` | `<name>` | §2.4 |
+| `--no-report` | — | — | §2.4 |
+| `--threads` | `-t` | `<n>` | §5 |
+| `--checkpoint` | `-c` | `<path>` | §6.1 |
+| `--resume` | `-r` | `<path>` | §6.1 |
+| `--cancel-file` | `-x` | `<path>` | §5 |
+
+Rules, applied before the request is read:
+
+- Options may precede or follow the input form, in any order. An option that takes a
+  value is always followed by that value as the next argument; `--name=value` is not
+  accepted.
+- Short forms are single letters and are never grouped: `-tc` is not `-t -c`.
+- Each option may appear once. Giving it twice, in either form (`-t 2 --threads 3`),
+  a missing value, or a value that starts with `--` or equals a short form is a
+  usage error.
+- The positional request path must not start with `-`; use `-i ./-name.json` for such a
+  file. Any other argument shape, including an unknown option, is a usage error.
+- A usage error writes the help text to stderr and exits 2 with empty stdout.
+- When any argument is exactly `-h` or `--help`, the help text is written to stdout
+  and the process exits 0 without reading the request; this wins over every other
+  argument and error. Otherwise, when any argument is exactly `-V` or `--version`, the
+  two version lines (the first two help lines) are written to stdout with exit 0.
+
+The help text is exactly (`<version>` is the crate version):
+
+```text
+enigma <version>
+protocol version 1
+
+Usage: enigma [options] <request.json>
+       enigma [options] --request <path|->
+
+Input:
+  -i, --request <path|->    read the request from a file, or from stdin with -
+
+Output:
+  -e, --events <path|->     write the JSONL event stream to a new file, or to
+                            stdout with - (no progress bar, no terminal report)
+  -o, --report <name>       save the report to <name>, a new file
+      --no-report           do not save a report file
+
+Attacks (hill_climb and partial_exhaustion):
+  -t, --threads <n>         worker threads, 1 to 256 (default: half the logical
+                            CPUs); completed runs give the same result for any <n>
+  -c, --checkpoint <path>   save checkpoints to a new file
+  -r, --resume <path>       resume from a checkpoint and keep saving to it
+  -x, --cancel-file <path>  stop safely once <path> exists as a regular file
+
+Other:
+  -h, --help                print this help
+  -V, --version             print the version
+
+By default progress is drawn on stderr when it is a terminal, and the result is
+printed on stdout and saved as a report in the working directory.
+See docs/protocol.md for the contract.
+```
+
+Relative paths in every option value use the invocation working directory.
+Diagnostics name options by their long form, whichever form was given.
+
+### 2.2 Human mode (default)
+
+Without `--events -` the process runs in human mode:
+
+- **Attacks** (HC/PE): while the search runs, the progress bar (below) is drawn on
+  stderr. At the end stdout receives the report text (§2.4), and the report is saved
+  to a file unless `--no-report` is given.
+- **Transform**: stdout receives the transformed text followed by one newline; no bar is
+  drawn; the transform report (§2.4) is saved to a file unless `--no-report` is given.
+- **Errors**: stdout stays empty; stderr carries the same diagnostics as in event mode
+  and the exit codes are unchanged. No report file is written when the job ends in an
+  error.
+
+With `--events <path>` (a file) human mode still applies; the event stream goes to
+that file in addition.
+
+**Progress bar.** Drawn only when stderr is a terminal; otherwise nothing is drawn and
+stderr carries diagnostics only. The bar is one line rewritten in place (carriage
+return, then the line, then clear to end of line), redrawn at Core progress snapshots
+(§4.1) and at most 10 times per second; the initial and terminal snapshots are always
+drawn. No timer thread is added. During the outer phase the line is
+
+```text
+[#########...............]  37.5% | 6591/17576 outer keys | 1.23M eval/s | 00:01:05 elapsed | ETA 00:01:48
+```
+
+- the bar has 24 cells, filled by `outers_completed / outers_selected`, rounded down;
+  the percent has one decimal;
+- the rate is evaluations completed by this process divided by its own running time,
+  with `K`/`M`/`G` suffixes and two decimals (`850.00 eval/s`, `1.23M eval/s`);
+- `elapsed` is the `elapsed_ms` of the snapshot, which on resume includes the time
+  before the stop (§6.5); so after `--resume` the bar starts at the restored share;
+- the ETA extrapolates the outer keys completed by this process to the remaining ones,
+  and shows `--:--:--` until this process completed one;
+- durations are `HH:MM:SS` (hours grow past 99 when needed).
+
+During chained stages the total is unknown and the line is
+
+```text
+chained stages | 1523000 evaluations | 1.23M eval/s | 00:02:10 elapsed
+```
+
+The line is cleared before the report is printed or a diagnostic is written.
+
+### 2.3 Event mode (`--events`)
+
+- `--events -` writes the complete JSONL stream (§4) to stdout. No bar is drawn and no
+  report text is printed; no report file is saved unless `--report` is given. Machine
+  consumers (TUI, web client, tests, timing harnesses) use this form. Stdout is then
+  exactly what the CLI wrote to stdout before human mode existed, apart from the
+  additive fields of §4.1.
+- `--events <path>` writes the same stream to a new file. If `<path>` already exists,
+  including as a dangling symlink, the CLI writes
+  `error: --events file already exists: "<path>"` to stderr and exits 2 with empty
+  stdout, before reading the request; a file is never overwritten. The file is
+  created before the request is read, and an error event is written to it like to
+  stdout in event mode.
+- Transport failures on either destination follow §4.1 (latched, stderr, nonzero exit).
+
+### 2.4 Reports
+
+An attack report is plain UTF-8 text, the same on stdout and in the file:
+
+```text
+Enigma attack report
+Status:       completed
+Request:      request-b.json
+Started:      2026-10-24T12:00:00Z
+Finished:     2026-10-24T12:01:10Z
+Duration:     00:01:10
+Outer keys:   17576 of 17576
+Evaluations:  142788085
+Threads:      6
+Measure:      ngram
+
+#1  score -8.333021  (gap to #2: 1.085312)
+    Wheels:     B I II III
+    Rings:      AAAV
+    Positions:  AVJN
+    Plugboard:  AB CD EF GH IJ KL MN OP QR ST
+    Plaintext:  VONVO NHEIN ...
+
+#2  score -9.418333  (gap to #3: 0.120000)
+...
+```
+
+- `Status` is `completed`, `empty slice` (`outer_slice_end`) or `CANCELLED`.
+  `Request` is the request path as given, or `stdin`. `Started`/`Finished` are this
+  process's RFC 3339 UTC start and end; `Duration` is the result `elapsed_ms` (it
+  includes restored time after a resume). `Outer keys` is `outers_completed of
+  outers_selected`; `Evaluations` is `evaluations_completed`; `Measure` is the final
+  measure ID.
+- Candidates follow `result.hold` in rank order (`#1` is `best`). The score is the
+  decimal measured score (§4.1); the gap is the absolute ranking difference to the
+  next candidate, omitted for the last one. With no candidate the block is the single
+  line `No candidates.`
+- The key uses the configuration slots in definition order: `Wheels` lists each
+  slot's wheel ID separated by spaces, `Rings` and `Positions` concatenate each slot's
+  symbol, and `Plugboard` lists the complete pairs (`none` when empty).
+- The plaintext is split into groups of five symbols separated by one space, ten
+  groups per line; continuation lines are indented to the first group.
+- A `CANCELLED` report ends with a `Resume:` line. When the run used `--checkpoint`
+  or `--resume`, it holds the command to continue: the invoked program name and
+  arguments with `--checkpoint`/`-c <path>` replaced by `--resume <path>`, each
+  argument quoted for a POSIX shell when it contains other than letters, digits or
+  `-_./=:`. Otherwise it reads
+  `Resume:       not available (run with --checkpoint to make a search resumable)`.
+
+A transform report has the header `Enigma transform report`, the `Request`,
+`Started`, `Finished` and `Direction` (`encrypt`/`decrypt`) lines, the key lines
+above for the request configuration, and `Input:` and `Output:` texts grouped like
+the plaintext.
+
+**File.** The report is saved, at the end of the job, to a new file in the working
+directory:
+
+- default name: the request file name with its last extension replaced by
+  `.report.txt` (`data/request-b.json` -> `request-b.report.txt`), or
+  `enigma-<UTC YYYYMMDDTHHMMSSZ>.report.txt` for stdin;
+- if the default name already exists (any file type, including a dangling symlink),
+  the UTC timestamp is inserted before `.report.txt` (`request-b.20261024T120110Z.report.txt`),
+  then `-2`, `-3`, ... after the timestamp until a free name is found; an existing
+  file is never overwritten or followed;
+- `--report <name>` uses `<name>` exactly, relative to the working directory. If it
+  already exists the CLI writes `error: --report file already exists: "<name>"` to
+  stderr and exits 2 with empty stdout, before reading the request. The file is still
+  created exclusively at the end; if it appeared meanwhile, saving fails as below;
+- `--no-report` saves nothing; combined with `--report` the CLI writes
+  `error: --report and --no-report cannot be combined` to stderr and exits 2.
+
+After saving, stderr receives
+`Report "<file name>" saved successfully in <absolute directory>`.
+If saving fails, stderr receives `error: failed to save report "<path>": <reason>`
+and the exit code is 1; the report text was already printed on stdout.
 
 ## 3. Request
 
@@ -331,8 +546,8 @@ alphabet, wheel count, stepping rule, or topology.
 
 ## 4. Events and validation errors
 
-Each stdout line is a JSON event with `event`, `protocol_version`, monotonic `seq`
-starting at 1, and RFC 3339 UTC `ts`. Unknown event names/fields may be ignored by
+Each event line (written to the `--events` destination, §2.3) is a JSON event with
+`event`, `protocol_version`, monotonic `seq` starting at 1, and RFC 3339 UTC `ts`. Unknown event names/fields may be ignored by
 clients. A successful validated job emits one `started` first, then applicable events,
 then exactly one terminal `done`; runtime failure emits terminal `error`. Search may
 emit `progress`, `candidate`, `checkpoint`, and `hold` according to job lifecycle.
@@ -409,8 +624,9 @@ Payloads below supplement the existing event envelope; `done` stays reason-only:
 
 | Event | Required payload |
 | --- | --- |
+| `started` | `outers_selected` (HC/PE only; transform `started` is unchanged) |
 | `progress` | `counters`, `elapsed_ms` |
-| `result` | `stages`, `best` (object or null), `hold` (Task 14 array), `counters`, `elapsed_ms` |
+| `result` | `stages`, `best` (object or null), `hold` (Task 14 array), `counters`, `elapsed_ms`, `threads`, `started_at`, `finished_at` |
 | `done` | `reason`: `completed`, `outer_slice_end`, or `cancelled` |
 | Runtime `error` | Existing `code`, `message`, `location`; additionally `context` |
 
@@ -431,7 +647,7 @@ plugboard, fixed pairs union committed mutable pairs. It is not the stepped key.
 are oriented and sorted by ordered alphabet indices. `start_index` is 0 for direct
 HC and the dense seed index for PE; `outer_index` is absolute, unsliced.
 `score` has exactly `measure` (the requested final measure ID), `measured_q32`,
-and `ranking_q32`. Ranking is higher-is-better; do not negate measured entropy.
+`ranking_q32`, `measured` and `ranking`; the same shape is used in every hold entry. Ranking is higher-is-better; do not negate measured entropy.
 The three boolean winner flags are independent of each other and of run termination;
 `incomplete` means that winning climb was interrupted. Ties retain earliest
 (outer index, start index). No best means JSON null, never a sentinel key or score.
@@ -439,8 +655,17 @@ The three boolean winner flags are independent of each other and of run terminat
 All new search count/index/elapsed fields are canonical unsigned decimal **strings**
 (`0` or a nonzero digit followed by digits), including u64 counts; Q32 fields are
 canonical signed decimal strings of raw i128 units (optional minus, no `+`, leading
-zeros or `-0`). The scale is exactly 2^32; no float, exponent or rounded decimal
-score is sent. u128 indices/counters retain their full range. Existing request
+zeros or `-0`). The scale is exactly 2^32 and the Q32 fields are authoritative.
+`measured` and `ranking` are informative decimal strings of the Q32 value divided
+by 2^32, rounded half away from zero to exactly six fraction digits (`-8.333021`,
+`0.000000`; optional minus, never `-0.000000`, no exponent); no float is sent.
+
+`outers_selected` is the number of outer keys in the requested slice (after `offset`
+and `limit`), the total that `outers_completed` reaches on exhaustion. `threads` is
+the worker count used by this process (§5). `started_at` and `finished_at` are this
+process's RFC 3339 UTC wall-clock times at execution entry and when `result` is
+built; after a resume they describe the resumed process only, while `elapsed_ms`
+includes restored time. u128 indices/counters retain their full range. Existing request
 integer grammar and transform envelope numbers (`protocol_version`, `seq`) do not
 change; strings are used consistently even inside the safe JSON integer range.
 
@@ -606,7 +831,9 @@ calling thread. Progress, cancellation inspection and all output stay on the cal
 thread, which merges finished blocks. Block outcomes are merged in key order, so hold ranking, duplicate
 payloads, winners, errors and counters match a one-thread run; chained stages then
 run on one thread. A completed run therefore writes the same events, exit code and
-stderr for every thread count, apart from `ts` and `elapsed_ms`. Progress is emitted
+stderr for every thread count, apart from `ts`, `elapsed_ms`, `threads`,
+`started_at` and `finished_at` (and, in human mode, the report lines derived from them
+and the progress bar). Progress is emitted
 only at block boundaries in key order, so its positions depend on the block layout,
 never on the thread count.
 
@@ -644,7 +871,7 @@ they use no randomness (seeds are enumerated, not drawn), so the record has no R
 - `--resume <path>` loads the checkpoint at `<path>`, checks it against the request
   (§6.4), continues the search from it and keeps saving checkpoints to the same `<path>`.
 - Both options take one path value with the placement, duplicate and missing-value
-  rules of `--cancel-file`, and combine with `--cancel-file` and `--threads`. Giving
+  rules of §2.1, and combine with `--cancel-file` and `--threads`. Giving
   both writes `error: --checkpoint and --resume cannot be combined` to stderr, exit 2,
   empty stdout. Relative paths use the invocation working directory.
 - Transform and unsupported search jobs reject either option with the seq 1
@@ -743,7 +970,8 @@ run's monotonic time.
 
 For completed runs, the `result` and `done` events of a search that was stopped and
 resumed (any number of times, with any thread counts) are equal to those of an
-uninterrupted run, apart from `ts`, `elapsed_ms` and `seq`. `progress` and `checkpoint`
+uninterrupted run, apart from `ts`, `elapsed_ms`, `seq`, `threads`, `started_at` and
+`finished_at`. `progress` and `checkpoint`
 events depend on where the stops happened and are not part of that promise.
 
 ## 7. Determinism
