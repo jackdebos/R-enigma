@@ -1,5 +1,6 @@
 #!/bin/sh
-# Times U-264 through the release enigma CLI and writes a new results file.
+# Times U-264 through the release enigma CLI (--events - in case_a_timing.rs)
+# and writes a new results file.
 # Usage: [ENIGMA_TIMING_CASE=a|positions|b|c] [ENIGMA_TIMING_RUNS=N]
 #        [ENIGMA_TIMING_THREADS=1..256] e2e/enigma_rust_timing/run.sh
 # Defaults: case a, runs=100, threads=1 (not the application's half-CPU default).

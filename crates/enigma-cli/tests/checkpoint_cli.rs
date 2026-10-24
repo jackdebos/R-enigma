@@ -30,6 +30,7 @@ impl Scratch {
     }
     fn run_interval(&self, args: &[&str], input: &Value, interval: Option<&str>) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_enigma"));
+        command.args(["--events", "-"]);
         command.env_remove("ENIGMA_TEST_CHECKPOINT_INTERVAL_MS");
         if let Some(interval) = interval {
             command.env("ENIGMA_TEST_CHECKPOINT_INTERVAL_MS", interval);
@@ -427,6 +428,7 @@ fn foreign_destination_after_started_survives_cancel_and_reports_exact_failure()
     let mut child = Command::new(env!("CARGO_BIN_EXE_enigma"))
         .current_dir(&dir.0)
         .env_remove("ENIGMA_TEST_CHECKPOINT_INTERVAL_MS")
+        .args(["--events", "-"])
         .args([
             "--request",
             "-",

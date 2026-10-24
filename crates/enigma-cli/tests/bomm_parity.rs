@@ -66,7 +66,7 @@ fn decrypt(engine: &Value, ciphertext: &str) -> String {
     });
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_enigma"))
-        .args(["--request", "-"])
+        .args(["--events", "-", "--request", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -368,7 +368,7 @@ fn historical_m4_u264_attack_board() {
     let (inputs, record, _) = prepare_attack_inputs("enigma-bomm-attack");
     let output = Command::new(env!("CARGO_BIN_EXE_enigma"))
         .current_dir(inputs.path())
-        .arg("request.json")
+        .args(["--events", "-", "request.json"])
         .output()
         .expect("failed to run the attack through the real CLI");
     verify_attack_output(&output, &record);

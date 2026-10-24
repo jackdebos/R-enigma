@@ -43,6 +43,7 @@ fn run_with_stdin(request: &Value) -> Output {
 /// Runs the binary with arbitrary arguments, writing the request to stdin.
 fn run_with_args(args: &[&str], request: &Value) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_enigma"))
+        .args(["--events", "-"])
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -64,7 +65,7 @@ fn run_with_args(args: &[&str], request: &Value) -> Output {
 /// Runs the binary with `--request -`, writing raw (possibly non-UTF-8) bytes to stdin.
 fn run_with_raw_stdin(bytes: &[u8]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_enigma"))
-        .args(["--request", "-"])
+        .args(["--events", "-", "--request", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -160,6 +161,7 @@ fn positional_file_path_emits_the_same_stream() {
     std::fs::write(&path, request.to_string()).expect("failed to write the request file");
 
     let output = Command::new(env!("CARGO_BIN_EXE_enigma"))
+        .args(["--events", "-"])
         .arg(&path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

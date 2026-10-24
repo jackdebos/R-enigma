@@ -32,7 +32,7 @@ impl Fixture {
     fn stdin_with(&self, request: &Value, extra: &[&str]) -> Output {
         let mut child = Command::new(env!("CARGO_BIN_EXE_enigma"))
             .current_dir(&self.0)
-            .args(["--request", "-"])
+            .args(["--events", "-", "--request", "-"])
             .args(extra)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -54,6 +54,7 @@ impl Fixture {
     fn file_with(&self, path: &str, extra: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_enigma"))
             .current_dir(&self.0)
+            .args(["--events", "-"])
             .args(extra)
             .arg(path)
             .output()

@@ -32,7 +32,7 @@ fn long_attack() -> Value {
 /// Sends `signal` once `started` is read, then checks the cancelled lifecycle and exit 0.
 fn assert_signal_cancels(signal: &str) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_enigma"))
-        .args(["--request", "-"])
+        .args(["--events", "-", "--request", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

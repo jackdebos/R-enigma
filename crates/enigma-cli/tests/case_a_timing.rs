@@ -104,9 +104,13 @@ fn timing_threads(value: Option<&OsStr>) -> Result<usize, String> {
 
 fn enigma_command(binary: &str, directory: &Path, threads: usize) -> Command {
     let mut command = Command::new(binary);
-    command
-        .current_dir(directory)
-        .args(["--threads", &threads.to_string(), "request.json"]);
+    command.current_dir(directory).args([
+        "--events",
+        "-",
+        "--threads",
+        &threads.to_string(),
+        "request.json",
+    ]);
     command
 }
 
@@ -606,7 +610,14 @@ fn thread_boundaries_and_exact_engine_arguments_preserve_capture_flags() {
         assert_eq!(command.get_current_dir(), Some(Path::new("inputs")));
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
-            ["--threads", &threads.to_string(), "request.json"].map(OsStr::new)
+            [
+                "--events",
+                "-",
+                "--threads",
+                &threads.to_string(),
+                "request.json"
+            ]
+            .map(OsStr::new)
         );
         for case in [ATTACK_CASE, POSITIONS_CASE, DESIGN_B_CASE, DESIGN_C_CASE] {
             let (_, record) = selected_fixture(case);

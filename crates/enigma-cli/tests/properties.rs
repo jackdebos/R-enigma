@@ -121,7 +121,7 @@ fn no_reflector_request(text: &str, direction: &str) -> Value {
 
 fn run(request: &Value) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_enigma"))
-        .args(["--request", "-"])
+        .args(["--events", "-", "--request", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

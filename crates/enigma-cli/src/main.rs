@@ -1,6 +1,6 @@
 //! Command-line client.
 //!
-//! Stage 1 speaks the protocol over `stdin`/`stdout` (see `docs/protocol.md` §2). This
+//! Stage 1 offers human output and opt-in JSONL events (see `docs/protocol.md` §2). This
 //! binary is a thin shell: it must contain no cryptanalytic logic, so that the same
 //! engine can be driven by the TUI (Stage 2), the local web client (Stage 2) and the
 //! test harness without divergence. Parsing, validation and computation live in
@@ -36,9 +36,13 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let mut events = EventSink::Discard;
     let resolved = split_options(&args).and_then(|(input, options)| {
         let checkpoint = CheckpointFile::prepare(&cwd, options.checkpoint, options.resume)
             .map_err(InputError::InvalidOption)?;
+        if let Some(target) = options.events {
+            events = EventSink::open(&cwd, target).map_err(InputError::InvalidOption)?;
+        }
         let cancel_file = options.cancel_file.map(|path| cwd.join(path));
         resolve_input(input, &cwd)
             .map(|(bytes, origin)| (bytes, origin, cancel_file, options.threads, checkpoint))
@@ -50,6 +54,7 @@ fn main() -> ExitCode {
             cancel_file.as_deref(),
             threads,
             checkpoint.as_ref(),
+            &mut events,
         ),
         Err(InputError::Usage) => {
             print_usage();
@@ -62,7 +67,9 @@ fn main() -> ExitCode {
         Err(InputError::ResourceLimit) => {
             let message =
                 format!("request JSON exceeds the {MAX_REQUEST_BYTES}-byte resource limit");
-            if let Err(write_error) = emit_error_line("resource_limit", &message, "", 1) {
+            if let Err(write_error) =
+                write_error_line(&mut events, "resource_limit", &message, "", 1)
+            {
                 eprintln!("error: failed to write protocol event: {write_error}");
             }
             eprintln!("resource_limit: {message}");
@@ -92,6 +99,58 @@ struct Options<'a> {
     threads: Option<ExecutionOptions>,
     checkpoint: Option<&'a str>,
     resume: Option<&'a str>,
+    /// Unresolved `--events` target: `-` for stdout, otherwise a new file.
+    events: Option<&'a str>,
+}
+
+/// Where protocol events go: stdout, a new file, or nowhere (human mode, §2.2).
+enum EventSink {
+    Stdout(io::Stdout),
+    File(fs::File),
+    Discard,
+}
+
+impl EventSink {
+    /// Opens the `--events` target before the request is read; never reuses a file.
+    fn open(cwd: &Path, target: &str) -> Result<Self, String> {
+        if target == "-" {
+            return Ok(Self::Stdout(io::stdout()));
+        }
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(cwd.join(target))
+            .map(Self::File)
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::AlreadyExists => {
+                    format!("--events file already exists: {target:?}")
+                }
+                _ => format!("failed to create --events file {target:?}: {error}"),
+            })
+    }
+
+    /// Human mode is everything except `--events -`.
+    fn is_human(&self) -> bool {
+        !matches!(self, Self::Stdout(_))
+    }
+}
+
+impl Write for EventSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Stdout(stdout) => stdout.lock().write(buf),
+            Self::File(file) => file.write(buf),
+            Self::Discard => Ok(buf.len()),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Stdout(stdout) => stdout.lock().flush(),
+            Self::File(file) => file.flush(),
+            Self::Discard => Ok(()),
+        }
+    }
 }
 
 const CANCEL_FILE: &str = "--cancel-file";
@@ -106,7 +165,7 @@ fn split_options(args: &[String]) -> Result<(&[String], Options<'_>), InputError
     let is_option = |arg: &String| {
         matches!(
             arg.as_str(),
-            CANCEL_FILE | THREADS | "--checkpoint" | "--resume"
+            CANCEL_FILE | THREADS | "--checkpoint" | "--resume" | "--events"
         )
     };
     let mut options = Options::default();
@@ -130,6 +189,7 @@ fn split_options(args: &[String]) -> Result<(&[String], Options<'_>), InputError
             CANCEL_FILE => options.cancel_file.replace(value).is_some(),
             "--checkpoint" => options.checkpoint.replace(value).is_some(),
             "--resume" => options.resume.replace(value).is_some(),
+            "--events" => options.events.replace(value).is_some(),
             _ => options.threads.replace(parse_threads(value)?).is_some(),
         };
         if duplicate {
@@ -265,6 +325,7 @@ fn run(
     cancel_file: Option<&Path>,
     threads: Option<ExecutionOptions>,
     checkpoint: Option<&CheckpointFile<'_>>,
+    events: &mut EventSink,
 ) -> ExitCode {
     let unsupported = unsupported_option(
         cancel_file.is_some(),
@@ -275,7 +336,7 @@ fn run(
         Ok(json) => json,
         Err(error) => {
             let message = format!("input is not valid UTF-8: {error}");
-            if let Err(write_error) = emit_error_line("invalid_json", &message, "", 1) {
+            if let Err(write_error) = write_error_line(events, "invalid_json", &message, "", 1) {
                 eprintln!("error: failed to write protocol event: {write_error}");
             }
             eprintln!("invalid_json: {message}");
@@ -285,10 +346,10 @@ fn run(
 
     match ParsedRequest::parse_json(&json) {
         Ok(ParsedRequest::Transform(request)) => match unsupported {
-            Some(message) => search_error("unsupported_job", message, "/job/kind"),
-            None => run_transform(request),
+            Some(message) => search_error(events, "unsupported_job", message, "/job/kind"),
+            None => run_transform(request, events),
         },
-        Ok(ParsedRequest::Search(request)) => run_search(request, origin, unsupported),
+        Ok(ParsedRequest::Search(request)) => run_search(request, origin, unsupported, events),
         Ok(ParsedRequest::Attack(request)) => run_attack(
             request,
             origin,
@@ -296,13 +357,13 @@ fn run(
             threads.unwrap_or_else(default_execution),
             checkpoint.map(|file| (file, json.as_str())),
             signals::install,
-            &mut io::stdout().lock(),
+            events,
         ),
         Err(diagnostics) => {
             // Pre-validation failure: exactly one `error` at seq 1, no `started`.
             let first = &diagnostics[0];
             if let Err(write_error) =
-                emit_error_line(first.code(), first.message(), first.location(), 1)
+                write_error_line(events, first.code(), first.message(), first.location(), 1)
             {
                 eprintln!("error: failed to write protocol event: {write_error}");
             }
@@ -320,10 +381,11 @@ fn run_search(
     request: ParsedSearchRequest,
     origin: &Path,
     unsupported_option: Option<&str>,
+    events: &mut EventSink,
 ) -> ExitCode {
     let contents = match resource_loader::load(request.resources(), origin) {
         Ok(contents) => contents,
-        Err(error) => return search_error(error.code, &error.message, &error.location),
+        Err(error) => return search_error(events, error.code, &error.message, &error.location),
     };
     let supplied: BTreeMap<String, &str> = contents
         .iter()
@@ -332,14 +394,14 @@ fn run_search(
     match request.bind_resources(&supplied) {
         Ok(_validated) => {
             let message = unsupported_option.unwrap_or("search execution is not implemented");
-            search_error("unsupported_job", message, "/job/kind")
+            search_error(events, "unsupported_job", message, "/job/kind")
         }
         Err(diagnostics) => {
             let first = &diagnostics[0];
             for diagnostic in &diagnostics {
                 eprintln!("{diagnostic}");
             }
-            search_error(first.code(), first.message(), first.location())
+            search_error(events, first.code(), first.message(), first.location())
         }
     }
 }
@@ -468,8 +530,8 @@ fn run_attack<'s>(
     }
 }
 
-fn search_error(code: &str, message: &str, location: &str) -> ExitCode {
-    if let Err(error) = emit_error_line(code, message, location, 1) {
+fn search_error(out: &mut impl Write, code: &str, message: &str, location: &str) -> ExitCode {
+    if let Err(error) = write_error_line(out, code, message, location, 1) {
         eprintln!("error: failed to write protocol event: {error}");
     }
     eprintln!("{code}: {message}");
@@ -477,24 +539,24 @@ fn search_error(code: &str, message: &str, location: &str) -> ExitCode {
 }
 
 /// Emits the successful lifecycle: `started`, one `output`, then terminal `done`.
-fn run_transform(request: TransformRequest) -> ExitCode {
+fn run_transform(request: TransformRequest, out: &mut EventSink) -> ExitCode {
     let ts = now_ts();
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
 
-    if let Err(error) = emit(&mut out, &Event::Started, 1, &ts) {
+    if let Err(error) = emit(out, &Event::Started, 1, &ts) {
         eprintln!("error: failed to write protocol event: {error}");
         return ExitCode::FAILURE;
     }
 
     match request.transform() {
         Ok(output) => {
-            if let Err(error) = emit(&mut out, &Event::Output { output }, 2, &ts) {
+            let human = out.is_human();
+            let text = human.then(|| output.clone());
+            if let Err(error) = emit(out, &Event::Output { output }, 2, &ts) {
                 eprintln!("error: failed to write protocol event: {error}");
                 return ExitCode::FAILURE;
             }
             if let Err(error) = emit(
-                &mut out,
+                out,
                 &Event::Done {
                     reason: DoneReason::Completed,
                 },
@@ -508,6 +570,12 @@ fn run_transform(request: TransformRequest) -> ExitCode {
                 eprintln!("error: failed to flush stdout: {error}");
                 return ExitCode::FAILURE;
             }
+            if let Some(text) = text {
+                if let Err(error) = writeln!(io::stdout().lock(), "{text}") {
+                    eprintln!("error: failed to write stdout: {error}");
+                    return ExitCode::FAILURE;
+                }
+            }
             ExitCode::SUCCESS
         }
         // Validation runs before `started`, so this branch is not expected; if the
@@ -516,7 +584,7 @@ fn run_transform(request: TransformRequest) -> ExitCode {
             let message = error.to_string();
             // `started` already used `seq: 1`, so the terminal error must continue the
             // stream monotonically instead of repeating the sequence number.
-            if let Err(write_error) = emit_error_line("internal_error", &message, "", 2) {
+            if let Err(write_error) = write_error_line(out, "internal_error", &message, "", 2) {
                 eprintln!("error: failed to write protocol event: {write_error}");
             }
             eprintln!("internal_error: {message}");
@@ -525,12 +593,7 @@ fn run_transform(request: TransformRequest) -> ExitCode {
     }
 }
 
-/// Writes one terminal `error` event at the caller-supplied `seq` to stdout.
-fn emit_error_line(code: &str, message: &str, location: &str, seq: u64) -> io::Result<()> {
-    let stdout = io::stdout();
-    write_error_line(&mut stdout.lock(), code, message, location, seq)
-}
-
+/// Writes one terminal `error` event at the caller-supplied `seq`.
 fn write_error_line(
     out: &mut impl Write,
     code: &str,
@@ -550,7 +613,7 @@ fn write_error_line(
     out.flush()
 }
 
-/// Encodes one event and writes it as a single stdout line.
+/// Encodes one event and writes it as a single line to the selected destination.
 fn emit(writer: &mut impl Write, event: &Event, seq: u64, ts: &str) -> io::Result<()> {
     let line = encode(event, seq, ts)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;

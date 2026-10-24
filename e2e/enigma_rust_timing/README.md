@@ -14,7 +14,9 @@ ls e2e/enigma_rust_timing/results/ | tail -n 1      # newest result
 
 Works from any directory. The script builds `target/release/enigma`, hashes it,
 and then runs the ignored test `enigma_rust_case_a_timing` in
-`crates/enigma-cli/tests/case_a_timing.rs`, which uses that same binary.
+`crates/enigma-cli/tests/case_a_timing.rs`, which uses that same binary with
+`enigma --events - --threads N request.json`. The opt-in JSONL stream keeps the
+live `started` measurement unchanged; no human report or progress bar is emitted.
 
 ## Select threads
 
