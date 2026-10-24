@@ -14,5 +14,4 @@ path = "src/main.rs"
 enigma-core.workspace = true
 ctrlc = { version = "3.5.2", features = ["termination"] }
 
-[dev-dependencies]
 serde_json.workspace = true

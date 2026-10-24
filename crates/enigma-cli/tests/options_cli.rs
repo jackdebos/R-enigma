@@ -171,8 +171,23 @@ fn report_preflight_preserves_existing_files_and_dangling_links() {
                 );
             }
         }
-        check(dir.run(&[flag, "new", "-i", "-"]), 0, "BB\n", "");
-        assert!(!dir.0.join("new").exists()); // Saving is T5, not parser work.
+        let name = if flag == "--report" {
+            "new-long"
+        } else {
+            "new-short"
+        };
+        check(
+            dir.run(&[flag, name, "-i", "-"]),
+            0,
+            "BB\n",
+            &format!(
+                "Report {name:?} saved successfully in {}\n",
+                dir.0.canonicalize().unwrap().display()
+            ),
+        );
+        assert!(std::fs::read_to_string(dir.0.join(name))
+            .unwrap()
+            .starts_with("Enigma transform report\n"));
     }
     check(dir.run(&["--no-report", "-i", "-"]), 0, "BB\n", "");
     assert_eq!(std::fs::read(dir.0.join("existing")).unwrap(), b"foreign");
@@ -226,7 +241,7 @@ fn short_forms_preserve_long_form_execution_and_diagnostics() {
         }
     }
     for flag in ["-i", "--request"] {
-        check(dir.run(&[flag, "-"]), 0, "BB\n", "");
+        check(dir.run(&[flag, "-", "--no-report"]), 0, "BB\n", "");
     }
     std::fs::write(dir.0.join("request"), transform().to_string()).unwrap();
     for args in [
@@ -258,7 +273,12 @@ fn short_forms_preserve_long_form_execution_and_diagnostics() {
                 .collect()
         };
         assert_eq!(normalize(&out.stdout), expected);
-        check(dir.run(&["--request", "-", flag, name]), 0, "BB\n", "");
+        check(
+            dir.run(&["--request", "-", flag, name, "--no-report"]),
+            0,
+            "BB\n",
+            "",
+        );
         assert_eq!(
             normalize(&std::fs::read(dir.0.join(name)).unwrap()),
             expected

@@ -10,6 +10,7 @@ mod attack_transport;
 mod cancel_file;
 mod checkpoint_file;
 mod progress_bar;
+mod report;
 mod resource_loader;
 mod signals;
 
@@ -55,23 +56,49 @@ fn main() -> ExitCode {
     let mut events = EventSink::Discard;
     let resolved = split_options(&args).and_then(|(input, options)| {
         options.validate_report(&cwd)?;
+        let report = report::Context {
+            cwd: &cwd,
+            request: input
+                .as_ref()
+                .map(|i| {
+                    if i.explicit && i.path == "-" {
+                        "stdin"
+                    } else {
+                        i.path
+                    }
+                })
+                .unwrap_or("stdin"),
+            stdin: input.as_ref().is_some_and(|i| i.explicit && i.path == "-"),
+            explicit: options.report,
+            disabled: options.no_report,
+            argv: std::env::args().collect(),
+        };
         let checkpoint = CheckpointFile::prepare(&cwd, options.checkpoint, options.resume)
             .map_err(InputError::InvalidOption)?;
         if let Some(target) = options.events {
             events = EventSink::open(&cwd, target).map_err(InputError::InvalidOption)?;
         }
         let cancel_file = options.cancel_file.map(|path| cwd.join(path));
-        resolve_input(input, &cwd)
-            .map(|(bytes, origin)| (bytes, origin, cancel_file, options.threads, checkpoint))
+        resolve_input(input, &cwd).map(|(bytes, origin)| {
+            (
+                bytes,
+                origin,
+                cancel_file,
+                options.threads,
+                checkpoint,
+                report,
+            )
+        })
     });
     match resolved {
-        Ok((bytes, origin, cancel_file, threads, checkpoint)) => run(
+        Ok((bytes, origin, cancel_file, threads, checkpoint, report)) => run(
             bytes,
             &origin,
             cancel_file.as_deref(),
             threads,
             checkpoint.as_ref(),
             &mut events,
+            &report,
         ),
         Err(InputError::Usage) => {
             eprint!("{}", help_text());
@@ -118,7 +145,7 @@ struct Options<'a> {
     resume: Option<&'a str>,
     /// Unresolved `--events` target: `-` for stdout, otherwise a new file.
     events: Option<&'a str>,
-    /// Parsed and preflight-validated here; report rendering and saving land in T5.
+    /// Explicit report destination, checked before reading input.
     report: Option<&'a str>,
     no_report: bool,
 }
@@ -414,6 +441,7 @@ fn run(
     threads: Option<ExecutionOptions>,
     checkpoint: Option<&CheckpointFile<'_>>,
     events: &mut EventSink,
+    report: &report::Context<'_>,
 ) -> ExitCode {
     let unsupported = unsupported_option(
         cancel_file.is_some(),
@@ -435,21 +463,50 @@ fn run(
     match ParsedRequest::parse_json(&json) {
         Ok(ParsedRequest::Transform(request)) => match unsupported {
             Some(message) => search_error(events, "unsupported_job", message, "/job/kind"),
-            None => run_transform(request, events),
+            None => run_transform(request, events, report, &json),
         },
         Ok(ParsedRequest::Search(request)) => run_search(request, origin, unsupported, events),
         Ok(ParsedRequest::Attack(request)) => {
             let draw = (events.is_human() && io::stderr().is_terminal())
                 .then(|| request.has_chained_stages());
-            run_attack_presented(
+            let human = events.is_human();
+            let mut capture = report::Capture::new(events);
+            let status = run_attack_presented(
                 request,
                 origin,
                 cancel_file,
                 threads.unwrap_or_else(default_execution),
                 checkpoint.map(|file| (file, json.as_str())),
                 signals::install,
-                (events, draw),
-            )
+                (&mut capture, draw),
+            );
+            if status != ExitCode::SUCCESS {
+                return status;
+            }
+            let job: serde_json::Value = serde_json::from_str(&json).expect("validated request");
+            let result = capture.result.as_ref().expect("successful result");
+            let reason = capture.done.as_ref().expect("successful done")["reason"]
+                .as_str()
+                .expect("reason");
+            let selected = capture.started.as_ref().expect("started")["outers_selected"]
+                .as_str()
+                .expect("selected");
+            let measure = result["hold"][0]["score"]["measure"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    job["job"]["attack"]["final_measure"]
+                        .as_str()
+                        .expect("measure")
+                });
+            let rendered = report::attack(
+                result,
+                reason,
+                selected,
+                report.request,
+                &report::resume(&report.argv),
+                measure,
+            );
+            report.deliver(&rendered, human, true)
         }
         Err(diagnostics) => {
             // Pre-validation failure: exactly one `error` at seq 1, no `started`.
@@ -653,7 +710,12 @@ fn search_error(out: &mut impl Write, code: &str, message: &str, location: &str)
 }
 
 /// Emits the successful lifecycle: `started`, one `output`, then terminal `done`.
-fn run_transform(request: TransformRequest, out: &mut EventSink) -> ExitCode {
+fn run_transform(
+    request: TransformRequest,
+    out: &mut EventSink,
+    report: &report::Context<'_>,
+    json: &str,
+) -> ExitCode {
     let ts = now_ts();
 
     if let Err(error) = emit(out, &Event::Started, 1, &ts) {
@@ -665,6 +727,8 @@ fn run_transform(request: TransformRequest, out: &mut EventSink) -> ExitCode {
         Ok(output) => {
             let human = out.is_human();
             let text = human.then(|| output.clone());
+            let job: serde_json::Value = serde_json::from_str(json).expect("validated request");
+            let rendered = report::transform(&job["job"], &output, report.request, &ts, &now_ts());
             if let Err(error) = emit(out, &Event::Output { output }, 2, &ts) {
                 eprintln!("error: failed to write protocol event: {error}");
                 return ExitCode::FAILURE;
@@ -690,7 +754,7 @@ fn run_transform(request: TransformRequest, out: &mut EventSink) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             }
-            ExitCode::SUCCESS
+            report.deliver(&rendered, human, false)
         }
         // Validation runs before `started`, so this branch is not expected; if the
         // engine ever fails, surface it as a terminal `error` with no `done`.
