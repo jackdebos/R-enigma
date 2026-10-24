@@ -271,6 +271,13 @@ func (s *Server) attackEngine(w http.ResponseWriter, r *http.Request) (string, b
 }
 
 func (s *Server) serveAttack(w http.ResponseWriter, r *http.Request) {
+	// Read a start body before locking, so a slow client cannot block status
+	// polling or the engine event reader.
+	var body []byte
+	var bodyErr error
+	if r.URL.Path == "/api/attack" && r.Method == http.MethodPost {
+		body, bodyErr = io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+	}
 	a := s.attacks
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -304,7 +311,6 @@ func (s *Server) serveAttack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resume := r.URL.Path == "/api/attack/resume"
-	var body []byte
 	var plan attack.Plan
 	if resume {
 		a.refresh()
@@ -313,9 +319,7 @@ func (s *Server) serveAttack(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		var err error
-		body, err = io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
-		if err != nil {
+		if bodyErr != nil {
 			apiIssue(w, 400, "invalid_request", "Expected one attack JSON object of at most 1 MiB.")
 			return
 		}
@@ -361,6 +365,19 @@ func (a *attackRun) cancel() error {
 
 func (a *attackRun) start(path string, resume bool) error {
 	v := a.view
+	if resume {
+		// A resume that cannot launch leaves the attack exactly as resumable as
+		// before, with its run numbering, and only reports the launch error.
+		previous, checkpoint, reason := *v, a.checkpoint, a.reason
+		defer func() {
+			if a.done == nil && v.Status == "failed" {
+				launch := v.Error
+				*v, a.checkpoint, a.reason = previous, checkpoint, reason
+				v.Error = launch
+				_ = a.persist()
+			}
+		}()
+	}
 	v.Runs++
 	v.Status = "running"
 	v.Error = nil

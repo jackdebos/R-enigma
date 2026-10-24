@@ -301,6 +301,9 @@ The engine runs directly, without a shell or attack deadline, in the job directo
 `enigma --events - --request request.json --checkpoint checkpoint.json --cancel-file
 cancel-1 --threads <n> --report report-1.txt`. Resume substitutes `--resume` for
 `--checkpoint` and increments the cancel/report numbers, leaving old markers intact.
+If a resume cannot launch the engine, the attack keeps its previous status, run count
+and resumability, and the view's `error` explains the launch failure. A start body is
+read before the attack state is locked, so a slow client never delays status polls.
 Own resources are rechecked during copying; text is never normalized. Stdout lines
 are bounded to 64 MiB; an invalid/excessive stream fails the attack. Restart loads
 the newest readable job ID and rebuilds observations from its log; a saved `running`
