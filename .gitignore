@@ -2,6 +2,9 @@
 .atl/
 /.codegraph/
 
+# Local scratch for builds, smoke checks and temporary files
+/.scratch/
+
 # Go web client build outputs
 /web/enigma-web
 /web/enigma-web.exe
