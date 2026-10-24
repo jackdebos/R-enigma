@@ -188,6 +188,67 @@ Failures have `{"error":{"code":"...","message":"..."}}`:
 | 502 | `engine_failed` | Failed process, excessive output, invalid JSONL or missing terminal/output events. |
 | 502 | `timeout` | Transform deadline exceeded or request cancelled. |
 
+## Attack preview
+
+`POST /api/attack/preview` builds a search request and estimate only: it never
+runs or requires a configured engine, writes files, or starts an attack. It uses
+the same cookie and Host/Origin guards; other methods return 405 (`Allow: POST`).
+The body is one strict JSON object, at most 1 MiB, with no unknown or duplicate
+members. All members below are required except `settings`; `null` explicitly
+marks an unknown reflector, wheel, ring or position. Slots follow catalog order.
+Text is copied unchanged, including invalid engine symbols.
+
+```json
+{"model":"enigma-i","reflector":"B","slots":[{"id":"left","wheel":"I","ring":"A","position":"A"},{"id":"middle","wheel":"II","ring":"A","position":"A"},{"id":"right","wheel":"III","ring":"A","position":null}],"plugboard":{"known":[],"search":true},"text":"ABCDEF","settings":{"threads":2}}
+```
+
+Success returns `{"request":{...},"outer_keys":"26","threads":2,
+"estimate_seconds":0.0014238362068965517,"resources":[{"measure":"sinkov_trigram",
+"file":"enigma1941-trigram.json","builtin":"enigma1941-trigram"}]}`.
+The request uses protocol 1 and bundled models. Unknowns enumerate complete catalog
+wheel domains or A–Z rings/positions; repeated wheels are included, not filtered.
+Known plugboard pairs are fixed; all remaining letters are mutable. With
+`search:false`, the pair cap equals the known pair count. A fully known key with
+no plugboard search is rejected; a full 13-pair board has no mutable letters and
+is also rejected.
+
+Optional advanced settings:
+
+| Setting | Default / allowed values |
+| --- | --- |
+| `method` | `hill_climb` (empty start); or `partial_exhaustion`. |
+| `seeds` | PE only: omitted selects all empty/single-pair seeds; an array selects seeds touching those unique uppercase mutable letters. |
+| `initial_measure`, `final_measure` | `ic`, `sinkov_trigram`. Measures: `ic`, `entropy`, `sinkov_monogram` through `sinkov_hexagram`, `trie`. |
+| `stages` | `[{"pass":"reswapping","measure":"sinkov_trigram"},{"pass":"measure","measure":"sinkov_trigram"}]`; `[]` disables stages. Each pass occurs at most once. |
+| Stage fields | `reswapping`/`measure`: optional `measure` (defaults `sinkov_trigram`/`ic`); `trie`: optional `base_measure` (otherwise carries the previous score). |
+| `switch_pairs`, `backtrack_pairs` | 7, 5; each 0–13. |
+| `max_pairs` | 13 when searching; between known pair count and 13. |
+| `hold` | 5; 1–1000. |
+| `threads` | Half the logical CPUs, at least one; explicit values 1–256. Returned separately, not embedded in the engine request. |
+| `tables` | Measure-to-absolute-file-path map; own files override built-ins. Only used resource measures are allowed. |
+
+Built-ins supply German 1941 bigrams/trigrams; see `internal/tables/NOTICE.md`
+for provenance and licence. Other Sinkov measures and trie need an own table.
+Own paths must resolve to regular files of at most 64 MiB. Preview checks metadata,
+not table contents. Resources return `own` instead of `builtin` for own sources;
+engine paths remain relative (`own-<measure>.json` or `<builtin id>.json`). Future
+runners must copy/write these resources before execution. Own files must follow
+[engine JSON v1 scoring resources](../docs/scoring-resources.md); convert n-grams
+with `python3 e2e/recovery/ngrams.py convert --help` from the repository root.
+
+The approximate duration is `outer_keys × 0.004235 seconds × (PE ? 20 : 1)
+× text_letters / 232 / threads` (ASCII letters counted without changing text).
+The basis is our engine's U-264 design B: 74.4 seconds / 17576 keys, one thread,
+Ryzen 5 2600. PE's factor is heuristic; hardware, text, stages and hold affect
+actual time. This is guidance, not a completion guarantee.
+
+Rejections return HTTP 400 with `{"error":{"code":"...","message":"...",
+"field":"settings/hold"}}`; `field` is a body path (empty for whole-body errors).
+Codes are `invalid_request` (JSON/schema/size), `unknown_model`,
+`invalid_component` (catalog/key facts), `invalid_settings` (advanced settings or
+own-file metadata), `missing_table` (required resource unavailable), and
+`nothing_to_search` (no unknown key dimension).
+
 ## Machine page
 
 - Choose Spanish or English in the header. The initial language follows the browser

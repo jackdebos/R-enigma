@@ -97,6 +97,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			s.serveMachines(w, r)
 			return
 		}
+		if r.URL.Path == "/api/attack/preview" {
+			s.serveAttackPreview(w, r)
+			return
+		}
 		if r.URL.Path == "/api/transform" {
 			s.serveTransform(w, r)
 			return
