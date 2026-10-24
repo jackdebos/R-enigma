@@ -9,3 +9,8 @@
 # Untracked timing results (see e2e/*_timing/README.md)
 /e2e/bomm_timing/results/
 /e2e/enigma_rust_timing/results/
+
+# Recovery corpora/derived tables and run results stay local
+/e2e/recovery/data/
+/e2e/recovery/results/
+/e2e/recovery/__pycache__/
