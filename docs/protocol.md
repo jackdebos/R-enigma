@@ -3,7 +3,8 @@
 Status: **Protocol v1 is unpublished; transform and validated HC/PE execution ship
 in Rust. Legacy search and deferred controls remain unimplemented.** It replaces the former superset-of-`bomm` proposal. It makes no promise to
 accept `bomm` query files unchanged; `bomm` remains a differential oracle. See
-`odd/tasks/enigma-engine.md` for task status. No UI is in Stage 1; UI begins in Stage 2.
+`odd/tasks/enigma-engine.md` for task status. The engine has no UI; the Stage 2 web
+client is a separate program that drives this CLI (§8).
 
 ## 1. Normative boundary
 
@@ -32,8 +33,7 @@ search support.
 
 | Mode | Use | Enabled by | Stage |
 | --- | --- | --- | --- |
-| `stdio` (default) | TUI, scripts, tests | — | 1 |
-| local listener | web client | `--listen 127.0.0.1:<port>` | 2 (planned) |
+| `stdio` (default) | scripts, tests, the web client (§8) | — | 1 |
 
 **Status:** §2.1-§2.4 and the additive §4.1 fields ship in the CLI
 (`odd/tasks/enigma-human-output.md`).
@@ -42,8 +42,8 @@ Stage 1 is one command-line process (§2.1). By default it runs in **human mode*
 (§2.2): a progress bar on stderr, a readable report at the end and a saved report
 file, with no JSON on stdout. The JSONL event stream (§4), one JSON object per line
 without embedded newlines, is written only when `--events` selects a destination
-(§2.3). Diagnostics always go to `stderr`. A future Stage 2 listener carries the same
-event messages. No UI is part of Stage 1.
+(§2.3). Diagnostics always go to `stderr`. The engine opens no network listener; the
+Stage 2 web client (§8) reads the same event stream from a child process.
 
 ### 2.1 Command line
 
@@ -170,7 +170,7 @@ The line is cleared before the report is printed or a diagnostic is written.
 
 - `--events -` writes the complete JSONL stream (§4) to stdout. No bar is drawn and no
   report text is printed; no report file is saved unless `--report` is given. Machine
-  consumers (TUI, web client, tests, timing harnesses) use this form. Stdout is then
+  consumers (web client, tests, timing harnesses) use this form. Stdout is then
   exactly what the CLI wrote to stdout before human mode existed, apart from the
   additive fields of §4.1.
 - `--events <path>` writes the same stream to a new file. If `<path>` already exists,
@@ -1000,12 +1000,24 @@ per-slot order but slices outer scramblers only; seed/action indices are separat
 as specified in [attack order](search-passes.md#3-pre-execution-gates-and-outer-order).
 This does not change legacy subset enumeration or define cross-pass holds.
 
-## 8. Local listener (Stage 2)
+## 8. Web client (Stage 2)
 
-Not Stage 1. A future listener binds `127.0.0.1` only, forbids `0.0.0.0`, uses a
-per-run bearer token printed once to stderr, validates `Origin` against an allow-list,
-and mirrors the protocol through `POST /jobs`, `GET /jobs/{id}/events`, and
-`POST /jobs/{id}/cancel`.
+The web client is a separate program, `enigma-web` (Go, `web/`), released apart from
+the engine. There is no TUI and the engine binary has no listener. `enigma-web` uses
+only this CLI's public surface: it runs `enigma` as a child process with
+`--events - --request -`, writes the request to stdin and reads the JSONL events of §4
+from stdout; cancellation uses the cancel file (§5), and checkpoints use the §6 options.
+It never links the engine library.
+
+Compatibility: `enigma-web` keeps an explicit list of supported engine versions, as
+printed by `--version` (`enigma <version>` and `protocol version <n>`). It refuses any
+other engine, older or newer, until `enigma-web` itself is updated; an engine change
+that the web client must follow therefore ships with a matching `enigma-web` release.
+
+The listener binds `127.0.0.1` only and never `0.0.0.0`, requires a per-run random
+token that is part of the URL opened in the browser, and rejects requests whose `Host`
+or `Origin` is not its own loopback address. Its HTTP routes belong to `enigma-web`
+and are documented in `web/README.md`; they are not part of this protocol.
 
 ## 9. `bomm` parity
 
@@ -1026,7 +1038,7 @@ execute) remain deferred; the checkpoint record is specified in §6.3. They must
 before their implementation, not presumed executable or imported from `bomm`.
 Search-space and [measure/resource schemas](scoring-resources.md) are specified as
 normative design; that does not assert implemented scoring or search execution.
-There is no Stage 1 UI; clients belong to Stage 2.
+The engine has no UI; the Stage 2 web client is the separate program of §8.
 
 ## 11. GPU constraints (Stage 4)
 
