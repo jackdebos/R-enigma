@@ -4,9 +4,65 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Enigma</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
 </head>
 <body>
-  <h1>Enigma</h1>
-  <p>The local web interface is coming soon.</p>
+  <header>
+    <div><h1 data-i18n="title"></h1><p data-i18n="subtitle"></p></div>
+    <label><span data-i18n="language"></span>
+      <select id="language">
+        <option value="es" data-i18n="language_es"></option>
+        <option value="en" data-i18n="language_en"></option>
+      </select>
+    </label>
+  </header>
+  <main>
+    <section aria-labelledby="engine-title">
+      <h2 id="engine-title" data-i18n="engine_title"></h2>
+      <form id="engine-form">
+        <label for="path" data-i18n="path"></label>
+        <div class="path-row"><input id="path" type="text" spellcheck="false" autocapitalize="off" autocomplete="off" aria-describedby="path-hint"><button id="save" type="submit" data-i18n="save"></button></div>
+        <p id="path-hint" class="hint" data-i18n="path_hint"></p>
+      </form>
+      <p id="engine-status" role="status" aria-live="polite"></p>
+    </section>
+    <section aria-labelledby="machine-title">
+      <h2 id="machine-title" data-i18n="machine_title"></h2>
+      <p class="hint" data-i18n="machine_intro"></p>
+      <p id="blocker" class="notice" data-i18n="blocker"></p>
+      <p id="catalog-error" role="alert" hidden></p>
+      <fieldset id="machine" disabled hidden>
+        <div class="model-row"><div id="model-field"></div><div id="reflector-field"></div></div>
+        <div id="rotors" class="rotors"></div>
+        <div id="plugboard-heading"></div>
+        <div class="pairs-editor"><div id="first-field"></div><div id="second-field"></div><button type="button" id="add-pair" data-i18n="add_pair"></button></div>
+        <p id="pair-count" class="hint"></p>
+        <ul id="pairs" class="pairs"></ul>
+        <p id="pair-error" role="alert" hidden></p>
+      </fieldset>
+    </section>
+    <section aria-labelledby="text-title">
+      <h2 id="text-title" data-i18n="text_title"></h2>
+      <form id="message-form">
+        <label for="text" data-i18n="text"></label>
+        <p id="text-hint" class="hint" data-i18n="text_hint"></p>
+        <textarea id="text" rows="5" spellcheck="false" autocapitalize="off" autocomplete="off" aria-describedby="text-hint"></textarea>
+        <div id="text-errors" role="alert" hidden><p data-i18n="invalid_text_intro"></p><ul id="offending"></ul></div>
+        <button type="button" id="uppercase" data-i18n="uppercase" hidden></button>
+        <p id="message-status" role="status" aria-live="polite"></p>
+        <button id="start" type="submit" data-i18n="start" disabled></button>
+      </form>
+      <div id="result" hidden>
+        <div class="result-heading"><label for="output" data-i18n="output"></label><button type="button" id="copy" data-i18n="copy"></button></div>
+        <textarea id="output" rows="4" readonly spellcheck="false"></textarea>
+        <p id="copy-status" role="status"></p>
+        <p class="hint" data-i18n="lamps"></p>
+        <div id="lamps" class="lamps" aria-hidden="true"></div>
+        <p class="hint" data-i18n="lamps_hint"></p>
+      </div>
+    </section>
+  </main>
 </body>
 </html>

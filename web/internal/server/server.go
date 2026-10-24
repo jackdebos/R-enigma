@@ -71,6 +71,8 @@ func jsonResponse(w http.ResponseWriter, status int, value any) {
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// These checks precede routing, including FileServer's redirects.
 	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	if r.Host != s.hosts[0] && r.Host != s.hosts[1] {
 		jsonResponse(w, http.StatusForbidden, map[string]string{"error": "forbidden host"})
 		return

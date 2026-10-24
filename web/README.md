@@ -1,9 +1,9 @@
 # enigma-web
 
-A separate, local web client for the Rust Enigma engine. **Currently implemented:
-server scaffold, embedded placeholder page, authenticated status route and persisted
-engine path/version validation, machine catalog and explicit transform execution.**
-The bilingual machine UI remains planned in T5 of `odd/tasks/enigma-web-client.md`.
+A separate, local web client for the Rust Enigma engine. The embedded bilingual
+machine page configures Enigma I, M3 and M4 and starts encryption or decryption
+explicitly, using the separately installed Rust engine. No framework, build step,
+CDN, external font, image, or JavaScript package installation is needed.
 
 ## Build and run
 
@@ -42,6 +42,9 @@ The executable includes the page; it needs no static files in its working direct
   the token from the address bar. The cookie is not `Secure` because this is local
   HTTP. Invalid tokens do not set a cookie. Bootstrap responses are not cached and
   responses use `Referrer-Policy: no-referrer`.
+- Every response includes `X-Content-Type-Options: nosniff` and a self-only Content
+  Security Policy (no inline scripts/styles, no framing, no external resources).
+  The page uses same-origin fetches with the session cookie.
 - Every `/api/...` request requires that cookie, checked in constant time, otherwise
   401 with `{"error":"unauthorized"}`. API responses use JSON and `Cache-Control:
   no-store`. Static content is public on the allowed hosts.
@@ -55,8 +58,8 @@ This is a local browser boundary, not isolation from other processes on your mac
 
 Use the absolute path to the installed Rust `enigma` executable, not its directory
 or the Go `enigma-web` binary. For a local release build, that is the repository's
-`target/release/enigma`; installed binaries can be located with `command -v enigma`
-on Unix. No PATH lookup, shell expansion, or shell invocation is used by the server.
+`target/release/enigma`; installed binaries can be located with `which enigma`
+on Linux/macOS or `where enigma` on Windows. No PATH lookup, shell expansion, or shell invocation is used by the server.
 Only configure an executable you trust: probing `--version` executes that program.
 
 All engine routes have the same cookie authentication and Host/Origin guards as
@@ -78,7 +81,7 @@ An unconfigured response has `configured:false`, empty path/version, protocol 0,
 `compatible:false`, and `error:null`. POST responses describe the attempted candidate,
 not the previous saved path; GET describes what is saved, including when it becomes
 invalid. Rejected JSON has empty candidate fields. Errors are objects with stable
-`code` and a short English `message`; the future page can translate the codes.
+`code` and a short English `message`; the page translates the codes.
 
 | Code | Meaning |
 | --- | --- |
@@ -174,6 +177,39 @@ Failures have `{"error":{"code":"...","message":"..."}}`:
 | 502 | `engine_failed` | Failed process, excessive output, invalid JSONL or missing terminal/output events. |
 | 502 | `timeout` | Transform deadline exceeded or request cancelled. |
 
+## Machine page
+
+- Choose Spanish or English in the header. The initial language follows the browser
+  (`es*` selects Spanish, otherwise English); a selection is saved in localStorage
+  when browser storage is available. Changing language preserves the current form.
+- Save the full executable path in the engine panel. Its status shows the compatible
+  engine and protocol versions, or explains the error (including found/supported
+  versions). Until a compatible engine is connected, a friendly notice replaces the
+  machine controls. A rejected candidate does not replace an already saved engine.
+- Choose the model, reflector and one wheel, ring and start position for each slot.
+  Slots follow catalog order, including the Greek wheel on M4. The small `?` buttons
+  open short explanations, including the distinction between ring and position.
+  Each CSS letter window shows only its chosen **initial** position: no animation,
+  stepping simulation, or final rotor state is implied.
+- Add or remove plugboard pairs using the two letter selectors. Used letters cannot
+  be reused, and the page shows the pair count (up to 13).
+- Type a message and press **Start / Comenzar**. Typing never starts a request.
+  Invalid characters are listed individually with 1-based Unicode code-point
+  positions (not UTF-16 offsets); spaces, tabs and line breaks have visible labels.
+  Nothing is sent if any character is outside A–Z. If lowercase is present,
+  **Convert to uppercase / Pasar a mayúsculas** explicitly changes the textarea,
+  but does not send it. Review it and press Start again; accents or other remaining
+  symbols are still rejected. No automatic trimming or normalization occurs.
+- The result is shown exactly as returned in a read-only text area with a Copy
+  button. A static lamp marks the last output letter. If clipboard access is denied,
+  select the result and copy it manually. Engine rejections show a translated
+  explanation and the engine's original message; other failures have friendly copy.
+
+All page copy and hints live in `static/i18n/{es,en}.json` with matching keys.
+`static/logic.js` contains DOM-free validation, request building and dictionary
+lookup with an English fallback. The server embeds only runtime assets; Node test
+files, package metadata and Go source are not served.
+
 ## Test
 
 From `web/`:
@@ -184,16 +220,29 @@ gofmt -l .
 ```
 
 The formatting check should print nothing. HTTP tests use `net/http/httptest` without
-opening a browser or network listener.
+opening a browser or network listener. Tests verify every runtime asset's content
+type, security headers on success and rejection paths, and dictionary key parity
+with no empty translations.
+
+From the repository root, with Node 24 or newer (no npm install):
+
+```sh
+node --test web/static/
+```
+
+`static/package.json` declares ES modules and points the directory runner at
+`logic.test.mjs`; it has no dependencies and is not embedded. The tests cover text
+validation, lowercase detection, disjoint plugboard pairs, unmodified request
+building for each model, language selection and dictionary fallback.
 
 ## Architecture and next steps
 
 - `cmd/enigma-web/`: flags, loopback listener, browser launcher and shutdown.
 - `internal/server/`: testable HTTP security boundary and routes.
 - `internal/engine/`: bounded version probing, exact compatibility gate and atomic config persistence.
-- `static/`: embedded page (currently a placeholder).
+- `static/`: embedded HTML, one stylesheet, ES modules and Spanish/English dictionaries.
 
-The future machine page will call the transform endpoint only on explicit start.
+The machine page calls the transform endpoint only on explicit start.
 The server reads JSONL events from `docs/protocol.md` §4; engine path/version
 validation follows §8. The engine stays
 in `crates/`; it has no web listener and is never linked into this Go binary.
