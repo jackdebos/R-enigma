@@ -493,6 +493,11 @@ fn foreign_destination_after_started_survives_cancel_and_reports_exact_failure()
 }
 
 #[test]
+// The interval override exists only in debug builds; release always waits 300 seconds.
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug-only ENIGMA_TEST_CHECKPOINT_INTERVAL_MS override"
+)]
 fn periodic_writes_and_failed_writes_keep_the_search_running() {
     let dir = Scratch::new();
     let mut value = request();
