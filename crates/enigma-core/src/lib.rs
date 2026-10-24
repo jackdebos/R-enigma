@@ -63,6 +63,8 @@ pub use attack_result::{
 };
 mod binding;
 mod candidate;
+mod checkpoint;
+pub use checkpoint::{checkpoint_identity, CheckpointIdentity, CheckpointIdentityError};
 mod capability;
 mod configuration;
 mod definition;

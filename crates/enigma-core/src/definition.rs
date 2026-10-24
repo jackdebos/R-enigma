@@ -133,17 +133,12 @@ impl DefinitionSource {
         match self {
             Self::Custom(definition) => Ok(definition),
             Self::Bundled { id } => {
-                let json = match id.as_str() {
-                    "enigma-i" => include_str!("../catalog/enigma-i.json"),
-                    "enigma-m3" => include_str!("../catalog/enigma-m3.json"),
-                    "enigma-m4" => include_str!("../catalog/enigma-m4.json"),
-                    _ => {
-                        return Err(vec![DefinitionDiagnostic::new(
-                            "unknown_bundled_definition",
-                            format!("bundled definition {id:?} is unavailable; only catalog entries explicitly shipped by the engine can be used"),
-                            "/id",
-                        )]);
-                    }
+                let Some(json) = bundled_catalog_json(&id) else {
+                    return Err(vec![DefinitionDiagnostic::new(
+                        "unknown_bundled_definition",
+                        format!("bundled definition {id:?} is unavailable; only catalog entries explicitly shipped by the engine can be used"),
+                        "/id",
+                    )]);
                 };
                 let tagged = format!(r#"{{"kind":"custom","value":{json}}}"#);
                 match Self::parse_json(&tagged)? {
@@ -154,6 +149,16 @@ impl DefinitionSource {
                 }
             }
         }
+    }
+}
+
+/// The exact catalog JSON shipped for a bundled definition alias.
+pub(crate) fn bundled_catalog_json(id: &str) -> Option<&'static str> {
+    match id {
+        "enigma-i" => Some(include_str!("../catalog/enigma-i.json")),
+        "enigma-m3" => Some(include_str!("../catalog/enigma-m3.json")),
+        "enigma-m4" => Some(include_str!("../catalog/enigma-m4.json")),
+        _ => None,
     }
 }
 
