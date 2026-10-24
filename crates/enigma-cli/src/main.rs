@@ -4,7 +4,7 @@
 //! binary is a thin shell: it must contain no cryptanalytic logic, so that the same
 //! engine can be driven by the TUI (Stage 2), the local web client (Stage 2) and the
 //! test harness without divergence. Parsing, validation and computation live in
-//! `enigma-core`; this module only moves bytes and emits protocol events.
+//! `enigma-core`; this module parses CLI arguments, moves bytes and emits protocol events.
 
 mod attack_transport;
 mod cancel_file;
@@ -29,6 +29,21 @@ use enigma_core::{
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // These exact tokens win even when used where an option value was expected.
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
+    {
+        print!("{}", help_text());
+        return ExitCode::SUCCESS;
+    }
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "-V" | "--version"))
+    {
+        print!("{}", version_text());
+        return ExitCode::SUCCESS;
+    }
     let cwd = match std::env::current_dir() {
         Ok(cwd) => cwd,
         Err(error) => {
@@ -38,6 +53,7 @@ fn main() -> ExitCode {
     };
     let mut events = EventSink::Discard;
     let resolved = split_options(&args).and_then(|(input, options)| {
+        options.validate_report(&cwd)?;
         let checkpoint = CheckpointFile::prepare(&cwd, options.checkpoint, options.resume)
             .map_err(InputError::InvalidOption)?;
         if let Some(target) = options.events {
@@ -57,7 +73,7 @@ fn main() -> ExitCode {
             &mut events,
         ),
         Err(InputError::Usage) => {
-            print_usage();
+            eprint!("{}", help_text());
             ExitCode::from(2)
         }
         Err(InputError::Io(message) | InputError::InvalidOption(message)) => {
@@ -101,6 +117,35 @@ struct Options<'a> {
     resume: Option<&'a str>,
     /// Unresolved `--events` target: `-` for stdout, otherwise a new file.
     events: Option<&'a str>,
+    /// Parsed and preflight-validated here; report rendering and saving land in T5.
+    report: Option<&'a str>,
+    no_report: bool,
+}
+
+impl Options<'_> {
+    fn validate_report(&self, cwd: &Path) -> Result<(), InputError> {
+        if self.report.is_some() && self.no_report {
+            return Err(InputError::InvalidOption(
+                "--report and --no-report cannot be combined".into(),
+            ));
+        }
+        if let Some(label) = self.report {
+            match fs::symlink_metadata(cwd.join(label)) {
+                Ok(_) => {
+                    return Err(InputError::InvalidOption(format!(
+                        "--report file already exists: {label:?}"
+                    )))
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(InputError::InvalidOption(format!(
+                        "cannot inspect report {label:?}: {error}"
+                    )))
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Where protocol events go: stdout, a new file, or nowhere (human mode, §2.2).
@@ -153,52 +198,82 @@ impl Write for EventSink {
     }
 }
 
-const CANCEL_FILE: &str = "--cancel-file";
 const THREADS: &str = "--threads";
 
-/// Splits control option pairs from before or after the input form.
-///
-/// A duplicate pair, a missing value or a `--`-prefixed value is a usage error; a
-/// `--threads` value other than a decimal integer in `1..=MAX_THREADS` is an
-/// invalid option. Both are reported before the request is read.
-fn split_options(args: &[String]) -> Result<(&[String], Options<'_>), InputError> {
-    let is_option = |arg: &String| {
-        matches!(
-            arg.as_str(),
-            CANCEL_FILE | THREADS | "--checkpoint" | "--resume" | "--events"
-        )
-    };
+/// A request path and whether `-` selects stdin (only with --request/-i).
+struct Input<'a> {
+    path: &'a str,
+    explicit: bool,
+}
+
+fn is_short_form(value: &str) -> bool {
+    matches!(
+        value,
+        "-h" | "-V" | "-i" | "-e" | "-o" | "-t" | "-c" | "-r" | "-x"
+    )
+}
+
+/// Linear, ungrouped parser. Both spellings share the same duplicate slot.
+fn split_options(args: &[String]) -> Result<(Option<Input<'_>>, Options<'_>), InputError> {
     let mut options = Options::default();
-    let mut input = args;
-    loop {
-        let (flag, value) = match input {
-            [flag, value, rest @ ..] if is_option(flag) => {
-                input = rest;
-                (flag, value)
+    let mut input = None;
+    let mut args = args.iter();
+    while let Some(flag) = args.next() {
+        if flag == "--no-report" {
+            if options.no_report {
+                return Err(InputError::Usage);
             }
-            [rest @ .., flag, value] if is_option(flag) => {
-                input = rest;
-                (flag, value)
+            options.no_report = true;
+            continue;
+        }
+        let slot = match flag.as_str() {
+            "--request" | "-i" => None,
+            "--events" | "-e" => Some(&mut options.events),
+            "--report" | "-o" => Some(&mut options.report),
+            "--checkpoint" | "-c" => Some(&mut options.checkpoint),
+            "--resume" | "-r" => Some(&mut options.resume),
+            "--cancel-file" | "-x" => Some(&mut options.cancel_file),
+            "--threads" | "-t" => None,
+            _ if !flag.starts_with('-') => {
+                if input
+                    .replace(Input {
+                        path: flag,
+                        explicit: false,
+                    })
+                    .is_some()
+                {
+                    return Err(InputError::Usage);
+                }
+                continue;
             }
-            _ => break,
+            _ => return Err(InputError::Usage),
         };
-        if value.starts_with("--") {
+        let value = args.next().ok_or(InputError::Usage)?;
+        if value.starts_with("--") || is_short_form(value) {
             return Err(InputError::Usage);
         }
-        let duplicate = match flag.as_str() {
-            CANCEL_FILE => options.cancel_file.replace(value).is_some(),
-            "--checkpoint" => options.checkpoint.replace(value).is_some(),
-            "--resume" => options.resume.replace(value).is_some(),
-            "--events" => options.events.replace(value).is_some(),
-            _ => options.threads.replace(parse_threads(value)?).is_some(),
+        let duplicate = if let Some(slot) = slot {
+            slot.replace(value.as_str()).is_some()
+        } else if matches!(flag.as_str(), "--request" | "-i") {
+            input
+                .replace(Input {
+                    path: value,
+                    explicit: true,
+                })
+                .is_some()
+        } else {
+            if options.threads.is_some() {
+                return Err(InputError::Usage);
+            }
+            options.threads = Some(parse_threads(value)?);
+            false
         };
         if duplicate {
             return Err(InputError::Usage);
         }
     }
-    if input.iter().any(is_option) {
-        return Err(InputError::Usage);
-    }
+    // Keep file preflight ahead of the missing-input error, as with long forms
+    // before short options were introduced.
     Ok((input, options))
 }
 
@@ -218,22 +293,13 @@ fn parse_threads(value: &str) -> Result<ExecutionOptions, InputError> {
         })
 }
 
-/// Resolves the accepted argument shapes into raw request bytes.
-///
-/// Accepted: no argument is a usage error; one positional non-flag argument is a file
-/// path; `--request -` reads stdin; `--request <path>` reads that file. Anything else
-/// is a usage error.
-fn resolve_input(args: &[String], cwd: &Path) -> Result<(Vec<u8>, PathBuf), InputError> {
-    let path = match args {
-        [path] if !path.starts_with("--") => path,
-        [flag, value] if flag == "--request" => {
-            if value == "-" {
-                return read_stdin().map(|bytes| (bytes, cwd.to_owned()));
-            }
-            value
-        }
-        _ => return Err(InputError::Usage),
-    };
+/// Reads the already validated input form, retaining its lexical origin.
+fn resolve_input(input: Option<Input<'_>>, cwd: &Path) -> Result<(Vec<u8>, PathBuf), InputError> {
+    let input = input.ok_or(InputError::Usage)?;
+    let path = input.path;
+    if input.explicit && path == "-" {
+        return read_stdin().map(|bytes| (bytes, cwd.to_owned()));
+    }
     // Lexical filename origin, deliberately not the canonical symlink target.
     let filename = cwd.join(path);
     let origin = filename.parent().unwrap_or(cwd).to_owned();
@@ -269,25 +335,46 @@ fn read_bounded(reader: impl Read, source: &str) -> Result<Vec<u8>, InputError> 
     Ok(buffer)
 }
 
-fn print_usage() {
-    eprintln!("enigma {}", env!("CARGO_PKG_VERSION"));
-    eprintln!("protocol version {}", enigma_core::PROTOCOL_VERSION);
-    eprintln!();
-    eprintln!("Usage: enigma <request.json>");
-    eprintln!("       enigma --request -        read the request from stdin");
-    eprintln!("       enigma --request <path>   read the request from a file");
-    eprintln!();
-    eprintln!("Options (before or after the request form):");
-    eprintln!("  --cancel-file <path>   cancel a hill_climb/partial_exhaustion attack");
-    eprintln!("                         once <path> exists as a regular file");
-    eprintln!("  --threads <n>          worker threads for a hill_climb/partial_exhaustion");
-    eprintln!("                         attack, 1 to 256 (default: half the logical CPUs);");
-    eprintln!("                         completed runs write the same output for any <n>");
-    eprintln!("  --checkpoint <path>  save HC/PE checkpoints to a new file");
-    eprintln!("  --resume <path>      resume HC/PE and keep saving to the same file");
-    eprintln!();
-    eprintln!("One JSON event is written per line to stdout; diagnostics go to stderr.");
-    eprintln!("See docs/protocol.md for the contract and odd/tasks/enigma-engine.md for the plan.");
+fn version_text() -> String {
+    format!(
+        "enigma {}\nprotocol version {}\n",
+        env!("CARGO_PKG_VERSION"),
+        enigma_core::PROTOCOL_VERSION
+    )
+}
+
+fn help_text() -> String {
+    format!(
+        "{}\n{}",
+        version_text(),
+        r#"Usage: enigma [options] <request.json>
+       enigma [options] --request <path|->
+
+Input:
+  -i, --request <path|->    read the request from a file, or from stdin with -
+
+Output:
+  -e, --events <path|->     write the JSONL event stream to a new file, or to
+                            stdout with - (no progress bar, no terminal report)
+  -o, --report <name>       save the report to <name>, a new file
+      --no-report           do not save a report file
+
+Attacks (hill_climb and partial_exhaustion):
+  -t, --threads <n>         worker threads, 1 to 256 (default: half the logical
+                            CPUs); completed runs give the same result for any <n>
+  -c, --checkpoint <path>   save checkpoints to a new file
+  -r, --resume <path>       resume from a checkpoint and keep saving to it
+  -x, --cancel-file <path>  stop safely once <path> exists as a regular file
+
+Other:
+  -h, --help                print this help
+  -V, --version             print the version
+
+By default progress is drawn on stderr when it is a terminal, and the result is
+printed on stdout and saved as a report in the working directory.
+See docs/protocol.md for the contract.
+"#
+    )
 }
 
 /// Rejection message for `--cancel-file` on jobs without a cancellation contract.

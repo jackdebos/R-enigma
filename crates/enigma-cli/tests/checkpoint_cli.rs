@@ -141,11 +141,12 @@ fn startup_conflicts_precede_request_read_and_preserve_files() {
 fn option_shapes_and_help() {
     let dir = Scratch::new();
     let help = dir.run(&["--help"], &request());
-    assert_eq!(help.status.code(), Some(2));
-    assert!(help.stdout.is_empty());
-    let usage = String::from_utf8(help.stderr.clone()).unwrap();
-    assert!(usage.contains("  --checkpoint <path>  save HC/PE checkpoints to a new file\n"));
-    let resume_help = "  --resume <path>      resume HC/PE and keep saving to the same file\n";
+    assert_eq!(help.status.code(), Some(0));
+    assert!(help.stderr.is_empty());
+    let usage = String::from_utf8(help.stdout.clone()).unwrap();
+    assert!(usage.contains("  -c, --checkpoint <path>   save checkpoints to a new file\n"));
+    let resume_help =
+        "  -r, --resume <path>       resume from a checkpoint and keep saving to it\n";
     assert!(usage.contains(resume_help));
     for option in ["--checkpoint", "--resume"] {
         for args in [
@@ -157,7 +158,7 @@ fn option_shapes_and_help() {
             let output = dir.run(&args, &request());
             assert_eq!(output.status.code(), Some(2));
             assert!(output.stdout.is_empty());
-            assert_eq!(output.stderr, help.stderr);
+            assert_eq!(output.stderr, help.stdout);
         }
     }
     assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
