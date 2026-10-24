@@ -73,14 +73,21 @@ impl<'a> OuterPlan<'a> {
         }
     }
 
-    // T4 also uses this range when starting dispatch at the restored cursor.
-    #[allow(dead_code)]
     pub(crate) fn selected_range(&self) -> (u128, u128) {
         (self.start, self.start + self.len)
     }
 
     pub(crate) fn blocks(&self) -> OuterBlocks {
         OuterBlocks::new(self.start, self.len)
+    }
+
+    /// Resume without changing the original selected-range block indices.
+    pub(crate) fn blocks_from(&self, next: u128) -> OuterBlocks {
+        let mut blocks = self.blocks();
+        blocks.next = next;
+        blocks.remaining = self.start + self.len - next;
+        blocks.index = (next - self.start).div_ceil(OUTER_BLOCK_KEYS);
+        blocks
     }
 
     pub(crate) fn block_count(&self) -> u128 {

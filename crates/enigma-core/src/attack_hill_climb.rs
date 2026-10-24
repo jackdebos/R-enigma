@@ -299,7 +299,7 @@ pub(crate) mod block_snapshot {
         request.outer_plan().selected_range()
     }
 
-    fn restore_raw(
+    pub(super) fn restore_raw(
         request: &crate::AttackRequest,
         entry: &Entry,
     ) -> Result<DirectOuterOutcome, CheckpointError> {
@@ -361,7 +361,85 @@ fn observed_run<O: CounterObserver>(
     result
 }
 
+/// A checked checkpoint bound to its request, ready to execute after preflight.
+/// Validation does not notify observers or charge evaluation counters.
+pub struct ResumedAttack<'a> {
+    request: &'a crate::AttackRequest,
+    state: block_snapshot::BlockPhaseSnapshot,
+}
+
+impl ResumedAttack<'_> {
+    /// Continue with restored counters; callbacks run only on the calling thread.
+    pub fn run_with(
+        self,
+        options: crate::ExecutionOptions,
+        observe: impl FnMut(crate::AttackProgress),
+        cancel_requested: impl FnMut() -> bool,
+    ) -> Result<crate::AttackResult, crate::AttackRunError> {
+        self.request.run_seeded(
+            options,
+            &PoolHooks::default(),
+            Some(self.state),
+            observe,
+            cancel_requested,
+        )
+    }
+}
+
 impl crate::AttackRequest {
+    /// Check and bind a parsed checkpoint before execution or `started` delivery.
+    ///
+    /// The caller MUST compare `record.identity()` with the identity computed from
+    /// this request and its loaded resources first; Core cannot recover raw resource
+    /// bytes from a bound request. Every retained entry is re-decrypted and re-scored
+    /// with the bound outer final measure, without charging accounting. `elapsed_ms`
+    /// remains entirely caller-owned. Stages always rerun from the saved outer hold.
+    pub fn resume(
+        &self,
+        record: &crate::CheckpointRecord,
+    ) -> Result<ResumedAttack<'_>, crate::CheckpointError> {
+        use crate::checkpoint::record::CheckpointError;
+        let state = block_snapshot::BlockPhaseSnapshot::restore(self, record)?;
+        let preparation = RunPreparation::new(self);
+        let plan = self.outer_plan();
+        for entry in record.best.iter().chain(&record.hold) {
+            let index = entry.outer_index.0;
+            let (start, _) = plan.selected_range();
+            if index < start || index >= state.next_outer {
+                return Err(CheckpointError(
+                    "entry index outside committed prefix".into(),
+                ));
+            }
+            let initial = plan
+                .keys(OuterBlock {
+                    index: 0,
+                    start: index,
+                    len: 1,
+                })
+                .next()
+                .expect("one key")
+                .1
+                .map_err(|_| CheckpointError("entry outer key failed to resolve".into()))?;
+            let raw = block_snapshot::restore_raw(self, entry)?;
+            if initial != raw.initial || entry.score.measure != self.settings().final_measure().id()
+            {
+                return Err(CheckpointError("entry key or measure mismatch".into()));
+            }
+            let scorer = preparation.evaluator(&initial, index, self.settings().final_measure());
+            let (plaintext, score) = scorer
+                .evaluate(&entry.mutable_plugboard)
+                .map_err(|error| CheckpointError(format!("entry re-scoring failed: {error}")))?;
+            let saved = raw.climb.current.expect("restored board");
+            if plaintext != saved.plaintext || score != saved.score {
+                return Err(CheckpointError("entry plaintext or score mismatch".into()));
+            }
+        }
+        Ok(ResumedAttack {
+            request: self,
+            state,
+        })
+    }
+
     /// Run this resource-bound owner with fresh accounting and latched cancellation.
     ///
     /// Observation is synchronous, infallible and counter-only; duplicate snapshots
@@ -396,10 +474,33 @@ impl crate::AttackRequest {
         options: crate::ExecutionOptions,
         hooks: &PoolHooks,
         observe: impl FnMut(crate::AttackProgress),
+        cancel_requested: impl FnMut() -> bool,
+    ) -> Result<crate::AttackResult, crate::AttackRunError> {
+        self.run_seeded(options, hooks, None, observe, cancel_requested)
+    }
+
+    fn run_seeded(
+        &self,
+        options: crate::ExecutionOptions,
+        hooks: &PoolHooks,
+        restored: Option<block_snapshot::BlockPhaseSnapshot>,
+        observe: impl FnMut(crate::AttackProgress),
         mut cancel_requested: impl FnMut() -> bool,
     ) -> Result<crate::AttackResult, crate::AttackRunError> {
-        let mut allowance = EvaluationAllowance { used: 0 };
-        let mut control = AttackControl::with_progress_every(self.settings().progress_every());
+        let state = restored.unwrap_or_else(|| block_snapshot::BlockPhaseSnapshot {
+            next_outer: self.outer_plan().selected_range().0,
+            allowance: EvaluationAllowance { used: 0 },
+            control: AttackControl::with_progress_every(self.settings().progress_every()),
+            best: None,
+            acceptance: DirectAcceptance::new(self.settings().hold_capacity()),
+        });
+        let block_snapshot::BlockPhaseSnapshot {
+            next_outer,
+            mut allowance,
+            mut control,
+            best,
+            acceptance,
+        } = state;
         let mut observer = ProgressObserver(observe);
         observed_run(&mut control, &mut observer, |control, observer| {
             // The serial outer phase fills this preparation; pool workers own theirs.
@@ -413,6 +514,7 @@ impl crate::AttackRequest {
                 control,
                 observer,
                 &mut cancel_requested,
+                (next_outer, best, acceptance),
             )?;
             let mut result = result;
             let completed = crate::AttackTermination::Completed;
@@ -2366,6 +2468,7 @@ impl crate::AttackRequest {
         hooks: &PoolHooks,
         preparation: &RunPreparation<'_>,
         plan: &crate::attack_blocks::OuterPlan<'_>,
+        next_outer: u128,
         control: &mut AttackControl,
         requested: &mut impl FnMut() -> bool,
         commit: &mut impl FnMut(
@@ -2374,13 +2477,19 @@ impl crate::AttackRequest {
             PhaseBlock,
         ) -> Result<(), crate::AttackRunError>,
     ) -> Result<DirectRunTermination, crate::AttackRunError> {
-        let blocks = usize::try_from(plan.block_count()).unwrap_or(usize::MAX);
+        let remaining = plan.selected_range().1 - next_outer;
+        let blocks = usize::try_from(remaining.div_ceil(crate::attack_blocks::OUTER_BLOCK_KEYS))
+            .unwrap_or(usize::MAX);
         let workers = options.threads().get().min(blocks);
         if workers > 1 {
-            return self.drive_pool(workers, hooks, plan, control, requested, commit);
+            return self.drive_pool(workers, hooks, plan, next_outer, control, requested, commit);
         }
-        let mut termination = DirectRunTermination::OuterSliceEnd;
-        for block in plan.blocks() {
+        let mut termination = if plan.block_count() == 0 {
+            DirectRunTermination::OuterSliceEnd
+        } else {
+            DirectRunTermination::Completed
+        };
+        for block in plan.blocks_from(next_outer) {
             if control.poll_cancellation(requested()) {
                 return Ok(DirectRunTermination::Cancelled);
             }
@@ -2398,11 +2507,13 @@ impl crate::AttackRequest {
     /// key order, emits progress and polls cancellation. A stop or a known error ends
     /// the hand-out; every block already handed out still finishes and, up to the
     /// first error, is committed, so a stop always keeps a key-order prefix.
+    #[allow(clippy::too_many_arguments)]
     fn drive_pool(
         &self,
         workers: usize,
         hooks: &PoolHooks,
         plan: &crate::attack_blocks::OuterPlan<'_>,
+        next_outer: u128,
         control: &mut AttackControl,
         requested: &mut impl FnMut() -> bool,
         commit: &mut impl FnMut(
@@ -2415,18 +2526,19 @@ impl crate::AttackRequest {
             return Ok(DirectRunTermination::Cancelled);
         }
         let count = plan.block_count();
+        let first = (next_outer - plan.selected_range().0) / crate::attack_blocks::OUTER_BLOCK_KEYS;
         let queue = BlockQueue {
             state: Mutex::new(Dispatch {
-                blocks: plan.blocks(),
-                handed: 0,
-                committed: 0,
+                blocks: plan.blocks_from(next_outer),
+                handed: first,
+                committed: first,
                 stop: false,
             }),
             changed: Condvar::new(),
             window: 2 * workers as u128,
         };
         let (sender, receiver) = std::sync::mpsc::channel();
-        let mut next = 0;
+        let mut next = first;
         std::thread::scope(|scope| {
             let _release = StopOnPanic(&queue);
             for worker in 0..workers {
@@ -2500,11 +2612,11 @@ impl crate::AttackRequest {
         control: &mut AttackControl,
         observer: &mut impl CounterObserver,
         requested: &mut impl FnMut() -> bool,
+        seed: (u128, Option<DirectOuterOutcome>, DirectAcceptance),
     ) -> Result<crate::AttackResult, crate::AttackRunError> {
         let plan = self.outer_plan();
         let measure = self.settings().final_measure();
-        let mut acceptance = DirectAcceptance::new(self.settings().hold_capacity());
-        let mut best = None;
+        let (next_outer, mut best, mut acceptance) = seed;
         let run = (|| {
             let mut commit = |control: &mut AttackControl, block: OuterBlock, outcome| {
                 let (accounting, candidates, error) = match outcome {
@@ -2641,6 +2753,7 @@ impl crate::AttackRequest {
                 hooks,
                 preparation,
                 &plan,
+                next_outer,
                 control,
                 requested,
                 &mut commit,
@@ -3890,6 +4003,134 @@ mod tests {
         record.phase = Phase::Outer;
         let error = CheckpointSnapshot::restore(&request, &record).unwrap_err();
         assert_eq!(error.to_string(), "phase does not match next_outer");
+    }
+
+    #[test]
+    fn checkpoint_resume_equivalence_matrix() {
+        use crate::checkpoint::record::CheckpointRecord;
+        let identity = crate::checkpoint_identity("{}", &Default::default()).unwrap();
+        let wire = |result: &crate::AttackResult| {
+            serde_json::to_value(crate::Event::result(result, 0)).unwrap()
+        };
+        for pe in [false, true] {
+            for capacity in [1, 5] {
+                for staged in [false, true] {
+                    let (mut request, snapshots) = checkpoint_boundaries(pe, capacity);
+                    if staged {
+                        // Keep the same outer space but add a genuinely executed stage.
+                        request = pool_request(pe, capacity, |job| {
+                            job["space"]["offset"] = 3.into();
+                            job["space"]["limit"] = 260.into();
+                            job["configuration"]["plugboard"] = serde_json::json!([["A", "B"]]);
+                            job["space"]["plugboard"]["symbols"] = serde_json::json!(["C", "D"]);
+                            job["space"]["plugboard"]["max_pairs"] = 2.into();
+                            job["attack"]["progress_every"] = 137.into();
+                            job["passes"].as_array_mut().unwrap().push("measure".into());
+                            job["attack"]["measure"] = serde_json::json!({"measure":"ic"});
+                        });
+                    }
+                    let baseline = request.run(|_| {}, || false).unwrap();
+                    for state in &snapshots {
+                        let mut record = state.record(&request, identity, 123).unwrap();
+                        let json = record.seal_json().unwrap();
+                        let parsed = CheckpointRecord::parse_json(&json).unwrap();
+                        for threads in [1, 2, 4] {
+                            let mut initial = None;
+                            let result = request
+                                .resume(&parsed)
+                                .unwrap()
+                                .run_with(
+                                    crate::ExecutionOptions::with_threads(threads).unwrap(),
+                                    |progress| {
+                                        initial.get_or_insert(progress);
+                                    },
+                                    || false,
+                                )
+                                .unwrap();
+                            assert_eq!(initial.unwrap().0, (&record.counters).into());
+                            assert_eq!(
+                                wire(&result),
+                                wire(&baseline),
+                                "pe={pe}, hold={capacity}, staged={staged}, threads={threads}"
+                            );
+                            assert_eq!(result.termination, baseline.termination);
+                            assert_eq!(result.evaluations_used, baseline.evaluations_used);
+                        }
+                    }
+                    // Resume the first checkpoint, stop after one more block, then
+                    // resume the matching T3b-captured state on a different pool.
+                    let mut first = snapshots[0].record(&request, identity, 0).unwrap();
+                    let parsed = CheckpointRecord::parse_json(&first.seal_json().unwrap()).unwrap();
+                    let polls = std::cell::Cell::new(0);
+                    let stopped = request
+                        .resume(&parsed)
+                        .unwrap()
+                        .run_with(
+                            crate::ExecutionOptions::serial(),
+                            |_| {},
+                            || {
+                                polls.set(polls.get() + 1);
+                                polls.get() > 1
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(stopped.termination, crate::AttackTermination::Cancelled);
+                    let mut second = snapshots[1].record(&request, identity, 0).unwrap();
+                    assert_eq!(stopped.counters().0, (&second.counters).into());
+                    assert_eq!(stopped.evaluations_used, second.evaluations_used.0);
+                    let parsed =
+                        CheckpointRecord::parse_json(&second.seal_json().unwrap()).unwrap();
+                    let result = request
+                        .resume(&parsed)
+                        .unwrap()
+                        .run_with(
+                            crate::ExecutionOptions::with_threads(4).unwrap(),
+                            |_| {},
+                            || false,
+                        )
+                        .unwrap();
+                    assert_eq!(wire(&result), wire(&baseline));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn checkpoint_resume_rejects_tampered_entries_before_observation() {
+        use crate::checkpoint::record::{CheckpointRecord, Decimal};
+        let identity = crate::checkpoint_identity("{}", &Default::default()).unwrap();
+        for pe in [false, true] {
+            for capacity in [1, 5] {
+                let (request, snapshots) = checkpoint_boundaries(pe, capacity);
+                let record = snapshots[0].record(&request, identity, 0).unwrap();
+                for field in ["plaintext", "measured", "ranking", "measure", "key"] {
+                    let mut bad = record.clone();
+                    let entry = bad.hold.last_mut().unwrap();
+                    match field {
+                        "plaintext" => entry.plaintext.push('A'),
+                        "measured" => entry.score.measured_q32 = Decimal(i128::MAX),
+                        "ranking" => entry.score.ranking_q32 = Decimal(i128::MIN),
+                        "measure" => entry.score.measure = "entropy".into(),
+                        "key" => {
+                            let position = &mut entry.configuration.slots[0].position;
+                            *position = if *position == 'A' { 'B' } else { 'A' };
+                        }
+                        _ => unreachable!(),
+                    }
+                    if capacity == 1 {
+                        bad.best = bad.hold.first().cloned();
+                    }
+                    let json = bad.seal_json().unwrap();
+                    let parsed = CheckpointRecord::parse_json(&json).unwrap();
+                    let error = request
+                        .resume(&parsed)
+                        .err()
+                        .expect("reject tampered entry");
+                    assert!(error.to_string().contains("entry"), "{field}: {error}");
+                    assert_eq!(record, snapshots[0].record(&request, identity, 0).unwrap());
+                }
+            }
+        }
     }
 
     /// Three fixed slots of 16 settings each: 4,096 outer keys, 32 blocks.

@@ -136,7 +136,8 @@ pub(crate) mod record {
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
-    pub(crate) struct CheckpointRecord {
+    /// Parsed checkpoint with opaque, checked wire state (protocol §6.3).
+    pub struct CheckpointRecord {
         pub(crate) checkpoint_version: u8,
         pub(crate) protocol_version: u8,
         #[serde(with = "digest")]
@@ -212,7 +213,7 @@ pub(crate) mod record {
 
     /// Human reason only; the CLI later supplies the path and diagnostic prefix.
     #[derive(Debug, PartialEq, Eq)]
-    pub(crate) struct CheckpointError(pub(crate) String);
+    pub struct CheckpointError(pub(crate) String);
     impl fmt::Display for CheckpointError {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str(&self.0)
@@ -310,6 +311,16 @@ pub(crate) mod record {
     }
 
     impl CheckpointRecord {
+        /// Identity to compare with the bound request before calling `resume`.
+        pub fn identity(&self) -> CheckpointIdentity {
+            self.identity
+        }
+
+        /// Accumulated elapsed time; Core never reads a clock.
+        pub fn elapsed_ms(&self) -> u128 {
+            self.elapsed_ms.0
+        }
+
         fn validate(&self) -> Result<(), CheckpointError> {
             for (name, version) in [
                 ("checkpoint_version", self.checkpoint_version),
@@ -344,7 +355,8 @@ pub(crate) mod record {
             Ok(serde_json::to_value(self)?.to_string())
         }
 
-        pub(crate) fn parse_json(input: &str) -> Result<Self, CheckpointError> {
+        /// Parse strict JSON and verify versions and the state digest.
+        pub fn parse_json(input: &str) -> Result<Self, CheckpointError> {
             let mut deserializer = serde_json::Deserializer::from_str(input);
             let value = StrictValue::deserialize(&mut deserializer)?.into_value();
             deserializer.end()?;

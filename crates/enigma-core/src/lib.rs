@@ -57,6 +57,7 @@ mod attack_result;
 mod attack_reswapping;
 pub use attack_execution::ExecutionOptions;
 pub use attack_gate::AttackGate;
+pub use attack_hill_climb::ResumedAttack;
 pub use attack_result::{
     AttackBest, AttackCounterOverflow, AttackHoldEntry, AttackProgress, AttackResult,
     AttackRunCategory, AttackRunError, AttackRunSource, AttackStageResult, AttackTermination,
@@ -64,6 +65,7 @@ pub use attack_result::{
 mod binding;
 mod candidate;
 mod checkpoint;
+pub use checkpoint::record::{CheckpointError, CheckpointRecord};
 pub use checkpoint::{checkpoint_identity, CheckpointIdentity, CheckpointIdentityError};
 mod capability;
 mod configuration;
