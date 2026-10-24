@@ -86,6 +86,28 @@ fn timing_runs(value: Option<&OsStr>) -> Result<usize, String> {
     }
 }
 
+/// Harness default stays monothread, independently of the application's default.
+fn timing_threads(value: Option<&OsStr>) -> Result<usize, String> {
+    let Some(value) = value else { return Ok(1) };
+    let text = value.to_str().unwrap_or("");
+    match text.parse::<usize>() {
+        Ok(threads) if (1..=256).contains(&threads) && text.bytes().all(|b| b.is_ascii_digit()) => {
+            Ok(threads)
+        }
+        _ => Err(format!(
+            "ENIGMA_TIMING_THREADS must be an integer from 1 to 256, got {value:?}"
+        )),
+    }
+}
+
+fn enigma_command(binary: &str, directory: &Path, threads: usize) -> Command {
+    let mut command = Command::new(binary);
+    command
+        .current_dir(directory)
+        .args(["--threads", &threads.to_string(), "request.json"]);
+    command
+}
+
 /// Nearest-rank percentile of ascending `sorted`: the sample at 1-based rank
 /// `ceil(percent * N / 100)`, at least 1. Always an observed sample, never interpolated.
 fn percentile(sorted: &[Duration], percent: usize) -> Duration {
@@ -144,12 +166,15 @@ fn cpu_model() -> Value {
 struct Settings {
     case: &'static str,
     runs: usize,
+    threads: usize,
     output: Option<PathBuf>,
     metadata: Map<String, Value>,
 }
 
 impl Settings {
     fn from_env(program: &str) -> Self {
+        let threads = timing_threads(std::env::var_os("ENIGMA_TIMING_THREADS").as_deref())
+            .unwrap_or_else(|error| panic!("{error}"));
         let runs = timing_runs(std::env::var_os("ENIGMA_TIMING_RUNS").as_deref())
             .unwrap_or_else(|error| panic!("{error}"));
         let case = timing_case(std::env::var_os("ENIGMA_TIMING_CASE").as_deref())
@@ -177,6 +202,7 @@ impl Settings {
         Settings {
             case,
             runs,
+            threads,
             output,
             metadata,
         }
@@ -202,6 +228,7 @@ impl Settings {
         };
         let mut report = self.metadata;
         report.insert("runs".into(), json!(self.runs));
+        report.insert("threads".into(), json!(self.threads));
         if let Some(count) = evaluations {
             report.insert("evaluations".into(), json!(count));
         }
@@ -355,11 +382,7 @@ fn enigma_rust_case_a_timing() {
     if settings.case != ATTACK_CASE {
         evaluations.set(None);
     }
-    let command = || {
-        let mut command = Command::new(binary);
-        command.current_dir(inputs.path()).arg("request.json");
-        command
-    };
+    let command = || enigma_command(binary, inputs.path(), settings.threads);
     let check = |output: &Output| {
         verify_attack_output(output, &record);
         if settings.case != ATTACK_CASE {
@@ -426,7 +449,7 @@ fn enigma_rust_case_a_timing() {
 }
 
 /// bomm options recorded in the capture command, between the binary and the query path.
-fn bomm_flags(record: &Value) -> Vec<String> {
+fn bomm_flags(record: &Value, threads: usize) -> Vec<String> {
     let command = record["capture"]["command"]
         .as_str()
         .expect("capture command");
@@ -445,14 +468,16 @@ fn bomm_flags(record: &Value) -> Vec<String> {
         .contains(query),
         "capture query path: {query}"
     );
-    let flags: Vec<String> = tokens[binary + 1..tokens.len() - 1]
+    let mut flags: Vec<String> = tokens[binary + 1..tokens.len() - 1]
         .iter()
         .map(|token| token.to_string())
         .collect();
-    assert!(
-        flags.windows(2).any(|pair| pair == ["-t", "1"]),
-        "{flags:?}"
-    );
+    let thread_value = flags
+        .windows(2)
+        .position(|pair| pair == ["-t", "1"])
+        .unwrap_or_else(|| panic!("capture must contain -t 1: {flags:?}"))
+        + 1;
+    flags[thread_value] = threads.to_string();
     flags
 }
 
@@ -520,7 +545,7 @@ fn bomm_case_a_timing() {
     settings
         .metadata
         .insert("bomm_commit".into(), json!(BOMM_COMMIT));
-    let flags = bomm_flags(&record);
+    let flags = bomm_flags(&record, settings.threads);
     let observed_key = record["observed"]["key"].as_str().unwrap();
     let key_prefix: Vec<_> = observed_key.split_whitespace().take(3).collect();
     let key_prefix = key_prefix.join(" ");
@@ -563,9 +588,149 @@ fn bomm_case_a_timing() {
 }
 
 #[test]
+fn thread_boundaries_and_exact_engine_arguments_preserve_capture_flags() {
+    assert_eq!(timing_threads(None), Ok(1));
+    for (text, threads) in [("1", 1), ("006", 6), ("256", 256)] {
+        assert_eq!(timing_threads(Some(OsStr::new(text))), Ok(threads));
+        let command = enigma_command("enigma", Path::new("inputs"), threads);
+        assert_eq!(command.get_current_dir(), Some(Path::new("inputs")));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["--threads", &threads.to_string(), "request.json"].map(OsStr::new)
+        );
+        for case in [ATTACK_CASE, POSITIONS_CASE, DESIGN_B_CASE] {
+            let (_, record) = selected_fixture(case);
+            let original = record["capture"]["command"].clone();
+            assert_eq!(
+                bomm_flags(&record, threads),
+                ["-q", "-t", text.trim_start_matches('0'), "-n", "5"]
+            );
+            assert_eq!(record["capture"]["command"], original);
+        }
+    }
+}
+
+#[test]
+fn case_a_public_harness_records_default_and_explicit_threads() {
+    for threads in [None, Some("1"), Some("6")] {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "enigma_rust_case_a_timing",
+                "--ignored",
+                "--exact",
+                "--nocapture",
+            ])
+            .env_remove("ENIGMA_TIMING_OUTPUT")
+            .env_remove("ENIGMA_TIMING_BINARY")
+            .env_remove("ENIGMA_TIMING_THREADS")
+            .env("ENIGMA_TIMING_CASE", "a")
+            .env("ENIGMA_TIMING_RUNS", "1");
+        if let Some(value) = threads {
+            command.env("ENIGMA_TIMING_THREADS", value);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let report = stdout.split_once("ENIGMA_TIMING {").unwrap().1;
+        let report = format!("{{{report}");
+        let report: Value = serde_json::Deserializer::from_str(&report)
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            report["threads"],
+            threads.unwrap_or("1").parse::<usize>().unwrap()
+        );
+        assert_eq!(report["runs"], 1);
+        assert_eq!(report["evaluations"], EVALUATIONS);
+        assert_eq!(report["startup_measurement"], "in_run_started_event");
+        for field in ["startup", "search", "full"] {
+            assert_eq!(
+                report[field]["samples_seconds"].as_array().unwrap().len(),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn launchers_reject_invalid_threads_before_building_or_writing_results() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for launcher in ["e2e/enigma_rust_timing/run.sh", "e2e/bomm_timing/run.sh"] {
+        for value in [
+            "",
+            "0",
+            "00",
+            "257",
+            "-1",
+            "+3",
+            " 3",
+            "3 ",
+            "1.5",
+            "ten",
+            "99999999999999999999999",
+        ] {
+            let output = Command::new("sh")
+                .arg(root.join(launcher))
+                .env("ENIGMA_TIMING_THREADS", value)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(1));
+            assert!(output.stdout.is_empty());
+            assert_eq!(
+                output.stderr,
+                b"run.sh: ENIGMA_TIMING_THREADS must be an integer from 1 to 256\n"
+            );
+        }
+        let script = std::fs::read_to_string(root.join(launcher)).unwrap();
+        assert!(script.contains("$case_suffix-t$threads.json"));
+        assert!(script.contains("threads=${ENIGMA_TIMING_THREADS-1}"));
+    }
+}
+
+#[test]
+fn thread_validation_precedes_measurement_in_both_public_harnesses() {
+    for harness in ["enigma_rust_case_a_timing", "bomm_case_a_timing"] {
+        for value in [
+            "",
+            "0",
+            "00",
+            "257",
+            "-1",
+            "+3",
+            " 3",
+            "3 ",
+            "1.5",
+            "ten",
+            "99999999999999999999999",
+        ] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([harness, "--ignored", "--exact", "--nocapture"])
+                .env_remove("ENIGMA_TIMING_OUTPUT")
+                .env("ENIGMA_TIMING_THREADS", value)
+                .env("ENIGMA_TIMING_RUNS", "invalid-sentinel")
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(101));
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(
+                stderr.contains(&format!(
+                    "ENIGMA_TIMING_THREADS must be an integer from 1 to 256, got {value:?}"
+                )),
+                "{harness}: {stderr}"
+            );
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("ENIGMA_TIMING {"));
+        }
+    }
+}
+
+#[test]
 fn positions_capture_uses_the_same_flags_and_its_own_decrypt_count() {
     let (_, record) = selected_fixture(POSITIONS_CASE);
-    assert_eq!(bomm_flags(&record), ["-q", "-t", "1", "-n", "5"]);
+    assert_eq!(bomm_flags(&record, 1), ["-q", "-t", "1", "-n", "5"]);
     let (count, pairs) = bomm_report(
         "│ UKW-B-thin,beta,II,IV,I aaaav avjna at bl df gj hm nw op qy rz vx │\nNumber of decrypts: 5492071\n",
         "UKW-B-thin,beta,II,IV,I aaaav avjna",
@@ -577,7 +742,7 @@ fn positions_capture_uses_the_same_flags_and_its_own_decrypt_count() {
 #[test]
 fn design_b_capture_uses_the_same_flags_and_its_own_decrypt_count() {
     let (_, record) = selected_fixture(DESIGN_B_CASE);
-    assert_eq!(bomm_flags(&record), ["-q", "-t", "1", "-n", "5"]);
+    assert_eq!(bomm_flags(&record, 1), ["-q", "-t", "1", "-n", "5"]);
     let (count, pairs) = bomm_report(
         "│ UKW-B-thin,beta,II,IV,I aaaav avjna at bl df gj hm nw op qy rz vx │\nNumber of decrypts: 142788085\n",
         "UKW-B-thin,beta,II,IV,I aaaav avjna",
@@ -797,7 +962,7 @@ fn results_are_never_overwritten() {
 #[test]
 fn bomm_flags_and_board_come_from_the_recorded_capture() {
     let (_, record) = attack_fixture();
-    assert_eq!(bomm_flags(&record), ["-q", "-t", "1", "-n", "5"]);
+    assert_eq!(bomm_flags(&record, 1), ["-q", "-t", "1", "-n", "5"]);
     let stdout = "Final query results:\n\
         │ \u{1b}[32mvonvon\u{1b}[37m   -8.333018 │\n\
         │ UKW-B-thin,beta,II,IV,I aaaav avjna vx at bl df gj hm nw op qy zr            │\n\

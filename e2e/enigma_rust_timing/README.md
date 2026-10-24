@@ -16,6 +16,14 @@ Works from any directory. The script builds `target/release/enigma`, hashes it,
 and then runs the ignored test `enigma_rust_case_a_timing` in
 `crates/enigma-cli/tests/case_a_timing.rs`, which uses that same binary.
 
+## Select threads
+
+`ENIGMA_TIMING_THREADS` is a decimal integer from 1 to 256; absent means **1**.
+Invalid values fail before measurement. The launcher passes explicit `--threads N`;
+this does not change the application's half-logical-CPU default. Reports include
+numeric `threads`, and every filename ends in `-tN.json`, including default `-t1`.
+Other flags, fixtures, correctness checks and statistics stay unchanged.
+
 ## Select the longer positions case
 
 ```sh
@@ -38,15 +46,16 @@ counter (stage `evaluations_used` alone is not the total), checked for stability
 on every run and recorded as `evaluations`. `per_evaluation_microseconds` uses
 our own count, never A's 8,456 or bomm's count.
 
-A2 results use `results/<UTC>-<short commit>-positions.json`, with
-`case: "m4-u264-attack-positions"`; A filenames remain unchanged.
+A2 results use `results/<UTC>-<short commit>-positions-tN.json`, with
+`case: "m4-u264-attack-positions"`.
 Never run the two harnesses concurrently.
 
 ## Select design B: all three rotating positions
 
 ```sh
-# Run only after the bomm harness has finished:
-ENIGMA_TIMING_CASE=b ENIGMA_TIMING_RUNS=3 e2e/enigma_rust_timing/run.sh
+# Run each invocation only after the previous harness has finished:
+ENIGMA_TIMING_CASE=b ENIGMA_TIMING_THREADS=1 ENIGMA_TIMING_RUNS=3 e2e/enigma_rust_timing/run.sh
+ENIGMA_TIMING_CASE=b ENIGMA_TIMING_THREADS=6 ENIGMA_TIMING_RUNS=3 e2e/enigma_rust_timing/run.sh
 ```
 
 Design B uses `e2e/bomm/m4-u264-attack-design-b/`: left/II, middle/IV and
@@ -61,9 +70,12 @@ each full run at `started`. Use a small count such as 3; a full warm-up is also 
 This is outcome-level timing: bomm applies every pass inline to every key;
 ours polishes only the hold-5 finalists with reswapping/measure. Each harness
 reports its own observed evaluation count and uses it for per-evaluation time.
-Results use `results/<UTC>-<short commit>-b.json` and
+Results use `results/<UTC>-<short commit>-b-tN.json` and
 `case: "m4-u264-attack-design-b"`. A and A2 behavior remains unchanged.
-Never run the harnesses concurrently.
+Never run the harnesses concurrently. Initial comparison uses explicit 1 and 6
+threads for both engines, each with one unrecorded warm-up and 3 recorded runs.
+Compare **full-time medians** primarily: equal threads do not imply equal evaluation
+work or equal startup boundaries. The 1/2/4/8 scaling sweep is deferred.
 
 ## What is measured (default A)
 
@@ -76,7 +88,8 @@ request or process is used.
   former one-evaluation probe and **not comparable to bomm's startup probe**.
 - **Full** = wall time from the same spawn boundary until process exit is observed.
   **Search** = full minus startup, computed separately for each run before statistics.
-  The search hot-loop comparison with bomm remains; startup equivalence is not claimed.
+  Full-time medians are the primary cross-engine comparison; startup equivalence
+  and identical evaluation work are not claimed.
 - **Order**: one unrecorded full warm-up, then N full runs, strictly sequentially.
   Do not run the bomm harness at the same time.
 - **Clock**: `Instant`, with stdout read as events arrive (not parsed after exit).
@@ -85,7 +98,7 @@ request or process is used.
 
 ## Reading a result
 
-Files are `results/<UTC yyyymmddTHHMMSSZ>-<short commit>.json`; name order is time
+Files for A are `results/<UTC yyyymmddTHHMMSSZ>-<short commit>-tN.json`; name order is time
 order, and an existing file is never overwritten. Results are untracked
 (`results/` is git-ignored); copy summaries to the task tracker.
 
@@ -96,6 +109,7 @@ order, and an existing file is never overwritten. Results are untracked
 | `search_seconds_median` | `search.median` (median of paired differences, not difference of medians) |
 | `evaluations` | completed evaluations per full run, checked for stability |
 | `per_evaluation_microseconds` | `search.median * 1e6 / evaluations` (8,456 for A) |
+| `threads` | explicit engine thread count (default 1) |
 | `git_commit`, `binary_sha256`, `cpu_model`, `timestamp_utc`, `runs` | provenance |
 
 Percentiles use nearest rank: the sample at rank `ceil(p·N/100)`, so `median` is the

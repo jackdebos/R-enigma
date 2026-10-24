@@ -1,9 +1,24 @@
 #!/bin/sh
 # Times U-264 through pinned bomm and writes a new results file.
-# Usage: [ENIGMA_TIMING_CASE=a|positions|b] [ENIGMA_TIMING_RUNS=N] e2e/bomm_timing/run.sh [BOMM_BIN]
-# Defaults: case a, N=100. Recommended: positions ENIGMA_TIMING_RUNS=20; b ENIGMA_TIMING_RUNS=3.
+# Usage: [ENIGMA_TIMING_CASE=a|positions|b] [ENIGMA_TIMING_RUNS=N]
+#        [ENIGMA_TIMING_THREADS=1..256] e2e/bomm_timing/run.sh [BOMM_BIN]
+# Defaults: case a, runs=100, threads=1.
+# Initial B comparison: explicit threads=1 then 6, runs=3, sequentially.
 # Run sequentially, never alongside the enigma-rust harness.
 set -eu
+
+# Normalize decimal input once so the filename and measured flag agree.
+threads=${ENIGMA_TIMING_THREADS-1}
+case $threads in
+    ''|*[!0-9]*) threads=invalid ;;
+esac
+while [ "${threads#0}" != "$threads" ]; do threads=${threads#0}; done
+if [ -z "$threads" ] || [ "${#threads}" -gt 3 ] || [ "$threads" = invalid ] || [ "$threads" -gt 256 ]; then
+    echo 'run.sh: ENIGMA_TIMING_THREADS must be an integer from 1 to 256' >&2
+    exit 1
+fi
+ENIGMA_TIMING_THREADS=$threads
+export ENIGMA_TIMING_THREADS
 
 bomm_bin=${1:-${BOMM_BIN:-}}
 if [ -z "$bomm_bin" ]; then
@@ -31,7 +46,7 @@ if [ "${ENIGMA_TIMING_CASE-}" = positions ]; then
 elif [ "${ENIGMA_TIMING_CASE-}" = b ]; then
     case_suffix=-b
 fi
-output=$results/$(printf '%s' "$timestamp" | tr -d ':-')-$(git rev-parse --short HEAD)$case_suffix.json
+output=$results/$(printf '%s' "$timestamp" | tr -d ':-')-$(git rev-parse --short HEAD)$case_suffix-t$threads.json
 mkdir -p "$results"
 if [ -e "$output" ]; then
     echo "run.sh: $output already exists; not overwriting" >&2

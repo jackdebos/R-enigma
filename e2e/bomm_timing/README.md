@@ -18,6 +18,14 @@ directory because it opens frequency tables relative to it. The script fails if
 no binary is given, and the test fails unless its SHA-256 equals the hash recorded
 in the design-A `case.json`.
 
+## Select threads
+
+`ENIGMA_TIMING_THREADS` is a decimal integer from 1 to 256; absent means **1**.
+Invalid values fail before measurement. Both probes use explicit `-t N`, replacing
+only the captured `-t 1` value; all other capture flags and fixtures are unchanged.
+Reports include numeric `threads`, and every filename ends in `-tN.json`, including
+default `-t1`. Correctness checks and statistics stay unchanged.
+
 ## Select the longer positions case
 
 ```sh
@@ -40,14 +48,17 @@ it never uses A's 8,456 for A2 or B. If bomm omits its count, both `evaluations`
 `per_evaluation_microseconds` are omitted. Otherwise the latter divides the
 median search time by bomm's own count, in microseconds.
 
-A2 results use `results/<UTC>-<short commit>-positions.json`, with
-`case: "m4-u264-attack-positions"`; A filenames and JSON fields remain unchanged.
+A2 results use `results/<UTC>-<short commit>-positions-tN.json`, with
+`case: "m4-u264-attack-positions"`.
 Never run the two harnesses concurrently.
 
 ## Select design B: all three rotating positions
 
 ```sh
-ENIGMA_TIMING_CASE=b ENIGMA_TIMING_RUNS=3 \
+ENIGMA_TIMING_CASE=b ENIGMA_TIMING_THREADS=1 ENIGMA_TIMING_RUNS=3 \
+  BOMM_BIN=../bomm-reference/build/bomm e2e/bomm_timing/run.sh
+# Wait for completion, then:
+ENIGMA_TIMING_CASE=b ENIGMA_TIMING_THREADS=6 ENIGMA_TIMING_RUNS=3 \
   BOMM_BIN=../bomm-reference/build/bomm e2e/bomm_timing/run.sh
 ```
 
@@ -62,9 +73,13 @@ and 142,788,085 decrypts; this is not a required cross-engine workload count.
 bomm runs all passes inline on every key, unlike our finalist-only polishing.
 
 Use a small count such as 3: each invocation also runs a full warm-up.
-Results use `results/<UTC>-<short commit>-b.json` and
+Results use `results/<UTC>-<short commit>-b-tN.json` and
 `case: "m4-u264-attack-design-b"`, with bomm's own observed count for timing.
-Wait for this harness to finish before running ours. A and A2 are unchanged.
+Wait for this harness to finish before running ours. A and A2 checks are unchanged.
+Initial comparison uses explicit 1 and 6 threads for both engines, each with one
+unrecorded warm-up per probe and 3 recorded runs. Compare **full-time medians**
+primarily: equal threads do not imply equal evaluation work or startup boundaries.
+The 1/2/4/8 scaling sweep is deferred.
 
 ## One-time reference
 
@@ -73,7 +88,8 @@ the comparison case changes. Never run it at the same time as our harness.
 
 ## What is measured (default A)
 
-Both probes use the flags recorded in the case capture (`-q -t 1 -n 5`).
+Both probes use the captured flags, replacing only the thread value
+(`-q -t N -n 5`, default N=1).
 
 | Probe | Query | Checked on every run |
 | --- | --- | --- |
@@ -87,12 +103,14 @@ Both probes use the flags recorded in the case capture (`-q -t 1 -n 5`).
 
 ## Reading a result
 
-Files are `results/<UTC yyyymmddTHHMMSSZ>-<short commit>.json` (repository commit);
+Files for A are `results/<UTC yyyymmddTHHMMSSZ>-<short commit>-tN.json` (repository commit);
 name order is time order and files are never overwritten. Results are untracked;
 copy summaries to the task tracker. `startup` and `full` contain execution-order
-samples and nearest-rank statistics, with `bomm_commit` recording provenance.
+samples and nearest-rank statistics, with `bomm_commit` recording provenance
+and numeric `threads` recording the explicit thread count.
 `search_seconds_median = full.median - startup.median` and
 `per_evaluation_microseconds = search_seconds_median * 1e6 / evaluations`.
 Our harness instead measures startup inside each full run at `started` and reports
 paired search samples (see `e2e/enigma_rust_timing/README.md`). Startup times are
-not comparable; only the search hot-loop comparison remains meaningful.
+not comparable; full-time medians are the primary cross-engine metric, not
+claims of identical hot-loop work.
