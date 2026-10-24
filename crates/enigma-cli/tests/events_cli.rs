@@ -665,3 +665,52 @@ fn checkpoint_failure_does_not_deliver_human_report() {
     );
     assert!(!dir.path("bad.txt").exists());
 }
+
+// S8: the printed Resume command runs even after saving events or a named report.
+#[cfg(unix)]
+#[test]
+fn printed_resume_is_usable_after_saving_events_or_an_explicit_report() {
+    for option in ["--events", "-e", "--report", "-o"] {
+        let dir = Scratch::new();
+        std::fs::write(dir.path("request.json"), attack().to_string()).unwrap();
+        std::fs::write(dir.path("stop"), b"").unwrap();
+        let output = dir.run(
+            &[
+                "request.json",
+                "--threads",
+                "1",
+                "-c",
+                "check point",
+                "-x",
+                "stop",
+                option,
+                "saved output",
+            ],
+            &attack(),
+        );
+        assert_eq!(output.status.code(), Some(0), "{option}");
+        let report = String::from_utf8(output.stdout).unwrap();
+        assert!(report.contains("Status:       CANCELLED\n"));
+        let command = report
+            .lines()
+            .find_map(|line| line.strip_prefix("Resume:       "))
+            .unwrap();
+        let saved = std::fs::read(dir.path("saved output")).unwrap();
+        std::fs::remove_file(dir.path("stop")).unwrap();
+        let resumed = Command::new("sh")
+            .args(["-c", command])
+            .current_dir(&dir.0)
+            .output()
+            .unwrap();
+        assert_eq!(
+            resumed.status.code(),
+            Some(0),
+            "{option}: {}",
+            String::from_utf8_lossy(&resumed.stderr)
+        );
+        let completed = String::from_utf8(resumed.stdout).unwrap();
+        assert!(completed.contains("Status:       completed\n"));
+        assert!(completed.contains("Outer keys:   2 of 2\n"));
+        assert_eq!(std::fs::read(dir.path("saved output")).unwrap(), saved);
+    }
+}
