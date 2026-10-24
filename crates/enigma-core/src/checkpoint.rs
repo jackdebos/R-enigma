@@ -82,8 +82,6 @@ pub fn checkpoint_identity(
     Ok(CheckpointIdentity(hasher.finish()))
 }
 
-// T4 connects the codec and checked conversions to production execution.
-#[allow(dead_code)]
 pub(crate) mod record {
     use super::*;
     use serde::{de::Error, Deserializer, Serialize, Serializer};
@@ -349,7 +347,7 @@ pub(crate) mod record {
         }
 
         /// Seal the record with its digest, then emit sorted, compact JSON.
-        pub(crate) fn seal_json(&mut self) -> Result<String, CheckpointError> {
+        pub fn seal_json(&mut self) -> Result<String, CheckpointError> {
             self.validate()?;
             self.state_digest = self.digest()?;
             Ok(serde_json::to_value(self)?.to_string())
