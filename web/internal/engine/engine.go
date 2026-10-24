@@ -130,14 +130,22 @@ func Validate(ctx context.Context, path string) State {
 	return s
 }
 
-// Store serializes reads/updates to a config file. No user config is accessed when
-// a caller injects a path via NewStore.
+// Store remembers the startup validation and successful saves. Version probes
+// serialize with other saves, never with remembered-state readers.
 type Store struct {
-	path string
-	mu   sync.Mutex
+	path   string
+	postMu sync.Mutex
+	mu     sync.RWMutex
+	state  State
 }
 
-func NewStore(path string) *Store { return &Store{path: path} }
+// NewStore loads and validates the saved engine once, before serving requests.
+// Configuration/probe failures remain visible as state rather than preventing startup.
+func NewStore(path string) *Store {
+	s := &Store{path: path}
+	s.state = s.load(context.Background())
+	return s
+}
 
 // DefaultConfigPath locates the per-user JSON file without creating it.
 func DefaultConfigPath() (string, error) {
@@ -148,10 +156,25 @@ func DefaultConfigPath() (string, error) {
 	return filepath.Join(dir, "enigma-web", "config.json"), nil
 }
 
-// Get reloads the saved path and revalidates the executable on every call.
-func (s *Store) Get(ctx context.Context) State {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// Get returns the remembered result without disk access or a version probe.
+func (s *Store) Get(_ context.Context) State {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	state := s.state
+	state.Supported = append([]Version(nil), state.Supported...)
+	if state.Error != nil {
+		issue := *state.Error
+		issue.Supported = append([]Version(nil), issue.Supported...)
+		if issue.Found != nil {
+			found := *issue.Found
+			issue.Found = &found
+		}
+		state.Error = &issue
+	}
+	return state
+}
+
+func (s *Store) load(ctx context.Context) State {
 	data, err := os.ReadFile(s.path)
 	if errors.Is(err, os.ErrNotExist) {
 		return blank("")
@@ -168,8 +191,8 @@ func (s *Store) Get(ctx context.Context) State {
 	return Validate(ctx, config.Path)
 }
 
-// ValidatedPath is the execution boundary for future job callers: never use a
-// cached path without revalidation. An unconfigured engine returns an issue.
+// ValidatedPath uses the remembered startup/save result. Executing a changed or
+// missing engine is left to the job process boundary. Unconfigured returns an issue.
 func (s *Store) ValidatedPath(ctx context.Context) (string, error) {
 	state := s.Get(ctx)
 	if state.Error != nil {
@@ -183,8 +206,8 @@ func (s *Store) ValidatedPath(ctx context.Context) (string, error) {
 
 // Set validates before any persistence; rejected candidates never alter config.
 func (s *Store) Set(ctx context.Context, path string) State {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.postMu.Lock()
+	defer s.postMu.Unlock()
 	state := Validate(ctx, path)
 	if !state.Compatible {
 		return state
@@ -192,6 +215,9 @@ func (s *Store) Set(ctx context.Context, path string) State {
 	if err := s.save(path); err != nil {
 		return failure(state, "internal_error", "Could not save the engine configuration.")
 	}
+	s.mu.Lock()
+	s.state = state
+	s.mu.Unlock()
 	return state
 }
 

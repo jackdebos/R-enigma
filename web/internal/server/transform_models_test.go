@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func TestTransformRevalidatesSavedEngine(t *testing.T) {
+func TestTransformUsesRememberedEngine(t *testing.T) {
 	dir := t.TempDir()
 	s, u, c := engineServer(t, filepath.Join(dir, "config.json"))
 	path := engineScript(t, dir, "engine", goodVersion, 0700)
@@ -22,12 +22,35 @@ func TestTransformRevalidatesSavedEngine(t *testing.T) {
 	r.AddCookie(c)
 	w := httptest.NewRecorder()
 	s.ServeHTTP(w, r)
-	if w.Code != 409 || !strings.Contains(w.Body.String(), `"code":"engine_incompatible"`) {
-		t.Fatalf("incompatible: %d %s", w.Code, w.Body.String())
+	if w.Code != 502 || !strings.Contains(w.Body.String(), `"code":"engine_failed"`) {
+		t.Fatalf("process failure: %d %s", w.Code, w.Body.String())
 	}
-	got := engineRequest(t, s, u, c, "GET", "", 200, "unsupported_version")
+	got := engineRequest(t, s, u, c, "GET", "", 200, "")
 	if got.Path != path {
 		t.Fatal("saved engine changed")
+	}
+}
+
+func TestTransformMissingRememberedEngine(t *testing.T) {
+	dir := t.TempDir()
+	s, u, c := engineServer(t, filepath.Join(dir, "config.json"))
+	path := engineScript(t, dir, "engine", goodVersion, 0700)
+	engineRequest(t, s, u, c, "POST", pathBody(path), 200, "")
+	// Keep the original file rather than deleting it.
+	if err := os.Rename(path, path+".retired"); err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRequest("POST", "/api/transform", strings.NewReader(form))
+	r.Host = u.Host
+	r.Header.Set("Origin", "http://"+u.Host)
+	r.AddCookie(c)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, r)
+	if w.Code != 502 || !strings.Contains(w.Body.String(), `"code":"engine_failed"`) {
+		t.Fatalf("missing process: %d %s", w.Code, w.Body.String())
+	}
+	if got := engineRequest(t, s, u, c, "GET", "", 200, ""); got.Path != path || !got.Compatible {
+		t.Fatalf("remembered state changed: %+v", got)
 	}
 }
 

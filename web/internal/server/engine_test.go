@@ -158,21 +158,6 @@ func TestEnginePersistenceAndRejectedUpdates(t *testing.T) {
 	if got.Path != good || !got.Compatible {
 		t.Fatalf("reload: %+v", got)
 	}
-	// Replace the file with incompatible output, then remove it: GET must revalidate.
-	if err := os.WriteFile(good, []byte("#!/bin/sh\nprintf 'enigma 0.2.0\\nprotocol version 1\\n'\n"), 0700); err != nil {
-		t.Fatal(err)
-	}
-	engineRequest(t, reloaded, ru, rc, "GET", "", 200, "unsupported_version")
-	if err := os.Remove(good); err != nil {
-		t.Fatal(err)
-	}
-	missing := engineRequest(t, reloaded, ru, rc, "GET", "", 200, "not_found")
-	if !missing.Configured || missing.Path != good {
-		t.Fatalf("missing saved path: %+v", missing)
-	}
-	if path, err := reloaded.ValidatedEnginePath(context.Background()); path != "" || err == nil {
-		t.Fatalf("disappeared path: %q %v", path, err)
-	}
 }
 
 func TestEngineValidationErrors(t *testing.T) {

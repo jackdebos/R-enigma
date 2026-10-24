@@ -18,11 +18,12 @@ import (
 
 // Server holds the authentication secret for one run and its bound port.
 type Server struct {
-	token   string
-	cookie  string
-	hosts   [2]string
-	files   http.Handler
-	engines *engine.Store
+	token       string
+	cookie      string
+	hosts       [2]string
+	defaultPort bool
+	files       http.Handler
+	engines     *engine.Store
 }
 
 // New creates a handler for the actual port selected by the loopback listener.
@@ -46,10 +47,11 @@ func NewWithConfig(port int, configPath string) (*Server, error) {
 	return &Server{
 		token: hex.EncodeToString(secret[:]),
 		// Browser cookies ignore ports, so concurrent runs need distinct names.
-		cookie:  fmt.Sprintf("enigma_token_%d", port),
-		hosts:   [2]string{fmt.Sprintf("127.0.0.1:%d", port), fmt.Sprintf("localhost:%d", port)},
-		files:   http.FileServer(http.FS(static.Files)),
-		engines: engine.NewStore(configPath),
+		cookie:      fmt.Sprintf("enigma_token_%d", port),
+		hosts:       [2]string{fmt.Sprintf("127.0.0.1:%d", port), fmt.Sprintf("localhost:%d", port)},
+		defaultPort: port == 80,
+		files:       http.FileServer(http.FS(static.Files)),
+		engines:     engine.NewStore(configPath),
 	}, nil
 }
 
@@ -73,13 +75,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	if r.Host != s.hosts[0] && r.Host != s.hosts[1] {
+	if !s.allowedHost(r.Host) {
 		jsonResponse(w, http.StatusForbidden, map[string]string{"error": "forbidden host"})
 		return
 	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		origin := r.Header.Get("Origin")
-		if origin != "http://"+s.hosts[0] && origin != "http://"+s.hosts[1] {
+		if !strings.HasPrefix(origin, "http://") || !s.allowedHost(strings.TrimPrefix(origin, "http://")) {
 			jsonResponse(w, http.StatusForbidden, map[string]string{"error": "forbidden origin"})
 			return
 		}
@@ -129,7 +131,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.files.ServeHTTP(w, r)
 }
 
-// ValidatedEnginePath is the reusable job boundary; it rechecks the saved engine.
+func (s *Server) allowedHost(host string) bool {
+	return host == s.hosts[0] || host == s.hosts[1] ||
+		s.defaultPort && (host == "127.0.0.1" || host == "localhost")
+}
+
+// ValidatedEnginePath is the reusable job boundary using startup/save validation.
 func (s *Server) ValidatedEnginePath(ctx context.Context) (string, error) {
 	return s.engines.ValidatedPath(ctx)
 }

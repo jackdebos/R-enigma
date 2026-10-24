@@ -32,10 +32,13 @@ The executable includes the page; it needs no static files in its working direct
 ## Security and routes
 
 - IPv4 loopback only, never `0.0.0.0`. `Host` must be exactly `127.0.0.1:<port>` or
-  `localhost:<port>`; any other value receives 403.
+  `localhost:<port>`. Only when listening on port 80, the browser's port-less
+  `127.0.0.1` and `localhost` forms are also accepted; other values receive 403.
 - Every non-GET/HEAD request requires an `Origin` exactly equal to
   `http://127.0.0.1:<port>` or `http://localhost:<port>`. Missing/foreign origins
-  receive 403, before authentication or routing. No cross-origin access is enabled.
+  receive 403, before authentication or routing. Only on port 80,
+  `http://127.0.0.1` and `http://localhost` are also accepted. Port-less forms
+  remain forbidden on every other port. No cross-origin access is enabled.
 - Each run generates 32 cryptographically random bytes, encoded as hex in the URL.
   `GET /?token=<correct token>` sets the host-only `enigma_token_<port>` session cookie (the port is in the name because browser cookies ignore ports)
   (`Path=/`, `HttpOnly`, `SameSite=Strict`) and redirects with 303 to `/`, removing
@@ -67,7 +70,7 @@ All engine routes have the same cookie authentication and Host/Origin guards as
 
 | Route | Result |
 | --- | --- |
-| `GET /api/engine` | 200 with the saved path, revalidated on every request; missing config means not configured. |
+| `GET /api/engine` | 200 with the remembered startup/save validation result; missing config at startup means not configured. |
 | `POST /api/engine` | Body `{"path":"/absolute/path/to/enigma"}`; 200 validates and atomically saves, 400 rejects without changing saved config. |
 
 Other methods return 405 (`Allow: GET, POST`). Requests must contain one JSON object
@@ -79,8 +82,8 @@ with a string `path`, no unknown fields, and at most 16 KiB. Responses have this
 
 An unconfigured response has `configured:false`, empty path/version, protocol 0,
 `compatible:false`, and `error:null`. POST responses describe the attempted candidate,
-not the previous saved path; GET describes what is saved, including when it becomes
-invalid. Rejected JSON has empty candidate fields. Errors are objects with stable
+not the previous saved path; GET describes the remembered state. Failed saves leave
+both that state and the saved config unchanged. Rejected JSON has empty candidate fields. Errors are objects with stable
 `code` and a short English `message`; the page translates the codes.
 
 | Code | Meaning |
@@ -115,7 +118,13 @@ config-file path before launching the binary. This overrides the user config loc
 no new command-line flag is exposed. Tests inject their own config path and create
 fake engines under `t.TempDir()`. The optional real-engine test skips if the release
 binary is absent. `Server.ValidatedEnginePath(ctx)` is the reusable boundary for
-jobs: it reloads and revalidates, never returning an invalid cached path.
+jobs: it uses the remembered startup/save validation result without probing or
+re-reading the config. Startup validates the saved engine once, before printing
+the URL; missing or invalid configuration does not prevent the server starting,
+and the page shows that state. Only saving a path probes `--version` again.
+GET and transform-path lookups do not wait for an in-progress save probe.
+Replacing the engine (or editing its saved config) requires a restart or saving
+the path again to refresh compatibility state.
 
 ## Machine catalog and transform
 
@@ -150,8 +159,10 @@ engine rejects lowercase letters, spaces, digits, punctuation and any other symb
 always an explicit user action on the page, never automatic.
 Empty text is allowed. Each request starts from the supplied initial positions.
 
-The server revalidates the saved engine before running it directly, without a shell,
-as `enigma --events - --request -`. Transform execution has a ten-second deadline,
+The server uses the remembered compatible engine path and runs it directly,
+without a shell, as `enigma --events - --request -`. If the engine disappears or
+changes after validation, transform attempts simply report the existing process
+or protocol error (for example `engine_failed`), without another version probe. Transform execution has a ten-second deadline,
 4 MiB stdout and 64 KiB stderr limits, plus a 100 ms inherited-pipe drain limit.
 No report file is produced. Successful responses are HTTP 200:
 
@@ -171,8 +182,8 @@ Failures have `{"error":{"code":"...","message":"..."}}`:
 | 400 | `unknown_model` | Model is not in the bundled catalog. |
 | 400 | `invalid_component` | Invalid reflector, slot order/count, wheel, ring, position or plugboard. |
 | 409 | `engine_not_configured` | Configure an engine first. |
-| 409 | `engine_incompatible` | Saved executable failed revalidation; message explains why. |
-| 500 | `internal_error` | Configuration could not be read or request could not be built. |
+| 409 | `engine_incompatible` | Remembered startup validation failed; message explains why. |
+| 500 | `internal_error` | Startup configuration could not be read or request could not be built. |
 | 422 | engine code, e.g. `invalid_text` | Engine error code/message passed through verbatim; also includes available location/expected/hint and events. |
 | 502 | `engine_failed` | Failed process, excessive output, invalid JSONL or missing terminal/output events. |
 | 502 | `timeout` | Transform deadline exceeded or request cancelled. |

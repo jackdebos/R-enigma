@@ -2,9 +2,11 @@ package server_test
 
 import (
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -13,7 +15,7 @@ import (
 
 func setup(t *testing.T) (*server.Server, *url.URL) {
 	t.Helper()
-	s, err := server.New(12345)
+	s, err := server.NewWithConfig(12345, filepath.Join(t.TempDir(), "config.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,6 +129,52 @@ func TestHostAndOrigin(t *testing.T) {
 	w := request(s, "POST", "/api/status", u.Host, "http://"+u.Host, c)
 	if w.Code != 405 {
 		t.Fatalf("authenticated POST should reach method check: %d", w.Code)
+	}
+}
+
+func TestDefaultPortHostAndOrigin(t *testing.T) {
+	for _, port := range []int{80, 81, 12345, 65535} {
+		t.Run(fmt.Sprint(port), func(t *testing.T) {
+			s, err := server.NewWithConfig(port, filepath.Join(t.TempDir(), "config.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			u, _ := url.Parse(s.URL())
+			if u.Host != fmt.Sprintf("127.0.0.1:%d", port) {
+				t.Fatal("URL changed", u)
+			}
+			w := request(s, "GET", u.String(), u.Host, "", nil)
+			cookies := w.Result().Cookies()
+			if w.Code != 303 || len(cookies) != 1 || cookies[0].Name != fmt.Sprintf("enigma_token_%d", port) {
+				t.Fatal("bootstrap changed", w)
+			}
+			hosts := []string{fmt.Sprintf("127.0.0.1:%d", port), fmt.Sprintf("localhost:%d", port)}
+			for _, host := range []string{"127.0.0.1", "localhost"} {
+				want := 403
+				if port == 80 {
+					want = 200
+				}
+				w := request(s, "GET", "/api/status", host, "", cookies[0])
+				if w.Code != want {
+					t.Errorf("host %q: %d want %d", host, w.Code, want)
+				}
+			}
+			if port == 80 {
+				hosts = append(hosts, "127.0.0.1", "localhost")
+			}
+			for _, host := range hosts {
+				for _, origin := range []string{"http://127.0.0.1", "http://localhost", fmt.Sprintf("http://127.0.0.1:%d", port), fmt.Sprintf("http://localhost:%d", port), "", "null", "https://localhost", "http://localhost:81", "http://localhost.evil", "http://127.0.0.1/"} {
+					want := 403
+					if origin == fmt.Sprintf("http://127.0.0.1:%d", port) || origin == fmt.Sprintf("http://localhost:%d", port) || port == 80 && (origin == "http://localhost" || origin == "http://127.0.0.1") {
+						want = 405
+					}
+					w := request(s, "POST", "/api/status", host, origin, cookies[0])
+					if w.Code != want {
+						t.Errorf("host %q origin %q: %d want %d", host, origin, w.Code, want)
+					}
+				}
+			}
+		})
 	}
 }
 
