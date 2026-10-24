@@ -1,8 +1,8 @@
 # Recovery benchmark: correct-key success rate
 
 Measures how often the engine recovers the correct key on synthetic,
-historical-style messages, not just how fast it searches. This scaffold provides
-an internal n-gram builder; fetching corpora and running recovery cases come later.
+historical-style messages, not just how fast it searches. The internal tools build scoring tables, fetch
+verified source texts and generate reproducible synthetic cases.
 The builder is standalone Python 3 (standard library only), not an engine command.
 
 ## Quick path
@@ -73,12 +73,42 @@ entries whose `verification.passed` is true may be used as benchmark input. On
 2026-10-24: 53 decrypted, 48 verified (4,916 letters, lengths 18-214), 5 failed
 on source inconsistencies, 16 skipped.
 
+## Generate synthetic cases
+
+After fetching the source texts and building the release CLI:
+
+```sh
+python3 -B e2e/recovery/cases.py
+```
+
+Writes `data/cases/manifest.json` (answers, source IDs and digest, engine digest,
+seed and stream offsets) plus our requests and bomm queries for both tables and
+both levels. The output directory must be new and inside `data/`; nothing is
+replaced. Use `--out`, `--plaintexts`, `--engine` or `--seed` to override inputs;
+`--help` lists their defaults. No source text is committed.
+
+Only records with `verification.passed: true` contribute. Join their plaintexts
+in recorded order with X, then consume non-overlapping segments: eight each of
+50, 75, 100, 150 and 200 letters (40 cases, 4,600 stream letters). Seed 20261024
+selects three distinct wheels I–V, independent rings and initial positions, B
+reflector and ten disjoint plugboard pairs. The CLI encrypts every segment.
+
+N1 searches all 17,576 positions with known wheels and rings; N2 also searches
+the right ring (456,976 outer keys). Both attack an unknown board (capacity 13),
+using HC (IC then Sinkov trigram), reswapping and final measure, with hold 100.
+This freezes the current default explicitly. Cases/keys are identical across
+levels and tables. Our resource paths are relative to each request; bomm paths
+are relative to the repository root. Generate tables before running attacks;
+case generation only transforms texts and does not load scoring resources.
+
 ## Layout and source policy
 
 - `ngrams.py`, `test_ngrams.py`: builder/converter and CLI tests.
 - `fetch_leipzig.sh`: Leipzig download and neutral tables.
 - `weierud.py`, `test_weierud.py`: 1941 plaintext extraction and its tests
   (synthetic snippets only).
+- `cases.py`, `test_cases.py`: seeded cases and N1/N2 requests; tests use invented
+  texts and the built release CLI, including full encrypt/decrypt round trips.
 - `sources.md`: source URLs and attribution; no copied historical texts.
 - `data/` (**git-ignored**): downloaded corpora, ciphertexts, keys, decrypted
   plaintexts and generated tables. Weierud-derived material is never committed;
