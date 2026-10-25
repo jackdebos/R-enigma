@@ -33,6 +33,8 @@ type Plan struct {
 	Request         json.RawMessage `json:"request"`
 	OuterKeys       string          `json:"outer_keys"`
 	Threads         int             `json:"threads"`
+	Backend         string          `json:"backend"`
+	GPUUsage        int             `json:"gpu_usage"`
 	EstimateSeconds float64         `json:"estimate_seconds"`
 	Resources       []Resource      `json:"resources"`
 }
@@ -66,6 +68,8 @@ type Settings struct {
 	BacktrackPairs *int              `json:"backtrack_pairs"`
 	Hold           *int              `json:"hold"`
 	Threads        *int              `json:"threads"`
+	Backend        *string           `json:"backend"`
+	GPUUsage       *int              `json:"gpu_usage"`
 	Tables         map[string]string `json:"tables"`
 }
 type Stage struct {

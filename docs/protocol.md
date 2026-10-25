@@ -1081,6 +1081,11 @@ from stdout; cancellation uses the cancel file (§5), and checkpoints use the §
 It never links the engine library. For attacks, `enigma-web` runs a child with
 `--events - --request request.json`, `--checkpoint`/`--resume` and a per-run cancel
 file, retaining each run's events and report in its attack directory.
+Advanced settings choose CPU (default, unchanged command line) or GPU, which adds
+`--backend gpu --gpu-usage <n>` (integer 1–100, default 100; lower values keep the
+screen smoother but take longer). Resume uses the currently chosen backend, without
+changing checkpoint identity; GPU unavailability or unsupported attacks display the
+engine error, never silently falling back to CPU.
 
 Compatibility: `enigma-web` keeps an explicit list of supported engine versions, as
 printed by `--version` (`enigma <version>` and `protocol version <n>`). It refuses any

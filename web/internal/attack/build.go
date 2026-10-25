@@ -134,6 +134,10 @@ func Build(models []Model, in Input, cpus int) (Plan, *Issue) {
 	invalid := func(field string) *Issue {
 		return issue("invalid_settings", "settings/"+field, "Invalid attack setting.")
 	}
+	backend, usage, problem := ResolveBackend(settings.Backend, settings.GPUUsage)
+	if problem != nil {
+		return plan, problem
+	}
 	method := stringDefault(settings.Method, "hill_climb")
 	if method != "hill_climb" && method != "partial_exhaustion" {
 		return plan, invalid("method")
@@ -283,6 +287,8 @@ func Build(models []Model, in Input, cpus int) (Plan, *Issue) {
 	plan.Request, _ = json.Marshal(request)
 	plan.OuterKeys = keys.String()
 	plan.Threads = threads
+	plan.Backend = backend
+	plan.GPUUsage = usage
 	count, _ := new(big.Float).SetInt(keys).Float64()
 	letters := 0
 	for _, r := range in.Text {

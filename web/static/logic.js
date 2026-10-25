@@ -33,12 +33,15 @@ export function buildAttackBody(state) {
   const settings = {};
   for (const [key, value] of Object.entries(state.advanced || {})) {
     if (value === '' || value === undefined || value === null) continue;
+    if (key === 'backend' || key === 'gpu_usage') continue;
     if (key === 'seeds' && state.advanced.method !== 'partial_exhaustion') continue;
     if (key === 'tables') {
       const tables = Object.fromEntries(Object.entries(value).filter(([, path]) => path !== ''));
       if (Object.keys(tables).length) settings.tables = tables;
     } else settings[key] = numeric.has(key) ? Number(value) : structuredClone(value);
   }
+  settings.backend = state.advanced?.backend ?? 'cpu';
+  if (settings.backend === 'gpu') settings.gpu_usage = Number(state.advanced?.gpu_usage ?? 100);
   settings.distinct_wheels = state.distinctWheels ?? true;
   return {
     model: state.model,
@@ -56,7 +59,7 @@ export function parseAttackInput(input) {
     slots: input.slots.map(slot => Object.fromEntries(Object.entries(slot).map(([key, value]) => [key, value ?? '']))),
     plugboard: input.plugboard.known.map(pair => [...pair]), search: input.plugboard.search,
     distinctWheels: input.settings?.distinct_wheels ?? true,
-    text: input.text, advanced: structuredClone(input.settings || {}),
+    text: input.text, advanced: { backend: 'cpu', gpu_usage: 100, ...structuredClone(input.settings || {}) },
   };
 }
 

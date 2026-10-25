@@ -204,7 +204,7 @@ Text is copied unchanged, including invalid engine symbols.
 ```
 
 Success returns `{"request":{...},"outer_keys":"26","threads":2,
-"estimate_seconds":0.0014238362068965517,"resources":[{"measure":"sinkov_trigram",
+"backend":"cpu","gpu_usage":100,"estimate_seconds":0.0014238362068965517,"resources":[{"measure":"sinkov_trigram",
 "file":"enigma1941-trigram.json","builtin":"enigma1941-trigram"}]}`.
 The request uses protocol 1 and bundled models. Unknowns enumerate complete catalog
 wheel domains or A–Z rings/positions. By default `settings.distinct_wheels` is
@@ -238,6 +238,8 @@ Optional settings (the page exposes distinct wheels directly and the rest in Adv
 | `max_pairs` | 13 when searching; between known pair count and 13. |
 | `hold` | 5; 1–1000. |
 | `threads` | Half the logical CPUs, at least one; explicit values 1–256. Returned separately, not embedded in the engine request. |
+| `backend` | `cpu` (default) or `gpu`; host setting, not part of the engine request. |
+| `gpu_usage` | Integer 1–100, default 100; validated and used only with GPU. |
 | `tables` | Measure-to-absolute-file-path map; own files override built-ins. Only used resource measures are allowed. |
 
 Built-ins supply German 1941 bigrams/trigrams; see `internal/tables/NOTICE.md`
@@ -273,7 +275,7 @@ authentication, Host/Origin guards and `Cache-Control: no-store` as other APIs:
 | `GET /api/attack` | 200 with `{"attack":null}` or the latest attack view. Poll about once a second. |
 | `POST /api/attack` | The exact preview body; builds and starts an attack, returning 202 with `{"attack":{...}}`. |
 | `POST /api/attack/cancel` | Creates this run's empty cancel marker; 202 with the current view. Cancellation takes effect at an engine safe boundary. |
-| `POST /api/attack/resume` | Continues the latest resumable attack, with a new run number; 202 with the view. |
+| `POST /api/attack/resume` | Continues the latest resumable attack, with a new run number; optional `{"backend":"gpu","gpu_usage":50}` chooses host settings for this resume; 202 with the view. Empty body/`{}` retains saved host settings. |
 
 Wrong methods return 405 with `Allow: GET, POST` for `/api/attack` and `Allow: POST`
 for cancel/resume. Builder rejections match preview (400). Conflicts use 409 codes:
@@ -282,7 +284,7 @@ for cancel/resume. Builder rejections match preview (400). Conflicts use 409 cod
 `internal_error`.
 
 The view includes `id`, `status`, `created_at` (UTC), absolute `directory`, original
-`input` object, `outer_keys`, `threads`, `estimate_seconds`, `outers_selected`,
+`input` object, `outer_keys`, `threads`, `backend`, `gpu_usage`, `estimate_seconds`, `outers_selected`,
 latest progress `counters` and `elapsed_ms`, complete `result` event, `error`
 (`code`, `message`), `stderr` (at most 64 KiB per run), `resumable` and `runs`.
 Unobserved event fields are null. Engine counter/time fields remain decimal strings.
@@ -314,6 +316,9 @@ The engine runs directly, without a shell or attack deadline, in the job directo
 `enigma --events - --request request.json --checkpoint checkpoint.json --cancel-file
 cancel-1 --threads <n> --report report-1.txt`. Resume substitutes `--resume` for
 `--checkpoint` and increments the cancel/report numbers, leaving old markers intact.
+GPU appends `--backend gpu --gpu-usage <n>`; CPU leaves this command byte-for-byte
+unchanged, with no backend flags. Neither setting enters the engine request or
+checkpoint identity, so supported attacks can resume across backends.
 If a resume cannot launch the engine, the attack keeps its previous status, run count
 and resumability, and the view's `error` explains the launch failure. A start body is
 read before the attack state is locked, so a slow client never delays status polls.
@@ -391,7 +396,7 @@ keeps both forms and the machine result intact.
   skipped for a faster search. Toggling it refreshes the count and estimate;
   unchecking also tries repeated wheels, with a visible explanation. Errors show
   translated guidance, server message and field.
-- **Advanced** starts collapsed. Untouched settings are omitted so the server
+- **Advanced** starts collapsed. Except for the explicit backend choice, untouched settings are omitted so the server
   supplies the recommended defaults: hill climb; initial `ic`, final
   `sinkov_trigram`; reswapping then measure stages on `sinkov_trigram`; 13 maximum
   pairs, switching 7, backtracking 5, hold 5 and half the logical CPUs. Every
@@ -400,7 +405,13 @@ keeps both forms and the machine result intact.
 - Advanced exposes HC/PE, PE seeds (all or touching chosen letters), initial/final
   scores (`ic`, `entropy`, Sinkov monogram through hexagram, `trie`), optional
   reswapping/measure/dictionary stages and their scores, pair thresholds, hold and
-  threads. Empty numeric fields use defaults. Each table-based score in use gets
+  threads, plus CPU (default) / GPU selection next to threads. GPU alone shows
+  **GPU usage (%) / Uso de GPU (%)**, an integer 1–100, default 100. Lower usage
+  keeps the screen smoother but takes longer; results do not change. Backend and
+  usage persist with the other advanced settings and saved input. Resume uses the
+  current form's backend and usage. Unavailable GPUs (`backend_unavailable`) and
+  unsupported GPU attacks (`unsupported_job`) show translated guidance and the
+  engine's reason; there is no silent CPU fallback. Empty numeric fields use defaults. Each table-based score in use gets
   an absolute own-file path field; bigrams/trigrams have included German 1941
   tables, other Sinkov scores and trie require own files. Hints explain engine
   JSON v1 n-gram/dictionary files and `e2e/recovery/ngrams.py convert` for bomm txt

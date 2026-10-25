@@ -504,6 +504,15 @@ function renderAttackAdvanced(parent) {
   for (const [key, placeholder, min, max] of [['max_pairs', '13', 0, 13], ['switch_pairs', '7', 0, 13], ['backtrack_pairs', '5', 0, 13], ['hold', '5', 1, 1000], ['threads', t('threads_default'), 1, 256]]) {
     attackInput(numbers, key, settings[key] ?? '', value => { if (value === '') delete settings[key]; else settings[key] = value; attackChanged(); }, { type: 'number', placeholder, min, max });
   }
+  attackSelect(numbers, 'backend', ['cpu', 'gpu'], settings.backend ?? 'cpu', value => {
+    settings.backend = value; attackChanged(); renderAttack();
+  }, { optionKey: 'backend' });
+  if (settings.backend === 'gpu') {
+    attackInput(numbers, 'gpu_usage', settings.gpu_usage ?? 100, value => {
+      if (value === '') delete settings.gpu_usage; else settings.gpu_usage = value;
+      attackChanged();
+    }, { type: 'number', min: 1, max: 100, placeholder: '100' });
+  }
   details.append(numbers, element('p', t('table_format'), 'hint'));
   const tables = element('div', undefined, 'advanced-grid');
   for (const measure of attackMeasures()) {
@@ -673,7 +682,10 @@ function renderAttackLast() {
     action('attack_cancel', () => attackAction('/api/attack/cancel'));
     root.append(element('p', t('cancel_hint'), 'hint'));
   }
-  if (['cancelled', 'interrupted'].includes(attack.status) && attack.resumable) action('attack_resume', () => attackAction('/api/attack/resume'));
+  if (['cancelled', 'interrupted'].includes(attack.status) && attack.resumable) action('attack_resume', () => {
+    const { backend, gpu_usage } = buildAttackBody(attackState).settings;
+    attackAction('/api/attack/resume', { backend, ...(backend === 'gpu' ? { gpu_usage } : {}) });
+  });
   if (attack.input) action('load_setup', () => {
     attackState = parseAttackInput(attack.input); attackFailure = null; attackChanged(); renderAttack();
   });

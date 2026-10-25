@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import { checkText, validatePair, buildRequest, lookup, initialLanguage, buildAttackBody, parseAttackInput, estimateDuration, progressInfo, holdEntries, groupFive } from './logic.js';
 
@@ -65,15 +66,15 @@ test('attack body preserves text, maps unknowns to null and sends only changed s
   assert.deepEqual(body, { model: 'enigma-m4', reflector: null, slots: [
     { id: 'greek', wheel: 'Beta', ring: 'A', position: null },
     { id: 'left', wheel: null, ring: null, position: 'Z' },
-  ], plugboard: { known: [['A', 'B']], search: true }, text: 'aZ é!\n', settings: { threads: 2, method: 'partial_exhaustion', seeds: ['C'], stages: [], distinct_wheels: true } });
+  ], plugboard: { known: [['A', 'B']], search: true }, text: 'aZ é!\n', settings: { threads: 2, method: 'partial_exhaustion', seeds: ['C'], stages: [], backend: 'cpu', distinct_wheels: true } });
   assert.deepEqual(state, before);
   assert.deepEqual(buildAttackBody(parseAttackInput(body)), body);
   const simple = { ...state, advanced: {}, search: false };
-  assert.deepEqual(buildAttackBody(simple).settings, { distinct_wheels: true });
+  assert.deepEqual(buildAttackBody(simple).settings, { backend: 'cpu', distinct_wheels: true });
   assert.equal(buildAttackBody(simple).plugboard.search, false);
   assert.deepEqual(buildAttackBody(parseAttackInput(buildAttackBody(simple))), buildAttackBody(simple));
   const hc = buildAttackBody({ ...state, advanced: { method: 'hill_climb', seeds: ['A'], max_pairs: '0', tables: { sinkov_bigram: '/own.json', trie: '' } } });
-  assert.deepEqual(hc.settings, { method: 'hill_climb', max_pairs: 0, tables: { sinkov_bigram: '/own.json' }, distinct_wheels: true });
+  assert.deepEqual(hc.settings, { method: 'hill_climb', max_pairs: 0, tables: { sinkov_bigram: '/own.json' }, backend: 'cpu', distinct_wheels: true });
 });
 
 test('saved attack input round trips all advanced settings and null dimensions for every model', () => {
@@ -81,7 +82,7 @@ test('saved attack input round trips all advanced settings and null dimensions f
     const input = { model, reflector: null,
       slots: (model === 'enigma-m4' ? ['greek', 'left', 'middle', 'right'] : ['left', 'middle', 'right']).map(id => ({ id, wheel: null, ring: null, position: null })),
       plugboard: { known: [['Y', 'Z']], search: false }, text: ' A\naé😀',
-      settings: { distinct_wheels: true, method: 'partial_exhaustion', initial_measure: 'entropy', final_measure: 'sinkov_quadgram', stages: [{ pass: 'reswapping', measure: 'sinkov_bigram' }, { pass: 'trie', base_measure: 'ic' }], max_pairs: 13, switch_pairs: 0, backtrack_pairs: 13, hold: 1000, threads: 256, tables: { sinkov_quadgram: '/tables/four.json', trie: '/tables/words.json' } },
+      settings: { backend: 'cpu', distinct_wheels: true, method: 'partial_exhaustion', initial_measure: 'entropy', final_measure: 'sinkov_quadgram', stages: [{ pass: 'reswapping', measure: 'sinkov_bigram' }, { pass: 'trie', base_measure: 'ic' }], max_pairs: 13, switch_pairs: 0, backtrack_pairs: 13, hold: 1000, threads: 256, tables: { sinkov_quadgram: '/tables/four.json', trie: '/tables/words.json' } },
     };
     const before = structuredClone(input);
     const state = parseAttackInput(input);
@@ -105,6 +106,36 @@ test('distinct wheels defaults on and preserves an explicit opt-out without chan
   const legacy = { ...off }; delete legacy.settings;
   assert.equal(parseAttackInput(legacy).distinctWheels, true);
   assert.deepEqual(state, before);
+});
+
+test('backend payload defaults to CPU and sends numeric GPU usage only for GPU', () => {
+  const state = { model: 'enigma-i', reflector: 'B', slots: [], plugboard: [], search: true, text: 'ABC', advanced: {} };
+  const before = structuredClone(state);
+  assert.deepEqual(buildAttackBody(state).settings, { backend: 'cpu', distinct_wheels: true });
+  assert.deepEqual(parseAttackInput(buildAttackBody(state)).advanced, { backend: 'cpu', gpu_usage: 100, distinct_wheels: true });
+  for (const [usage, expected] of [[undefined, 100], ['1', 1], ['37', 37], ['100', 100]]) {
+    const body = buildAttackBody({ ...state, advanced: { backend: 'gpu', gpu_usage: usage } });
+    assert.deepEqual(body.settings, { backend: 'gpu', gpu_usage: expected, distinct_wheels: true });
+    assert.deepEqual(buildAttackBody(parseAttackInput(body)), body);
+  }
+  assert.deepEqual(buildAttackBody({ ...state, advanced: { backend: 'cpu', gpu_usage: '0' } }).settings, { backend: 'cpu', distinct_wheels: true });
+  assert.deepEqual(state, before);
+});
+
+test('backend labels, hints and errors exist with exact bilingual copy', () => {
+  for (const [lang, cpu, gpu, usage] of [
+    ['es', 'Procesador (CPU)', 'Placa de video (GPU)', 'Uso de GPU (%)'],
+    ['en', 'Processor (CPU)', 'Graphics card (GPU)', 'GPU usage (%)'],
+  ]) {
+    const dictionary = JSON.parse(readFileSync(new URL(`./i18n/${lang}.json`, import.meta.url), 'utf8'));
+    assert.equal(dictionary.backend_cpu, cpu);
+    assert.equal(dictionary.backend_gpu, gpu);
+    assert.equal(dictionary.gpu_usage, usage);
+    for (const key of ['backend', 'backend_hint', 'gpu_usage_hint', 'error_backend_unavailable', 'engine_error_unsupported_job']) {
+      assert.equal(typeof dictionary[key], 'string', `${lang}/${key}`);
+      assert.notEqual(dictionary[key].trim(), '', `${lang}/${key}`);
+    }
+  }
 });
 
 test('duration units change at exact minute, hour and day boundaries', () => {

@@ -33,6 +33,8 @@ type attackView struct {
 	Input           json.RawMessage `json:"input"`
 	OuterKeys       string          `json:"outer_keys"`
 	Threads         int             `json:"threads"`
+	Backend         string          `json:"backend"`
+	GPUUsage        int             `json:"gpu_usage"`
 	EstimateSeconds float64         `json:"estimate_seconds"`
 	OutersSelected  json.RawMessage `json:"outers_selected"`
 	Counters        json.RawMessage `json:"counters"`
@@ -218,7 +220,7 @@ func (a *attackRun) create(body []byte, plan attack.Plan) error {
 	if err := exclusive(filepath.Join(dir, "input.json"), body); err != nil {
 		return err
 	}
-	a.view = &attackView{ID: id, Status: "running", CreatedAt: time.Now().UTC().Format(time.RFC3339), Directory: dir, Input: append(json.RawMessage(nil), body...), OuterKeys: plan.OuterKeys, Threads: plan.Threads, EstimateSeconds: plan.EstimateSeconds}
+	a.view = &attackView{ID: id, Status: "running", CreatedAt: time.Now().UTC().Format(time.RFC3339), Directory: dir, Input: append(json.RawMessage(nil), body...), OuterKeys: plan.OuterKeys, Threads: plan.Threads, Backend: plan.Backend, GPUUsage: plan.GPUUsage, EstimateSeconds: plan.EstimateSeconds}
 	return nil
 }
 
@@ -275,7 +277,7 @@ func (s *Server) serveAttack(w http.ResponseWriter, r *http.Request) {
 	// polling or the engine event reader.
 	var body []byte
 	var bodyErr error
-	if r.URL.Path == "/api/attack" && r.Method == http.MethodPost {
+	if (r.URL.Path == "/api/attack" || r.URL.Path == "/api/attack/resume") && r.Method == http.MethodPost {
 		body, bodyErr = io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
 	}
 	a := s.attacks
@@ -318,6 +320,25 @@ func (s *Server) serveAttack(w http.ResponseWriter, r *http.Request) {
 			apiIssue(w, 409, "attack_not_resumable", "The latest attack cannot be resumed.")
 			return
 		}
+		if bodyErr != nil {
+			apiIssue(w, 400, "invalid_request", "Expected one attack JSON object of at most 1 MiB.")
+			return
+		}
+		options, problem := attack.DecodeBackend(bytes.NewReader(body))
+		if problem == nil {
+			// Old clients with no host settings retain the saved backend.
+			if options.Backend == nil && a.view.Backend != "" {
+				options.Backend = &a.view.Backend
+			}
+			if options.GPUUsage == nil && a.view.GPUUsage != 0 {
+				options.GPUUsage = &a.view.GPUUsage
+			}
+			plan.Backend, plan.GPUUsage, problem = attack.ResolveBackend(options.Backend, options.GPUUsage)
+		}
+		if problem != nil {
+			jsonResponse(w, 400, map[string]any{"error": problem})
+			return
+		}
 	} else {
 		if bodyErr != nil {
 			apiIssue(w, 400, "invalid_request", "Expected one attack JSON object of at most 1 MiB.")
@@ -340,7 +361,7 @@ func (s *Server) serveAttack(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if err := a.start(path, resume); err != nil {
+	if err := a.start(path, resume, plan.Backend, plan.GPUUsage); err != nil {
 		apiIssue(w, 500, "internal_error", err.Error())
 		return
 	}
@@ -363,7 +384,7 @@ func (a *attackRun) cancel() error {
 	return err
 }
 
-func (a *attackRun) start(path string, resume bool) error {
+func (a *attackRun) start(path string, resume bool, backend string, usage int) error {
 	v := a.view
 	if resume {
 		// A resume that cannot launch leaves the attack exactly as resumable as
@@ -378,6 +399,7 @@ func (a *attackRun) start(path string, resume bool) error {
 			}
 		}()
 	}
+	v.Backend, v.GPUUsage = backend, usage
 	v.Runs++
 	v.Status = "running"
 	v.Error = nil
@@ -395,6 +417,9 @@ func (a *attackRun) start(path string, resume bool) error {
 		option = "--resume"
 	}
 	cmd := exec.Command(path, "--events", "-", "--request", "request.json", option, "checkpoint.json", "--cancel-file", "cancel-"+n, "--threads", strconv.Itoa(v.Threads), "--report", "report-"+n+".txt")
+	if v.Backend == "gpu" {
+		cmd.Args = append(cmd.Args, "--backend", "gpu", "--gpu-usage", strconv.Itoa(v.GPUUsage))
+	}
 	cmd.Dir = v.Directory
 	runner.ParentDeathSignal(cmd)
 	cmd.WaitDelay = 100 * time.Millisecond
