@@ -102,11 +102,10 @@ pub(crate) fn resolve_outer(
 impl ClimbOracle {
     /// Parses the attack and binds its supplied JSON v1 trigram resource, without I/O.
     pub fn from_json(request: &str, trigram_resource: &str) -> Result<Self, String> {
-        let parsed = crate::ParsedAttackRequest::parse_json(request).map_err(|e| format!("{e:?}"))?;
-        let supplied = std::collections::BTreeMap::from([(
-            "sinkov_trigram".to_owned(),
-            trigram_resource,
-        )]);
+        let parsed =
+            crate::ParsedAttackRequest::parse_json(request).map_err(|e| format!("{e:?}"))?;
+        let supplied =
+            std::collections::BTreeMap::from([("sinkov_trigram".to_owned(), trigram_resource)]);
         let request = parsed
             .bind_resources(&supplied)
             .map_err(|e| format!("{e:?}"))?;
@@ -138,9 +137,44 @@ impl ClimbOracle {
             .map_err(|e| format!("{e:?}"))
     }
 
+    /// Appends the rows of `count` consecutive outer keys from `first` to `out`,
+    /// byte-identical to calling `rows` per key, but builds the candidate plan once.
+    pub fn rows_into(&self, first: u128, count: usize, out: &mut Vec<u8>) -> Result<(), String> {
+        let plan = self.request.outer_plan();
+        let (start, end) = plan.selected_range();
+        let last = first + count as u128;
+        if first < start || last > end {
+            return Err(format!(
+                "outer range {first}..{last} outside {start}..{end}"
+            ));
+        }
+        let block = crate::attack_blocks::OuterBlock {
+            index: 0,
+            start: first,
+            len: count as u128,
+        };
+        for (_, resolved) in plan.keys(block) {
+            let mut engine = resolved
+                .map_err(|e| format!("{e:?}"))?
+                .into_engine()
+                .map_err(|e| format!("{e:?}"))?;
+            engine
+                .scrambler_byte_rows(
+                    self.request.text().chars().count(),
+                    crate::Direction::Decrypt,
+                    out,
+                )
+                .map_err(|e| format!("{e:?}"))?;
+        }
+        Ok(())
+    }
+
     /// Borrows the bound production trigram table, without rebuilding its model.
     pub fn dense_weights(&self) -> Option<(&[i64], u64)> {
-        match self.request.bound_resource(crate::MeasureId::SinkovTrigram)? {
+        match self
+            .request
+            .bound_resource(crate::MeasureId::SinkovTrigram)?
+        {
             crate::BoundResource::Ngram(model) => dense_weights(model),
             _ => None,
         }
