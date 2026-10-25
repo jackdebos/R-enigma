@@ -6,13 +6,35 @@
 
 use std::num::NonZeroUsize;
 
-/// How many worker threads an attack may use for its outer-key phase.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ExecutionOptions {
+/// Host threads and optional borrowed accelerator for the outer-key phase.
+/// The borrow keeps options `Copy` and requires no device ownership or allocation.
+#[derive(Clone, Copy)]
+pub struct ExecutionOptions<'a> {
     threads: NonZeroUsize,
+    accelerator: Option<&'a dyn crate::ClimbAccelerator>,
 }
 
-impl ExecutionOptions {
+impl std::fmt::Debug for ExecutionOptions<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutionOptions")
+            .field("threads", &self.threads)
+            .field("accelerator", &self.accelerator.is_some())
+            .finish()
+    }
+}
+impl PartialEq for ExecutionOptions<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.threads == other.threads
+            && match (self.accelerator, other.accelerator) {
+                (None, None) => true,
+                (Some(a), Some(b)) => std::ptr::eq(a, b),
+                _ => false,
+            }
+    }
+}
+impl Eq for ExecutionOptions<'_> {}
+
+impl<'a> ExecutionOptions<'a> {
     /// Largest accepted thread count.
     pub const MAX_THREADS: usize = 256;
 
@@ -20,6 +42,7 @@ impl ExecutionOptions {
     pub const fn serial() -> Self {
         Self {
             threads: NonZeroUsize::MIN,
+            accelerator: None,
         }
     }
 
@@ -27,7 +50,10 @@ impl ExecutionOptions {
     pub fn with_threads(threads: usize) -> Option<Self> {
         NonZeroUsize::new(threads)
             .filter(|threads| threads.get() <= Self::MAX_THREADS)
-            .map(|threads| Self { threads })
+            .map(|threads| Self {
+                threads,
+                accelerator: None,
+            })
     }
 
     /// Half of `available` logical CPUs, at least one and at most `MAX_THREADS`.
@@ -36,13 +62,27 @@ impl ExecutionOptions {
         Self::with_threads(threads).unwrap_or_else(Self::serial)
     }
 
+    /// Select an exact climb accelerator. Unsupported requests fail before any
+    /// progress; runtime errors never fall back to CPU. Finalist stages stay CPU.
+    pub fn with_accelerator(self, accelerator: &'a dyn crate::ClimbAccelerator) -> Self {
+        Self {
+            accelerator: Some(accelerator),
+            ..self
+        }
+    }
+
+    /// Selected accelerator, absent for the unchanged CPU execution path.
+    pub fn accelerator(self) -> Option<&'a dyn crate::ClimbAccelerator> {
+        self.accelerator
+    }
+
     /// Requested worker thread count.
     pub fn threads(self) -> NonZeroUsize {
         self.threads
     }
 }
 
-impl Default for ExecutionOptions {
+impl Default for ExecutionOptions<'_> {
     fn default() -> Self {
         Self::serial()
     }

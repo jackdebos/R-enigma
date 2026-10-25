@@ -191,7 +191,6 @@ impl NgramModel {
     }
 
     /// The dense weights in radix-width window order and their largest magnitude.
-    #[cfg(feature = "gpu-spike")]
     pub(crate) fn dense_parts(&self) -> Option<(&[i64], u64)> {
         self.dense
             .as_ref()
@@ -301,7 +300,7 @@ impl NgramModel {
 }
 
 /// Whether `windows` weights of magnitude at most `max_abs` sum within i64.
-fn fits_i64(windows: u128, max_abs: u64) -> bool {
+pub(crate) fn fits_i64(windows: u128, max_abs: u64) -> bool {
     u128::from(max_abs)
         .checked_mul(windows)
         .is_some_and(|bound| bound <= i64::MAX as u128)

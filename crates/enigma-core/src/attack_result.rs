@@ -218,6 +218,8 @@ impl AttackResult {
 /// Public classification without exposing private scheduler payloads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttackRunCategory {
+    /// Unsupported accelerator job, device failure or terminal score mismatch.
+    Accelerator,
     /// Candidate resolution diagnostics.
     Resolution,
     /// Decryption, board construction or scoring failure.
@@ -247,6 +249,8 @@ pub enum AttackCounterOverflow {
 
 #[derive(Debug)]
 pub(crate) enum RunPayload {
+    Accelerator(crate::AcceleratorError),
+    UnsupportedAccelerator(crate::ClimbUnsupported),
     Resolution(Vec<crate::SearchDiagnostic>),
     Evaluation(crate::attack_evaluator::TrialEvaluationError),
     Counter(crate::attack_control::CounterOverflow),
@@ -290,10 +294,20 @@ impl AttackRunSource {
     /// Classification independent of private payload representation.
     pub fn category(&self) -> AttackRunCategory {
         match self.0 {
+            RunPayload::Accelerator(_) | RunPayload::UnsupportedAccelerator(_) => {
+                AttackRunCategory::Accelerator
+            }
             RunPayload::Resolution(_) => AttackRunCategory::Resolution,
             RunPayload::Evaluation(_) => AttackRunCategory::Evaluation,
             RunPayload::Counter(_) => AttackRunCategory::Counter,
             RunPayload::Invariant(_) => AttackRunCategory::Invariant,
+        }
+    }
+    /// Exact preflight rejection reason, when accelerator eligibility failed.
+    pub fn unsupported_accelerator(&self) -> Option<&crate::ClimbUnsupported> {
+        match &self.0 {
+            RunPayload::UnsupportedAccelerator(reason) => Some(reason),
+            _ => None,
         }
     }
     /// Original resolution diagnostics, without formatting conversion.
@@ -324,6 +338,10 @@ impl AttackRunSource {
 impl std::fmt::Display for AttackRunSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.0 {
+            RunPayload::Accelerator(error) => error.fmt(f),
+            RunPayload::UnsupportedAccelerator(reason) => {
+                write!(f, "accelerator unsupported: {reason}")
+            }
             RunPayload::Resolution(diagnostics) => write!(f, "attack resolution: {diagnostics:?}"),
             RunPayload::Evaluation(source) => source.fmt(f),
             RunPayload::Counter(source) => source.fmt(f),
@@ -335,6 +353,8 @@ impl std::fmt::Display for AttackRunSource {
 impl std::error::Error for AttackRunSource {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.0 {
+            RunPayload::Accelerator(source) => Some(source),
+            RunPayload::UnsupportedAccelerator(source) => Some(source),
             RunPayload::Evaluation(source) => Some(source),
             RunPayload::Counter(source) => Some(source),
             _ => None,

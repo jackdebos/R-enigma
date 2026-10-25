@@ -16,6 +16,8 @@ use crate::{
 use std::ops::ControlFlow;
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
+mod accelerator_executor;
+
 type MutableBoard = Vec<(char, char)>;
 
 /// Owned initial key facts remain separate from the committed mutable remainder.
@@ -599,6 +601,19 @@ impl crate::AttackRequest {
             best,
             acceptance,
         } = state;
+        if options.accelerator().is_some() {
+            if let Err(reason) = self.climb_job() {
+                let error = ControlledDirectError {
+                    outer_index: None,
+                    evaluations_used: allowance.used,
+                    source: DirectRunError::UnsupportedAccelerator(reason),
+                    best,
+                    counters: control.snapshot(),
+                }
+                .project(self.domain(), self.settings().final_measure());
+                return attach_held(Err(error), acceptance.0);
+            }
+        }
         let mut observer = ProgressObserver(observe);
         observed_run(&mut control, &mut observer, |control, observer| {
             // The serial outer phase fills this preparation; pool workers own theirs.
@@ -951,6 +966,8 @@ pub(crate) struct DirectRunOutcome {
 
 #[derive(Debug)]
 pub(crate) enum DirectRunError {
+    Accelerator(crate::AcceleratorError),
+    UnsupportedAccelerator(crate::ClimbUnsupported),
     Resolution(Vec<crate::SearchDiagnostic>),
     Climb(DirectClimbError),
     Counter(CounterOverflow),
@@ -1687,12 +1704,11 @@ impl crate::AttackRequest {
 
     /// Spike-only oracle: the production climb and its production accounting.
     #[cfg(feature = "gpu-spike")]
-    pub(crate) fn spike_climb(
-        &self,
-        index: u128,
-    ) -> Result<crate::gpu_spike::ClimbResult, String> {
+    pub(crate) fn spike_climb(&self, index: u128) -> Result<crate::gpu_spike::ClimbResult, String> {
         let initial = crate::gpu_spike::resolve_outer(self, index)?;
-        let (scoring, start) = self.direct_scoring(&initial).map_err(|e| format!("{e:?}"))?;
+        let (scoring, start) = self
+            .direct_scoring(&initial)
+            .map_err(|e| format!("{e:?}"))?;
         let mut accounting = BlockAccounting::default();
         let outcome = scoring
             .climb_accounted(start, self.settings().backtrack_pairs(), &mut accounting)
@@ -2082,6 +2098,10 @@ impl ControlledDirectError {
             DirectRunError::Projection(error) => {
                 projection_error = Some(error);
                 RunPayload::Invariant("accepted best projection failed")
+            }
+            DirectRunError::Accelerator(error) => RunPayload::Accelerator(error),
+            DirectRunError::UnsupportedAccelerator(reason) => {
+                RunPayload::UnsupportedAccelerator(reason)
             }
             DirectRunError::Resolution(diagnostics) => RunPayload::Resolution(diagnostics),
             DirectRunError::Climb(DirectClimbError::Evaluation(source)) => source.into(),
@@ -2614,6 +2634,17 @@ impl crate::AttackRequest {
             PhaseBlock,
         ) -> Result<(), crate::AttackRunError>,
     ) -> Result<DirectRunTermination, crate::AttackRunError> {
+        if let Some(accelerator) = options.accelerator() {
+            return self.drive_accelerated(
+                options.threads().get(),
+                accelerator,
+                plan,
+                next_outer,
+                control,
+                requested,
+                commit,
+            );
+        }
         let remaining = plan.selected_range().1 - next_outer;
         let blocks = usize::try_from(remaining.div_ceil(crate::attack_blocks::OUTER_BLOCK_KEYS))
             .unwrap_or(usize::MAX);
@@ -4581,6 +4612,420 @@ mod tests {
         }
         edit(&mut value["job"]);
         crate::AttackRequest::parse_json(&value.to_string()).unwrap()
+    }
+
+    fn accelerator_ngram_request(order: usize, identical: bool) -> crate::AttackRequest {
+        let id = if order == 3 {
+            "sinkov_trigram"
+        } else {
+            "sinkov_bigram"
+        };
+        let initial = if identical { id } else { "ic" };
+        let model = serde_json::json!({"resource_version":1,"kind":"ngram",
+            "alphabet":["A","B","C","D"],"order":order,
+            "entries":[{"gram":vec!["A"; order],"count":31},
+                {"gram":vec!["B"; order],"count":7}]})
+        .to_string();
+        let value = serde_json::json!({"protocol_version":1,
+            "machine":{"definition":{"kind":"custom","value":{
+                "alphabet":["A","B","C","D"],
+                "wheels":[{"name":"r","wiring":["B","D","A","C"],"turnovers":[]}],
+                "slots":[{"id":"r","role":"rotor","movement":"movable","wheel":"r"}],
+                "stepping":{"rules":[{"when":{"always":true},"advance":["r"]}]}}}},
+            "job":{"kind":"search","configuration":{"slots":[],"plugboard":[]},
+                "text":"AAABACADBBABCDABAAA","passes":["hill_climb"],
+                "measures":if identical { vec![id] } else { vec!["ic",id] },
+                "resources":{id:{"path":"model.json"}},
+                "space":{"offset":1,"limit":13,"slots":[{"id":"r",
+                    "positions":["D","B","A","C"],"rings":["A","B","C","D"]}],
+                    "plugboard":{"kind":"attack","symbols":["A","B","C","D"],"max_pairs":2}},
+                "attack":{"kind":"hill_climb","initial_measure":initial,"final_measure":id,
+                    "switch_pairs":1,"backtrack_pairs":0,"hold":5,"start":[],"progress_every":137}}});
+        crate::ParsedAttackRequest::parse_json(&value.to_string())
+            .unwrap()
+            .bind_resources(&std::collections::BTreeMap::from([(
+                id.to_owned(),
+                model.as_str(),
+            )]))
+            .unwrap()
+    }
+
+    #[test]
+    fn accelerator_matches_cpu_progress_checkpoints_and_cross_resume() {
+        let identity = crate::checkpoint_identity("{}", &Default::default()).unwrap();
+        for variant in 0..8 {
+            let request = if variant >= 4 {
+                accelerator_ngram_request(if variant < 6 { 3 } else { 2 }, variant % 2 == 1)
+            } else {
+                pool_request(false, 5, |job| {
+                    job["space"]["offset"] = 3.into();
+                    job["space"]["limit"] = 261.into();
+                    job["attack"]["progress_every"] = 137.into();
+                    job["attack"]["backtrack_pairs"] = (variant % 3).into();
+                    job["attack"]["switch_pairs"] = (variant % 3).into();
+                    job["space"]["plugboard"]["max_pairs"] = 2.into();
+                    if variant == 1 {
+                        job["attack"]["start"] = serde_json::json!([["D", "C"]]);
+                    }
+                    if variant == 2 {
+                        job["configuration"]["plugboard"] = serde_json::json!([["B", "A"]]);
+                        job["space"]["plugboard"]["symbols"] = serde_json::json!(["C", "D"]);
+                    }
+                    if variant == 3 {
+                        job["space"]["plugboard"]["symbols"] = serde_json::json!(["A", "C", "D"]);
+                        job["space"]["plugboard"]["max_pairs"] = 1.into();
+                    }
+                })
+            };
+            for threads in [1, 3] {
+                let cpu = crate::ExecutionOptions::with_threads(threads).unwrap();
+                let accelerated = cpu.with_accelerator(&crate::ReferenceClimbAccelerator);
+                let run = |options| {
+                    let mut progress = Vec::new();
+                    let mut records = Vec::new();
+                    let result = request.run_with_checkpoints(
+                        options,
+                        |p| progress.push(p),
+                        || false,
+                        |s| records.push(s.record(identity, 0).unwrap()),
+                    );
+                    (format!("{:?}", result.unwrap()), progress, records)
+                };
+                let expected = run(cpu);
+                if variant >= 4 {
+                    assert!(
+                        expected.0.contains("final_objective_ascent: true"),
+                        "ngram phase must be ascended: {variant}"
+                    );
+                }
+                let actual = run(accelerated);
+                assert_eq!(actual, expected);
+                for (from, to) in [(cpu, accelerated), (accelerated, cpu)] {
+                    let mut records = Vec::new();
+                    request
+                        .run_with_checkpoints(
+                            from,
+                            |_| {},
+                            || false,
+                            |s| records.push(s.record(identity, 0).unwrap()),
+                        )
+                        .unwrap();
+                    let resumed = request
+                        .resume(&records[0])
+                        .unwrap()
+                        .run_with(to, |_| {}, || false)
+                        .unwrap();
+                    assert_eq!(format!("{resumed:?}"), expected.0);
+                }
+            }
+        }
+    }
+
+    struct BatchAccelerator {
+        max_keys: usize,
+        fail_at: Option<u128>,
+        mismatch: bool,
+        calls: Mutex<Vec<(u128, usize)>>,
+    }
+
+    impl BatchAccelerator {
+        fn new(max_keys: usize, fail_at: Option<u128>, mismatch: bool) -> Self {
+            Self {
+                max_keys,
+                fail_at,
+                mismatch,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl crate::ClimbAccelerator for BatchAccelerator {
+        fn preferred_max_keys(&self) -> usize {
+            self.max_keys
+        }
+        fn climb(
+            &self,
+            job: &crate::ClimbJob<'_>,
+            first: u128,
+            rows: &[u8],
+        ) -> Result<Vec<crate::AcceleratedClimb>, crate::AcceleratorError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((first, rows.len() / (job.alphabet_size * job.text_length)));
+            let fail = self.fail_at == Some(first);
+            if fail && !self.mismatch {
+                return Err(crate::AcceleratorError("later dispatch failed".into()));
+            }
+            let mut result = crate::ClimbAccelerator::climb(
+                &crate::ReferenceClimbAccelerator,
+                job,
+                first,
+                rows,
+            )?;
+            if fail {
+                result[0].score_units += 1;
+            }
+            Ok(result)
+        }
+    }
+
+    fn accelerator_batch_request() -> crate::AttackRequest {
+        pool_request(false, 5, |job| {
+            job["space"]["offset"] = 3.into();
+            job["space"]["limit"] = 773.into();
+            job["attack"]["progress_every"] = 137.into();
+        })
+    }
+
+    #[test]
+    fn accelerator_empty_slice_and_finished_resume_ignore_cancellation() {
+        let identity = crate::checkpoint_identity("{}", &Default::default()).unwrap();
+        for empty in [false, true] {
+            let request = pool_request(false, 1, |job| {
+                job["space"]["limit"] = 1.into();
+                if empty {
+                    job["space"]["offset"] = 10000.into();
+                }
+            });
+            let mut saved = None;
+            request
+                .run_with_checkpoints(
+                    crate::ExecutionOptions::serial(),
+                    |_| {},
+                    || false,
+                    |s| saved = Some(s.record(identity, 0).unwrap()),
+                )
+                .unwrap();
+            let run = |options| {
+                let mut events = Vec::new();
+                let result = request
+                    .resume(saved.as_ref().unwrap())
+                    .unwrap()
+                    .run_with(options, |p| events.push(p), || true)
+                    .unwrap();
+                (format!("{result:?}"), events)
+            };
+            assert_eq!(
+                run(crate::ExecutionOptions::serial()),
+                run(crate::ExecutionOptions::serial()
+                    .with_accelerator(&crate::ReferenceClimbAccelerator))
+            );
+        }
+    }
+
+    #[test]
+    fn accelerator_multiblock_dispatch_and_tail_match_cpu() {
+        let request = accelerator_batch_request();
+        let accelerator = BatchAccelerator::new(384, None, false);
+        let identity = crate::checkpoint_identity("{}", &Default::default()).unwrap();
+        let run = |options| {
+            let mut progress = Vec::new();
+            let mut records = Vec::new();
+            let result = request
+                .run_with_checkpoints(
+                    options,
+                    |p| progress.push(p),
+                    || false,
+                    |s| records.push(s.record(identity, 0).unwrap()),
+                )
+                .unwrap();
+            (format!("{result:?}"), progress, records)
+        };
+        let cpu = crate::ExecutionOptions::with_threads(3).unwrap();
+        assert_eq!(run(cpu.with_accelerator(&accelerator)), run(cpu));
+        assert_eq!(
+            *accelerator.calls.lock().unwrap(),
+            [(3, 384), (387, 384), (771, 5)]
+        );
+    }
+
+    #[test]
+    fn accelerator_cancellation_matches_cpu_at_committed_block_prefix() {
+        let request = accelerator_batch_request();
+        let identity = crate::checkpoint_identity("{}", &Default::default()).unwrap();
+        for stop in [1, 2, 3, 4] {
+            let accelerator = BatchAccelerator::new(384, None, false);
+            let run = |options| {
+                let committed = std::cell::Cell::new(0);
+                let mut progress = Vec::new();
+                let mut records = Vec::new();
+                let result = request
+                    .run_with_checkpoints(
+                        options,
+                        |p| progress.push(p),
+                        || committed.get() >= stop,
+                        |s| {
+                            if s.reason() == CheckpointReason::BlockCommitted {
+                                committed.set(committed.get() + 1);
+                            }
+                            records.push(s.record(identity, 0).unwrap());
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(result.termination(), crate::AttackTermination::Cancelled);
+                assert_eq!(result.counters().outers_completed(), stop * 128);
+                assert_eq!(records.last().unwrap().next_outer.0, 3 + stop * 128);
+                (format!("{result:?}"), progress, records)
+            };
+            // Serial CPU cancellation has no worker drain, so the callback selects
+            // the same exact committed prefix independently of preparation threads.
+            assert_eq!(
+                run(crate::ExecutionOptions::with_threads(3)
+                    .unwrap()
+                    .with_accelerator(&accelerator)),
+                run(crate::ExecutionOptions::serial())
+            );
+        }
+    }
+
+    #[test]
+    fn accelerator_later_dispatch_fault_retains_prior_blocks_and_checkpoint() {
+        let request = accelerator_batch_request();
+        let identity = crate::checkpoint_identity("{}", &Default::default()).unwrap();
+        let committed = std::cell::Cell::new(0);
+        let mut expected_records = Vec::new();
+        let expected = request
+            .run_with_checkpoints(
+                crate::ExecutionOptions::serial(),
+                |_| {},
+                || committed.get() == 2,
+                |s| {
+                    if s.reason() == CheckpointReason::BlockCommitted {
+                        committed.set(committed.get() + 1);
+                        expected_records.push(s.record(identity, 0).unwrap());
+                    }
+                },
+            )
+            .unwrap();
+        for mismatch in [false, true] {
+            let accelerator = BatchAccelerator::new(256, Some(259), mismatch);
+            let mut records = Vec::new();
+            let error = request
+                .run_with_checkpoints(
+                    crate::ExecutionOptions::with_threads(3)
+                        .unwrap()
+                        .with_accelerator(&accelerator),
+                    |_| {},
+                    || false,
+                    |s| records.push(s.record(identity, 0).unwrap()),
+                )
+                .unwrap_err();
+            assert_eq!(error.outer_index(), Some(259));
+            assert_eq!(
+                error.run_source().category(),
+                crate::AttackRunCategory::Accelerator
+            );
+            assert!(error.to_string().contains(if mismatch {
+                "score mismatch"
+            } else {
+                "later dispatch failed"
+            }));
+            assert_eq!(error.counters(), expected.counters());
+            assert_eq!(error.evaluations_used(), expected.evaluations_used());
+            assert_eq!(
+                format!("{:?}", error.best().unwrap()),
+                format!("{:?}", expected.best())
+            );
+            assert_eq!(records, expected_records);
+            assert_eq!(*accelerator.calls.lock().unwrap(), [(3, 256), (259, 256)]);
+            // The last successful checkpoint remains resumable on either backend.
+            for options in [
+                crate::ExecutionOptions::serial(),
+                crate::ExecutionOptions::serial()
+                    .with_accelerator(&crate::ReferenceClimbAccelerator),
+            ] {
+                let resumed = request
+                    .resume(records.last().unwrap())
+                    .unwrap()
+                    .run_with(options, |_| {}, || false)
+                    .unwrap();
+                let full = request.run(|_| {}, || false).unwrap();
+                assert_eq!(format!("{resumed:?}"), format!("{full:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn accelerator_errors_stop_without_committing_failed_dispatch() {
+        struct Fault(bool);
+        impl crate::ClimbAccelerator for Fault {
+            fn climb(
+                &self,
+                job: &crate::ClimbJob<'_>,
+                first: u128,
+                rows: &[u8],
+            ) -> Result<Vec<crate::AcceleratedClimb>, crate::AcceleratorError> {
+                if !self.0 {
+                    return Err(crate::AcceleratorError("device failed".into()));
+                }
+                let mut results = crate::ClimbAccelerator::climb(
+                    &crate::ReferenceClimbAccelerator,
+                    job,
+                    first,
+                    rows,
+                )?;
+                results[0].score_units += 1;
+                Ok(results)
+            }
+        }
+        let request = pool_request(false, 5, |job| {
+            job["space"]["limit"] = 260.into();
+        });
+        for mismatch in [false, true] {
+            let fault = Fault(mismatch);
+            let mut checkpoints = 0;
+            let error = request
+                .run_with_checkpoints(
+                    crate::ExecutionOptions::serial().with_accelerator(&fault),
+                    |_| {},
+                    || false,
+                    |_| checkpoints += 1,
+                )
+                .unwrap_err();
+            assert_eq!(
+                error.run_source().category(),
+                crate::AttackRunCategory::Accelerator
+            );
+            assert!(error.to_string().contains(if mismatch {
+                "score mismatch"
+            } else {
+                "device failed"
+            }));
+            assert_eq!(error.counters().outers_completed(), 0);
+            assert_eq!(error.evaluations_used(), 0);
+            assert_eq!(checkpoints, 0);
+        }
+    }
+
+    #[test]
+    fn accelerator_ineligible_fails_before_progress() {
+        for entropy in [false, true] {
+            let request = pool_request(!entropy, 1, |job| {
+                if entropy {
+                    job["measures"] = serde_json::json!(["entropy"]);
+                    job["attack"]["initial_measure"] = "entropy".into();
+                    job["attack"]["final_measure"] = "entropy".into();
+                }
+            });
+            assert!(request.climb_job().is_err());
+            let mut events = Vec::new();
+            let error = request
+                .run_with(
+                    crate::ExecutionOptions::serial()
+                        .with_accelerator(&crate::ReferenceClimbAccelerator),
+                    |p| events.push(p),
+                    || false,
+                )
+                .unwrap_err();
+            assert!(events.is_empty());
+            assert_eq!(error.evaluations_used(), 0);
+            assert!(error.to_string().contains(if entropy {
+                "entropy"
+            } else {
+                "partial exhaustion"
+            }));
+        }
     }
 
     fn pooled(

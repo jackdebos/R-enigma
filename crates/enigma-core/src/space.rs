@@ -3800,6 +3800,52 @@ mod tests {
     }
 
     #[test]
+    fn accelerator_resolution_failure_matches_cpu_prefix() {
+        let mut value = attack_request();
+        value["job"]["configuration"]["slots"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("position");
+        value["job"]["space"]["slots"] = json!([{"id":"fast","positions":["A","B","C","D"]}]);
+        let mut request = AttackRequest::parse_json(&value.to_string()).unwrap();
+        // Validated owners cannot naturally fail resolution: corrupt a later
+        // private position after binding, as in the existing resolver tests.
+        request.carrier.parsed.space.slots[0]
+            .positions
+            .as_mut()
+            .unwrap()[2] = 'Z';
+        let diagnostics = request.outer_candidates().nth(2).unwrap().1.unwrap_err();
+        let identity = crate::checkpoint_identity("{}", &Default::default()).unwrap();
+        let run = |options| {
+            let mut progress = Vec::new();
+            let mut records = Vec::new();
+            let error = request
+                .run_with_checkpoints(
+                    options,
+                    |p| progress.push(p),
+                    || false,
+                    |s| records.push(s.record(identity, 0).unwrap()),
+                )
+                .unwrap_err();
+            assert_eq!(error.outer_index(), Some(2));
+            assert_eq!(error.start_index(), None);
+            assert_eq!(
+                error.run_source().diagnostics(),
+                Some(diagnostics.as_slice())
+            );
+            assert_eq!(error.counters().outers_completed(), 2);
+            assert!(records.is_empty());
+            (format!("{error:?}"), progress, records)
+        };
+        assert_eq!(
+            run(crate::ExecutionOptions::serial()),
+            run(crate::ExecutionOptions::with_threads(3)
+                .unwrap()
+                .with_accelerator(&crate::ReferenceClimbAccelerator))
+        );
+    }
+
+    #[test]
     fn attack_outer_candidates_preserve_resolution_errors() {
         let mut value = attack_request();
         value["job"]["configuration"]["slots"][1]

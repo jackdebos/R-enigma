@@ -441,6 +441,7 @@ impl Event {
             counters: error.counters().into(),
             source: RuntimeSource {
                 kind: match source.category() {
+                    AttackRunCategory::Accelerator => "accelerator",
                     AttackRunCategory::Resolution => "resolution",
                     AttackRunCategory::Evaluation => "evaluation",
                     AttackRunCategory::Counter => "counter",
@@ -1196,6 +1197,9 @@ mod tests {
                         ("resolution", "/job/space/slots/0")
                     }
                     RunPayload::Resolution(_) => ("resolution", "/job"),
+                    RunPayload::Accelerator(_) | RunPayload::UnsupportedAccelerator(_) => {
+                        ("accelerator", "/job")
+                    }
                     RunPayload::Evaluation(_) => ("evaluation", "/job"),
                     RunPayload::Counter(_) => ("counter", "/job"),
                     RunPayload::Invariant(_) => ("invariant", "/job"),

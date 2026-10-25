@@ -140,7 +140,7 @@ struct Options<'a> {
     /// Unresolved `--cancel-file` path; the caller joins it to the invocation cwd.
     cancel_file: Option<&'a str>,
     /// Validated `--threads` value.
-    threads: Option<ExecutionOptions>,
+    threads: Option<ExecutionOptions<'static>>,
     checkpoint: Option<&'a str>,
     resume: Option<&'a str>,
     /// Unresolved `--events` target: `-` for stdout, otherwise a new file.
@@ -306,7 +306,7 @@ fn split_options(args: &[String]) -> Result<(Option<Input<'_>>, Options<'_>), In
 }
 
 /// Accepts only ASCII decimal digits naming a count in `1..=MAX_THREADS`.
-fn parse_threads(value: &str) -> Result<ExecutionOptions, InputError> {
+fn parse_threads(value: &str) -> Result<ExecutionOptions<'static>, InputError> {
     value
         .bytes()
         .all(|byte| byte.is_ascii_digit())
@@ -427,7 +427,7 @@ fn unsupported_option(cancel_file: bool, threads: bool, checkpoint: bool) -> Opt
 }
 
 /// Default `--threads`: half the logical CPUs, or one when they cannot be counted.
-fn default_execution() -> ExecutionOptions {
+fn default_execution() -> ExecutionOptions<'static> {
     std::thread::available_parallelism()
         .map(ExecutionOptions::half_of)
         .unwrap_or_else(|_| ExecutionOptions::serial())
@@ -438,7 +438,7 @@ fn run(
     bytes: Vec<u8>,
     origin: &Path,
     cancel_file: Option<&Path>,
-    threads: Option<ExecutionOptions>,
+    threads: Option<ExecutionOptions<'static>>,
     checkpoint: Option<&CheckpointFile<'_>>,
     events: &mut EventSink,
     report: &report::Context<'_>,
@@ -815,7 +815,7 @@ mod attack_tests {
 
     /// A signal flag that is never raised; no real handler is installed in tests.
     static IDLE: AtomicBool = AtomicBool::new(false);
-    const SERIAL: ExecutionOptions = ExecutionOptions::serial();
+    const SERIAL: ExecutionOptions<'static> = ExecutionOptions::serial();
 
     fn request() -> Value {
         json!({"protocol_version":1,"machine":{"definition":{"kind":"custom","value":{

@@ -273,6 +273,30 @@ impl<'a> TrialEvaluator<'a> {
         }
     }
 
+    /// Prepare through the same validation, allocation policy and Engine as trials.
+    pub(super) fn byte_rows(
+        &self,
+        start: &[(char, char)],
+    ) -> Result<Vec<u8>, TrialEvaluationError> {
+        self.with_trial(start, |_, _, prepared, _| match prepared {
+            Some(Prepared::Bytes { rows, .. }) => Ok(rows.clone()),
+            _ => Err(TrialEvaluationError::Invariant(
+                "accelerator byte-row preparation failed",
+            )),
+        })
+    }
+
+    /// Retain host-prepared rows for reference climbs and uncharged terminal checks.
+    pub(super) fn with_byte_rows(self, input: &[u8], rows: &[u8]) -> Self {
+        self.prepared
+            .set(Some(Prepared::Bytes {
+                input: input.to_vec(),
+                rows: rows.to_vec(),
+            }))
+            .expect("fresh evaluator");
+        self
+    }
+
     pub(super) fn objective(&self) -> MeasureId {
         self.objective
     }
@@ -669,7 +693,7 @@ fn table_entries(length: usize, width: usize) -> Option<usize> {
 }
 
 /// Compact byte rows cost `width` bytes per input symbol under the same data limit.
-fn byte_rows_fit(length: usize, width: usize) -> bool {
+pub(crate) fn byte_rows_fit(length: usize, width: usize) -> bool {
     width <= 256 && byte_row_entries(length, width).is_some()
 }
 
