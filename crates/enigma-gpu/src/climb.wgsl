@@ -13,6 +13,19 @@ const PAIR_SLICE: u32 = {{PAIR_SLICE}}u;
 const LANE_ACTIONS: u32 = {{LANE_ACTIONS}}u;
 // False when no symbol is fixed or immutable: mask reads are skipped.
 const MASKED: bool = {{MASKED}};
+// Long texts: all lanes share each evaluation, COOP_LETTERS positions per lane and
+// round, COOP_ROUNDS rounds per dispatch; partial sums/counts persist in State.
+const COOPERATIVE: bool = {{COOPERATIVE}};
+const COOP_LETTERS: u32 = {{COOP_LETTERS}}u;
+const COOP_ROUNDS: u32 = {{COOP_ROUNDS}}u;
+// WIDTH rounded up to even keeps the State stride a multiple of eight bytes.
+const COUNT_WORDS: u32 = {{COUNT_WORDS}}u;
+// Pending cooperative evaluation kinds.
+const EVAL_NONE: u32 = 0u;
+const EVAL_INITIAL: u32 = 1u;
+const EVAL_TRIAL: u32 = 2u;
+const EVAL_SWITCH: u32 = 3u;
+const EVAL_FINAL: u32 = 4u;
 // Scalar-packed private mappings avoid dynamically indexed private-array spills
 // on Polaris for alphabets <=32. Wider alphabets keep the general array path.
 struct PackedBoard { a: u32, b: u32, c: u32, d: u32, e: u32, f: u32, g: u32, h: u32 }
@@ -24,13 +37,17 @@ struct Params {
     start_len: u32, identical: u32, initial_order: u32, final_order: u32,
     budget: u32, pair_slice: u32, lane_actions: u32, padding1: u32,
 }
-// Host wire layout: 16 header words, WIDTH map words, WIDTH ordered-pair words.
+// Host wire layout: 24 header words, WIDTH map words, WIDTH ordered-pair words,
+// COUNT_WORDS partial histogram words. Cooperative mode alone uses partial..counts;
+// its cursor is the next action ordinal to search instead of a pair index.
 struct State {
     score: i64, evaluations: u64, best_score: i64,
     pairs: u32, phase: u32, ascent: u32, initialized: u32,
     done: u32, cursor: u32, best_ordinal: u32, best_pairs: u32,
     board_len: u32, padding: u32,
-    mapping: array<u32, WIDTH>, board: array<u32, WIDTH>,
+    partial: i64, pending: u32, position: u32, ordinal: u32,
+    padding1: u32, padding2: u32, padding3: u32,
+    mapping: array<u32, WIDTH>, board: array<u32, WIDTH>, counts: array<u32, COUNT_WORDS>,
 }
 struct Candidate { score: i64, ordinal: u32, pairs: u32, count: u32 }
 struct Trial { mapping: Mapping, links: u32, valid: bool }
@@ -47,12 +64,18 @@ struct Trial { mapping: Mapping, links: u32, valid: bool }
 var<workgroup> cached_rows: array<u32, CACHE_WORDS>;
 var<workgroup> current: State;
 var<workgroup> candidates: array<Candidate, 128>;
+var<workgroup> hist: array<atomic<u32>, WIDTH>;
+var<workgroup> next_trial: atomic<u32>;
 
 fn byte_at(key: u32, index: u32) -> u32 {
     var word: u32;
     if (CACHE_ROWS) { word = cached_rows[index / 4u]; }
     else { word = rows[key * params.row_words + index / 4u]; }
     return (word >> ((index % 4u) * 8u)) & 255u;
+}
+
+fn decode(key: u32, mapping: Mapping, p: u32) -> u32 {
+    return lookup(mapping, byte_at(key, p * WIDTH + lookup(mapping, input[p])));
 }
 
 fn load_board() -> Mapping {
@@ -75,7 +98,7 @@ fn score(key: u32, mapping: Mapping, order: u32, phase: u32) -> i64 {
     var window = 0u;
     var sum = 0li;
     for (var p = 0u; p < LENGTH; p++) {
-        let plain = lookup(mapping, byte_at(key, p * WIDTH + lookup(mapping, input[p])));
+        let plain = decode(key, mapping, p);
         if (order == 0u) {
             if (PACKED_COUNTS) { put(&small_counts, plain, lookup(small_counts, plain) + 1u); }
             else { counts[plain] += 1u; }
@@ -88,18 +111,24 @@ fn score(key: u32, mapping: Mapping, order: u32, phase: u32) -> i64 {
             }
         }
     }
-    if (order != 0u) {
-        let windows = i64(LENGTH - order + 1u);
-        var quotient = sum / windows;
-        if (sum < 0li && sum % windows != 0li) { quotient -= 1li; }
-        return quotient;
-    }
+    if (order != 0u) { return ngram_quotient(sum, order); }
     var pairs = 0lu;
     for (var i = 0u; i < WIDTH; i++) {
         var count = u64(counts[i]);
         if (PACKED_COUNTS) { count = u64(lookup(small_counts, i)); }
         if (count > 0lu) { pairs += count * (count - 1lu); }
     }
+    return ic_quotient(pairs);
+}
+
+fn ngram_quotient(sum: i64, order: u32) -> i64 {
+    let windows = i64(LENGTH - order + 1u);
+    var quotient = sum / windows;
+    if (sum < 0li && sum % windows != 0li) { quotient -= 1li; }
+    return quotient;
+}
+
+fn ic_quotient(pairs: u64) -> i64 {
     let numerator = pairs * u64(WIDTH);
     let denominator = u64(LENGTH) * u64(LENGTH - 1u);
     // With <=255 letters and <=32 symbols, this product provably fits u64.
@@ -190,12 +219,23 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index
             current.board_len = params.start_len;
             current.pairs = params.fixed_count + params.start_len;
             current.phase = u32(current.pairs >= params.switch_pairs);
-            current.score = evaluate(key, load_board(), current.phase);
-            current.evaluations = 1lu;
+            if (COOPERATIVE) { start_evaluation(EVAL_INITIAL); }
+            else {
+                current.score = evaluate(key, load_board(), current.phase);
+                current.evaluations = 1lu;
+            }
             current.initialized = 1u;
         }
     }
     workgroupBarrier();
+    // The host emits only the specialized path: unused workgroup storage of the
+    // other path would otherwise still be allocated and zero-initialized.
+    {{CLIMB}}(key, lane);
+    if (lane == 0u) { states[key] = current; }
+}
+
+// Short texts: each lane evaluates whole trials of a bounded scan slice.
+fn sliced(key: u32, lane: u32) {
     let pair_count = WIDTH * (WIDTH - 1u) / 2u;
     // A step is a bounded slice of a scan; at most budget full scans can finish.
     for (var step = 0u; step < params.budget; step++) {
@@ -250,41 +290,195 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index
             }
             current.cursor = end;
             if (end == pair_count) {
-                current.ascent |= u32(current.phase != 0u || IDENTICAL);
-                current.cursor = 0u;
-                if (current.best_score <= current.score) {
-                    current.done = 1u;
-                    atomicAdd(&finished, 1u);
-                    if (current.phase == 0u && !IDENTICAL) {
-                        current.score = evaluate(key, board, 1u);
-                        current.evaluations += 1lu;
-                    }
-                } else {
-                    let ab = endpoints(current.best_ordinal / 4u);
-                    let trial = trial_for(board, ab.x, ab.y, current.best_ordinal % 4u);
-                    for (var i = 0u; i < WIDTH; i++) { current.mapping[i] = lookup(trial.mapping, i); }
-                    current.pairs = current.best_pairs;
-                    current.score = current.best_score;
-                    // CPU winner_board canonicalizes in alphabet order, unlike an
-                    // untouched starting board whose order/orientation is retained.
-                    current.board_len = 0u;
-                    for (var i = 0u; i < WIDTH; i++) {
-                        if (i < current.mapping[i] && job[i] == 0u) {
-                            current.board[current.board_len] = i | (current.mapping[i] << 8u);
-                            current.board_len += 1u;
-                        }
-                    }
-                    if (current.phase == 0u && current.pairs >= params.switch_pairs) {
-                        current.phase = 1u;
-                        if (!IDENTICAL) {
-                            current.score = evaluate(key, trial.mapping, 1u);
-                            current.evaluations += 1lu;
-                        }
-                    }
+                let rescore = end_scan(board);
+                if (rescore != EVAL_NONE) {
+                    current.score = evaluate(key, load_board(), 1u);
+                    current.evaluations += 1lu;
                 }
+                if (rescore == EVAL_FINAL) { finish_climb(); }
             }
         }
         workgroupBarrier();
     }
-    if (lane == 0u) { states[key] = current; }
+}
+
+fn finish_climb() {
+    current.done = 1u;
+    atomicAdd(&finished, 1u);
+}
+
+// Lane 0, after a complete scan: commit its winner or stop. Returns the final-
+// objective rescore the CPU charges next (switch or final), if any.
+fn end_scan(board: Mapping) -> u32 {
+    current.ascent |= u32(current.phase != 0u || IDENTICAL);
+    current.cursor = 0u;
+    if (current.best_score <= current.score) {
+        if (current.phase == 0u && !IDENTICAL) { return EVAL_FINAL; }
+        finish_climb();
+        return EVAL_NONE;
+    }
+    let ab = endpoints(current.best_ordinal / 4u);
+    let trial = trial_for(board, ab.x, ab.y, current.best_ordinal % 4u);
+    for (var i = 0u; i < WIDTH; i++) { current.mapping[i] = lookup(trial.mapping, i); }
+    current.pairs = current.best_pairs;
+    current.score = current.best_score;
+    // CPU winner_board canonicalizes in alphabet order, unlike an
+    // untouched starting board whose order/orientation is retained.
+    current.board_len = 0u;
+    for (var i = 0u; i < WIDTH; i++) {
+        if (i < current.mapping[i] && job[i] == 0u) {
+            current.board[current.board_len] = i | (current.mapping[i] << 8u);
+            current.board_len += 1u;
+        }
+    }
+    if (current.phase == 0u && current.pairs >= params.switch_pairs) {
+        current.phase = 1u;
+        if (!IDENTICAL) { return EVAL_SWITCH; }
+    }
+    return EVAL_NONE;
+}
+
+fn start_evaluation(kind: u32) {
+    current.pending = kind;
+    current.position = 0u;
+    current.partial = 0li;
+}
+
+// Lane 0: apply one finished evaluation exactly as the CPU walker would.
+fn complete_evaluation(kind: u32, value: i64, links: u32) {
+    current.pending = EVAL_NONE;
+    current.evaluations += 1lu;
+    if (kind == EVAL_TRIAL) {
+        if (value > current.best_score || (value == current.best_score && current.ordinal < current.best_ordinal)) {
+            current.best_score = value;
+            current.best_ordinal = current.ordinal;
+            current.best_pairs = links;
+        }
+        return;
+    }
+    current.score = value;
+    if (kind == EVAL_FINAL) { finish_climb(); }
+}
+
+fn sum_lanes(lane: u32, value: i64) -> i64 {
+    candidates[lane].score = value;
+    workgroupBarrier();
+    for (var stride = 64u; stride > 0u; stride /= 2u) {
+        if (lane < stride) { candidates[lane].score += candidates[lane + stride].score; }
+        workgroupBarrier();
+    }
+    return candidates[0].score;
+}
+
+// Window sums for windows ending in [start, end); IC counts go to `hist`.
+fn partial_score(key: u32, mapping: Mapping, phase: u32, start: u32, end: u32) -> i64 {
+    if (phase == 0u) { return chunk(key, mapping, INITIAL_ORDER, 0u, start, end); }
+    return chunk(key, mapping, FINAL_ORDER, 1u, start, end);
+}
+
+fn chunk(key: u32, mapping: Mapping, order: u32, phase: u32, start: u32, end: u32) -> i64 {
+    var radix = 1u;
+    for (var i = 1u; i < order; i++) { radix *= WIDTH; }
+    // Re-decode the order-1 letters before start; every position decodes alone.
+    var first = start;
+    if (order > 1u) { first = start - min(start, order - 1u); }
+    var window = 0u;
+    var sum = 0li;
+    for (var p = first; p < end; p++) {
+        let plain = decode(key, mapping, p);
+        if (order == 0u) { atomicAdd(&hist[plain], 1u); }
+        else {
+            window = (window % radix) * WIDTH + plain;
+            if (p >= start && p + 1u >= order) {
+                if (phase == 0u) { sum += initial_weights[window]; }
+                else { sum += final_weights[window]; }
+            }
+        }
+    }
+    return sum;
+}
+
+// Long texts: the workgroup searches the next legal trial in ordinal order, then
+// evaluates it together across rounds and dispatches. Integer partial sums and
+// counts are associative, so the split cannot change any score.
+fn cooperative(key: u32, lane: u32) {
+    let actions = 2u * WIDTH * (WIDTH - 1u);
+    for (var i = lane; i < WIDTH; i += 128u) { atomicStore(&hist[i], current.counts[i]); }
+    var lane_sum = 0li;
+    for (var round = 0u; round < COOP_ROUNDS; round++) {
+        workgroupBarrier();
+        if (workgroupUniformLoad(&current.done) != 0u) { break; }
+        let pending = workgroupUniformLoad(&current.pending);
+        let board = load_board();
+        if (pending == EVAL_NONE) {
+            if (lane == 0u) { atomicStore(&next_trial, 0xffffffffu); }
+            workgroupBarrier();
+            let ordinal = current.cursor + lane;
+            if (ordinal < actions) {
+                let ab = endpoints(ordinal / 4u);
+                if (trial_for(board, ab.x, ab.y, ordinal % 4u).valid) { atomicMin(&next_trial, ordinal); }
+            }
+            workgroupBarrier();
+            if (lane == 0u) {
+                if (current.cursor == 0u) {
+                    current.best_score = current.score;
+                    current.best_ordinal = 0xffffffffu;
+                    current.best_pairs = current.pairs;
+                }
+                let found = atomicLoad(&next_trial);
+                if (found != 0xffffffffu) {
+                    start_evaluation(EVAL_TRIAL);
+                    current.ordinal = found;
+                    current.cursor = found + 1u;
+                } else if (current.cursor + 128u >= actions) {
+                    start_evaluation(end_scan(board));
+                } else {
+                    current.cursor += 128u;
+                }
+            }
+            continue;
+        }
+        let phase = select(current.phase, 1u, pending >= EVAL_SWITCH);
+        var mapping = board;
+        var links = 0u;
+        if (pending == EVAL_TRIAL) {
+            let ab = endpoints(current.ordinal / 4u);
+            let trial = trial_for(board, ab.x, ab.y, current.ordinal % 4u);
+            mapping = trial.mapping;
+            links = trial.links;
+        }
+        let base = workgroupUniformLoad(&current.position);
+        let start = min(base + lane * COOP_LETTERS, LENGTH);
+        lane_sum += partial_score(key, mapping, phase, start, min(start + COOP_LETTERS, LENGTH));
+        let next = base + 128u * COOP_LETTERS;
+        if (next < LENGTH) {
+            workgroupBarrier();
+            if (lane == 0u) { current.position = next; }
+            continue;
+        }
+        let total = sum_lanes(lane, lane_sum);
+        lane_sum = 0li;
+        if (lane == 0u) {
+            let order = select(INITIAL_ORDER, FINAL_ORDER, phase != 0u);
+            var value = 0li;
+            if (order == 0u) {
+                var pairs = 0lu;
+                for (var i = 0u; i < WIDTH; i++) {
+                    let count = u64(atomicLoad(&hist[i]));
+                    if (count > 0lu) { pairs += count * (count - 1lu); }
+                }
+                value = ic_quotient(pairs);
+            } else {
+                value = ngram_quotient(total + current.partial, order);
+            }
+            complete_evaluation(pending, value, links);
+        }
+        workgroupBarrier();
+        for (var i = lane; i < WIDTH; i += 128u) { atomicStore(&hist[i], 0u); }
+    }
+    workgroupBarrier();
+    let carried = sum_lanes(lane, lane_sum);
+    if (lane == 0u) { current.partial += carried; }
+    for (var i = lane; i < WIDTH; i += 128u) { current.counts[i] = atomicLoad(&hist[i]); }
+    workgroupBarrier();
 }

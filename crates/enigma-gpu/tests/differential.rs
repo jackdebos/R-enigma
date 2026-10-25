@@ -23,7 +23,7 @@ fn request(width: usize, variant: usize) -> AttackRequest {
         5 => "sinkov_pentagram",
         _ => "sinkov_hexagram",
     };
-    let final_id = if variant == 0 || variant == 12 {
+    let final_id = if variant == 0 || variant == 12 || variant == 13 {
         "ic"
     } else {
         id
@@ -67,6 +67,13 @@ fn request(width: usize, variant: usize) -> AttackRequest {
         value["machine"]["definition"]["value"]["wheels"][0]["wiring"] = json!(alphabet);
         value["job"]["attack"]["start"] = json!([["D", "C"], ["B", "A"]]);
         value["job"]["space"]["limit"] = json!(1);
+    }
+    if variant == 13 {
+        // IC-only, 779 letters with pairs: with the third accelerator's geometry every
+        // evaluation takes 7 rounds against 6 per dispatch, so its partial counts
+        // always cross a dispatch boundary, starting with the initial score.
+        value["job"]["text"] = json!("AAABACADBBABCDABAAA".repeat(41));
+        value["job"]["space"]["limit"] = json!(64);
     }
     if final_id == "ic" {
         return AttackRequest::parse_json(&value.to_string()).unwrap();
@@ -150,9 +157,14 @@ fn invalid_options_are_rejected_without_a_device() {
 fn device_matches_cpu_results_progress_checkpoints_and_geometry() {
     let Some(first) = gpu(25, 1) else { return };
     let Some(second) = gpu(20, 2) else { return };
+    // Every text cooperative, one letter per lane and six rounds per dispatch, so
+    // evaluations of texts over 128 letters span rounds and dispatches.
+    let Some(third) = gpu(20, 3).map(|gpu| gpu.with_cooperative_geometry(1, 1, 2)) else {
+        return;
+    };
     let identity = enigma_core::checkpoint_identity("{}", &Default::default()).unwrap();
     for width in [4, 26, 34] {
-        for variant in 0..13 {
+        for variant in 0..14 {
             // Keep long/multiblock and high-order cases on the small alphabet.
             if (width == 26 && (variant == 0 || variant >= 7)) || (width == 34 && variant != 1) {
                 continue;
@@ -180,6 +192,11 @@ fn device_matches_cpu_results_progress_checkpoints_and_geometry() {
                 run(Some(&Audited(&second))),
                 expected,
                 "width={width} variant={variant} budget=2"
+            );
+            assert_eq!(
+                run(Some(&Audited(&third))),
+                expected,
+                "width={width} variant={variant} cooperative"
             );
             if variant == 0 {
                 // CPU checkpoint -> GPU, and GPU checkpoint -> CPU.
@@ -227,7 +244,23 @@ fn device_matches_cpu_results_progress_checkpoints_and_geometry() {
     assert_eq!(error.evaluations_used(), 0);
     assert_eq!(error.counters().outers_completed(), 0);
     assert_eq!(checkpoints, 0);
-    for (gpu, idle_factor) in [(&first, 3.0), (&second, 4.0)] {
+    // Watchdog: a batch that outlives its dispatch bound stops with an error.
+    let Some(limited) = gpu(25, 1).map(|gpu| gpu.with_dispatch_limit(1)) else {
+        return;
+    };
+    let error = request(4, 1)
+        .run_with(
+            ExecutionOptions::serial().with_accelerator(&limited),
+            |_| {},
+            || false,
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("provable bound of 1 dispatches"),
+        "{error}"
+    );
+    assert_eq!(error.counters().outers_completed(), 0);
+    for (gpu, idle_factor) in [(&first, 3.0), (&second, 4.0), (&third, 4.0)] {
         let stats = gpu.dispatch_stats();
         use std::io::Write;
         let _ = writeln!(std::io::stderr(), "enigma-gpu {} dispatches={} max={:?} total={:?} (host submit/readback; includes scheduling)", gpu.adapter_name(), stats.dispatches, stats.max_dispatch, stats.work_time);

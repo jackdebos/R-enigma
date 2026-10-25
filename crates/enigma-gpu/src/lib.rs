@@ -64,6 +64,11 @@ pub struct DispatchStats {
     pub work_time: Duration,
     pub idle_time: Duration,
     pub max_dispatch: Duration,
+    /// Awaited host-to-device copies of at most 4 MiB (rows, tables), timed apart
+    /// from dispatches but included in `work_time` and the duty cycle. The last
+    /// queued chunk (also at most 4 MiB) instead travels with the next dispatch.
+    pub uploads: u64,
+    pub max_upload: Duration,
 }
 
 /// One dispatch's host timing and bounded work geometry, for opt-in instrumentation.
@@ -94,6 +99,45 @@ pub struct GpuClimbAccelerator {
     failure: Arc<Mutex<Option<String>>>,
     session: Mutex<Session>,
     observer: Option<Box<dyn Fn(DispatchSample) + Send + Sync>>,
+    cooperative: Cooperative,
+    dispatch_limit: u64,
+}
+
+/// Texts longer than `from` letters share each evaluation across the workgroup:
+/// `letters` positions per lane and round, `rounds * scan_budget` rounds per
+/// dispatch with `letters / scan_budget` positions (at least one) per lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Cooperative {
+    from: usize,
+    letters: usize,
+    rounds: usize,
+}
+
+const COOPERATIVE: Cooperative = Cooperative {
+    from: 1024,
+    letters: 16,
+    rounds: 8,
+};
+
+/// Sliced lanes decode whole trials, so keys per dispatch shrink inversely with
+/// text length above 256 letters (512 keys at <=256, 128 at 1024), in multiples of 32.
+fn sliced_keys(length: usize) -> usize {
+    let keys = (512 * 256 / length.max(256)).max(1);
+    if keys >= 32 {
+        keys / 32 * 32
+    } else {
+        keys
+    }
+}
+
+/// Host-to-device bytes that may be queued ahead of one dispatch or one timed wait.
+const UPLOAD_CHUNK: usize = 4 << 20;
+
+/// Header words before the alphabet-wide mapping, board and partial counts.
+const STATE_HEADER: usize = 24;
+
+fn state_words(width: usize) -> usize {
+    STATE_HEADER + 2 * width + width.next_multiple_of(2)
 }
 
 /// Immutable job facts compiled into a pipeline; one cache entry per distinct job shape.
@@ -108,6 +152,7 @@ struct Specialization {
     identical: bool,
     pair_slice: usize,
     masked: bool,
+    cooperative: Option<(usize, usize)>,
 }
 
 struct JobLayout {
@@ -118,6 +163,8 @@ struct JobLayout {
     initial_order: usize,
     final_order: usize,
     identical: bool,
+    /// Letters per lane and round, and rounds per dispatch, for long texts.
+    cooperative: Option<(usize, usize)>,
 }
 
 fn bounded_pair_slice(base: usize, budget: u32) -> usize {
@@ -253,7 +300,28 @@ impl GpuClimbAccelerator {
             failure,
             session: Mutex::new(Session::default()),
             observer: None,
+            cooperative: COOPERATIVE,
+            dispatch_limit: u64::MAX,
         })
+    }
+
+    /// Test hook: cooperative long-text geometry for texts longer than `from`.
+    #[doc(hidden)]
+    pub fn with_cooperative_geometry(mut self, from: usize, letters: usize, rounds: usize) -> Self {
+        assert!(letters > 0 && rounds > 0);
+        self.cooperative = Cooperative {
+            from,
+            letters,
+            rounds,
+        };
+        self
+    }
+
+    /// Test hook: lower the per-batch dispatch bound to exercise the watchdog.
+    #[doc(hidden)]
+    pub fn with_dispatch_limit(mut self, limit: u64) -> Self {
+        self.dispatch_limit = limit;
+        self
     }
 
     /// Opt in to dispatch samples. Callback work is excluded from dispatch timing;
@@ -280,10 +348,62 @@ impl GpuClimbAccelerator {
     }
 
     fn layout(&self, job: &ClimbJob<'_>) -> Result<JobLayout, GpuUnsupported> {
-        let mut layout = Self::layout_for(job, &self.limits)?;
+        Self::bounded_layout(job, &self.limits, self.scan_budget, self.cooperative)
+    }
+
+    /// Device layout plus the per-dispatch work bounds for this scan budget.
+    fn bounded_layout(
+        job: &ClimbJob<'_>,
+        limits: &wgpu::Limits,
+        budget: u32,
+        geometry: Cooperative,
+    ) -> Result<JobLayout, GpuUnsupported> {
+        let mut layout = Self::layout_for(job, limits)?;
         // Larger requested slice counts must not become a long-dispatch mode.
-        layout.pair_slice = bounded_pair_slice(layout.pair_slice, self.scan_budget);
+        layout.pair_slice = bounded_pair_slice(layout.pair_slice, budget);
+        layout.cooperative = (job.text_length > geometry.from).then(|| {
+            let budget = budget as usize;
+            ((geometry.letters / budget).max(1), geometry.rounds * budget)
+        });
+        if layout.cooperative.is_none() {
+            layout.keys_per_dispatch = layout.keys_per_dispatch.min(sliced_keys(job.text_length));
+        }
         Ok(layout)
+    }
+
+    /// Provable upper bound on dispatches until every key of a batch finishes.
+    /// Each committed winner strictly raises the phase objective's score, so a
+    /// climb has at most `distinct(initial) + distinct(final) + 2` scans. Every
+    /// unfinished key consumes `scan_budget` slices (sliced) or a fixed number of
+    /// rounds (cooperative) per dispatch. The bound is a liveness backstop against
+    /// a kernel that never finishes, not an expected duration.
+    fn dispatch_bound(job: &ClimbJob<'_>, layout: &JobLayout, budget: u32) -> u64 {
+        let distinct = |objective| match objective {
+            ClimbObjective::Ic { denominator, .. } => denominator.saturating_add(1),
+            ClimbObjective::DenseNgram { max_abs, .. } => u128::from(max_abs) * 2 + 2,
+        };
+        let scans = distinct(job.initial_objective)
+            .saturating_add(distinct(job.final_objective))
+            .saturating_add(2);
+        let width = job.alphabet_size as u128;
+        let pairs = width * width.saturating_sub(1) / 2;
+        let dispatches = match layout.cooperative {
+            None => scans
+                .saturating_mul(pairs.div_ceil(layout.pair_slice as u128).max(1))
+                .div_ceil(u128::from(budget)),
+            Some((letters, rounds)) => {
+                let evaluation = (job.text_length as u128).div_ceil(128 * letters as u128);
+                let actions = 4 * pairs;
+                let per_scan = (actions + 1)
+                    .saturating_mul(evaluation + 1)
+                    .saturating_add(actions.div_ceil(128) + 1);
+                scans
+                    .saturating_mul(per_scan)
+                    .saturating_add(evaluation)
+                    .div_ceil(rounds as u128)
+            }
+        };
+        u64::try_from(dispatches.saturating_add(1)).unwrap_or(u64::MAX)
     }
 
     fn layout_for(job: &ClimbJob<'_>, limits: &wgpu::Limits) -> Result<JobLayout, GpuUnsupported> {
@@ -346,14 +466,15 @@ impl GpuClimbAccelerator {
         let final_order = objective(job.final_objective, width, length, max_buffer)?;
         // 128 reduction records (24 bytes), two State copies conservatively,
         // and optional row cache. A one-word placeholder keeps WGSL arrays legal.
-        let shared = 128 * 24 + 2 * (16 + 2 * width) * 4;
+        // Plus the cooperative histogram and next-trial word.
+        let shared = 128 * 24 + 2 * state_words(width) * 4 + width * 4 + 4;
         let available = limits.max_compute_workgroup_storage_size as usize;
         if limits.max_compute_invocations_per_workgroup < 128
             || limits.max_compute_workgroup_size_x < 128
             || limits.max_storage_buffers_per_shader_stage < 7
             || limits.max_uniform_buffer_binding_size < 64
             || shared + 4 > available
-            || (16 + 2 * width) as u64 * 4 > max_buffer
+            || state_words(width) as u64 * 4 > max_buffer
         {
             return Err(unsupported(
                 "device lacks workgroup or storage resources for the exact kernel",
@@ -367,7 +488,7 @@ impl GpuClimbAccelerator {
         let keys_per_dispatch = 512usize
             .min(limits.max_compute_workgroups_per_dimension as usize)
             .min((max_buffer / (row_words * 4) as u64) as usize)
-            .min((max_buffer / ((16 + 2 * width) * 4) as u64) as usize);
+            .min((max_buffer / (state_words(width) * 4) as u64) as usize);
         if keys_per_dispatch == 0 {
             return Err(unsupported("device cannot dispatch one key"));
         }
@@ -381,6 +502,7 @@ impl GpuClimbAccelerator {
             initial_order,
             final_order,
             identical: same_objectives(job.initial_objective, job.final_objective),
+            cooperative: None,
         })
     }
 
@@ -418,6 +540,58 @@ impl GpuClimbAccelerator {
             })
     }
 
+    /// Duty-cycle idling after measured GPU work.
+    fn rest(&self, elapsed: Duration, stats: &mut DispatchStats) {
+        let idle = Instant::now();
+        std::thread::sleep(elapsed.mul_f64(f64::from(100 - self.usage) / f64::from(self.usage)));
+        stats.idle_time += idle.elapsed();
+    }
+
+    /// Queue `bytes` into a new storage buffer. Before queued writes would exceed
+    /// `UPLOAD_CHUNK`, they are submitted and awaited as one timed upload, so at most
+    /// one chunk precedes the next dispatch on the queue (`pending` tracks it).
+    fn upload(
+        &self,
+        label: &str,
+        bytes: &[u8],
+        pending: &mut usize,
+        stats: &mut DispatchStats,
+    ) -> Result<wgpu::Buffer, GpuError> {
+        let buffer = self.checked(|| {
+            Ok(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: bytes.len().next_multiple_of(4).max(4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }))
+        })?;
+        for (index, chunk) in bytes.chunks(UPLOAD_CHUNK).enumerate() {
+            if *pending > 0 && *pending + chunk.len() > UPLOAD_CHUNK {
+                let start = Instant::now();
+                self.checked(|| {
+                    self.queue.submit([]);
+                    self.device
+                        .poll(wgpu::PollType::wait_indefinitely())
+                        .map_err(|e| GpuError::Device(e.to_string()))?;
+                    Ok(())
+                })?;
+                let elapsed = start.elapsed();
+                *pending = 0;
+                stats.uploads += 1;
+                stats.work_time += elapsed;
+                stats.max_upload = stats.max_upload.max(elapsed);
+                self.rest(elapsed, stats);
+            }
+            self.checked(|| {
+                self.queue
+                    .write_buffer(&buffer, (index * UPLOAD_CHUNK) as u64, chunk);
+                Ok(())
+            })?;
+            *pending += chunk.len();
+        }
+        Ok(buffer)
+    }
+
     fn read_words(&self, buffer: &wgpu::Buffer) -> Result<Vec<u32>, GpuError> {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         buffer.map_async(wgpu::MapMode::Read, .., move |result| {
@@ -446,6 +620,7 @@ impl GpuClimbAccelerator {
             identical: layout.identical,
             pair_slice: layout.pair_slice,
             masked: !job.fixed_pairs.is_empty() || job.mutable_mask.iter().any(|&m| !m),
+            cooperative: layout.cooperative,
         }
     }
 
@@ -468,6 +643,18 @@ impl GpuClimbAccelerator {
             .replace("{{PAIR_SLICE}}", &spec.pair_slice.to_string())
             .replace("{{LANE_ACTIONS}}", &lane_actions(spec.pair_slice).to_string())
             .replace("{{MASKED}}", &spec.masked.to_string())
+            .replace("{{COOPERATIVE}}", &spec.cooperative.is_some().to_string())
+            .replace(
+                "{{CLIMB}}",
+                if spec.cooperative.is_some() {
+                    "cooperative"
+                } else {
+                    "sliced"
+                },
+            )
+            .replace("{{COOP_LETTERS}}", &spec.cooperative.map_or(1, |c| c.0).to_string())
+            .replace("{{COOP_ROUNDS}}", &spec.cooperative.map_or(1, |c| c.1).to_string())
+            .replace("{{COUNT_WORDS}}", &spec.width.next_multiple_of(2).to_string())
             .replace("{{CACHE_WORDS}}", &spec.cache_words.max(1).to_string())
             .replace("{{CACHE_ROWS}}", &(spec.cache_words != 0).to_string());
         self.checked(|| {
@@ -531,25 +718,28 @@ impl GpuClimbAccelerator {
             ClimbObjective::Ic { .. } => &[0i64][..],
             ClimbObjective::DenseNgram { weights, .. } => weights,
         };
-        let (input, data, initial, final_weights) = self.checked(|| {
-            let storage = wgpu::BufferUsages::STORAGE;
-            Ok((
-                self.buffer("input", bytemuck::cast_slice(&input), storage),
-                self.buffer("job", bytemuck::cast_slice(&data), storage),
-                self.buffer(
-                    "initial weights",
-                    bytemuck::cast_slice(weights(job.initial_objective)),
-                    storage,
-                ),
-                self.buffer(
-                    "final weights",
-                    bytemuck::cast_slice(weights(job.final_objective)),
-                    storage,
-                ),
-            ))
-        })?;
-        let mut results = Vec::with_capacity(rows.len() / stride);
         let mut stats = session.stats;
+        let mut pending = 0;
+        let input = self.upload(
+            "input",
+            bytemuck::cast_slice(&input),
+            &mut pending,
+            &mut stats,
+        )?;
+        let data = self.upload("job", bytemuck::cast_slice(&data), &mut pending, &mut stats)?;
+        let initial = self.upload(
+            "initial weights",
+            bytemuck::cast_slice(weights(job.initial_objective)),
+            &mut pending,
+            &mut stats,
+        )?;
+        let final_weights = self.upload(
+            "final weights",
+            bytemuck::cast_slice(weights(job.final_objective)),
+            &mut pending,
+            &mut stats,
+        )?;
+        let mut results = Vec::with_capacity(rows.len() / stride);
         for batch in rows.chunks(stride * layout.keys_per_dispatch) {
             let keys = batch.len() / stride;
             let mut packed = vec![0u8; keys * layout.row_words * 4];
@@ -575,11 +765,11 @@ impl GpuClimbAccelerator {
                 lane_actions(layout.pair_slice),
                 0,
             ];
-            let state_words = 16 + 2 * width;
+            let state_words = state_words(width);
             let size = (keys * state_words * 4) as u64;
+            let rows = self.upload("rows", &packed, &mut pending, &mut stats)?;
             let (states, read, finished, finished_read, bindings) = self.checked(|| {
                 let storage = wgpu::BufferUsages::STORAGE;
-                let rows = self.buffer("rows", &packed, storage);
                 let params = self.buffer(
                     "params",
                     bytemuck::cast_slice(&params),
@@ -633,6 +823,9 @@ impl GpuClimbAccelerator {
                 });
                 Ok((states, read, finished, finished_read, bindings))
             })?;
+            let bound =
+                Self::dispatch_bound(job, &layout, self.scan_budget).min(self.dispatch_limit);
+            let mut batch_dispatches = 0u64;
             loop {
                 let start = Instant::now();
                 let records = self.checked(|| {
@@ -654,6 +847,8 @@ impl GpuClimbAccelerator {
                     self.queue.submit([encoder.finish()]);
                     self.read_words(&read).map(Some)
                 })?;
+                // The submission also flushed any queued upload chunk.
+                pending = 0;
                 let elapsed = start.elapsed();
                 stats.dispatches += 1;
                 stats.work_time += elapsed;
@@ -667,11 +862,7 @@ impl GpuClimbAccelerator {
                     });
                 }
                 // Idle after EVERY completed dispatch, including the terminal one.
-                let idle = Instant::now();
-                std::thread::sleep(
-                    elapsed.mul_f64(f64::from(100 - self.usage) / f64::from(self.usage)),
-                );
-                stats.idle_time += idle.elapsed();
+                self.rest(elapsed, &mut stats);
                 if let Some(records) = records {
                     for record in records.chunks_exact(state_words) {
                         let signed = |at| {
@@ -685,11 +876,12 @@ impl GpuClimbAccelerator {
                             bytemuck::cast_slice(&record[2..4]).try_into().unwrap(),
                         );
                         let len = record[14] as usize;
+                        let board = STATE_HEADER + width;
                         if record[10] == 0 || len > width / 2 {
                             return Err(GpuError::Device("invalid terminal board length".into()));
                         }
                         results.push(AcceleratedClimb {
-                            board: record[16 + width..16 + width + len]
+                            board: record[board..board + len]
                                 .iter()
                                 .map(|&pair| ((pair & 255) as u8, (pair >> 8) as u8))
                                 .collect(),
@@ -699,6 +891,13 @@ impl GpuClimbAccelerator {
                         });
                     }
                     break;
+                }
+                batch_dispatches += 1;
+                if batch_dispatches >= bound {
+                    session.stats = stats;
+                    return Err(GpuError::Device(format!(
+                        "climb batch did not finish within its provable bound of {bound} dispatches"
+                    )));
                 }
             }
         }

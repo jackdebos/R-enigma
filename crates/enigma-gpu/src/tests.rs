@@ -127,3 +127,59 @@ fn dense_objectives_require_exact_dimensions_bounds_and_device_storage() {
         assert!(matches!(result, Err(GpuUnsupported::Job(_))));
     }
 }
+
+#[test]
+fn dispatch_work_is_bounded_for_any_text_length() {
+    let limits = wgpu::Limits::default();
+    assert_eq!(
+        [1, 232, 256, 257, 341, 512, 1024, 1025, 4864].map(sliced_keys),
+        [512, 512, 512, 480, 384, 256, 128, 96, 26]
+    );
+    for (length, cooperative) in [
+        (19, None),
+        (1024, None),
+        (1025, Some((16, 8))),
+        (4864, Some((16, 8))),
+    ] {
+        let request = request(length);
+        let job = request.climb_job().unwrap();
+        let layout = GpuClimbAccelerator::bounded_layout(&job, &limits, 1, COOPERATIVE).unwrap();
+        assert_eq!(layout.cooperative, cooperative, "length={length}");
+        if cooperative.is_none() {
+            assert!(layout.keys_per_dispatch <= sliced_keys(length));
+        }
+    }
+    // Larger budgets split cooperative work into finer rounds, not longer dispatches.
+    let request = request(4864);
+    let job = request.climb_job().unwrap();
+    assert_eq!(
+        [1, 2, 3, 4].map(|budget| {
+            GpuClimbAccelerator::bounded_layout(&job, &limits, budget, COOPERATIVE)
+                .unwrap()
+                .cooperative
+        }),
+        [Some((16, 8)), Some((8, 16)), Some((5, 24)), Some((4, 32))]
+    );
+}
+
+#[test]
+fn dispatch_bound_follows_distinct_scores_slices_and_rounds() {
+    let limits = wgpu::Limits::default();
+    let short = request(19);
+    let job = short.climb_job().unwrap();
+    let bound = |budget| {
+        let layout =
+            GpuClimbAccelerator::bounded_layout(&job, &limits, budget, COOPERATIVE).unwrap();
+        GpuClimbAccelerator::dispatch_bound(&job, &layout, budget)
+    };
+    // IC has 19 * 18 + 1 distinct scores per objective: 688 scans of one slice.
+    assert_eq!([bound(1), bound(2)], [689, 345]);
+    let long = request(4864);
+    let job = long.climb_job().unwrap();
+    let layout = GpuClimbAccelerator::bounded_layout(&job, &limits, 1, COOPERATIVE).unwrap();
+    // 47,307,268 scans of at most 102 rounds, plus the initial evaluation, 8 per dispatch.
+    assert_eq!(
+        GpuClimbAccelerator::dispatch_bound(&job, &layout, 1),
+        603_167_669
+    );
+}

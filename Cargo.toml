@@ -19,3 +19,12 @@ serde_json = "1"
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+
+# GPU device tests compile one specialized shader per job shape; the shader
+# translator dominates their debug-build time unless it is optimized.
+[profile.dev.package.naga]
+opt-level = 3
+[profile.dev.package.wgpu-core]
+opt-level = 3
+[profile.dev.package.wgpu-hal]
+opt-level = 3
