@@ -4841,6 +4841,65 @@ mod tests {
     }
 
     #[test]
+    fn accelerator_unbounded_preference_is_capped_without_changing_results() {
+        let request = accelerator_batch_request();
+        let accelerator = BatchAccelerator::new(usize::MAX, None, false);
+        let identity = crate::checkpoint_identity("{}", &Default::default()).unwrap();
+        let run = |options| {
+            let mut progress = Vec::new();
+            let mut records = Vec::new();
+            let result = request
+                .run_with_checkpoints(
+                    options,
+                    |p| progress.push(p),
+                    || false,
+                    |s| records.push(s.record(identity, 0).unwrap()),
+                )
+                .unwrap();
+            (format!("{result:?}"), progress, records)
+        };
+        let cpu = crate::ExecutionOptions::with_threads(3).unwrap();
+        assert_eq!(run(cpu.with_accelerator(&accelerator)), run(cpu));
+        assert_eq!(*accelerator.calls.lock().unwrap(), [(3, 512), (515, 261)]);
+    }
+
+    #[test]
+    fn accelerator_oversized_block_rows_fail_before_work() {
+        let request = pool_request(false, 1, |job| {
+            job["text"] = "ABCD".repeat(35_000).into();
+        });
+        let accelerator = BatchAccelerator::new(usize::MAX, None, false);
+        assert!(matches!(
+            request.climb_job(),
+            Err(crate::ClimbUnsupported::RowDataLimit)
+        ));
+        let mut events = Vec::new();
+        let mut checkpoints = Vec::new();
+        let error = request
+            .run_with_checkpoints(
+                crate::ExecutionOptions::serial().with_accelerator(&accelerator),
+                |p| events.push(p),
+                || false,
+                |s| {
+                    checkpoints.push(
+                        s.record(
+                            crate::checkpoint_identity("{}", &Default::default()).unwrap(),
+                            0,
+                        )
+                        .unwrap(),
+                    )
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("row"));
+        assert_eq!(error.evaluations_used(), 0);
+        assert_eq!(error.counters().outers_completed(), 0);
+        assert!(events.is_empty());
+        assert!(checkpoints.is_empty());
+        assert!(accelerator.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn accelerator_cancellation_matches_cpu_at_committed_block_prefix() {
         let request = accelerator_batch_request();
         let identity = crate::checkpoint_identity("{}", &Default::default()).unwrap();

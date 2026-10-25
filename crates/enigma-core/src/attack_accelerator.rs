@@ -6,6 +6,25 @@
 
 use crate::{AttackKind, AttackRequest, BoundResource, MeasureId};
 
+// Bounds apply to each prepared dispatch, including the one prepared ahead.
+// During execution core also holds a concatenated copy of the active rows.
+const MAX_DISPATCH_KEYS: usize = 512;
+const MAX_DISPATCH_ROW_BYTES: usize = 64 * 1024 * 1024;
+
+/// Preserve logical blocks while bounding both key count and row payload size.
+/// None means even one logical block would exceed the row data policy.
+pub(crate) fn dispatch_key_limit(stride: usize, preferred: usize) -> Option<usize> {
+    let block = crate::attack_blocks::OUTER_BLOCK_KEYS as usize;
+    if stride == 0 {
+        return None;
+    }
+    let keys = (MAX_DISPATCH_ROW_BYTES / stride)
+        .min(MAX_DISPATCH_KEYS)
+        .min(preferred.max(block));
+    let keys = keys / block * block;
+    (keys >= block).then_some(keys)
+}
+
 /// An objective's exact integer data; all scores are higher-is-better Q32 units.
 #[derive(Clone, Copy, Debug)]
 pub enum ClimbObjective<'a> {
@@ -87,7 +106,7 @@ pub enum ClimbUnsupported {
     PartialExhaustion,
     /// Byte rows require at most 256 symbols.
     AlphabetTooLarge,
-    /// Production byte-row preparation has a bounded data policy.
+    /// Byte rows or one logical block exceed the bounded row data policy.
     RowDataLimit,
     /// Entropy, trie or another nonrepresentable objective.
     Objective(MeasureId),
@@ -101,7 +120,7 @@ impl std::fmt::Display for ClimbUnsupported {
         match self {
             Self::PartialExhaustion => f.write_str("partial exhaustion"),
             Self::AlphabetTooLarge => f.write_str("alphabet exceeds 256 symbols"),
-            Self::RowDataLimit => f.write_str("text exceeds byte-row preparation limit"),
+            Self::RowDataLimit => f.write_str("text exceeds accelerator row data limit"),
             Self::Objective(id) => write!(f, "unsupported objective {}", id.id()),
             Self::SparseNgram(id) => write!(f, "sparse n-gram objective {}", id.id()),
             Self::WideNgram(id) => write!(f, "i128 n-gram objective {}", id.id()),
@@ -118,8 +137,11 @@ impl std::error::Error for ClimbUnsupported {}
 /// Return exactly one result per key, or a fatal error. Cancellation is owned by
 /// core and polled between bounded dispatches, not inside this synchronous call.
 pub trait ClimbAccelerator: Sync {
-    /// Preferred maximum keys per dispatch. Core rounds down to whole 128-key
-    /// blocks (minimum one block); the selected range's final block may be short.
+    /// Preferred maximum keys per call (not necessarily one hardware dispatch).
+    /// Core clamps to 512 keys and 64 MiB of byte rows, then rounds down to whole
+    /// 128-key blocks (minimum one block). A final block may be short. Jobs whose
+    /// full logical block cannot fit the row limit are rejected before work.
+    /// Implementations must further split calls into bounded hardware dispatches.
     fn preferred_max_keys(&self) -> usize {
         128
     }
@@ -164,7 +186,12 @@ impl AttackRequest {
             .map(|c| alphabet.index_of(c).expect("bound input") as u8)
             .collect();
         let length = input.len();
-        if !crate::attack_evaluator::byte_rows_fit(length, width) {
+        if !crate::attack_evaluator::byte_rows_fit(length, width)
+            || length
+                .checked_mul(width)
+                .and_then(|stride| dispatch_key_limit(stride, MAX_DISPATCH_KEYS))
+                .is_none()
+        {
             return Err(ClimbUnsupported::RowDataLimit);
         }
         let objective = |id: MeasureId| {
@@ -220,5 +247,33 @@ impl AttackRequest {
             final_objective: objective(self.settings().final_measure())?,
             owner: self,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_limits_bound_rows_keys_and_round_only_whole_blocks() {
+        for (stride, preferred, expected) in [
+            (1, 0, Some(128)),
+            (1, 127, Some(128)),
+            (1, 255, Some(128)),
+            (1, 384, Some(384)),
+            (1, usize::MAX, Some(512)),
+            (MAX_DISPATCH_ROW_BYTES / 384, usize::MAX, Some(384)),
+            (MAX_DISPATCH_ROW_BYTES / 128, usize::MAX, Some(128)),
+            (MAX_DISPATCH_ROW_BYTES / 128 + 1, usize::MAX, None),
+            (usize::MAX, usize::MAX, None),
+            (0, usize::MAX, None),
+        ] {
+            assert_eq!(dispatch_key_limit(stride, preferred), expected);
+            if let Some(keys) = expected {
+                assert!(keys * stride <= MAX_DISPATCH_ROW_BYTES);
+                assert!(keys <= MAX_DISPATCH_KEYS);
+                assert_eq!(keys % 128, 0);
+            }
+        }
     }
 }

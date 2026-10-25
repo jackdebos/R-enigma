@@ -86,7 +86,12 @@ impl crate::AttackRequest {
         }
         let job = self.climb_job().expect("preflight checked");
         let block_keys = crate::attack_blocks::OUTER_BLOCK_KEYS as usize;
-        let batch_blocks = (accelerator.preferred_max_keys() / block_keys).max(1);
+        let batch_blocks = crate::attack_accelerator::dispatch_key_limit(
+            job.text_length * job.alphabet_size,
+            accelerator.preferred_max_keys(),
+        )
+        .expect("preflight checked row data limit")
+            / block_keys;
         // A rendezvous channel bounds preparation to exactly one dispatch ahead.
         // The producer never calls user hooks or touches coordinator accounting.
         let (sender, receiver) = std::sync::mpsc::sync_channel(0);
