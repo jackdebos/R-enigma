@@ -11,6 +11,7 @@
 
 # Rust
 /target/
+/spikes/*/target/
 **/*.rs.bk
 
 # Untracked timing results (see e2e/*_timing/README.md)
