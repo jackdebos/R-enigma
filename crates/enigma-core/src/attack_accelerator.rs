@@ -145,6 +145,11 @@ pub trait ClimbAccelerator: Sync {
     fn preferred_max_keys(&self) -> usize {
         128
     }
+    /// Device-specific capability checks, before any preparation or progress.
+    /// A failure stops the run; core never selects another accelerator implicitly.
+    fn check_job(&self, _job: &ClimbJob<'_>) -> Result<(), AcceleratorError> {
+        Ok(())
+    }
     /// Climb a run of consecutive prepared outer keys, without host side effects.
     fn climb(
         &self,

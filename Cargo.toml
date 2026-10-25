@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/enigma-core", "crates/enigma-cli"]
+members = ["crates/enigma-core", "crates/enigma-cli", "crates/enigma-gpu"]
 
 [workspace.package]
 version = "0.2.0"

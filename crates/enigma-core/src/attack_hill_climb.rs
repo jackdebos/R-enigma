@@ -601,12 +601,20 @@ impl crate::AttackRequest {
             best,
             acceptance,
         } = state;
-        if options.accelerator().is_some() {
-            if let Err(reason) = self.climb_job() {
+        if let Some(accelerator) = options.accelerator() {
+            let preflight = self
+                .climb_job()
+                .map_err(DirectRunError::UnsupportedAccelerator)
+                .and_then(|job| {
+                    accelerator
+                        .check_job(&job)
+                        .map_err(DirectRunError::Accelerator)
+                });
+            if let Err(source) = preflight {
                 let error = ControlledDirectError {
                     outer_index: None,
                     evaluations_used: allowance.used,
-                    source: DirectRunError::UnsupportedAccelerator(reason),
+                    source,
                     best,
                     counters: control.snapshot(),
                 }
@@ -5055,6 +5063,53 @@ mod tests {
             assert_eq!(error.evaluations_used(), 0);
             assert_eq!(checkpoints, 0);
         }
+    }
+
+    #[test]
+    fn accelerator_device_preflight_fails_before_progress_or_preparation() {
+        struct Rejected;
+        impl crate::ClimbAccelerator for Rejected {
+            fn check_job(&self, _: &crate::ClimbJob<'_>) -> Result<(), crate::AcceleratorError> {
+                Err(crate::AcceleratorError("synthetic device limit".into()))
+            }
+
+            fn climb(
+                &self,
+                _: &crate::ClimbJob<'_>,
+                _: u128,
+                _: &[u8],
+            ) -> Result<Vec<crate::AcceleratedClimb>, crate::AcceleratorError> {
+                panic!("a rejected job must not be dispatched");
+            }
+        }
+        let request = accelerator_batch_request();
+        let mut progress = Vec::new();
+        let mut checkpoints = 0;
+        let error = request
+            .run_with_checkpoints(
+                crate::ExecutionOptions::serial().with_accelerator(&Rejected),
+                |p| progress.push(p),
+                || false,
+                |_| checkpoints += 1,
+            )
+            .unwrap_err();
+        assert_eq!(error.to_string(), "accelerator: synthetic device limit");
+        assert_eq!(error.outer_index(), None);
+        assert_eq!(error.evaluations_used(), 0);
+        assert_eq!(error.counters().outers_completed(), 0);
+        assert_eq!(checkpoints, 0);
+        assert!(progress.is_empty());
+        // The default no-op preflight preserves the existing CPU reference path.
+        let cpu = request.run(|_| {}, || false).unwrap();
+        let reference = request
+            .run_with(
+                crate::ExecutionOptions::serial()
+                    .with_accelerator(&crate::ReferenceClimbAccelerator),
+                |_| {},
+                || false,
+            )
+            .unwrap();
+        assert_eq!(format!("{cpu:?}"), format!("{reference:?}"));
     }
 
     #[test]

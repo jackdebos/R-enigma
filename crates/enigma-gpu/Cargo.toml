@@ -1,0 +1,15 @@
+[package]
+name = "enigma-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+enigma-core.workspace = true
+wgpu = "29"
+pollster = "0.4"
+bytemuck = "1"
+
+[dev-dependencies]
+serde_json.workspace = true
