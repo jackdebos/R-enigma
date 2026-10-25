@@ -190,6 +190,14 @@ impl NgramModel {
             .unwrap_or_else(|| self.score_valid(text))
     }
 
+    /// The dense weights in radix-width window order and their largest magnitude.
+    #[cfg(feature = "gpu-spike")]
+    pub(crate) fn dense_parts(&self) -> Option<(&[i64], u64)> {
+        self.dense
+            .as_ref()
+            .map(|dense| (dense.weights.as_slice(), dense.max_abs))
+    }
+
     /// Dense-table [`Self::score_indices`] over streamed indices; `None` means this
     /// model has no dense table and the caller must score text sparsely instead.
     pub(crate) fn score_index_iter<I: ExactSizeIterator<Item = u32>>(

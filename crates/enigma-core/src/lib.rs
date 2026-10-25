@@ -72,6 +72,9 @@ mod configuration;
 mod definition;
 mod engine;
 mod event;
+#[cfg(feature = "gpu-spike")]
+#[doc(hidden)]
+pub mod gpu_spike;
 mod measure;
 mod ngram;
 mod request;

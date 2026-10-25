@@ -106,6 +106,11 @@ impl Engine {
         })
     }
 
+    #[cfg(feature = "gpu-spike")]
+    pub(crate) fn alphabet(&self) -> &crate::Alphabet {
+        self.topology.alphabet()
+    }
+
     /// The current displayed position of every slot in physical left-to-right order.
     pub fn positions(&self) -> &[char] {
         &self.positions

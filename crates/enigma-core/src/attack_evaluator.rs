@@ -183,6 +183,33 @@ impl Iterator for WideDecoded<'_> {
 
 impl ExactSizeIterator for WideDecoded<'_> {}
 
+/// The streamed IC ranking of a prepared byte-table trial, exactly as
+/// [`TrialEvaluator`] scores it, in Q32 units.
+#[cfg(feature = "gpu-spike")]
+pub(crate) fn spike_ic_units(
+    input: &[u8],
+    rows: &[u8],
+    mapping: &[usize],
+) -> Result<i128, MeasureError> {
+    let decoded = ByteDecoded::new(input, rows, mapping);
+    index_coincidence_iter(mapping.len(), decoded).map(|score| score.ranking().units())
+}
+
+/// The streamed dense n-gram ranking of a prepared byte-table trial, exactly as
+/// [`TrialEvaluator`] scores it, in Q32 units; None without a dense table.
+#[cfg(feature = "gpu-spike")]
+pub(crate) fn spike_dense_units(
+    model: &NgramModel,
+    input: &[u8],
+    rows: &[u8],
+    mapping: &[usize],
+) -> Option<Result<i128, MeasureError>> {
+    let decoded = ByteDecoded::new(input, rows, mapping);
+    model
+        .score_index_iter(decoded)
+        .map(|score| score.map(|score| score.ranking().units()))
+}
+
 /// A single run's input/domain/direction and most recently evaluated outer.
 /// The scheduler supplies absolute outer indices from this same request only.
 /// No row reference escapes a trial, so eviction drops the old payload before building.
