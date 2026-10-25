@@ -84,7 +84,7 @@ fn main() -> ExitCode {
                 bytes,
                 origin,
                 cancel_file,
-                options.threads,
+                (options.threads, options.backend),
                 checkpoint,
                 report,
             )
@@ -141,6 +141,7 @@ struct Options<'a> {
     cancel_file: Option<&'a str>,
     /// Validated `--threads` value.
     threads: Option<ExecutionOptions<'static>>,
+    backend: BackendOptions,
     checkpoint: Option<&'a str>,
     resume: Option<&'a str>,
     /// Unresolved `--events` target: `-` for stdout, otherwise a new file.
@@ -148,6 +149,19 @@ struct Options<'a> {
     /// Explicit report destination, checked before reading input.
     report: Option<&'a str>,
     no_report: bool,
+}
+
+/// Host-only GPU selection; an absent backend retains the CPU path.
+#[derive(Clone, Copy, Default)]
+struct BackendOptions {
+    choice: Option<Backend>,
+    usage: Option<u8>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    Cpu,
+    Gpu,
 }
 
 impl Options<'_> {
@@ -261,7 +275,7 @@ fn split_options(args: &[String]) -> Result<(Option<Input<'_>>, Options<'_>), In
             "--checkpoint" | "-c" => Some(&mut options.checkpoint),
             "--resume" | "-r" => Some(&mut options.resume),
             "--cancel-file" | "-x" => Some(&mut options.cancel_file),
-            "--threads" | "-t" => None,
+            "--threads" | "-t" | "--backend" | "--gpu-usage" => None,
             _ if !flag.starts_with('-') => {
                 if input
                     .replace(Input {
@@ -289,6 +303,26 @@ fn split_options(args: &[String]) -> Result<(Option<Input<'_>>, Options<'_>), In
                     explicit: true,
                 })
                 .is_some()
+        } else if flag == "--backend" {
+            if options.backend.choice.is_some() {
+                return Err(InputError::Usage);
+            }
+            options.backend.choice = Some(match value.as_str() {
+                "cpu" => Backend::Cpu,
+                "gpu" => Backend::Gpu,
+                _ => {
+                    return Err(InputError::InvalidOption(format!(
+                        "--backend expects cpu or gpu, got {value:?}"
+                    )))
+                }
+            });
+            false
+        } else if flag == "--gpu-usage" {
+            if options.backend.usage.is_some() {
+                return Err(InputError::Usage);
+            }
+            options.backend.usage = Some(parse_gpu_usage(value)?);
+            false
         } else {
             if options.threads.is_some() {
                 return Err(InputError::Usage);
@@ -299,6 +333,11 @@ fn split_options(args: &[String]) -> Result<(Option<Input<'_>>, Options<'_>), In
         if duplicate {
             return Err(InputError::Usage);
         }
+    }
+    if options.backend.usage.is_some() && options.backend.choice != Some(Backend::Gpu) {
+        return Err(InputError::InvalidOption(
+            "--gpu-usage requires --backend gpu".into(),
+        ));
     }
     // Keep file preflight ahead of the missing-input error, as with long forms
     // before short options were introduced.
@@ -317,6 +356,21 @@ fn parse_threads(value: &str) -> Result<ExecutionOptions<'static>, InputError> {
             InputError::InvalidOption(format!(
                 "{THREADS} expects an integer from 1 to {}, got {value:?}",
                 ExecutionOptions::MAX_THREADS
+            ))
+        })
+}
+
+/// Accepts only ASCII decimal digits naming a percentage in `1..=100`.
+fn parse_gpu_usage(value: &str) -> Result<u8, InputError> {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then(|| value.parse::<u8>().ok())
+        .flatten()
+        .filter(|usage| (1..=100).contains(usage))
+        .ok_or_else(|| {
+            InputError::InvalidOption(format!(
+                "--gpu-usage expects an integer from 1 to 100, got {value:?}"
             ))
         })
 }
@@ -390,6 +444,9 @@ Output:
 Attacks (hill_climb and partial_exhaustion):
   -t, --threads <n>         worker threads, 1 to 256 (default: half the logical
                             CPUs); completed runs give the same result for any <n>
+      --backend <cpu|gpu>   execution backend (default: cpu); GPU requires hill_climb
+      --gpu-usage <n>       GPU duty cycle, 1 to 100 (default: 100); requires
+                            --backend gpu
   -c, --checkpoint <path>   save checkpoints to a new file
   -r, --resume <path>       resume from a checkpoint and keep saving to it
   -x, --cancel-file <path>  stop safely once <path> exists as a regular file
@@ -413,14 +470,21 @@ const CANCEL_FILE_UNSUPPORTED: &str =
 const THREADS_UNSUPPORTED: &str =
     "--threads is supported only for hill_climb and partial_exhaustion attacks";
 
-/// The option message for a job that accepts neither option; `--cancel-file` wins.
-fn unsupported_option(cancel_file: bool, threads: bool, checkpoint: bool) -> Option<&'static str> {
+/// The option message for a non-attack job; existing option precedence is retained.
+fn unsupported_option(
+    cancel_file: bool,
+    threads: bool,
+    checkpoint: bool,
+    backend: bool,
+) -> Option<&'static str> {
     if cancel_file {
         Some(CANCEL_FILE_UNSUPPORTED)
     } else if threads {
         Some(THREADS_UNSUPPORTED)
     } else if checkpoint {
         Some("--checkpoint and --resume are supported only for hill_climb and partial_exhaustion attacks")
+    } else if backend {
+        Some("--backend is supported only for hill_climb and partial_exhaustion attacks")
     } else {
         None
     }
@@ -438,15 +502,17 @@ fn run(
     bytes: Vec<u8>,
     origin: &Path,
     cancel_file: Option<&Path>,
-    threads: Option<ExecutionOptions<'static>>,
+    execution: (Option<ExecutionOptions<'static>>, BackendOptions),
     checkpoint: Option<&CheckpointFile<'_>>,
     events: &mut EventSink,
     report: &report::Context<'_>,
 ) -> ExitCode {
+    let (threads, backend) = execution;
     let unsupported = unsupported_option(
         cancel_file.is_some(),
         threads.is_some(),
         checkpoint.is_some(),
+        backend.choice.is_some(),
     );
     let json = match String::from_utf8(bytes) {
         Ok(json) => json,
@@ -475,7 +541,7 @@ fn run(
                 request,
                 origin,
                 cancel_file,
-                threads.unwrap_or_else(default_execution),
+                (threads.unwrap_or_else(default_execution), backend),
                 checkpoint.map(|file| (file, json.as_str())),
                 signals::install,
                 (&mut capture, draw),
@@ -572,7 +638,7 @@ fn run_attack<'s>(
         request,
         origin,
         cancel_file,
-        execution,
+        (execution, BackendOptions::default()),
         checkpoint,
         install_signals,
         (out, None),
@@ -583,7 +649,7 @@ fn run_attack_presented<'s>(
     request: ParsedAttackRequest,
     origin: &Path,
     cancel_file: Option<&Path>,
-    execution: ExecutionOptions,
+    execution: (ExecutionOptions, BackendOptions),
     checkpoint: Option<(&CheckpointFile<'_>, &str)>,
     install_signals: impl FnOnce() -> Result<&'s AtomicBool, String>,
     output: (&mut impl Write, Option<bool>),
@@ -606,6 +672,47 @@ fn run_attack_presented<'s>(
         .collect();
     match request.bind_resources(&supplied) {
         Ok(validated) => {
+            let (execution, backend) = execution;
+            let gpu = if backend.choice == Some(Backend::Gpu) {
+                let job = match validated.climb_job() {
+                    Ok(job) => job,
+                    Err(reason) => {
+                        return failure(
+                            out,
+                            "unsupported_job",
+                            &format!("--backend gpu does not support this attack: {reason}"),
+                            "/job/attack",
+                        )
+                    }
+                };
+                let gpu =
+                    match enigma_gpu::GpuClimbAccelerator::new(backend.usage.unwrap_or(100), 1) {
+                        Ok(gpu) => gpu,
+                        Err(reason) => {
+                            return failure(
+                                out,
+                                "backend_unavailable",
+                                &format!("GPU backend unavailable: {reason}"),
+                                "",
+                            )
+                        }
+                    };
+                if let Err(reason) = gpu.supports_job(&job) {
+                    return failure(
+                        out,
+                        "backend_unavailable",
+                        &format!("GPU backend unavailable: {reason}"),
+                        "",
+                    );
+                }
+                Some(gpu)
+            } else {
+                None
+            };
+            let execution = match &gpu {
+                Some(gpu) => execution.with_accelerator(gpu),
+                None => execution,
+            };
             let mut resumed = None;
             let mut restored_elapsed = 0;
             let mut checkpoint_writer = None;

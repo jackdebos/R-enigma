@@ -52,8 +52,8 @@ enigma [options] <request.json>
 enigma [options] --request <path|->
 ```
 
-Every option has a long form; all but `--no-report` also have a one-letter short
-form that behaves exactly like it:
+Every option has a long form; all but `--no-report`, `--backend` and `--gpu-usage`
+also have a one-letter short form that behaves exactly like it:
 
 | Long | Short | Value | Contract |
 | --- | --- | --- | --- |
@@ -64,6 +64,8 @@ form that behaves exactly like it:
 | `--report` | `-o` | `<name>` | §2.4 |
 | `--no-report` | — | — | §2.4 |
 | `--threads` | `-t` | `<n>` | §5 |
+| `--backend` | — | `<cpu\|gpu>` | §5 |
+| `--gpu-usage` | — | `<n>` | §5 |
 | `--checkpoint` | `-c` | `<path>` | §6.1 |
 | `--resume` | `-r` | `<path>` | §6.1 |
 | `--cancel-file` | `-x` | `<path>` | §5 |
@@ -106,6 +108,9 @@ Output:
 Attacks (hill_climb and partial_exhaustion):
   -t, --threads <n>         worker threads, 1 to 256 (default: half the logical
                             CPUs); completed runs give the same result for any <n>
+      --backend <cpu|gpu>   execution backend (default: cpu); GPU requires hill_climb
+      --gpu-usage <n>       GPU duty cycle, 1 to 100 (default: 100); requires
+                            --backend gpu
   -c, --checkpoint <path>   save checkpoints to a new file
   -r, --resume <path>       resume from a checkpoint and keep saving to it
   -x, --cancel-file <path>  stop safely once <path> exists as a regular file
@@ -594,7 +599,7 @@ default. Example location: `/job/configuration/slots/1/position`. Error codes in
 `invalid_json`, `invalid_request`, `unsupported_version`, `unknown_field`,
 `invalid_definition`, `invalid_symbol`, `invalid_wiring`, `invalid_reflector`,
 `invalid_plugboard`, `invalid_slot`, `invalid_rule`, `invalid_search_space`,
-`unsupported_job`,
+`unsupported_job`, `backend_unavailable` (GPU adapter/device/job capability preflight),
 `unsupported_pass`, `unsupported_measure`, `unsupported_resource`, `invalid_text`,
 `unsupported_topology`, `resource_limit` (including pre-execution count/resource bounds),
 and `internal_error`. `internal_error` is reserved for an
@@ -736,7 +741,7 @@ their per-trial polling.
 Runtime `context` has exactly `outer_index`, `start_index` (nullable when unavailable),
 `evaluations_used`, `counters`, and `source`. `source` has `kind`, `message`, and
 `diagnostics` (array, empty unless resolution diagnostics exist). Kinds distinguish
-`resolution`, `evaluation`, `counter`, and `invariant`; each resolution diagnostic
+`resolution`, `evaluation`, `counter`, `invariant`, and `accelerator`; each resolution diagnostic
 retains its original code/message/location. Runtime failures use `internal_error`
 and `/job` unless an original diagnostic supplies a more precise location. Preserve
 the original nested Core source in the API error, not a cancellation replacement;
@@ -864,6 +869,45 @@ and `done` with `reason: "cancelled"` as above. Blocks are sized to last about a
 second or less in typical searches, so stopping may take that long; a second signal
 still exits immediately with code 130. Which blocks finish before a stop depends on
 timing, so cancelled runs are not promised to match across thread counts.
+
+### `--backend <cpu|gpu>` / `--gpu-usage <n>` contract
+
+These long-form-only options are host configuration, never request fields (§11).
+The GPU backend is always included in the CLI; no build feature is needed.
+`--backend` selects `cpu` (the default, unchanged execution) or `gpu`.
+Any other value fails before reading the request with
+`error: --backend expects cpu or gpu, got "<value>"` on stderr, exit 2,
+and empty stdout. `--gpu-usage` accepts only ASCII decimal digits naming an integer
+from 1 to 100 (default 100). Other values fail before reading the request with
+`error: --gpu-usage expects an integer from 1 to 100, got "<value>"`, exit 2,
+and empty stdout. Without explicit `--backend gpu`, giving `--gpu-usage` fails with
+`error: --gpu-usage requires --backend gpu`, exit 2 and empty stdout.
+Placement, duplicate and missing-value rules are those of §2.1.
+
+Transform and unsupported search jobs reject these options with one seq 1
+`unsupported_job` at `/job/kind`, message
+`--backend is supported only for hill_climb and partial_exhaustion attacks`, exit 1.
+Existing `--cancel-file`, `--threads` and checkpoint-option messages retain precedence
+(in that order), with backend rejection after them. Request parsing and resource
+loading/binding errors retain precedence.
+
+After successful attack resource binding, before checkpoint validation or `started`,
+GPU preflight first projects the climb job. Unsupported attacks (including partial
+exhaustion, entropy/trie objectives, and sparse or i128 n-grams) emit one seq 1
+`unsupported_job` at `/job/attack`, message
+`--backend gpu does not support this attack: <reason>`, exit 1.
+No suitable adapter (including missing 64-bit integer support), device initialization
+failure, or device-specific job limit emits one seq 1 `backend_unavailable` at `""`,
+message `GPU backend unavailable: <reason>`, exit 1. Stderr is
+`<code>: <message>` followed by a newline; no `started` or work events are emitted.
+There is never silent CPU fallback. Runtime GPU failures use the existing terminal
+`internal_error` with source kind `accelerator` (§4.1), exit 1; the previous checkpoint
+stays valid.
+
+`--threads` still controls CPU row-preparation workers with the GPU. GPU dispatches
+are bounded to keep the display responsive; below 100 the runtime idles between
+dispatches to approximate the requested wall-time duty cycle, not a hardware
+utilization guarantee. Usage never changes results. No new event fields are added.
 
 ## 6. Checkpoint and resume (Task 16)
 
@@ -1077,3 +1121,8 @@ The engine has no UI; the Stage 2 web client is the separate program of §8.
 Progress uses completed work units. A cursor identifies a resumable position without a
 CPU loop counter. Scores are independent per candidate. Thread counts, workgroup sizes,
 and dispatch geometry are not protocol fields; backend metadata is informational only.
+Backend choice (`--backend`) and GPU duty cycle (`--gpu-usage`) are host configuration,
+not checkpoint identity. CPU and GPU commit the same ordered logical blocks, counters,
+progress, hold and checkpoint content. Checkpoints resume across backends (for jobs
+the selected backend supports), with unchanged search results. A GPU failure never
+silently switches backend; the last valid checkpoint may be resumed with either.

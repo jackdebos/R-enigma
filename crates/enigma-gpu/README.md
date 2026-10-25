@@ -21,7 +21,9 @@ Construction distinguishes unavailable adapters, missing `SHADER_INT64`, invalid
 options and device failures. `supports_job` returns a typed unsupported reason.
 Core invokes `check_job` before row preparation or progress. Runtime failures
 become `AcceleratorError`, stopping the attack without switching backends.
-CLI/web wiring remains separate. The `timing` example exercises the real core
+The CLI includes this backend unconditionally: select `--backend gpu` and optionally
+`--gpu-usage N` (1-100, default 100); CPU is the default. Web wiring remains separate.
+The `timing` example exercises the real core
 executor, and `ClimbJob::climb_from_projection` is a hidden device-free oracle
 that consumes job fields and rows without following the private request owner.
 
