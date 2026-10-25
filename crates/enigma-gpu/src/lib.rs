@@ -66,9 +66,18 @@ pub struct DispatchStats {
     pub max_dispatch: Duration,
 }
 
+/// One dispatch's host timing and bounded work geometry, for opt-in instrumentation.
+#[derive(Clone, Copy, Debug)]
+pub struct DispatchSample {
+    pub duration: Duration,
+    pub keys: usize,
+    pub scan_budget: u32,
+    pub pair_slice: usize,
+}
+
 #[derive(Default)]
 struct Session {
-    pipelines: HashMap<(usize, usize), wgpu::ComputePipeline>,
+    pipelines: HashMap<(usize, usize, bool), wgpu::ComputePipeline>,
     stats: DispatchStats,
 }
 
@@ -84,6 +93,7 @@ pub struct GpuClimbAccelerator {
     scan_budget: u32,
     failure: Arc<Mutex<Option<String>>>,
     session: Mutex<Session>,
+    observer: Option<Box<dyn Fn(DispatchSample) + Send + Sync>>,
 }
 
 struct JobLayout {
@@ -94,6 +104,10 @@ struct JobLayout {
     initial_order: usize,
     final_order: usize,
     identical: bool,
+}
+
+fn bounded_pair_slice(base: usize, budget: u32) -> usize {
+    (base / budget as usize).max(1)
 }
 
 fn unsupported(reason: impl Into<String>) -> GpuUnsupported {
@@ -208,7 +222,18 @@ impl GpuClimbAccelerator {
             scan_budget,
             failure,
             session: Mutex::new(Session::default()),
+            observer: None,
         })
+    }
+
+    /// Opt in to dispatch samples. Callback work is excluded from dispatch timing;
+    /// it must be short and must not re-enter this serialized accelerator.
+    pub fn with_dispatch_observer(
+        mut self,
+        observer: impl Fn(DispatchSample) + Send + Sync + 'static,
+    ) -> Self {
+        self.observer = Some(Box::new(observer));
+        self
     }
 
     pub fn adapter_name(&self) -> &str {
@@ -225,7 +250,10 @@ impl GpuClimbAccelerator {
     }
 
     fn layout(&self, job: &ClimbJob<'_>) -> Result<JobLayout, GpuUnsupported> {
-        Self::layout_for(job, &self.limits)
+        let mut layout = Self::layout_for(job, &self.limits)?;
+        // Larger requested slice counts must not become a long-dispatch mode.
+        layout.pair_slice = bounded_pair_slice(layout.pair_slice, self.scan_budget);
+        Ok(layout)
     }
 
     fn layout_for(job: &ClimbJob<'_>, limits: &wgpu::Limits) -> Result<JobLayout, GpuUnsupported> {
@@ -306,7 +334,7 @@ impl GpuClimbAccelerator {
         } else {
             0
         };
-        let keys_per_dispatch = 4usize
+        let keys_per_dispatch = 512usize
             .min(limits.max_compute_workgroups_per_dimension as usize)
             .min((max_buffer / (row_words * 4) as u64) as usize)
             .min((max_buffer / ((16 + 2 * width) * 4) as u64) as usize);
@@ -363,7 +391,16 @@ impl GpuClimbAccelerator {
         job: &ClimbJob<'_>,
         layout: &JobLayout,
     ) -> Result<wgpu::ComputePipeline, GpuError> {
+        let packed = job.alphabet_size <= 32;
         let source = include_str!("climb.wgsl")
+            .replace("{{MAPPING_TYPE}}", if packed { "PackedBoard" } else { "array<u32, WIDTH>" })
+            .replace("{{MAPPING_FUNCTIONS}}", if packed {
+                include_str!("packed.wgsl")
+            } else {
+                "fn lookup(board: Mapping, index: u32) -> u32 { return board[index]; }\n\
+                 fn put(board: ptr<function, Mapping>, index: u32, value: u32) { (*board)[index] = value; }"
+            })
+            .replace("{{PACKED_COUNTS}}", if packed && job.text_length <= 255 { "true" } else { "false" })
             .replace("{{WIDTH}}", &job.alphabet_size.to_string())
             .replace("{{CACHE_WORDS}}", &layout.cache_words.max(1).to_string())
             .replace(
@@ -400,15 +437,19 @@ impl GpuClimbAccelerator {
         let stride = width * job.text_length;
         if rows.is_empty()
             || !rows.len().is_multiple_of(stride)
-            || rows.len() / stride > 128
+            || rows.len() / stride > 512
             || rows.iter().any(|&s| s as usize >= width)
         {
             return Err(GpuError::Unsupported(unsupported(
-                "rows must contain 1-128 complete, valid keys",
+                "rows must contain 1-512 complete, valid keys",
             )));
         }
         let mut session = self.session.lock().unwrap();
-        let cache_key = (width, layout.cache_words);
+        let cache_key = (
+            width,
+            layout.cache_words,
+            width <= 32 && job.text_length <= 255,
+        );
         if let std::collections::hash_map::Entry::Vacant(entry) = session.pipelines.entry(cache_key)
         {
             entry.insert(self.pipeline(job, &layout)?);
@@ -556,6 +597,14 @@ impl GpuClimbAccelerator {
                 stats.dispatches += 1;
                 stats.work_time += elapsed;
                 stats.max_dispatch = stats.max_dispatch.max(elapsed);
+                if let Some(observer) = &self.observer {
+                    observer(DispatchSample {
+                        duration: elapsed,
+                        keys,
+                        scan_budget: self.scan_budget,
+                        pair_slice: layout.pair_slice,
+                    });
+                }
                 // Idle after EVERY completed dispatch, including the terminal one.
                 let idle = Instant::now();
                 std::thread::sleep(
@@ -599,7 +648,7 @@ impl GpuClimbAccelerator {
 
 impl ClimbAccelerator for GpuClimbAccelerator {
     fn preferred_max_keys(&self) -> usize {
-        128
+        512
     }
 
     fn check_job(&self, job: &ClimbJob<'_>) -> Result<(), AcceleratorError> {

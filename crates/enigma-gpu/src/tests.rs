@@ -25,7 +25,7 @@ fn job_limits_and_global_row_fallback_are_device_free() {
     let layout = GpuClimbAccelerator::layout_for(&job, &limits).unwrap();
     assert_eq!(layout.row_words, 19);
     assert_eq!(layout.cache_words, 19);
-    assert_eq!(layout.keys_per_dispatch, 4);
+    assert_eq!(layout.keys_per_dispatch, 512);
     assert_eq!(layout.pair_slice, 128);
     assert!(layout.identical);
     for limits in [
@@ -56,6 +56,19 @@ fn job_limits_and_global_row_fallback_are_device_free() {
     assert_eq!(layout.cache_words, 0);
     assert_eq!(layout.row_words, 4864);
     assert_eq!(layout.pair_slice, 1);
+}
+
+#[test]
+fn increasing_scan_budget_still_bounds_dispatch_work() {
+    assert_eq!(
+        [1, 2, 3, 4].map(|budget| bounded_pair_slice(35, budget)),
+        [35, 17, 11, 8]
+    );
+    for base in 1..=128 {
+        for budget in 1..=4 {
+            assert!((1..=base).contains(&bounded_pair_slice(base, budget)));
+        }
+    }
 }
 
 #[test]

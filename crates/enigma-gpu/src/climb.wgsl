@@ -3,6 +3,12 @@
 const WIDTH: u32 = {{WIDTH}}u;
 const CACHE_WORDS: u32 = {{CACHE_WORDS}}u;
 const CACHE_ROWS: bool = {{CACHE_ROWS}};
+const PACKED_COUNTS: bool = {{PACKED_COUNTS}};
+// Scalar-packed private mappings avoid dynamically indexed private-array spills
+// on Polaris for alphabets <=32. Wider alphabets keep the general array path.
+struct PackedBoard { a: u32, b: u32, c: u32, d: u32, e: u32, f: u32, g: u32, h: u32 }
+alias Mapping = {{MAPPING_TYPE}};
+{{MAPPING_FUNCTIONS}}
 struct Params {
     keys: u32, length: u32, width: u32, row_words: u32,
     max_pairs: u32, backtrack: u32, switch_pairs: u32, fixed_count: u32,
@@ -18,7 +24,7 @@ struct State {
     mapping: array<u32, WIDTH>, board: array<u32, WIDTH>,
 }
 struct Candidate { score: i64, ordinal: u32, pairs: u32, count: u32 }
-struct Trial { mapping: array<u32, WIDTH>, links: u32, valid: bool }
+struct Trial { mapping: Mapping, links: u32, valid: bool }
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> input: array<u32>;
 @group(0) @binding(2) var<storage, read> rows: array<u32>;
@@ -38,16 +44,26 @@ fn byte_at(key: u32, index: u32) -> u32 {
     return (word >> ((index % 4u) * 8u)) & 255u;
 }
 
-fn evaluate(key: u32, mapping: array<u32, WIDTH>, phase: u32) -> i64 {
+fn load_board() -> Mapping {
+    var board: Mapping;
+    for (var i = 0u; i < WIDTH; i++) { put(&board, i, current.mapping[i]); }
+    return board;
+}
+
+fn evaluate(key: u32, mapping: Mapping, phase: u32) -> i64 {
     var counts: array<u32, WIDTH>;
+    var small_counts: Mapping;
     let order = select(params.initial_order, params.final_order, phase != 0u);
     var radix = 1u;
     for (var i = 1u; i < order; i++) { radix *= WIDTH; }
     var window = 0u;
     var sum = 0li;
     for (var p = 0u; p < params.length; p++) {
-        let plain = mapping[byte_at(key, p * WIDTH + mapping[input[p]])];
-        if (order == 0u) { counts[plain] += 1u; }
+        let plain = lookup(mapping, byte_at(key, p * WIDTH + lookup(mapping, input[p])));
+        if (order == 0u) {
+            if (PACKED_COUNTS) { put(&small_counts, plain, lookup(small_counts, plain) + 1u); }
+            else { counts[plain] += 1u; }
+        }
         else {
             window = (window % radix) * WIDTH + plain;
             if (p + 1u >= order) {
@@ -64,11 +80,14 @@ fn evaluate(key: u32, mapping: array<u32, WIDTH>, phase: u32) -> i64 {
     }
     var pairs = 0lu;
     for (var i = 0u; i < WIDTH; i++) {
-        let count = u64(counts[i]);
+        var count = u64(counts[i]);
+        if (PACKED_COUNTS) { count = u64(lookup(small_counts, i)); }
         if (count > 0lu) { pairs += count * (count - 1lu); }
     }
     let numerator = pairs * u64(WIDTH);
     let denominator = u64(params.length) * u64(params.length - 1u);
+    // With <=255 letters and <=32 symbols, this product provably fits u64.
+    if (PACKED_COUNTS) { return i64(numerator * 4294967296lu / denominator); }
     // Exact Q32 long division, without overflowing a u64 numerator shifted by 32.
     var quotient = numerator / denominator;
     var remainder = numerator % denominator;
@@ -80,9 +99,9 @@ fn evaluate(key: u32, mapping: array<u32, WIDTH>, phase: u32) -> i64 {
     return i64(quotient);
 }
 
-fn trial_for(board: array<u32, WIDTH>, a: u32, b: u32, action: u32) -> Trial {
-    let c = board[a];
-    let d = board[b];
+fn trial_for(board: Mapping, a: u32, b: u32, action: u32) -> Trial {
+    let c = lookup(board, a);
+    let d = lookup(board, b);
     let both_free = a == c && b == d;
     var result: Trial;
     result.mapping = board;
@@ -110,10 +129,14 @@ fn trial_for(board: array<u32, WIDTH>, a: u32, b: u32, action: u32) -> Trial {
     if (remaining + links > params.max_pairs) { return result; }
     if (links > 0u && (job[WIDTH + x] == 0u || job[WIDTH + y] == 0u)) { return result; }
     if (links > 1u && (job[WIDTH + z] == 0u || job[WIDTH + w] == 0u)) { return result; }
-    result.mapping[a] = a; result.mapping[b] = b;
-    result.mapping[c] = c; result.mapping[d] = d;
-    if (links > 0u) { result.mapping[x] = y; result.mapping[y] = x; }
-    if (links > 1u) { result.mapping[z] = w; result.mapping[w] = z; }
+    // Keep a function-local pointer: Naga 29's SPIR-V writer cannot cache a
+    // pointer to a nested struct member passed as a function argument.
+    var mapping = board;
+    put(&mapping, a, a); put(&mapping, b, b);
+    put(&mapping, c, c); put(&mapping, d, d);
+    if (links > 0u) { put(&mapping, x, y); put(&mapping, y, x); }
+    if (links > 1u) { put(&mapping, z, w); put(&mapping, w, z); }
+    result.mapping = mapping;
     result.links = remaining + links;
     result.valid = true;
     return result;
@@ -134,6 +157,8 @@ fn endpoints(pair_index: u32) -> vec2<u32> {
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index) lane: u32) {
     let key = group.x;
+    if (lane == 0u) { current = states[key]; }
+    if (workgroupUniformLoad(&current.done) != 0u) { return; }
     if (CACHE_ROWS) {
         for (var i = lane; i < params.row_words; i += 128u) {
             cached_rows[i] = rows[key * params.row_words + i];
@@ -141,7 +166,6 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index
     }
     workgroupBarrier();
     if (lane == 0u) {
-        current = states[key];
         if (current.initialized == 0u) {
             for (var i = 0u; i < WIDTH; i++) {
                 current.mapping[i] = job[2u * WIDTH + i];
@@ -150,7 +174,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index
             current.board_len = params.start_len;
             current.pairs = params.fixed_count + params.start_len;
             current.phase = u32(current.pairs >= params.switch_pairs);
-            current.score = evaluate(key, current.mapping, current.phase);
+            current.score = evaluate(key, load_board(), current.phase);
             current.evaluations = 1lu;
             current.initialized = 1u;
         }
@@ -160,20 +184,17 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index
     // A step is a bounded slice of a scan; at most budget full scans can finish.
     for (var step = 0u; step < params.budget; step++) {
         if (workgroupUniformLoad(&current.done) != 0u) { break; }
-        let board = current.mapping;
+        let board = load_board();
         var best = Candidate(current.score, 0xffffffffu, current.pairs, 0u);
         let end = min(pair_count, current.cursor + params.pair_slice);
-        for (var index = current.cursor + lane; index < end; index += 128u) {
-            let ab = endpoints(index);
-            for (var action = 0u; action < 4u; action++) {
-                let trial = trial_for(board, ab.x, ab.y, action);
-                if (!trial.valid) { continue; }
-                let score = evaluate(key, trial.mapping, current.phase);
-                let ordinal = index * 4u + action;
-                best.count += 1u;
-                if (score > best.score || (score == best.score && ordinal < best.ordinal)) {
-                    best.score = score; best.ordinal = ordinal; best.pairs = trial.links;
-                }
+        for (var ordinal = current.cursor * 4u + lane; ordinal < end * 4u; ordinal += 128u) {
+            let ab = endpoints(ordinal / 4u);
+            let trial = trial_for(board, ab.x, ab.y, ordinal % 4u);
+            if (!trial.valid) { continue; }
+            let score = evaluate(key, trial.mapping, current.phase);
+            best.count += 1u;
+            if (score > best.score || (score == best.score && ordinal < best.ordinal)) {
+                best.score = score; best.ordinal = ordinal; best.pairs = trial.links;
             }
         }
         candidates[lane] = best;
@@ -209,13 +230,13 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index
                 if (current.best_score <= current.score) {
                     current.done = 1u;
                     if (current.phase == 0u && params.identical == 0u) {
-                        current.score = evaluate(key, current.mapping, 1u);
+                        current.score = evaluate(key, board, 1u);
                         current.evaluations += 1lu;
                     }
                 } else {
                     let ab = endpoints(current.best_ordinal / 4u);
                     let trial = trial_for(board, ab.x, ab.y, current.best_ordinal % 4u);
-                    current.mapping = trial.mapping;
+                    for (var i = 0u; i < WIDTH; i++) { current.mapping[i] = lookup(trial.mapping, i); }
                     current.pairs = current.best_pairs;
                     current.score = current.best_score;
                     // CPU winner_board canonicalizes in alphabet order, unlike an
@@ -230,7 +251,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index
                     if (current.phase == 0u && current.pairs >= params.switch_pairs) {
                         current.phase = 1u;
                         if (params.identical == 0u) {
-                            current.score = evaluate(key, current.mapping, 1u);
+                            current.score = evaluate(key, trial.mapping, 1u);
                             current.evaluations += 1lu;
                         }
                     }

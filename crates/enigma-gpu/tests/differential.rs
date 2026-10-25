@@ -38,7 +38,7 @@ fn request(width: usize, variant: usize) -> AttackRequest {
         "job":{"kind":"search","configuration":{"slots":[],"plugboard":[]},
             "text":"AAABACADBBABCDABAAA","passes":["hill_climb"],
             "measures":if initial_id == final_id { vec![final_id] } else { vec![initial_id,final_id] },
-            "space":{"offset":3,"limit":if variant == 0 { 261 } else { 3 },
+            "space":{"offset":3,"limit":if variant == 0 { 773 } else { 3 },
                 "slots":(0..3).map(|i| json!({"id":format!("r{i}"),"positions":&alphabet[..4],"rings":&alphabet[..4]})).collect::<Vec<_>>(),
                 "plugboard":{"kind":"attack","symbols":alphabet,"max_pairs":width / 2}},
             "attack":{"kind":"hill_climb","initial_measure":initial_id,"final_measure":final_id,
@@ -105,6 +105,10 @@ fn gpu(usage: u8, budget: u32) -> Option<GpuClimbAccelerator> {
 // Check every key, including outcomes not retained by hold, against production.
 struct Audited<'a>(&'a GpuClimbAccelerator);
 impl ClimbAccelerator for Audited<'_> {
+    fn preferred_max_keys(&self) -> usize {
+        self.0.preferred_max_keys()
+    }
+
     fn check_job(
         &self,
         job: &enigma_core::ClimbJob<'_>,
@@ -121,6 +125,7 @@ impl ClimbAccelerator for Audited<'_> {
         let actual = self.0.climb(job, first, rows)?;
         let expected = enigma_core::ReferenceClimbAccelerator.climb(job, first, rows)?;
         assert_eq!(actual, expected, "per-key terminal facts at outer {first}");
+        assert_eq!(actual, job.climb_from_projection(rows)?);
         Ok(actual)
     }
 }
@@ -146,10 +151,10 @@ fn device_matches_cpu_results_progress_checkpoints_and_geometry() {
     let Some(first) = gpu(25, 1) else { return };
     let Some(second) = gpu(20, 2) else { return };
     let identity = enigma_core::checkpoint_identity("{}", &Default::default()).unwrap();
-    for width in [4, 26] {
+    for width in [4, 26, 34] {
         for variant in 0..13 {
             // Keep long/multiblock and high-order cases on the small alphabet.
-            if width == 26 && (variant == 0 || variant >= 7) {
+            if (width == 26 && (variant == 0 || variant >= 7)) || (width == 34 && variant != 1) {
                 continue;
             }
             let request = request(width, variant);

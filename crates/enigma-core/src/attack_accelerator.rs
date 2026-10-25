@@ -49,6 +49,7 @@ pub enum ClimbObjective<'a> {
 /// A bound, machine-independent description shared by every outer in a run.
 /// Pair endpoints are alphabet indices. Fixed and start pair ordering is retained.
 /// The private owner link is used only by the production CPU reference oracle.
+#[derive(Clone)]
 pub struct ClimbJob<'a> {
     /// Ordered alphabet width, at most 256.
     pub alphabet_size: usize,
@@ -170,6 +171,224 @@ impl ClimbAccelerator for ReferenceClimbAccelerator {
         rows: &[u8],
     ) -> Result<Vec<AcceleratedClimb>, AcceleratorError> {
         job.owner.reference_climbs(job, first, rows)
+    }
+}
+
+impl ClimbJob<'_> {
+    /// Device-free projection oracle. Uses only public job fields and supplied rows,
+    /// never the private request owner. The production walker retains its board
+    /// validation, neighborhood ordering and winner canonicalization invariants.
+    #[doc(hidden)]
+    pub fn climb_from_projection(
+        &self,
+        rows: &[u8],
+    ) -> Result<Vec<AcceleratedClimb>, AcceleratorError> {
+        use crate::attack_neighborhood::NeighborhoodWalker;
+        let fail = |message: &str| AcceleratorError(format!("projected reference: {message}"));
+        let width = self.alphabet_size;
+        let stride = self.text_length.checked_mul(width).unwrap_or(0);
+        if !(1..=256).contains(&width)
+            || stride == 0
+            || !rows.len().is_multiple_of(stride)
+            || self.input.len() != self.text_length
+            || self.mutable_mask.len() != width
+            || self.input.iter().chain(rows).any(|&s| s as usize >= width)
+        {
+            return Err(fail("invalid job or row dimensions"));
+        }
+        // Only the generic walker's validated board context needs a topology.
+        // Its identity wiring is never evaluated; all decoding uses supplied rows.
+        let symbols: Vec<_> = (0..width)
+            .map(|i| char::from_u32(0xe000 + i as u32).unwrap())
+            .collect();
+        let pairs = |pairs: &[(u8, u8)]| {
+            pairs
+                .iter()
+                .map(|&(a, b)| {
+                    symbols
+                        .get(a as usize)
+                        .zip(symbols.get(b as usize))
+                        .map(|(&a, &b)| (a, b))
+                        .ok_or_else(|| fail("invalid pair index"))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let fixed = pairs(&self.fixed_pairs)?;
+        let start = pairs(&self.start_board)?;
+        let source = serde_json::json!({"kind":"custom","value":{
+            "alphabet":symbols,
+            "wheels":[{"name":"r","wiring":symbols,"turnovers":[]}],
+            "slots":[{"id":"r","role":"rotor","movement":"fixed","wheel":"r"}],
+            "stepping":{"rules":[]}}});
+        let definition = crate::DefinitionSource::parse_json(&source.to_string())
+            .and_then(|source| source.resolve())
+            .map_err(|e| AcceleratorError(format!("projected reference: {e:?}")))?;
+        let initial = crate::TransformConfiguration::new(
+            vec![crate::SlotConfiguration::new(
+                "r", "r", symbols[0], symbols[0],
+            )],
+            fixed.clone(),
+        )
+        .resolve(&definition)
+        .map_err(|e| AcceleratorError(format!("projected reference: {e:?}")))?;
+        let mask: Vec<_> = symbols
+            .iter()
+            .zip(&self.mutable_mask)
+            .filter_map(|(&s, &mutable)| mutable.then_some(s))
+            .collect();
+        let domain = crate::AttackPlugboardDomain::parse_json(
+            definition.alphabet(),
+            &fixed,
+            &serde_json::json!({"kind":"attack","symbols":mask,"max_pairs":self.max_pairs})
+                .to_string(),
+        )
+        .map_err(|e| AcceleratorError(format!("projected reference: {e:?}")))?;
+        let identical = match (self.initial_objective, self.final_objective) {
+            (
+                ClimbObjective::Ic {
+                    scale: a,
+                    denominator: x,
+                },
+                ClimbObjective::Ic {
+                    scale: b,
+                    denominator: y,
+                },
+            ) => a == b && x == y,
+            (
+                ClimbObjective::DenseNgram {
+                    order: a,
+                    weights: x,
+                    ..
+                },
+                ClimbObjective::DenseNgram {
+                    order: b,
+                    weights: y,
+                    ..
+                },
+            ) => a == b && x == y,
+            _ => false,
+        };
+        rows.chunks_exact(stride)
+            .map(|rows| {
+                let evaluate = |mapping: &[usize], objective| -> Result<i128, AcceleratorError> {
+                    let plain: Vec<_> = self
+                        .input
+                        .iter()
+                        .zip(rows.chunks_exact(width))
+                        .map(|(&s, row)| mapping[row[mapping[s as usize]] as usize])
+                        .collect();
+                    match objective {
+                        ClimbObjective::Ic { scale, denominator } => {
+                            let mut counts = vec![0u128; width];
+                            for s in plain {
+                                counts[s] += 1;
+                            }
+                            let pairs: u128 = counts.iter().map(|&c| c * c.saturating_sub(1)).sum();
+                            let units = pairs
+                                .checked_mul(width as u128)
+                                .and_then(|v| v.checked_mul(scale))
+                                .and_then(|v| v.checked_div(denominator))
+                                .ok_or_else(|| fail("invalid IC arithmetic"))?;
+                            i128::try_from(units).map_err(|_| fail("IC score exceeds i128"))
+                        }
+                        ClimbObjective::DenseNgram { order, weights, .. } => {
+                            if order == 0 || plain.len() < order {
+                                return Err(fail("invalid n-gram order"));
+                            }
+                            let mut sum = 0i64;
+                            for window in plain.windows(order) {
+                                let index = window
+                                    .iter()
+                                    .try_fold(0usize, |index, &s| {
+                                        index.checked_mul(width).and_then(|v| v.checked_add(s))
+                                    })
+                                    .ok_or_else(|| fail("n-gram index overflow"))?;
+                                let weight = weights
+                                    .get(index)
+                                    .ok_or_else(|| fail("missing dense weight"))?;
+                                sum = sum
+                                    .checked_add(*weight)
+                                    .ok_or_else(|| fail("n-gram sum overflow"))?;
+                            }
+                            crate::floor_div(i128::from(sum), (plain.len() - order + 1) as i128)
+                                .map_err(|_| fail("invalid n-gram divisor"))
+                        }
+                    }
+                };
+                let mut board = start.clone();
+                let mut phase = fixed.len() + board.len() >= self.switch_pairs;
+                let mut walker =
+                    NeighborhoodWalker::validated(&initial, &domain, &board, self.backtrack_pairs)
+                        .map_err(|e| AcceleratorError(format!("projected reference: {e:?}")))?;
+                let mut score = evaluate(
+                    walker.mapping(),
+                    if phase {
+                        self.final_objective
+                    } else {
+                        self.initial_objective
+                    },
+                )?;
+                let mut evaluations = 1;
+                let mut ascent = false;
+                loop {
+                    let mut best = score;
+                    let mut winner = None;
+                    while let Some(action) = walker.next_action() {
+                        walker.apply(action);
+                        let trial = evaluate(
+                            walker.mapping(),
+                            if phase {
+                                self.final_objective
+                            } else {
+                                self.initial_objective
+                            },
+                        )?;
+                        walker.restore();
+                        evaluations += 1;
+                        if trial > best {
+                            best = trial;
+                            winner = Some(walker.selected(action));
+                        }
+                    }
+                    ascent |= phase || identical;
+                    let Some(winner) = winner else { break };
+                    board = walker.winner_board(&winner, &symbols);
+                    walker = NeighborhoodWalker::validated(
+                        &initial,
+                        &domain,
+                        &board,
+                        self.backtrack_pairs,
+                    )
+                    .map_err(|e| AcceleratorError(format!("projected reference: {e:?}")))?;
+                    score = best;
+                    if !phase && fixed.len() + board.len() >= self.switch_pairs {
+                        phase = true;
+                        if !identical {
+                            score = evaluate(walker.mapping(), self.final_objective)?;
+                            evaluations += 1;
+                        }
+                    }
+                }
+                if !phase && !identical {
+                    score = evaluate(walker.mapping(), self.final_objective)?;
+                    evaluations += 1;
+                }
+                Ok(AcceleratedClimb {
+                    board: board
+                        .iter()
+                        .map(|&(a, b)| {
+                            (
+                                symbols.iter().position(|&s| s == a).unwrap() as u8,
+                                symbols.iter().position(|&s| s == b).unwrap() as u8,
+                            )
+                        })
+                        .collect(),
+                    evaluations,
+                    final_objective_ascent: ascent,
+                    score_units: score,
+                })
+            })
+            .collect()
     }
 }
 

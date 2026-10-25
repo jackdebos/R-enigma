@@ -4708,6 +4708,34 @@ mod tests {
                 }
                 let actual = run(accelerated);
                 assert_eq!(actual, expected);
+                struct ProjectionOnly;
+                impl crate::ClimbAccelerator for ProjectionOnly {
+                    fn climb(
+                        &self,
+                        job: &crate::ClimbJob<'_>,
+                        first: u128,
+                        rows: &[u8],
+                    ) -> Result<Vec<crate::AcceleratedClimb>, crate::AcceleratorError>
+                    {
+                        let unrelated = pool_request(false, 1, |job| {
+                            job["space"]["offset"] = 10000.into();
+                        });
+                        let mut detached = job.clone();
+                        detached.owner = &unrelated;
+                        // This owner has an empty, incompatible selected range:
+                        // accidentally following it cannot satisfy the comparison.
+                        let projected = detached.climb_from_projection(rows)?;
+                        let reference = crate::ClimbAccelerator::climb(
+                            &crate::ReferenceClimbAccelerator,
+                            job,
+                            first,
+                            rows,
+                        )?;
+                        assert_eq!(projected, reference, "every key, not only hold finalists");
+                        Ok(projected)
+                    }
+                }
+                assert_eq!(run(cpu.with_accelerator(&ProjectionOnly)), expected);
                 for (from, to) in [(cpu, accelerated), (accelerated, cpu)] {
                     let mut records = Vec::new();
                     request
