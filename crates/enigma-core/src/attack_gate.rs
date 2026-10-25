@@ -192,14 +192,29 @@ impl AttackGate {
                 ))
             }
         };
-        // Count the full slot-only product before slicing; never enumerate candidates.
-        let outer_total = request.candidate_count().ok_or_else(|| {
+        // Count the full, optionally filtered slot-only order before slicing.
+        let plan = crate::candidate::CandidatePlan::build(request);
+        if plan.distinct_uncountable() {
+            return Err(failure(
+                "resource_limit",
+                "distinct_wheels names too many slots and wheels to count exactly",
+                "/job/space/constraints/distinct_wheels",
+            ));
+        }
+        let outer_total = plan.count().ok_or_else(|| {
             failure(
                 "resource_limit",
                 "full outer cardinality exceeds u128",
                 "/job/space",
             )
         })?;
+        if !request.space().distinct_wheels().is_empty() && outer_total == 0 {
+            return Err(failure(
+                "invalid_search_space",
+                "no assignment of the slots named by distinct_wheels uses distinct wheels",
+                "/job/space/constraints/distinct_wheels",
+            ));
+        }
         // Detached stage declarations are checked after resource/text/count preflight.
         for (index, stage) in settings.stages().iter().enumerate() {
             use crate::space::AttackStage;

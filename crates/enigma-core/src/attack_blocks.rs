@@ -112,7 +112,7 @@ impl<'a> OuterPlan<'a> {
 mod tests {
     use super::*;
     use crate::AttackRequest;
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     #[test]
     fn block_coverage_is_contiguous_and_ordered() {
@@ -178,6 +178,314 @@ mod tests {
             value["job"]["space"]["limit"] = json!(limit);
         }
         AttackRequest::parse_json(&value.to_string()).unwrap()
+    }
+
+    /// Rotor slots `a`, `b`, `c` share three admissible wheels; `f` fixes its wheel.
+    /// `space` is the whole `job.space` object; `configuration_slots` fill the rest.
+    fn wheel_request(
+        space: Value,
+        configuration_slots: Value,
+    ) -> Result<AttackRequest, Vec<crate::RequestDiagnostic>> {
+        let rotor = |id: &str| json!({"id":id,"role":"rotor","movement":"fixed","allowed_wheels":["w0","w1","w2"]});
+        let value = json!({"protocol_version":1,"machine":{"definition":{"kind":"custom","value":{
+            "alphabet":["A","B","C","D"],
+            "wheels":[
+                {"name":"w0","wiring":["B","C","D","A"],"turnovers":[]},
+                {"name":"w1","wiring":["C","D","B","A"],"turnovers":[]},
+                {"name":"w2","wiring":["D","A","C","B"],"turnovers":[]}],
+            "slots":[rotor("a"), rotor("b"), rotor("c"),
+                {"id":"f","role":"rotor","movement":"fixed","wheel":"w0"}],
+            "stepping":{"rules":[]}}}},"job":{"kind":"search",
+            "configuration":{"slots":configuration_slots,"plugboard":[]},
+            "text":"ABCD","passes":["hill_climb"],"measures":["ic"],
+            "space":space,
+            "attack":{"kind":"hill_climb","initial_measure":"ic","final_measure":"ic",
+                "switch_pairs":0,"backtrack_pairs":0,"start":[]}}});
+        AttackRequest::parse_json(&value.to_string())
+    }
+
+    fn wheel_space(known_a: bool) -> (Value, Value) {
+        let mut a = json!({"id":"a","positions":["A","B"]});
+        let mut fixed_a = json!({"id":"a","ring":"A"});
+        if known_a {
+            fixed_a["wheel"] = json!("w1");
+        } else {
+            a["wheels"] = json!(["w0", "w1", "w2"]);
+        }
+        let space = json!({"slots":[a,
+                {"id":"b","wheels":["w2","w0","w1"],"rings":["A","C"]},
+                {"id":"c","wheels":["w1","w2"]}],
+            "plugboard":{"kind":"attack","symbols":["C","D"],"max_pairs":1}});
+        let configuration = json!([fixed_a, {"id":"b","position":"A"},
+            {"id":"c","position":"B","ring":"A"}, {"id":"f","position":"A","ring":"A"}]);
+        (space, configuration)
+    }
+
+    /// Independent oracle: filter the unconstrained flat order (protocol §7) by
+    /// decomposing each base index with the domain sizes this test declares.
+    fn filtered_base_keys(
+        known_a: bool,
+        named: &[&str],
+    ) -> Vec<Result<ResolvedConfiguration, Vec<SearchDiagnostic>>> {
+        let (space, configuration) = wheel_space(known_a);
+        let base = wheel_request(space, configuration).unwrap();
+        let wheels: [&[&str]; 3] = [
+            if known_a {
+                &["w1"]
+            } else {
+                &["w0", "w1", "w2"]
+            },
+            &["w2", "w0", "w1"],
+            &["w1", "w2"],
+        ];
+        // Per slot a, b, c, f: wheel, position, ring radices.
+        let radices = [wheels[0].len() as u128, 2, 1, 3, 1, 2, 2, 1, 1, 1, 1, 1];
+        base.outer_candidates()
+            .filter(|(index, _)| {
+                let mut rest = *index;
+                let mut digits = [0u128; 12];
+                for position in (0..12).rev() {
+                    digits[position] = rest % radices[position];
+                    rest /= radices[position];
+                }
+                let chosen: Vec<&str> = ["a", "b", "c"]
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, id)| named.contains(id))
+                    .map(|(slot, _)| wheels[slot][digits[slot * 3] as usize])
+                    .collect();
+                let unique: std::collections::HashSet<_> = chosen.iter().collect();
+                unique.len() == chosen.len()
+            })
+            .map(|(_, key)| key)
+            .collect()
+    }
+
+    fn constrained(
+        known_a: bool,
+        named: &[&str],
+        offset: u64,
+        limit: Option<u64>,
+    ) -> AttackRequest {
+        let (mut space, configuration) = wheel_space(known_a);
+        space["constraints"] = json!({"distinct_wheels": named});
+        space["offset"] = json!(offset);
+        if let Some(limit) = limit {
+            space["limit"] = json!(limit);
+        }
+        wheel_request(space, configuration).unwrap()
+    }
+
+    fn planned_keys(
+        request: &AttackRequest,
+    ) -> Vec<(u128, Result<ResolvedConfiguration, Vec<SearchDiagnostic>>)> {
+        let plan = request.outer_plan();
+        plan.blocks()
+            .flat_map(|block| plan.keys(block).collect::<Vec<_>>())
+            .collect()
+    }
+
+    #[test]
+    fn distinct_wheels_order_is_the_filtered_base_order() {
+        for (known_a, named, count) in [
+            (false, &["a", "b", "c"][..], 16),
+            (false, &["c", "a"][..], 48),
+            // Known a=w1 forces c=w2 and b=w0: 1 assignment * 2 positions * 2 rings.
+            (true, &["a", "b", "c"][..], 4),
+            (false, &["a", "b"][..], 48),
+        ] {
+            let expected = filtered_base_keys(known_a, named);
+            assert_eq!(expected.len() as u128, count, "oracle {named:?}");
+            let request = constrained(known_a, named, 0, None);
+            assert_eq!(request.gate().outer_total(), count);
+            assert_eq!(request.gate().outer_selected(), count);
+            let actual = planned_keys(&request);
+            let indices: Vec<u128> = actual.iter().map(|(index, _)| *index).collect();
+            assert_eq!(indices, (0..count).collect::<Vec<_>>());
+            let keys: Vec<_> = actual.into_iter().map(|(_, key)| key).collect();
+            assert_eq!(keys, expected, "order for {named:?}, known a {known_a}");
+            let serial: Vec<_> = request.outer_candidates().map(|(_, key)| key).collect();
+            assert_eq!(serial, expected);
+        }
+    }
+
+    #[test]
+    fn distinct_wheels_offset_and_limit_slice_the_filtered_order() {
+        let expected = filtered_base_keys(false, &["a", "b", "c"]);
+        for (offset, limit) in [
+            (0, Some(1)),
+            (3, Some(5)),
+            (15, None),
+            (16, None),
+            (40, Some(2)),
+        ] {
+            let request = constrained(false, &["a", "b", "c"], offset, limit);
+            let start = (offset as usize).min(expected.len());
+            let end = limit.map_or(expected.len(), |limit| {
+                (start + limit as usize).min(expected.len())
+            });
+            assert_eq!(request.gate().outer_total(), 16);
+            assert_eq!(request.gate().outer_selected(), (end - start) as u128);
+            let actual = planned_keys(&request);
+            let indices: Vec<u128> = actual.iter().map(|(index, _)| *index).collect();
+            assert_eq!(indices, (start as u128..end as u128).collect::<Vec<_>>());
+            let keys: Vec<_> = actual.into_iter().map(|(_, key)| key).collect();
+            assert_eq!(keys, expected[start..end]);
+        }
+    }
+
+    fn constraint_error(
+        constraints: Value,
+        configuration_a: Option<Value>,
+    ) -> (String, String, String) {
+        let (mut space, mut configuration) = wheel_space(false);
+        space["constraints"] = constraints;
+        if let Some(entry) = configuration_a {
+            configuration[0] = entry;
+            space["slots"][0] = json!({"id":"a","positions":["A","B"]});
+        }
+        let error = wheel_request(space, configuration).unwrap_err().remove(0);
+        (
+            error.code().to_owned(),
+            error.location().to_owned(),
+            error.message().to_owned(),
+        )
+    }
+
+    #[test]
+    fn distinct_wheels_rejects_malformed_and_impossible_constraints() {
+        let path = "/job/space/constraints/distinct_wheels";
+        for (constraints, code, location) in [
+            (
+                json!({"distinct_wheels":["a","b"],"x":1}),
+                "unknown_field",
+                "/job/space/constraints/x".to_owned(),
+            ),
+            (json!({}), "invalid_request", path.to_owned()),
+            (
+                json!([]),
+                "invalid_request",
+                "/job/space/constraints".to_owned(),
+            ),
+            (
+                json!({"distinct_wheels":["a"]}),
+                "invalid_search_space",
+                path.to_owned(),
+            ),
+            (
+                json!({"distinct_wheels":[]}),
+                "invalid_search_space",
+                path.to_owned(),
+            ),
+            (
+                json!({"distinct_wheels":["a","a"]}),
+                "invalid_search_space",
+                path.to_owned(),
+            ),
+            (
+                json!({"distinct_wheels":["a","z"]}),
+                "invalid_search_space",
+                format!("{path}/1"),
+            ),
+            (
+                json!({"distinct_wheels":["a","f"]}),
+                "invalid_search_space",
+                format!("{path}/1"),
+            ),
+            (
+                json!({"distinct_wheels":["a",2]}),
+                "invalid_request",
+                format!("{path}/1"),
+            ),
+        ] {
+            let (actual_code, actual_location, message) =
+                constraint_error(constraints.clone(), None);
+            assert_eq!(
+                (actual_code.as_str(), actual_location.as_str()),
+                (code, location.as_str()),
+                "{constraints}: {message}"
+            );
+        }
+        // Two named slots with the same known wheel leave no outer candidate.
+        let (mut space, mut configuration) = wheel_space(true);
+        space["slots"][2] = json!({"id":"c"});
+        configuration[2] = json!({"id":"c","wheel":"w1","position":"B","ring":"A"});
+        space["slots"].as_array_mut().unwrap().remove(2);
+        space["constraints"] = json!({"distinct_wheels":["a","c"]});
+        let error = wheel_request(space, configuration).unwrap_err().remove(0);
+        assert_eq!(
+            (error.code(), error.location()),
+            ("invalid_search_space", path)
+        );
+        assert!(error.message().contains("distinct"), "{}", error.message());
+    }
+
+    #[test]
+    fn distinct_wheels_is_rejected_outside_the_attack_branch() {
+        let value = json!({"protocol_version":1,"machine":{"definition":{"kind":"bundled","id":"enigma-i"}},
+            "job":{"kind":"search","configuration":{"slots":[
+                {"id":"reflector","wheel":"B","position":"A","ring":"A"},
+                {"id":"left","position":"A","ring":"A"},
+                {"id":"middle","wheel":"II","position":"A","ring":"A"},
+                {"id":"right","wheel":"III","position":"A","ring":"A"}],"plugboard":[]},
+                "text":"ABCDEFGHIJ","passes":["hill_climb"],"measures":["ic"],
+                "space":{"slots":[{"id":"left","wheels":["I","IV"]}],
+                    "constraints":{"distinct_wheels":["left","middle"]}}}});
+        let error = crate::SearchRequest::parse_json(&value.to_string())
+            .unwrap_err()
+            .remove(0);
+        assert_eq!(
+            (error.code(), error.location()),
+            ("invalid_search_space", "/job/space/constraints")
+        );
+    }
+
+    #[test]
+    fn distinct_wheels_too_many_combinations_is_a_resource_limit() {
+        // 20 named slots over 40 wheels: exact counting would visit too many states.
+        let symbols: Vec<String> = (0..6).map(|i| ((b'A' + i) as char).to_string()).collect();
+        let mut wirings = Vec::new();
+        let mut current: Vec<usize> = (0..6).collect();
+        while wirings.len() < 40 {
+            wirings.push(
+                current
+                    .iter()
+                    .map(|&i| symbols[i].clone())
+                    .collect::<Vec<_>>(),
+            );
+            // Next lexicographic permutation.
+            let mut i = 4;
+            while current[i] > current[i + 1] {
+                i -= 1;
+            }
+            let mut j = 5;
+            while current[j] < current[i] {
+                j -= 1;
+            }
+            current.swap(i, j);
+            current[i + 1..].reverse();
+        }
+        let names: Vec<String> = (0..40).map(|i| format!("w{i}")).collect();
+        let ids: Vec<String> = (0..20).map(|i| format!("s{i}")).collect();
+        let value = json!({"protocol_version":1,"machine":{"definition":{"kind":"custom","value":{
+            "alphabet":symbols,
+            "wheels":names.iter().zip(&wirings).map(|(name, wiring)| json!({"name":name,"wiring":wiring,"turnovers":[]})).collect::<Vec<_>>(),
+            "slots":ids.iter().map(|id| json!({"id":id,"role":"rotor","movement":"fixed","allowed_wheels":names})).collect::<Vec<_>>(),
+            "stepping":{"rules":[]}}}},"job":{"kind":"search",
+            "configuration":{"slots":ids.iter().map(|id| json!({"id":id,"position":"A","ring":"A"})).collect::<Vec<_>>(),"plugboard":[]},
+            "text":"ABCDEF","passes":["hill_climb"],"measures":["ic"],
+            "space":{"slots":ids.iter().map(|id| json!({"id":id,"wheels":names})).collect::<Vec<_>>(),
+                "plugboard":{"kind":"attack","symbols":["A","B"],"max_pairs":1},
+                "constraints":{"distinct_wheels":ids}},
+            "attack":{"kind":"hill_climb","initial_measure":"ic","final_measure":"ic",
+                "switch_pairs":0,"backtrack_pairs":0,"start":[]}}});
+        let error = AttackRequest::parse_json(&value.to_string())
+            .unwrap_err()
+            .remove(0);
+        assert_eq!(
+            (error.code(), error.location()),
+            ("resource_limit", "/job/space/constraints/distinct_wheels")
+        );
     }
 
     #[test]

@@ -478,6 +478,8 @@ already complete.
   restricted. The constraint applies only when requested: no catalog definition implies
   it, and transform still accepts repeated wheels. Unknown members are `unknown_field`.
   Example: `"constraints": {"distinct_wheels": ["left", "middle", "right"]}`.
+  Counting is exact; a constraint needing more than 100,000 counting states fails
+  with `resource_limit` at `/job/space/constraints/distinct_wheels`.
 
 The separately discriminated
 [`kind: "attack"` branch](search-passes.md#1-two-domain-branches-no-implicit-unknown-key)

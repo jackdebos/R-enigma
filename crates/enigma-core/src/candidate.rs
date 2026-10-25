@@ -9,7 +9,8 @@
 //! `position`, `ring`; the plugboard remainder is the last dimension. Later dimensions
 //! vary fastest (odometer). The plugboard remainder enumerates the `size`-element
 //! combinations of `candidates` in increasing candidate-index order, lexicographically.
-//! [`SearchRequest::space`] `offset`/`limit` address that single flat order.
+//! When requested, `distinct_wheels` removes tuples with repeated named-slot wheels.
+//! [`SearchRequest::space`] `offset`/`limit` address that filtered flat order.
 //!
 //! Candidate resolution reuses [`TransformConfiguration::resolve`], so no admissibility
 //! rule already enforced by the search-space validator is duplicated here. Fail closed:
@@ -29,13 +30,15 @@ impl SearchRequest {
     /// This is the product of every varying dimension's domain size across all definition
     /// slots (in slot order, then `wheel`, `position`, `ring`) times the plugboard
     /// combination count `C(candidates.len(), size)` when a plugboard remainder is
-    /// searched, or `1` otherwise. Returns `None` when that product overflows `u128`.
+    /// searched, or `1` otherwise, filtered by explicit `distinct_wheels` constraints.
+    /// Returns `None` on `u128` overflow or when exact constraint counting exceeds its
+    /// 100,000-state budget.
     pub fn candidate_count(&self) -> Option<u128> {
         CandidatePlan::build(self).count
     }
 
     /// Lazily enumerates the validated candidates after `space.offset()` and within
-    /// `space.limit()`.
+    /// `space.limit()`, in the order filtered by any explicit `distinct_wheels`.
     ///
     /// Each item resolves the addressed assignment tuple through
     /// [`TransformConfiguration::resolve`]. The space was validated before this point, so
@@ -45,10 +48,12 @@ impl SearchRequest {
         CandidateIterator::new(self)
     }
 
-    /// Resolves the single candidate at flat `index` in the frozen order.
+    /// Resolves the single candidate at flat `index` in the frozen, optionally
+    /// `distinct_wheels`-filtered order.
     ///
     /// Returns `None` when `index` is at or beyond [`SearchRequest::candidate_count`].
-    /// When the count overflows `u128`, indexing is unbounded and every `index` resolves.
+    /// For unconstrained `u128` overflow, indexing is unbounded and every index resolves.
+    /// An uncountable constrained plan instead yields an internal-error `Err`.
     pub fn candidate_at(
         &self,
         index: u128,
@@ -134,6 +139,139 @@ pub(crate) struct CandidatePlan<'a> {
     plugboard: Option<PlugboardAxes>,
     radices: Vec<u128>,
     count: Option<u128>,
+    distinct: Option<DistinctPlan>,
+}
+
+/// Immutable memoized suffix counts; construction is bounded, lookup is read-only.
+struct DistinctPlan {
+    dimensions: Vec<usize>,
+    wheels: Vec<Vec<usize>>,
+    completions: std::collections::HashMap<(usize, [u64; 4]), u128>,
+    assignments: Option<u128>,
+    free_suffix: Option<Vec<u128>>,
+}
+
+fn with_wheel(mut used: [u64; 4], id: usize) -> Option<[u64; 4]> {
+    let bit = 1u64 << (id % 64);
+    if used[id / 64] & bit != 0 {
+        return None;
+    }
+    used[id / 64] |= bit;
+    Some(used)
+}
+
+impl DistinctPlan {
+    fn completions(&mut self, j: usize, used: [u64; 4], visited: &mut usize) -> Option<u128> {
+        if let Some(count) = self.completions.get(&(j, used)) {
+            return Some(*count);
+        }
+        if *visited >= 100_000 {
+            return None;
+        }
+        *visited += 1;
+        let mut count = 0u128;
+        if j == self.wheels.len() {
+            count = 1;
+        } else {
+            for i in 0..self.wheels[j].len() {
+                if let Some(next) = with_wheel(used, self.wheels[j][i]) {
+                    count = count.checked_add(self.completions(j + 1, next, visited)?)?;
+                }
+            }
+        }
+        self.completions.insert((j, used), count);
+        Some(count)
+    }
+
+    fn build(slots: &[SlotAxes], named: &[String], radices: &[u128]) -> Self {
+        let mut names = Vec::new();
+        let mut dimensions = Vec::new();
+        let mut wheels = Vec::new();
+        for (i, slot) in slots.iter().enumerate() {
+            if !named.contains(&slot.id) {
+                continue;
+            }
+            dimensions.push(i * 3);
+            wheels.push(
+                slot.wheels
+                    .iter()
+                    .map(
+                        |name| match names.iter().position(|existing| existing == name) {
+                            Some(id) => id,
+                            None => {
+                                names.push(name.clone());
+                                names.len() - 1
+                            }
+                        },
+                    )
+                    .collect(),
+            );
+        }
+        let mut plan = Self {
+            dimensions,
+            wheels,
+            completions: std::collections::HashMap::new(),
+            assignments: None,
+            free_suffix: None,
+        };
+        // Definition validation bounds the union to at most 256 wheel names.
+        if names.len() <= 256 {
+            plan.assignments = plan.completions(0, [0; 4], &mut 0);
+        }
+        let mut suffix = vec![1u128; radices.len() + 1];
+        for p in (0..radices.len()).rev() {
+            let radix = if plan.dimensions.contains(&p) {
+                1
+            } else {
+                radices[p]
+            };
+            let Some(count) = suffix[p + 1].checked_mul(radix) else {
+                return plan;
+            };
+            suffix[p] = count;
+        }
+        plan.free_suffix = Some(suffix);
+        plan
+    }
+
+    fn digits(&self, mut index: u128, radices: &[u128]) -> Option<Vec<u128>> {
+        let suffix = self.free_suffix.as_ref()?;
+        let mut digits = vec![0; radices.len()];
+        let mut j = 0;
+        let mut used = [0; 4];
+        for p in 0..radices.len() {
+            if self.dimensions.get(j) == Some(&p) {
+                let mut chosen = None;
+                for (digit, &id) in self.wheels[j].iter().enumerate() {
+                    let Some(next) = with_wheel(used, id) else {
+                        continue;
+                    };
+                    let block =
+                        suffix[p + 1].checked_mul(*self.completions.get(&(j + 1, next))?)?;
+                    if index < block {
+                        chosen = Some((digit, next));
+                        break;
+                    }
+                    index -= block;
+                }
+                let (digit, next) = chosen?;
+                digits[p] = digit as u128;
+                used = next;
+                j += 1;
+            } else {
+                let block = suffix[p + 1].checked_mul(*self.completions.get(&(j, used))?)?;
+                if block == 0 {
+                    return None;
+                }
+                digits[p] = index / block;
+                index %= block;
+                if digits[p] >= radices[p] {
+                    return None;
+                }
+            }
+        }
+        Some(digits)
+    }
 }
 
 impl<'a> CandidatePlan<'a> {
@@ -204,6 +342,16 @@ impl<'a> CandidatePlan<'a> {
             }
         }
 
+        let distinct = (!space.distinct_wheels().is_empty())
+            .then(|| DistinctPlan::build(&slots, space.distinct_wheels(), &radices));
+        if let Some(plan) = &distinct {
+            count = plan.assignments.and_then(|assignments| {
+                plan.free_suffix
+                    .as_ref()
+                    .and_then(|suffix| assignments.checked_mul(suffix[0]))
+            });
+        }
+
         Self {
             definition,
             slots,
@@ -211,15 +359,38 @@ impl<'a> CandidatePlan<'a> {
             plugboard,
             radices,
             count,
+            distinct,
         }
+    }
+
+    pub(crate) fn count(&self) -> Option<u128> {
+        self.count
+    }
+
+    pub(crate) fn distinct_uncountable(&self) -> bool {
+        self.distinct
+            .as_ref()
+            .is_some_and(|plan| plan.assignments.is_none())
     }
 
     pub(crate) fn resolve(
         &self,
         index: u128,
     ) -> Result<ResolvedConfiguration, Vec<SearchDiagnostic>> {
-        let digits = decompose(index, &self.radices);
+        let digits = match &self.distinct {
+            None => decompose(index, &self.radices),
+            Some(plan) => self
+                .count
+                .and_then(|_| plan.digits(index, &self.radices))
+                .ok_or_else(|| vec![internal_resolution_failure(&[])])?,
+        };
+        self.resolve_digits(&digits)
+    }
 
+    fn resolve_digits(
+        &self,
+        digits: &[u128],
+    ) -> Result<ResolvedConfiguration, Vec<SearchDiagnostic>> {
         let mut slots = Vec::with_capacity(self.slots.len());
         for (slot_index, axes) in self.slots.iter().enumerate() {
             let base = slot_index * 3;

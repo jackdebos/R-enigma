@@ -774,6 +774,7 @@ fn parse_seed_policy(
 /// dimensions. `offset` defaults to `0`; `limit` is an explicit optional request bound.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SearchSpace {
+    distinct_wheels: Vec<String>,
     slots: Vec<SearchSlotDomain>,
     plugboard: Option<PlugboardDomain>,
     offset: u64,
@@ -781,6 +782,11 @@ pub struct SearchSpace {
 }
 
 impl SearchSpace {
+    /// Slots required to use distinct wheel names, in request order; empty when absent.
+    pub fn distinct_wheels(&self) -> &[String] {
+        &self.distinct_wheels
+    }
+
     /// The declared slot domains in source order.
     pub fn slots(&self) -> &[SearchSlotDomain] {
         &self.slots
@@ -1398,7 +1404,42 @@ fn parse_space(
 ) -> Result<SearchSpace, Vec<SearchDiagnostic>> {
     let path = "/job/space";
     let space = object(value, path)?;
-    allow_keys(space, &["slots", "plugboard", "offset", "limit"], path)?;
+    allow_keys(
+        space,
+        &["slots", "plugboard", "offset", "limit", "constraints"],
+        path,
+    )?;
+
+    let mut distinct_wheels = Vec::new();
+    if let Some(value) = space.get("constraints") {
+        let path = "/job/space/constraints";
+        if !matches!(plugboard, PlugboardConstruction::SlotOnly) {
+            return Err(vec![invalid_search_space(
+                "constraints are allowed only on the attack branch (space.plugboard.kind = \"attack\")",
+                path,
+            )]);
+        }
+        let constraints = object(value, path)?;
+        allow_keys(constraints, &["distinct_wheels"], path)?;
+        let value = required(constraints, "distinct_wheels", path)?;
+        let path = child(path, "distinct_wheels");
+        distinct_wheels = parse_unique_string_array(value, &path)?;
+        if distinct_wheels.len() < 2 {
+            return Err(vec![invalid_search_space(
+                "distinct_wheels must name at least two unique slots",
+                &path,
+            )]);
+        }
+        for (index, id) in distinct_wheels.iter().enumerate() {
+            let item_path = child(&path, &index.to_string());
+            let slot = definition.slots().iter().find(|slot| slot.id() == id);
+            match slot {
+                None => return Err(vec![invalid_search_space(format!("distinct_wheels slot {id:?} must name a definition slot"), item_path)]),
+                Some(slot) if slot.wheel().is_some() => return Err(vec![invalid_search_space(format!("distinct_wheels slot {id:?} must declare allowed_wheels, not a structurally fixed wheel"), item_path)]),
+                Some(_) => {}
+            }
+        }
+    }
 
     let mut slots = Vec::new();
     if let Some(slots_value) = space.get("slots") {
@@ -1458,6 +1499,7 @@ fn parse_space(
     };
 
     Ok(SearchSpace {
+        distinct_wheels,
         slots,
         plugboard,
         offset,
