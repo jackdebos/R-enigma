@@ -4,6 +4,15 @@ const WIDTH: u32 = {{WIDTH}}u;
 const CACHE_WORDS: u32 = {{CACHE_WORDS}}u;
 const CACHE_ROWS: bool = {{CACHE_ROWS}};
 const PACKED_COUNTS: bool = {{PACKED_COUNTS}};
+// Immutable job facts specialized per pipeline; params keep the same values.
+const LENGTH: u32 = {{LENGTH}}u;
+const INITIAL_ORDER: u32 = {{INITIAL_ORDER}}u;
+const FINAL_ORDER: u32 = {{FINAL_ORDER}}u;
+const IDENTICAL: bool = {{IDENTICAL}};
+const PAIR_SLICE: u32 = {{PAIR_SLICE}}u;
+const LANE_ACTIONS: u32 = {{LANE_ACTIONS}}u;
+// False when no symbol is fixed or immutable: mask reads are skipped.
+const MASKED: bool = {{MASKED}};
 // Scalar-packed private mappings avoid dynamically indexed private-array spills
 // on Polaris for alphabets <=32. Wider alphabets keep the general array path.
 struct PackedBoard { a: u32, b: u32, c: u32, d: u32, e: u32, f: u32, g: u32, h: u32 }
@@ -13,7 +22,7 @@ struct Params {
     keys: u32, length: u32, width: u32, row_words: u32,
     max_pairs: u32, backtrack: u32, switch_pairs: u32, fixed_count: u32,
     start_len: u32, identical: u32, initial_order: u32, final_order: u32,
-    budget: u32, pair_slice: u32, padding0: u32, padding1: u32,
+    budget: u32, pair_slice: u32, lane_actions: u32, padding1: u32,
 }
 // Host wire layout: 16 header words, WIDTH map words, WIDTH ordered-pair words.
 struct State {
@@ -33,6 +42,8 @@ struct Trial { mapping: Mapping, links: u32, valid: bool }
 // fixed mask, mutable mask, starting mapping, ordered starting pairs.
 @group(0) @binding(5) var<storage, read> job: array<u32>;
 @group(0) @binding(6) var<storage, read_write> states: array<State>;
+// Keys of this batch that finished; the only per-dispatch readback.
+@group(0) @binding(7) var<storage, read_write> finished: atomic<u32>;
 var<workgroup> cached_rows: array<u32, CACHE_WORDS>;
 var<workgroup> current: State;
 var<workgroup> candidates: array<Candidate, 128>;
@@ -50,15 +61,20 @@ fn load_board() -> Mapping {
     return board;
 }
 
+// Constant orders per phase let the compiler fold radix, windows and branches.
 fn evaluate(key: u32, mapping: Mapping, phase: u32) -> i64 {
+    if (phase == 0u) { return score(key, mapping, INITIAL_ORDER, 0u); }
+    return score(key, mapping, FINAL_ORDER, 1u);
+}
+
+fn score(key: u32, mapping: Mapping, order: u32, phase: u32) -> i64 {
     var counts: array<u32, WIDTH>;
     var small_counts: Mapping;
-    let order = select(params.initial_order, params.final_order, phase != 0u);
     var radix = 1u;
     for (var i = 1u; i < order; i++) { radix *= WIDTH; }
     var window = 0u;
     var sum = 0li;
-    for (var p = 0u; p < params.length; p++) {
+    for (var p = 0u; p < LENGTH; p++) {
         let plain = lookup(mapping, byte_at(key, p * WIDTH + lookup(mapping, input[p])));
         if (order == 0u) {
             if (PACKED_COUNTS) { put(&small_counts, plain, lookup(small_counts, plain) + 1u); }
@@ -73,7 +89,7 @@ fn evaluate(key: u32, mapping: Mapping, phase: u32) -> i64 {
         }
     }
     if (order != 0u) {
-        let windows = i64(params.length - order + 1u);
+        let windows = i64(LENGTH - order + 1u);
         var quotient = sum / windows;
         if (sum < 0li && sum % windows != 0li) { quotient -= 1li; }
         return quotient;
@@ -85,7 +101,7 @@ fn evaluate(key: u32, mapping: Mapping, phase: u32) -> i64 {
         if (count > 0lu) { pairs += count * (count - 1lu); }
     }
     let numerator = pairs * u64(WIDTH);
-    let denominator = u64(params.length) * u64(params.length - 1u);
+    let denominator = u64(LENGTH) * u64(LENGTH - 1u);
     // With <=255 letters and <=32 symbols, this product provably fits u64.
     if (PACKED_COUNTS) { return i64(numerator * 4294967296lu / denominator); }
     // Exact Q32 long division, without overflowing a u64 numerator shifted by 32.
@@ -106,7 +122,7 @@ fn trial_for(board: Mapping, a: u32, b: u32, action: u32) -> Trial {
     var result: Trial;
     result.mapping = board;
     if ((!both_free && current.pairs < params.backtrack)
-        || job[a] != 0u || job[b] != 0u || job[c] != 0u || job[d] != 0u) { return result; }
+        || (MASKED && (job[a] != 0u || job[b] != 0u || job[c] != 0u || job[d] != 0u))) { return result; }
     var actions = 4u;
     if (both_free || c == b) { actions = 1u; }
     else if (a == c || b == d) { actions = 2u; }
@@ -127,8 +143,8 @@ fn trial_for(board: Mapping, a: u32, b: u32, action: u32) -> Trial {
     }
     let remaining = current.pairs - u32(a != c) - u32(b != d && c != b);
     if (remaining + links > params.max_pairs) { return result; }
-    if (links > 0u && (job[WIDTH + x] == 0u || job[WIDTH + y] == 0u)) { return result; }
-    if (links > 1u && (job[WIDTH + z] == 0u || job[WIDTH + w] == 0u)) { return result; }
+    if (MASKED && links > 0u && (job[WIDTH + x] == 0u || job[WIDTH + y] == 0u)) { return result; }
+    if (MASKED && links > 1u && (job[WIDTH + z] == 0u || job[WIDTH + w] == 0u)) { return result; }
     // Keep a function-local pointer: Naga 29's SPIR-V writer cannot cache a
     // pointer to a nested struct member passed as a function argument.
     var mapping = board;
@@ -186,15 +202,24 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index
         if (workgroupUniformLoad(&current.done) != 0u) { break; }
         let board = load_board();
         var best = Candidate(current.score, 0xffffffffu, current.pairs, 0u);
-        let end = min(pair_count, current.cursor + params.pair_slice);
-        for (var ordinal = current.cursor * 4u + lane; ordinal < end * 4u; ordinal += 128u) {
-            let ab = endpoints(ordinal / 4u);
-            let trial = trial_for(board, ab.x, ab.y, ordinal % 4u);
-            if (!trial.valid) { continue; }
-            let score = evaluate(key, trial.mapping, current.phase);
-            best.count += 1u;
-            if (score > best.score || (score == best.score && ordinal < best.ordinal)) {
-                best.score = score; best.ordinal = ordinal; best.pairs = trial.links;
+        let end = min(pair_count, current.cursor + PAIR_SLICE);
+        // A lane owns lane_actions (4: whole pair, 1: one action slot) consecutive
+        // actions. Whole pairs avoid idle lanes in add-only scans, where only
+        // action 0 is legal. Ordinals keep the CPU emission order either way.
+        let per_pair = 4u / LANE_ACTIONS;
+        for (var unit = current.cursor * per_pair + lane; unit < end * per_pair; unit += 128u) {
+            let pair = unit / per_pair;
+            let ab = endpoints(pair);
+            let first = (unit % per_pair) * LANE_ACTIONS;
+            for (var action = first; action < first + LANE_ACTIONS; action++) {
+                let trial = trial_for(board, ab.x, ab.y, action);
+                if (!trial.valid) { continue; }
+                let ordinal = pair * 4u + action;
+                let score = evaluate(key, trial.mapping, current.phase);
+                best.count += 1u;
+                if (score > best.score || (score == best.score && ordinal < best.ordinal)) {
+                    best.score = score; best.ordinal = ordinal; best.pairs = trial.links;
+                }
             }
         }
         candidates[lane] = best;
@@ -225,11 +250,12 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index
             }
             current.cursor = end;
             if (end == pair_count) {
-                current.ascent |= u32(current.phase != 0u || params.identical != 0u);
+                current.ascent |= u32(current.phase != 0u || IDENTICAL);
                 current.cursor = 0u;
                 if (current.best_score <= current.score) {
                     current.done = 1u;
-                    if (current.phase == 0u && params.identical == 0u) {
+                    atomicAdd(&finished, 1u);
+                    if (current.phase == 0u && !IDENTICAL) {
                         current.score = evaluate(key, board, 1u);
                         current.evaluations += 1lu;
                     }
@@ -250,7 +276,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index
                     }
                     if (current.phase == 0u && current.pairs >= params.switch_pairs) {
                         current.phase = 1u;
-                        if (params.identical == 0u) {
+                        if (!IDENTICAL) {
                             current.score = evaluate(key, trial.mapping, 1u);
                             current.evaluations += 1lu;
                         }

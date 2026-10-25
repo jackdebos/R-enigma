@@ -47,12 +47,17 @@ that consumes job fields and rows without following the private request owner.
 ## Resumption and display sharing
 
 Each 128-lane workgroup owns one key. A dispatch processes at most `scan_budget`
-scan slices per key. The base slice is `clamp(8192 / text_length, 1, 128)`
-lexicographic symbol pairs; the effective slice is `max(base / scan_budget, 1)`.
-Each pair emits at most four trials, distributed across lanes by action ordinal.
-Increasing the slice count therefore does not create a long-dispatch mode.
+scan slices per key. The base slice is `32 * clamp(1024 / text_length, 1, 4)`
+lexicographic symbol pairs (about 1024 decoded letters per lane and slice); the
+effective slice is `base / scan_budget`, rounded down to a multiple of 32 when it
+is at least 32, and never below 1. A full 128-pair slice gives each lane one whole
+pair and its up to four actions, so add-only scans (only action 0 is legal) do not
+idle three of four lanes. Smaller slices give each lane one action slot, so 32
+pairs fill a 128-lane round. Either way a lane evaluates about four trials per
+slice, so a larger slice count does not create a long-dispatch mode. Ordinals and
+the reduction are unchanged by the lane layout.
 Even an unfinished neighborhood can yield; no provisional winner commits early.
-U-264 uses 512 keys, budget 1 and 35 pairs per slice.
+U-264 uses 512 keys, budget 1 and 128 whole-pair lanes per slice.
 
 The persistent state has a 64-byte header, an alphabet-wide u32 mapping, and an
 alphabet-wide ordered-pair array (one packed pair per word). Its header retains
@@ -66,8 +71,18 @@ and a 16-KiB cache ceiling; otherwise decoding reads packed global storage.
 Weights always remain in global storage. Alphabets up to 32 symbols use scalar,
 byte-packed private mappings; wider alphabets keep array mappings. Histograms
 also pack only when text length is <=255, where byte counts cannot overflow.
-Pipelines specialize these storage choices, not objectives or climb decisions.
+Pipelines are also specialized per immutable job shape and cached for the
+accelerator's lifetime: text length, initial/final objective orders (so radix,
+window count and the phase branch fold), identical objectives, slice size and lane
+layout, and whether any symbol is fixed or immutable (otherwise mask reads are
+skipped). Scores, thresholds and climb decisions are computed exactly as before;
+a new job shape costs one pipeline compilation outside dispatch timing.
 Already-finished keys return before loading their rows again.
+
+Climb state stays in GPU memory for the whole batch. After each dispatch the host
+reads back only a 4-byte count of finished keys, which each workgroup increments
+once when its climb stops; full terminal states are read once, after the batch
+finishes. A batch is the whole core call when it fits (512 keys for U-264).
 
 After **every** dispatch, including the last, the host sleeps for
 `elapsed * (100 - usage) / usage`. `elapsed` measures submit through completion,
@@ -109,29 +124,30 @@ threads: CPU once, GPU at 100% once and GPU at 50% once, budget 1. All hold/fina
 stages are included. Parsing, device setup and 128-key warmups are excluded.
 Every `AttackResult` field is compared via its derived Debug representation
 (the type does not implement `PartialEq`). It reports wall time, dispatch count,
-maximum and median host dispatch duration, and the historical L25 references.
+maximum, p99 and median host dispatch duration, and the historical L25 references.
 The example converts the checked-in trigram table in memory, like the spike;
 it writes no converted resource or scratch files.
 
-### RX 580 measurement (Stage B)
+### RX 580 measurement (after L34 optimization)
 
 Single release sample per configuration, all 17,576 keys; whole-result equality
-passed at both usage percentages. CPU-6 wall time was **15.395346209 s**.
+passed at both usage percentages. CPU-6 wall time in the same invocation was
+**17.130141836 s** (CPU-6 samples range 14.9-17.1 s across invocations on this machine).
 
-| Usage | GPU wall | Dispatches | Maximum dispatch | Median dispatch |
-| --- | ---: | ---: | ---: | ---: |
-| 100% | 16.722646321 s | 7340 | 7.492814 ms | 2.260000 ms |
-| 50% | 32.025874485 s | 7340 | 8.106128 ms | 2.237662 ms |
+| Usage | GPU wall | Dispatches | Maximum dispatch | p99 dispatch | Median dispatch |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 100% | 4.240908921 s | 2202 | 5.486316 ms | 3.733956 ms | 0.997150 ms |
+| 50% | 7.800849360 s | 2202 | 6.305153 ms | 3.152401 ms | 1.174326 ms |
 
-Chosen geometry: **512 keys, budget 1, 35 pairs/slice**, with a smaller final
-batch. The maximum includes readback and host scheduling; the 50% sample is
-slightly above 8 ms, so this is an approximately-8-ms target, not a hard deadline.
-An earlier 512-key/budget-2/35-pair setting was exact but rejected for latency:
-100% wall 15.300024796 s, max 9.493541 ms; 50% wall 29.091004084 s, max 9.621174 ms.
+Chosen geometry: **512 keys, budget 1, 128 whole-pair lanes per slice**, with a
+smaller final batch. `--tune` (512 keys, 25%) was exact with budgets 1, 2 and 4
+(maximum 3.2-3.7 ms). Maximums include readback and host scheduling; this is an
+approximately-8-ms target, not a hard deadline. Interleaved repeat samples and
+rejected settings are in `DIAGNOSIS.md`.
 
-The selected 100% run is **3.457x the L25 spike's 4.837 s**, and slower than the
-current six-thread CPU (0.921x speedup). At 50% it is 6.621x the spike. This is
-an observed end-to-end cost, not an isolated short-dispatch penalty: the product
-also has generalized scoring/state, core guards/commits and finalist stages;
-the spike omitted the latter stages. The historical CLI reference was 14.888 s.
-The speed trade-off needs the user's decision before any unlimited mode is added.
+At 100% the GPU run is about 3.5-4.0x the six-thread CPU and 0.88x the L25 spike's
+4.837 s, while including finalist stages and core commits that the spike omitted.
+The earlier Stage B setting (512 keys, 35-pair action-slot slices, no job
+specialization, full-state readback per dispatch) took 16.722646321 s at 100%
+(7340 dispatches, maximum 7.492814 ms) and 32.025874485 s at 50%.
+No asynchronous or unlimited mode exists; see `DIAGNOSIS.md` for why it was not added.

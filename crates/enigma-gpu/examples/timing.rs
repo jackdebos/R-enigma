@@ -61,9 +61,10 @@ fn report(samples: &[DispatchSample]) {
         durations[durations.len() / 2]
     };
     let max = durations.last().copied().unwrap_or(Duration::ZERO);
+    let p99 = durations[(durations.len() * 99).div_ceil(100) - 1];
     let max_keys = samples.iter().map(|s| s.keys).max().unwrap_or(0);
     let max_pairs = samples.iter().map(|s| s.pair_slice).max().unwrap_or(0);
-    println!("dispatches={} max={max:?} median={median:?}; keys/dispatch<={max_keys}, pair_slice<={max_pairs}", samples.len());
+    println!("dispatches={} max={max:?} p99={p99:?} median={median:?}; keys/dispatch<={max_keys}, pair_slice<={max_pairs}", samples.len());
 }
 
 fn main() -> Result<(), Box<dyn Error>> {

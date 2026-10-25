@@ -55,15 +55,25 @@ fn job_limits_and_global_row_fallback_are_device_free() {
     let layout = GpuClimbAccelerator::layout_for(&long.climb_job().unwrap(), &limits).unwrap();
     assert_eq!(layout.cache_words, 0);
     assert_eq!(layout.row_words, 4864);
-    assert_eq!(layout.pair_slice, 1);
+    assert_eq!(layout.pair_slice, 32);
+    assert_eq!(lane_actions(layout.pair_slice), 1);
+    let layout =
+        GpuClimbAccelerator::layout_for(&self::request(232).climb_job().unwrap(), &limits).unwrap();
+    assert_eq!((layout.keys_per_dispatch, layout.pair_slice), (512, 128));
+    assert_eq!(lane_actions(layout.pair_slice), 4);
+    let layout =
+        GpuClimbAccelerator::layout_for(&self::request(257).climb_job().unwrap(), &limits).unwrap();
+    assert_eq!(layout.pair_slice, 96);
 }
 
 #[test]
 fn increasing_scan_budget_still_bounds_dispatch_work() {
     assert_eq!(
-        [1, 2, 3, 4].map(|budget| bounded_pair_slice(35, budget)),
-        [35, 17, 11, 8]
+        [1, 2, 3, 4].map(|budget| bounded_pair_slice(128, budget)),
+        [128, 64, 32, 32]
     );
+    // Only full slices take whole-pair lanes; smaller ones keep action slots.
+    assert_eq!([128, 96, 64, 32, 1].map(lane_actions), [4, 1, 1, 1, 1]);
     for base in 1..=128 {
         for budget in 1..=4 {
             assert!((1..=base).contains(&bounded_pair_slice(base, budget)));

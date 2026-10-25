@@ -2,8 +2,55 @@
 
 **Most of the regression is GPU work caused by small scan tiles, not CPU row
 preparation or finalists.** Host synchronization is a significant second cost.
-Product defaults and source are unchanged; all temporary instrumentation was
-removed after these measurements. No proposed optimization below was implemented.
+The measurements below this first section describe `766a5ab`; all temporary
+instrumentation was removed after them. The first section records the L34
+follow-up ("Optimizar con pantalla fluida"), which implemented options 1, 3 and 4.
+
+## L34 follow-up: short-dispatch optimizations
+
+Same machine and tool (`cargo run --release -p enigma-gpu --example timing`), usage
+100%, all 17,576 keys. Every row matched the CPU's whole `AttackResult`. Sweeps
+used a temporary geometry override and a 100%-only switch, both removed. Where two
+binaries are compared, runs were interleaved because samples drift by about 5%
+(CPU-6 ranged 14.9-17.1 s). The kept rows are cumulative.
+
+| Step | Wall | Dispatches | Maximum | p99 | Median | Decision |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Baseline `b4cc751` (512 keys x 35-pair action slots) | 16.646 s | 7340 | 7.44 ms | 4.33 ms | 2.26 ms | reference |
+| 1a action slots, 256 x 64 / 256 x 128 / 128 x 128 | 11.77 / 10.74 / 12.36 s | 8466 / 4233 / 8133 | 7.08 / 7.18 / 5.97 ms | 2.57 / 4.29 / 2.83 ms | 1.35 / 2.47 / 1.33 ms | superseded by 1b |
+| 1a action slots, 256 x 70 / 384 x 48 / 512 x 32 / 256 x 96 | 13.51 / 14.38 / 11.76 / 11.14 s | 7055 / 9751 / 8074 / 5644 | 6.81 / 7.36 / 8.22 / 8.48 ms | 3.67 / 3.52 / 3.47 / 3.78 ms | 1.87 / 0.96 / 1.46 / 1.90 ms | rejected |
+| 1a action slots, 512 x 64 | 10.45 s | 4404 | 11.39 ms | 4.20 ms | 2.42 ms | rejected: latency |
+| 1b whole-pair lanes, 256 x 128 | 9.545 s (A/B 9.12-9.65 s) | 4233 | 7.41 ms | 4.06 ms | 1.68 ms | **kept** |
+| 1b whole-pair lanes, 512 x 128 (before step 3) | 8.18 s | 2202 | 9.93 ms | 7.25 ms | 2.38 ms | rejected: latency |
+| 1b whole-pair lanes, 320 / 384 x 128; 256 x 192 | 9.41 / 9.45 / 10.88 s | 4212 / 4179 / 2822 | 8.21 / 8.90 / 9.88 ms | 4.80 / 5.46 / 7.40 ms | 1.68 / 1.52 / 3.02 ms | rejected |
+| 2a call-resident state + 4-byte atomic count, 256 keys | 9.98-10.06 s vs 9.49-9.63 s | 4233 | 7.40-8.24 ms | 4.26-4.32 ms | 1.74-1.76 ms | rejected: slower |
+| 2b call-resident state + per-key done words, 256 keys | 9.69-10.00 s vs 9.12-9.50 s | 4233 | 7.45-9.08 ms | 4.54-4.60 ms | 1.70-1.76 ms | rejected: slower |
+| 3 immutable-job pipeline specialization, 256 x 128 | 5.561 / 5.639 s vs 9.624 / 9.651 s | 4233 | 6.03 / 5.25 ms | 2.88 / 2.85 ms | 0.88 / 0.89 ms | **kept** |
+| 3 + geometry 512 x 128 | 4.104 s | 2202 | 5.93 ms | 3.71 ms | 0.99 ms | **kept** |
+| 3 + geometry 512 x 256 / 384 x 128 / 256 x 256 | 3.94 / 5.21 / 5.18 s | 1468 / 4179 / 2822 | 6.73 / 5.85 / 9.81 ms | 5.34 / 3.07 / 3.96 ms | 1.60 / 0.80 / 1.36 ms | rejected: p99/latency or slower |
+| 2c per-batch 4-byte atomic count, 512 x 128 (4 interleaved pairs) | mean 4.080 s vs 4.129 s | 2202 | 5.53-7.28 ms | 3.54-3.79 ms | 0.94-0.96 ms | **kept** (dispatch work 3.23 s vs 3.32 s, lower in 4/4) |
+| Final, default tool run | **4.241 s** (50%: 7.801 s) | 2202 | 5.49 ms (50%: 6.31 ms) | 3.73 ms | 1.00 ms | result |
+
+- Whole-pair lanes (1b) are the main tiling gain. In the climb's add-only scans
+  (fewer than `backtrack_pairs` pairs), only action 0 is legal, so action-slot
+  lanes are mostly idle. Lane-per-pair is used only for full 128-pair slices;
+  smaller slices (long texts, budgets above 1) keep action slots, so a lane still
+  evaluates about four trials per slice.
+- Specialization (step 3) halved GPU time at unchanged geometry. It made 512-key
+  dispatches short enough for the target; `keys_per_dispatch` is now the whole
+  512-key core call. Core caps calls at 512 keys (R4), so larger dispatches were
+  not tried.
+- Minimal readback did not help while a call spanned two 256-key batches with a
+  call-resident state buffer (both 2a and 2b were about 0.5 s slower; the cause was
+  not isolated). With one batch per call, the per-batch 4-byte count variant
+  measured slightly faster and was kept.
+- Option 2 (bounded asynchronous submission) was **not implemented**. Single
+  dispatches already peak at 5.5-7.3 ms, so two in flight could form bursts of
+  about 11-15 ms, above the ~8-ms target. The remaining host gap is at most
+  wall minus dispatch work, about 0.9 s, much of it core executor work.
+- Fault checks: forcing `MASKED` false, or dropping action 3 in whole-pair lanes,
+  fails the device differential test.
+
 
 ## Measurements
 

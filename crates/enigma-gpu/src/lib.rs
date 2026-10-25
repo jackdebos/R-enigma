@@ -77,7 +77,7 @@ pub struct DispatchSample {
 
 #[derive(Default)]
 struct Session {
-    pipelines: HashMap<(usize, usize, bool), wgpu::ComputePipeline>,
+    pipelines: HashMap<Specialization, wgpu::ComputePipeline>,
     stats: DispatchStats,
 }
 
@@ -96,6 +96,20 @@ pub struct GpuClimbAccelerator {
     observer: Option<Box<dyn Fn(DispatchSample) + Send + Sync>>,
 }
 
+/// Immutable job facts compiled into a pipeline; one cache entry per distinct job shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Specialization {
+    width: usize,
+    length: usize,
+    cache_words: usize,
+    packed_counts: bool,
+    initial_order: usize,
+    final_order: usize,
+    identical: bool,
+    pair_slice: usize,
+    masked: bool,
+}
+
 struct JobLayout {
     row_words: usize,
     cache_words: usize,
@@ -107,7 +121,23 @@ struct JobLayout {
 }
 
 fn bounded_pair_slice(base: usize, budget: u32) -> usize {
-    (base / budget as usize).max(1)
+    let slice = (base / budget as usize).max(1);
+    // 32 pairs fill one 128-lane round of action slots.
+    if slice >= 32 {
+        slice / 32 * 32
+    } else {
+        slice
+    }
+}
+
+/// Whole-pair lanes for full 128-pair slices, else one action slot per lane.
+/// Both bound a lane to about four evaluations per slice.
+fn lane_actions(pair_slice: usize) -> u32 {
+    if pair_slice >= 128 {
+        4
+    } else {
+        1
+    }
 }
 
 fn unsupported(reason: impl Into<String>) -> GpuUnsupported {
@@ -320,7 +350,7 @@ impl GpuClimbAccelerator {
         let available = limits.max_compute_workgroup_storage_size as usize;
         if limits.max_compute_invocations_per_workgroup < 128
             || limits.max_compute_workgroup_size_x < 128
-            || limits.max_storage_buffers_per_shader_stage < 6
+            || limits.max_storage_buffers_per_shader_stage < 7
             || limits.max_uniform_buffer_binding_size < 64
             || shared + 4 > available
             || (16 + 2 * width) as u64 * 4 > max_buffer
@@ -345,7 +375,9 @@ impl GpuClimbAccelerator {
             row_words,
             cache_words,
             keys_per_dispatch,
-            pair_slice: (8192 / length).clamp(1, 128),
+            // About 1024 decoded letters per lane and slice: 128 pairs below
+            // 257 letters, then 96/64/32-pair action-slot rounds.
+            pair_slice: 32 * (1024 / length).clamp(1, 4),
             initial_order,
             final_order,
             identical: same_objectives(job.initial_objective, job.final_objective),
@@ -386,12 +418,39 @@ impl GpuClimbAccelerator {
             })
     }
 
-    fn pipeline(
-        &self,
-        job: &ClimbJob<'_>,
-        layout: &JobLayout,
-    ) -> Result<wgpu::ComputePipeline, GpuError> {
-        let packed = job.alphabet_size <= 32;
+    fn read_words(&self, buffer: &wgpu::Buffer) -> Result<Vec<u32>, GpuError> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        buffer.map_async(wgpu::MapMode::Read, .., move |result| {
+            let _ = sender.send(result);
+        });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| GpuError::Device(e.to_string()))?;
+        receiver
+            .recv()
+            .map_err(|e| GpuError::Device(e.to_string()))?
+            .map_err(|e| GpuError::Device(e.to_string()))?;
+        let words = bytemuck::cast_slice::<u8, u32>(&buffer.get_mapped_range(..)).to_vec();
+        buffer.unmap();
+        Ok(words)
+    }
+
+    fn specialization(job: &ClimbJob<'_>, layout: &JobLayout) -> Specialization {
+        Specialization {
+            width: job.alphabet_size,
+            length: job.text_length,
+            cache_words: layout.cache_words,
+            packed_counts: job.alphabet_size <= 32 && job.text_length <= 255,
+            initial_order: layout.initial_order,
+            final_order: layout.final_order,
+            identical: layout.identical,
+            pair_slice: layout.pair_slice,
+            masked: !job.fixed_pairs.is_empty() || job.mutable_mask.iter().any(|&m| !m),
+        }
+    }
+
+    fn pipeline(&self, spec: &Specialization) -> Result<wgpu::ComputePipeline, GpuError> {
+        let packed = spec.width <= 32;
         let source = include_str!("climb.wgsl")
             .replace("{{MAPPING_TYPE}}", if packed { "PackedBoard" } else { "array<u32, WIDTH>" })
             .replace("{{MAPPING_FUNCTIONS}}", if packed {
@@ -400,17 +459,17 @@ impl GpuClimbAccelerator {
                 "fn lookup(board: Mapping, index: u32) -> u32 { return board[index]; }\n\
                  fn put(board: ptr<function, Mapping>, index: u32, value: u32) { (*board)[index] = value; }"
             })
-            .replace("{{PACKED_COUNTS}}", if packed && job.text_length <= 255 { "true" } else { "false" })
-            .replace("{{WIDTH}}", &job.alphabet_size.to_string())
-            .replace("{{CACHE_WORDS}}", &layout.cache_words.max(1).to_string())
-            .replace(
-                "{{CACHE_ROWS}}",
-                if layout.cache_words != 0 {
-                    "true"
-                } else {
-                    "false"
-                },
-            );
+            .replace("{{PACKED_COUNTS}}", &spec.packed_counts.to_string())
+            .replace("{{WIDTH}}", &spec.width.to_string())
+            .replace("{{LENGTH}}", &spec.length.to_string())
+            .replace("{{INITIAL_ORDER}}", &spec.initial_order.to_string())
+            .replace("{{FINAL_ORDER}}", &spec.final_order.to_string())
+            .replace("{{IDENTICAL}}", &spec.identical.to_string())
+            .replace("{{PAIR_SLICE}}", &spec.pair_slice.to_string())
+            .replace("{{LANE_ACTIONS}}", &lane_actions(spec.pair_slice).to_string())
+            .replace("{{MASKED}}", &spec.masked.to_string())
+            .replace("{{CACHE_WORDS}}", &spec.cache_words.max(1).to_string())
+            .replace("{{CACHE_ROWS}}", &(spec.cache_words != 0).to_string());
         self.checked(|| {
             let module = self
                 .device
@@ -445,14 +504,10 @@ impl GpuClimbAccelerator {
             )));
         }
         let mut session = self.session.lock().unwrap();
-        let cache_key = (
-            width,
-            layout.cache_words,
-            width <= 32 && job.text_length <= 255,
-        );
+        let cache_key = Self::specialization(job, &layout);
         if let std::collections::hash_map::Entry::Vacant(entry) = session.pipelines.entry(cache_key)
         {
-            entry.insert(self.pipeline(job, &layout)?);
+            entry.insert(self.pipeline(&cache_key)?);
         }
         let pipeline = &session.pipelines[&cache_key];
         let input: Vec<u32> = job.input.iter().map(|&s| u32::from(s)).collect();
@@ -517,12 +572,12 @@ impl GpuClimbAccelerator {
                 layout.final_order as u32,
                 self.scan_budget,
                 layout.pair_slice as u32,
-                0,
+                lane_actions(layout.pair_slice),
                 0,
             ];
             let state_words = 16 + 2 * width;
             let size = (keys * state_words * 4) as u64;
-            let (states, read, bindings) = self.checked(|| {
+            let (states, read, finished, finished_read, bindings) = self.checked(|| {
                 let storage = wgpu::BufferUsages::STORAGE;
                 let rows = self.buffer("rows", &packed, storage);
                 let params = self.buffer(
@@ -542,6 +597,18 @@ impl GpuClimbAccelerator {
                     usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
+                let finished = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("finished keys"),
+                    size: 4,
+                    usage: storage | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                });
+                let finished_read = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("finished readback"),
+                    size: 4,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
                 let bindings = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("climb"),
                     layout: &pipeline.get_bind_group_layout(0),
@@ -553,6 +620,7 @@ impl GpuClimbAccelerator {
                         &final_weights,
                         &data,
                         &states,
+                        &finished,
                     ]
                     .iter()
                     .enumerate()
@@ -563,7 +631,7 @@ impl GpuClimbAccelerator {
                     .collect::<Vec<_>>()
                     .as_slice(),
                 });
-                Ok((states, read, bindings))
+                Ok((states, read, finished, finished_read, bindings))
             })?;
             loop {
                 let start = Instant::now();
@@ -575,23 +643,16 @@ impl GpuClimbAccelerator {
                         pass.set_bind_group(0, &bindings, &[]);
                         pass.dispatch_workgroups(keys as u32, 1, 1);
                     }
+                    encoder.copy_buffer_to_buffer(&finished, 0, &finished_read, 0, 4);
+                    self.queue.submit([encoder.finish()]);
+                    if self.read_words(&finished_read)?[0] as usize != keys {
+                        return Ok(None);
+                    }
+                    // Whole terminal states only once the batch has finished.
+                    let mut encoder = self.device.create_command_encoder(&Default::default());
                     encoder.copy_buffer_to_buffer(&states, 0, &read, 0, size);
                     self.queue.submit([encoder.finish()]);
-                    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-                    read.map_async(wgpu::MapMode::Read, .., move |result| {
-                        let _ = sender.send(result);
-                    });
-                    self.device
-                        .poll(wgpu::PollType::wait_indefinitely())
-                        .map_err(|e| GpuError::Device(e.to_string()))?;
-                    receiver
-                        .recv()
-                        .map_err(|e| GpuError::Device(e.to_string()))?
-                        .map_err(|e| GpuError::Device(e.to_string()))?;
-                    let records =
-                        bytemuck::cast_slice::<u8, u32>(&read.get_mapped_range(..)).to_vec();
-                    read.unmap();
-                    Ok(records)
+                    self.read_words(&read).map(Some)
                 })?;
                 let elapsed = start.elapsed();
                 stats.dispatches += 1;
@@ -611,7 +672,7 @@ impl GpuClimbAccelerator {
                     elapsed.mul_f64(f64::from(100 - self.usage) / f64::from(self.usage)),
                 );
                 stats.idle_time += idle.elapsed();
-                if records.chunks_exact(state_words).all(|r| r[10] != 0) {
+                if let Some(records) = records {
                     for record in records.chunks_exact(state_words) {
                         let signed = |at| {
                             i64::from_le_bytes(
@@ -624,7 +685,7 @@ impl GpuClimbAccelerator {
                             bytemuck::cast_slice(&record[2..4]).try_into().unwrap(),
                         );
                         let len = record[14] as usize;
-                        if len > width / 2 {
+                        if record[10] == 0 || len > width / 2 {
                             return Err(GpuError::Device("invalid terminal board length".into()));
                         }
                         results.push(AcceleratedClimb {
