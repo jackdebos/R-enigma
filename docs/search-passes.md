@@ -79,6 +79,8 @@ control contract in §6.1 and public Core HC/PE facade in §6.2;
 lifecycle/results/progress, now delivered by the CLI for HC/PE. Chained stages are
 specified in [§9](#9-chained-stages--task-13) and the hold list in [§10](#10-hold-list--task-14);
 checkpoints remain separate work; multi-variant search is not planned.
+The Stage 3 `bombe` pass, which reuses this attack branch with a crib and a
+finishing climb, is specified in [crib-attack.md](crib-attack.md).
 
 ## 1. Two domain branches, no implicit unknown key
 

@@ -570,6 +570,9 @@ The chained `reswapping`/`trie`/`measure` stages are specified and implemented i
 Representability by the definition schema does not imply algorithm support for arbitrary
 alphabet, wheel count, stepping rule, or topology.
 
+Stage 3 adds the crib attack (`job.attack.kind = "bombe"`), specified in
+[crib-attack.md](crib-attack.md); it is designed, not implemented yet.
+
 ## 4. Events and validation errors
 
 Each event line (written to the `--events` destination, §2.3) is a JSON event with
