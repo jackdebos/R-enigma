@@ -68,6 +68,7 @@ pub use attack_result::{
     AttackRunCategory, AttackRunError, AttackRunSource, AttackStageResult, AttackTermination,
 };
 mod binding;
+mod bombe;
 mod candidate;
 mod checkpoint;
 pub use checkpoint::record::{CheckpointError, CheckpointRecord};
