@@ -81,7 +81,7 @@ func configureAttack(t *testing.T, script string) (*server.Server, *url.URL, *ht
 	t.Helper()
 	dir := t.TempDir()
 	s, u, c := engineServer(t, filepath.Join(dir, "config.json"))
-	prefix := "if [ \"$1\" = --version ]; then printf 'enigma 0.1.0\\nprotocol version 1\\n'; exit; fi\n"
+	prefix := "if [ \"$1\" = --version ]; then printf 'enigma 0.2.0\\nprotocol version 1\\n'; exit; fi\n"
 	path := engineScript(t, dir, "engine", prefix+script, 0700)
 	engineRequest(t, s, u, c, "POST", pathBody(path), 200, "")
 	t.Cleanup(func() {
@@ -287,15 +287,7 @@ func TestRealAttackCancelResume(t *testing.T) {
 }
 func realAttackRun(t *testing.T, resume bool) {
 	t.Helper()
-	path, err := filepath.Abs("../../../target/release/enigma")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		t.Skip("release engine absent")
-	} else if err != nil {
-		t.Fatal(err)
-	}
+	path := realEnginePath(t)
 	query, err := os.ReadFile("../../../e2e/bomm/m4-u264-attack-design-b/query.json")
 	if err != nil {
 		t.Fatal(err)
@@ -349,7 +341,8 @@ func realAttackRun(t *testing.T, resume bool) {
 	}
 	timeout := time.Minute
 	if resume {
-		timeout = 5 * time.Minute
+		// ENIGMA_TEST_BIN may be an unoptimized debug build.
+		timeout = 20 * time.Minute
 	}
 	v := waitAttack(t, s, u, c, "completed", timeout)
 	var result struct{ Best *struct{ Plaintext string } }

@@ -34,7 +34,7 @@ func TestTransform(t *testing.T) {
 			dir := t.TempDir()
 			s, u, c := engineServer(t, filepath.Join(dir, "config.json"))
 			capture := filepath.Join(dir, "request.json")
-			script := "if [ \"$1\" = --version ]; then printf 'enigma 0.1.0\\nprotocol version 1\\n'; exit; fi\n[ \"$*\" = '--events - --request -' ] || exit 8\ncat > '" + capture + "'\n" + tc.script
+			script := "if [ \"$1\" = --version ]; then printf 'enigma 0.2.0\\nprotocol version 1\\n'; exit; fi\n[ \"$*\" = '--events - --request -' ] || exit 8\ncat > '" + capture + "'\n" + tc.script
 			path := engineScript(t, dir, "engine with spaces", script, 0700)
 			engineRequest(t, s, u, c, "POST", pathBody(path), 200, "")
 			r := httptest.NewRequest("POST", "/api/transform", strings.NewReader(form))
@@ -195,15 +195,7 @@ func TestMachines(t *testing.T) {
 }
 
 func TestRealHistoricalTransform(t *testing.T) {
-	path, err := filepath.Abs("../../../target/release/enigma")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		t.Skip("release engine absent")
-	} else if err != nil {
-		t.Fatal(err)
-	}
+	path := realEnginePath(t)
 	s, u, c := engineServer(t, filepath.Join(t.TempDir(), "config.json"))
 	engineRequest(t, s, u, c, "POST", pathBody(path), 200, "")
 	// CryptoCellar 1941-07-05 Nr.101, sourced in crates/enigma-cli/tests/historical_vectors.rs.

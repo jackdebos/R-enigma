@@ -64,7 +64,7 @@ func TestTransformNavalModels(t *testing.T) {
 			if model == "enigma-m4" {
 				check = `grep -q '"id":"reflector","wheel":"Thin-C","ring":"A","position":"A"},{"id":"greek","wheel":"Gamma","ring":"Z","position":"B"}' || exit 8`
 			}
-			script := "if [ \"$1\" = --version ]; then printf 'enigma 0.1.0\\nprotocol version 1\\n'; exit; fi\n" + check + "\nprintf '%s\\n' '" + successEvents + "'"
+			script := "if [ \"$1\" = --version ]; then printf 'enigma 0.2.0\\nprotocol version 1\\n'; exit; fi\n" + check + "\nprintf '%s\\n' '" + successEvents + "'"
 			path := engineScript(t, dir, "engine", script, 0700)
 			engineRequest(t, s, u, c, "POST", pathBody(path), 200, "")
 			body := strings.Replace(form, "enigma-i", model, 1)

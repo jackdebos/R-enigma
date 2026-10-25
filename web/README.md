@@ -77,7 +77,7 @@ Other methods return 405 (`Allow: GET, POST`). Requests must contain one JSON ob
 with a string `path`, no unknown fields, and at most 16 KiB. Responses have this shape:
 
 ```json
-{"configured":true,"path":"/absolute/path/to/enigma","version":"0.1.0","protocol":1,"compatible":true,"error":null,"supported":[{"version":"0.1.0","protocol":1}]}
+{"configured":true,"path":"/absolute/path/to/enigma","version":"0.2.0","protocol":1,"compatible":true,"error":null,"supported":[{"version":"0.2.0","protocol":1}]}
 ```
 
 An unconfigured response has `configured:false`, empty path/version, protocol 0,
@@ -101,8 +101,9 @@ Version stdout must be exactly two lines: `enigma <version>` and
 `protocol version <n>` (a final newline is optional). Stderr is discarded. Probes
 have a five-second timeout and a 100 ms pipe-drain limit, so inherited output pipes
 cannot hold the request open indefinitely. Supported pairs are exact, not minimums:
-**engine 0.1.0, protocol 1**. Older and newer engines are refused. To support another
-engine, test its CLI/protocol contract, update the single `supported` list in
+**engine 0.2.0, protocol 1**. The attack builder sends the new distinct-wheel
+constraint by default, so engine 0.1.0 is no longer supported. Older and newer
+engines are refused. To support another engine, test its CLI/protocol contract, update the single `supported` list in
 `internal/engine/engine.go` plus tests and this document, then release the web client.
 
 The saved JSON is `{"path":"..."}` in `enigma-web/config.json` under Go's
@@ -116,9 +117,9 @@ directory permissions are left unchanged.
 For tests/headless smoke checks only, set **`ENIGMA_WEB_CONFIG`** to a temporary
 config-file path before launching the binary. This overrides the user config location;
 no new command-line flag is exposed. Tests inject their own config path and create
-fake engines under `t.TempDir()`. The optional real-engine test skips if the release
-binary is absent. `Server.ValidatedEnginePath(ctx)` is the reusable boundary for
-jobs: it uses the remembered startup/save validation result without probing or
+fake engines under `t.TempDir()`. Optional real-engine tests use `ENIGMA_TEST_BIN`
+(an absolute path to engine 0.2.0) and skip with a message when unset or unavailable.
+`Server.ValidatedEnginePath(ctx)` is the reusable boundary for jobs: it uses the remembered startup/save validation result without probing or
 re-reading the config. Startup validates the saved engine once, before printing
 the URL; missing or invalid configuration does not prevent the server starting,
 and the page shows that state. Only saving a path probes `--version` again.
@@ -206,16 +207,28 @@ Success returns `{"request":{...},"outer_keys":"26","threads":2,
 "estimate_seconds":0.0014238362068965517,"resources":[{"measure":"sinkov_trigram",
 "file":"enigma1941-trigram.json","builtin":"enigma1941-trigram"}]}`.
 The request uses protocol 1 and bundled models. Unknowns enumerate complete catalog
-wheel domains or A–Z rings/positions; repeated wheels are included, not filtered.
+wheel domains or A–Z rings/positions. By default `settings.distinct_wheels` is
+`true` (also when absent). The builder adds
+`"constraints":{"distinct_wheels":["left","middle","right"]}` to `job.space`
+for Enigma I, M3 and M4; M4's Greek wheel has a separate domain and is not named.
+Known wheels also participate. Repeated orders are skipped, and both `outer_keys`
+and the estimate use the exact filtered count (for example 1,054,560 instead of
+2,197,000 for Enigma I with unknown wheels/positions and known rings).
+Set `settings.distinct_wheels:false` to omit the constraint and restore the previous
+request bytes and product count, including repeats. If known wheels already repeat,
+the default preview rejects the input with `invalid_settings` at
+`settings/distinct_wheels`; choose different wheels, mark one unknown, or turn the
+setting off. The builder never changes the input.
 Known plugboard pairs are fixed; all remaining letters are mutable. With
 `search:false`, the pair cap equals the known pair count. A fully known key with
 no plugboard search is rejected; a full 13-pair board has no mutable letters and
 is also rejected.
 
-Optional advanced settings:
+Optional settings (the page exposes distinct wheels directly and the rest in Advanced):
 
 | Setting | Default / allowed values |
 | --- | --- |
+| `distinct_wheels` | `true`; boolean. `false` also tries repeated wheels. |
 | `method` | `hill_climb` (empty start); or `partial_exhaustion`. |
 | `seeds` | PE only: omitted selects all empty/single-pair seeds; an array selects seeds touching those unique uppercase mutable letters. |
 | `initial_measure`, `final_measure` | `ic`, `sinkov_trigram`. Measures: `ic`, `entropy`, `sinkov_monogram` through `sinkov_hexagram`, `trie`. |
@@ -372,8 +385,12 @@ keeps both forms and the machine result intact.
   The preview shows grouped outer-key counts and an approximate duration in
   seconds, minutes, hours or days, with warnings above one hour and 24 hours.
   The reference-computer estimate is not a guarantee; the running panel shows
-  observed elapsed time. Unknown wheels include repeats such as I–I–I, with a
-  visible explanation. Errors show translated guidance, server message and field.
+  observed elapsed time. **Distinct wheels (as on the real machine) / Rotores
+  distintos (como en la máquina real)** is checked by default. Its `?` explains
+  that the real machine had one copy of each wheel, so orders like II-II-IV are
+  skipped for a faster search. Toggling it refreshes the count and estimate;
+  unchecking also tries repeated wheels, with a visible explanation. Errors show
+  translated guidance, server message and field.
 - **Advanced** starts collapsed. Untouched settings are omitted so the server
   supplies the recommended defaults: hill climb; initial `ic`, final
   `sinkov_trigram`; reswapping then measure stages on `sinkov_trigram`; 13 maximum
@@ -419,6 +436,14 @@ From `web/`:
 ```sh
 go vet ./... && go test ./...
 gofmt -l .
+```
+
+To include real-engine tests (including preview count versus
+`started.outers_selected`), build engine 0.2.0 with `cargo build -p enigma-cli`
+from the repository root, then run from `web/`:
+
+```sh
+ENIGMA_TEST_BIN="$(cd .. && pwd)/target/debug/enigma" go test ./...
 ```
 
 The formatting check should print nothing. HTTP tests use `net/http/httptest` without

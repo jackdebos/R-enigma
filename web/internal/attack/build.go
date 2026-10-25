@@ -28,8 +28,8 @@ func validMeasure(s string) bool {
 	return slices.Contains([]string{"ic", "entropy", "sinkov_monogram", "sinkov_bigram", "sinkov_trigram", "sinkov_quadgram", "sinkov_pentagram", "sinkov_hexagram", "trie"}, s)
 }
 
-// Build keeps catalog order and counts the Cartesian product, including repeated
-// wheels. Resource source paths are returned separately from relative engine paths.
+// Build keeps catalog order and counts the exact constrained outer space.
+// Resource source paths are returned separately from relative engine paths.
 func Build(models []Model, in Input, cpus int) (Plan, *Issue) {
 	var plan Plan
 	var model *Model
@@ -94,6 +94,23 @@ func Build(models []Model, in Input, cpus int) (Plan, *Issue) {
 		}
 		if p := addSlot(s.ID, s.Wheel, s.Ring, s.Position, model.Slots[i].Wheels, field); p != nil {
 			return plan, p
+		}
+	}
+	var distinctIDs []string
+	if in.Settings.DistinctWheels == nil || *in.Settings.DistinctWheels {
+		indices := overlappingWheelSlots(model.Slots)
+		if len(indices) >= 2 {
+			for _, i := range indices {
+				distinctIDs = append(distinctIDs, model.Slots[i].ID)
+				if in.Slots[i].Wheel == nil {
+					keys.Quo(keys, big.NewInt(int64(len(model.Slots[i].Wheels))))
+				}
+			}
+			assignments := distinctWheelAssignments(model.Slots, in.Slots, indices)
+			if assignments.Sign() == 0 {
+				return Plan{}, issue("invalid_settings", "settings/distinct_wheels", "No distinct wheel order is possible. Choose different known wheels, mark a wheel unknown, or turn off distinct wheels.")
+			}
+			keys.Mul(keys, assignments)
 		}
 	}
 	used := map[string]bool{}
@@ -250,6 +267,9 @@ func Build(models []Model, in Input, cpus int) (Plan, *Issue) {
 	space := map[string]any{"plugboard": map[string]any{"kind": "attack", "symbols": free, "max_pairs": maxPairs}}
 	if len(domains) > 0 {
 		space["slots"] = domains
+	}
+	if len(distinctIDs) >= 2 {
+		space["constraints"] = map[string]any{"distinct_wheels": distinctIDs}
 	}
 	known := in.Plugboard.Known
 	if known == nil {

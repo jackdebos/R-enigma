@@ -155,15 +155,7 @@ func TestAttackPreviewOwnTables(t *testing.T) {
 }
 
 func TestRealHistoricalAttackPreview(t *testing.T) {
-	path, err := filepath.Abs("../../../target/release/enigma")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		t.Skip("release engine absent")
-	} else if err != nil {
-		t.Fatal(err)
-	}
+	path := realEnginePath(t)
 	query, err := os.ReadFile("../../../e2e/bomm/m4-u264-attack-design-b/query.json")
 	if err != nil {
 		t.Fatal(err)

@@ -361,14 +361,14 @@ function chooseAttackModel(id) {
     slots: model.slots.map((slot, i) => ({ id: slot.id,
       wheel: slot.allowed_wheels[slot.id === 'greek' ? 0 : i - (model.slots[0].id === 'greek' ? 1 : 0)],
       ring: 'A', position: '',
-    })), plugboard: [], search: true, text: attackState?.text || '', advanced: {},
+    })), plugboard: [], search: true, distinctWheels: true, text: attackState?.text || '', advanced: {},
   };
 }
 function attackIssue(failure) {
   if (failure.network) return t('error_network');
   if (failure.status === 401) return t('error_unauthorized');
   const issue = failure.data?.error || failure;
-  const key = `error_${issue.code}`;
+  const key = issue.field === 'settings/distinct_wheels' ? 'error_distinct_wheels' : `error_${issue.code}`;
   const engineKey = `engine_error_${issue.code}`;
   const reason = dictionaries.en[key] ? t(key) : dictionaries.en[engineKey] ? t(engineKey) : t('error_generic');
   return `${reason} ${issue.message || ''}${issue.field ? ` (${issue.field})` : ''}`;
@@ -403,7 +403,7 @@ function attackInput(parent, key, value, change, { type = 'text', placeholder = 
 function attackCheckbox(parent, key, checked, change, id = `attack-${key}`) {
   const row = element('div', undefined, 'field-heading');
   const input = element('input');
-  input.type = 'checkbox'; input.id = id; input.checked = checked;
+  input.type = 'checkbox'; input.id = id; input.name = key; input.checked = checked;
   const label = element('label', t(key)); label.htmlFor = id;
   input.addEventListener('change', () => change(input.checked));
   row.append(input, label, help(key, `${key}_hint`));
@@ -539,6 +539,7 @@ function renderAttack() {
     rotors.append(block);
   });
   controls.append(rotors);
+  attackCheckbox(controls, 'distinct_wheels', attackState.distinctWheels, checked => { attackState.distinctWheels = checked; attackChanged(); });
   heading(controls, 'plugboard', 'attack_plugboard_hint');
   const pairs = element('div'); pairs.id = 'attack-pairs-editor'; controls.append(pairs);
   attackCheckbox(controls, 'search_plugboard', attackState.search, checked => { attackState.search = checked; attackChanged(); });
@@ -628,7 +629,7 @@ function renderAttackPreview() {
       element('p', t('estimate_hint'), 'hint'));
     if (preview.estimate_seconds > 3600) root.append(element('p', t(preview.estimate_seconds > 86400 ? 'estimate_very_long' : 'estimate_long'), preview.estimate_seconds > 86400 ? 'notice strong-notice' : 'notice'));
   }
-  if (attackState.slots.some(slot => !slot.wheel)) root.append(element('p', t('repeated_wheels'), 'hint'));
+  if (!attackState.distinctWheels && attackState.slots.some(slot => !slot.wheel)) root.append(element('p', t('repeated_wheels'), 'hint'));
   $('attack-request').textContent = preview ? JSON.stringify(preview.request, null, 2) : '';
 }
 function updateAttackAvailability() {

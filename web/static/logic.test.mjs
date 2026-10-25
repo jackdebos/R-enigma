@@ -65,15 +65,15 @@ test('attack body preserves text, maps unknowns to null and sends only changed s
   assert.deepEqual(body, { model: 'enigma-m4', reflector: null, slots: [
     { id: 'greek', wheel: 'Beta', ring: 'A', position: null },
     { id: 'left', wheel: null, ring: null, position: 'Z' },
-  ], plugboard: { known: [['A', 'B']], search: true }, text: 'aZ é!\n', settings: { threads: 2, method: 'partial_exhaustion', seeds: ['C'], stages: [] } });
+  ], plugboard: { known: [['A', 'B']], search: true }, text: 'aZ é!\n', settings: { threads: 2, method: 'partial_exhaustion', seeds: ['C'], stages: [], distinct_wheels: true } });
   assert.deepEqual(state, before);
   assert.deepEqual(buildAttackBody(parseAttackInput(body)), body);
   const simple = { ...state, advanced: {}, search: false };
-  assert.equal(Object.hasOwn(buildAttackBody(simple), 'settings'), false);
+  assert.deepEqual(buildAttackBody(simple).settings, { distinct_wheels: true });
   assert.equal(buildAttackBody(simple).plugboard.search, false);
   assert.deepEqual(buildAttackBody(parseAttackInput(buildAttackBody(simple))), buildAttackBody(simple));
   const hc = buildAttackBody({ ...state, advanced: { method: 'hill_climb', seeds: ['A'], max_pairs: '0', tables: { sinkov_bigram: '/own.json', trie: '' } } });
-  assert.deepEqual(hc.settings, { method: 'hill_climb', max_pairs: 0, tables: { sinkov_bigram: '/own.json' } });
+  assert.deepEqual(hc.settings, { method: 'hill_climb', max_pairs: 0, tables: { sinkov_bigram: '/own.json' }, distinct_wheels: true });
 });
 
 test('saved attack input round trips all advanced settings and null dimensions for every model', () => {
@@ -81,7 +81,7 @@ test('saved attack input round trips all advanced settings and null dimensions f
     const input = { model, reflector: null,
       slots: (model === 'enigma-m4' ? ['greek', 'left', 'middle', 'right'] : ['left', 'middle', 'right']).map(id => ({ id, wheel: null, ring: null, position: null })),
       plugboard: { known: [['Y', 'Z']], search: false }, text: ' A\naé😀',
-      settings: { method: 'partial_exhaustion', initial_measure: 'entropy', final_measure: 'sinkov_quadgram', stages: [{ pass: 'reswapping', measure: 'sinkov_bigram' }, { pass: 'trie', base_measure: 'ic' }], max_pairs: 13, switch_pairs: 0, backtrack_pairs: 13, hold: 1000, threads: 256, tables: { sinkov_quadgram: '/tables/four.json', trie: '/tables/words.json' } },
+      settings: { distinct_wheels: true, method: 'partial_exhaustion', initial_measure: 'entropy', final_measure: 'sinkov_quadgram', stages: [{ pass: 'reswapping', measure: 'sinkov_bigram' }, { pass: 'trie', base_measure: 'ic' }], max_pairs: 13, switch_pairs: 0, backtrack_pairs: 13, hold: 1000, threads: 256, tables: { sinkov_quadgram: '/tables/four.json', trie: '/tables/words.json' } },
     };
     const before = structuredClone(input);
     const state = parseAttackInput(input);
@@ -90,6 +90,21 @@ test('saved attack input round trips all advanced settings and null dimensions f
     assert.deepEqual(input, before);
     assert.deepEqual(buildAttackBody(parseAttackInput({ ...input, settings: undefined })).text, input.text);
   }
+});
+
+// distinct-wheels S7: default checked, explicit opt-out and saved-input loading.
+test('distinct wheels defaults on and preserves an explicit opt-out without changing text', () => {
+  const state = { model: 'enigma-i', reflector: 'B', slots: [], plugboard: [], search: true, text: ' aZ é!\n', advanced: {} };
+  const before = structuredClone(state);
+  assert.equal(buildAttackBody(state).settings.distinct_wheels, true);
+  const off = buildAttackBody({ ...state, distinctWheels: false });
+  assert.equal(off.settings.distinct_wheels, false);
+  assert.equal(off.text, state.text);
+  assert.equal(parseAttackInput(off).distinctWheels, false);
+  assert.deepEqual(buildAttackBody(parseAttackInput(off)), off);
+  const legacy = { ...off }; delete legacy.settings;
+  assert.equal(parseAttackInput(legacy).distinctWheels, true);
+  assert.deepEqual(state, before);
 });
 
 test('duration units change at exact minute, hour and day boundaries', () => {

@@ -39,6 +39,7 @@ export function buildAttackBody(state) {
       if (Object.keys(tables).length) settings.tables = tables;
     } else settings[key] = numeric.has(key) ? Number(value) : structuredClone(value);
   }
+  settings.distinct_wheels = state.distinctWheels ?? true;
   return {
     model: state.model,
     reflector: state.reflector || null,
@@ -54,6 +55,7 @@ export function parseAttackInput(input) {
     model: input.model, reflector: input.reflector || '',
     slots: input.slots.map(slot => Object.fromEntries(Object.entries(slot).map(([key, value]) => [key, value ?? '']))),
     plugboard: input.plugboard.known.map(pair => [...pair]), search: input.plugboard.search,
+    distinctWheels: input.settings?.distinct_wheels ?? true,
     text: input.text, advanced: structuredClone(input.settings || {}),
   };
 }

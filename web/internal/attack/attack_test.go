@@ -67,7 +67,7 @@ func asAny(t *testing.T, data []byte) any {
 	return v
 }
 
-// S8: the simple-mode defaults reproduce the tested U-264 design B request.
+// web-attacks S8 PRESERVE: opting out reproduces the tested U-264 design B request.
 func TestDefaultsReproduceDesignB(t *testing.T) {
 	data, err := os.ReadFile("../../../e2e/bomm/m4-u264-attack-design-b/case.json")
 	if err != nil {
@@ -82,7 +82,7 @@ func TestDefaultsReproduceDesignB(t *testing.T) {
 	job := c.Engine["job"].(map[string]any)
 	job["text"] = u264
 	job["resources"] = map[string]any{"sinkov_trigram": map[string]any{"path": "enigma1941-trigram.json"}}
-	plan := build(t, designB(u264))
+	plan := build(t, strings.TrimSuffix(designB(u264), "}")+`,"settings":{"distinct_wheels":false}}`)
 	if got := asAny(t, plan.Request); !reflect.DeepEqual(got, asAny(t, mustJSON(c.Engine))) {
 		t.Fatalf("request differs:\n got %s\nwant %s", plan.Request, mustJSON(c.Engine))
 	}
@@ -115,7 +115,7 @@ func TestTextUnchanged(t *testing.T) {
 	}
 }
 
-// S2, S6: every unknown field becomes a full domain, repeated wheels included.
+// web-attacks S2/S6 PRESERVE: opt-out keeps full domains and repeated wheels.
 func TestUnknownDomainsAndCount(t *testing.T) {
 	body := `{"model":"enigma-m4","reflector":null,"slots":[` +
 		`{"id":"greek","wheel":null,"ring":null,"position":null},` +
@@ -123,7 +123,7 @@ func TestUnknownDomainsAndCount(t *testing.T) {
 		`{"id":"middle","wheel":null,"ring":null,"position":null},` +
 		`{"id":"right","wheel":null,"ring":null,"position":null}],` +
 		`"plugboard":{"known":[["A","B"]],"search":true},"text":"ABC"}`
-	plan := build(t, body)
+	plan := build(t, strings.TrimSuffix(body, "}")+`,"settings":{"distinct_wheels":false}}`)
 	job := asAny(t, plan.Request).(map[string]any)["job"].(map[string]any)
 	space := job["space"].(map[string]any)
 	slots := space["slots"].([]any)

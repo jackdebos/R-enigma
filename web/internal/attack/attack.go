@@ -55,6 +55,7 @@ type Plugboard struct {
 	Search bool       `json:"search"`
 }
 type Settings struct {
+	DistinctWheels *bool             `json:"distinct_wheels"`
 	Method         *string           `json:"method"`
 	Seeds          []string          `json:"seeds"`
 	InitialMeasure *string           `json:"initial_measure"`
