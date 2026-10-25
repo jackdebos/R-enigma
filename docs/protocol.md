@@ -537,8 +537,8 @@ once. Absolute paths are allowed; no expansion, URL loading, automatic symlink
 canonicalization, or sandbox restriction is introduced.
 
 **Implementation status:** Current execution availability is summarized in §4.1.
-`space.constraints` is specified for engine 0.2.0 and
-not implemented yet; engine 0.1.0 rejects it as `unknown_field`.
+Engine 0.2.0 implements `space.constraints` (`distinct_wheels`);
+older engines reject it as `unknown_field`.
 Task 9 implements the structural boundary and capability
 framework. Task 10 implements deterministic IC, Shannon entropy, Sinkov n-gram and
 weighted trie scoring, strict external resource parsers, typed measure/resource
@@ -1057,6 +1057,9 @@ passes are equivalent. Shared acceptance of one JSON file is not evidence of par
 Task 17 is the differential-oracle validation task.
 
 ## 10. Version and status
+
+Engine 0.2.0 adds the optional `space.constraints` member under protocol version 1,
+an additive extension like `hold` and chained stages.
 
 `protocol_version: 1` denotes this unpublished contract. Unknown
 versions and fields fail before work. Incompatible changes to field meaning,

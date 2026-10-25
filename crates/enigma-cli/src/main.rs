@@ -793,9 +793,11 @@ fn write_error_line(
 
 /// Encodes one event and writes it as a single line to the selected destination.
 fn emit(writer: &mut impl Write, event: &Event, seq: u64, ts: &str) -> io::Result<()> {
-    let line = encode(event, seq, ts)
+    let mut line = encode(event, seq, ts)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    writeln!(writer, "{line}")
+    // Report capture consumes complete JSONL records, not a separate newline write.
+    line.push('\n');
+    writer.write_all(line.as_bytes())
 }
 
 /// The current time as RFC 3339 UTC. A clock before the epoch maps to the epoch.
