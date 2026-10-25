@@ -200,6 +200,18 @@ Outer indices are absolute unsliced indices. Each selected outer candidate runs
 all seeds in order before advancing the outer tuple, unless cancellation stops the run.
 Legacy subset indices/order remain unchanged in their own branch.
 
+`space.constraints.distinct_wheels` (protocol §3.3) filters this order: every outer
+tuple in which two named slots hold the same wheel name is removed, and the remaining
+tuples keep their relative order. Index 0 is the first remaining tuple; "absolute
+unsliced" means unsliced by `offset`/`limit` within the filtered order. Validity depends
+only on the wheel coordinates, so the count and the n-th tuple are computed directly
+from per-slot wheel counts, without enumerating earlier tuples; the result is the same
+as filtering the full order one tuple at a time. Example: Enigma I with `left`,
+`middle` and `right` wheels unknown (5 wheels each), positions unknown and rings known
+has 5 x 5 x 5 x 26^3 = 2,197,000 outer keys; naming those three slots leaves
+5 x 4 x 3 x 26^3 = 1,054,560. For M4 name `left`, `middle` and `right`: the `greek`
+slot has its own wheels (`Beta`, `Gamma`), so naming it removes nothing.
+
 An empty outer slice returns no best candidate with termination `outer_slice_end`.
 Otherwise normal exhaustion of the requested slice is `completed`; completion is
 only of that slice, never a claim of all mathematical plugboards being exhausted.

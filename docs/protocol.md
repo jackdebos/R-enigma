@@ -447,8 +447,9 @@ section is normative for the §3.2/§3.3 structure only; execution is specified 
 the pass contracts (HC/PE attacks and the Task 13 chained stages of
 [search-passes §9](search-passes.md#9-chained-stages--task-13) execute; §4.1).
 
-`space` is an object allowing exactly `slots`, `plugboard`, `offset`, and `limit`; all
-four are optional, so an empty object means the fixed choices are already complete.
+`space` is an object allowing exactly `slots`, `plugboard`, `offset`, `limit`, and
+`constraints`; all five are optional, so an empty object means the fixed choices are
+already complete.
 `slots` and `plugboard` are present only when that dimension is variable:
 
 - `slots`: array of slot domains. Each entry is an object with exactly `id` plus any
@@ -466,6 +467,17 @@ four are optional, so an empty object means the fixed choices are already comple
   enumeration order of §7.
 - `limit`: optional positive integer bounding the number of enumerated candidates;
   omission means no explicit request bound (documented resource limits still apply).
+- `constraints`: optional object restricting which candidates exist, allowed only with
+  the attack branch (`space.plugboard.kind = "attack"`); on any other request it is
+  `invalid_search_space`. It has exactly one member, `distinct_wheels`, required: an
+  array of at least two unique slot IDs, each naming a definition slot with
+  `allowed_wheels`. It removes every outer candidate in which two of the named slots hold
+  the same wheel name, as on the real machine, where each wheel exists once. Named slots
+  may have a known wheel (`configuration`) or a variable one (`space.slots`); a known
+  wheel therefore excludes itself from the other named slots. Slots not named are not
+  restricted. The constraint applies only when requested: no catalog definition implies
+  it, and transform still accepts repeated wheels. Unknown members are `unknown_field`.
+  Example: `"constraints": {"distinct_wheels": ["left", "middle", "right"]}`.
 
 The separately discriminated
 [`kind: "attack"` branch](search-passes.md#1-two-domain-branches-no-implicit-unknown-key)
@@ -485,6 +497,10 @@ Coverage and conflict are checked before enumeration:
   structurally fixed wheel) is `invalid_search_space`; a required dimension covered by
   no path is `invalid_search_space` with an actionable message. Unknown members remain
   `unknown_field`. No value is defaulted or inferred.
+- A `distinct_wheels` constraint that leaves no outer candidate (for example two named
+  slots with the same known wheel, or more named slots than wheels available to them) is
+  `invalid_search_space` at `/job/space/constraints/distinct_wheels`, reported before
+  any work.
 - The candidate resolver enforces definition restrictions, disjoint plugboard pairs,
   and unique complete candidates; concrete candidates bind anew to their final
   topology and stepping rules. Incompatible slot/wheel combinations and unsupported
@@ -519,6 +535,8 @@ once. Absolute paths are allowed; no expansion, URL loading, automatic symlink
 canonicalization, or sandbox restriction is introduced.
 
 **Implementation status:** Current execution availability is summarized in §4.1.
+`space.constraints` is specified for engine 0.2.0 and
+not implemented yet; engine 0.1.0 rejects it as `unknown_field`.
 Task 9 implements the structural boundary and capability
 framework. Task 10 implements deterministic IC, Shannon entropy, Sinkov n-gram and
 weighted trie scoring, strict external resource parsers, typed measure/resource
@@ -947,7 +965,10 @@ definition is bundled, the exact catalog JSON of that alias followed by `\n`; th
 each loaded resource in ascending measure-ID order, its ID, `\n`, its byte length in
 decimal, `\n` and its exact bytes. The request already carries `protocol_version`, the
 whole job, text and settings; changing any of them, the catalog content or a
-resource byte changes the identity. Reformatting the request does not.
+resource byte changes the identity. Reformatting the request does not. Adding or
+removing `space.constraints` changes the identity, so a checkpoint never resumes a run
+with different constraints; reordering the IDs inside `distinct_wheels` changes it too,
+although it selects the same keys.
 
 Resume reads and parses the record before the request. An unreadable file, invalid
 JSON, an unknown member, an unsupported `checkpoint_version` or `protocol_version`,
@@ -998,6 +1019,10 @@ state. Holds order by `(score desc, enumeration index asc)`; for attacks the ind
 only to implemented search jobs. The planned Task 11 attack branch retains the
 per-slot order but slices outer scramblers only; seed/action indices are separate,
 as specified in [attack order](search-passes.md#3-pre-execution-gates-and-outer-order).
+With `space.constraints.distinct_wheels`, the outer order is that same order with every
+candidate that repeats a wheel among the named slots removed; outer indices, `offset`,
+`limit`, `outers_selected`, blocks and checkpoint `next_outer` all count in that
+filtered order. Without constraints the order and counts are exactly as before.
 This does not change legacy subset enumeration or define cross-pass holds.
 
 ## 8. Web client (Stage 2)
