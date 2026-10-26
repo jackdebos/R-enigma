@@ -422,3 +422,37 @@ fn entropy_boundaries_and_phase_rescore_match_cpu() {
         }
     }
 }
+
+#[test]
+fn sparse_cache_changes_models_after_drop() {
+    // Same order, different models, each dropped before the next: the resident
+    // table must follow the model, and a repeated call must not re-upload it.
+    use enigma_core::{Alphabet, ClimbObjective, NgramModel};
+    let Some(device) = gpu(25, 1) else { return };
+    let owner = request(26, 0);
+    let rows: Vec<u8> = (0..8).flat_map(|_| 0..26u8).collect();
+    for count in [31, 1, 63] {
+        let model = NgramModel::new(
+            Alphabet::new("ABCDEFGHIJKLMNOPQRSTUVWXYZ".chars().collect()).unwrap(),
+            4,
+            vec![(vec!['A'; 4], count), (vec!['B'; 4], 7)],
+        )
+        .unwrap();
+        let objective = ClimbObjective::SparseNgram {
+            model: &model,
+            order: 4,
+            max_abs: model.i64_max_abs().unwrap(),
+        };
+        let mut job = owner.climb_job().unwrap();
+        job.text_length = 8;
+        job.input = vec![0; 8];
+        job.max_pairs = 0;
+        job.initial_objective = objective;
+        job.final_objective = objective;
+        let expected = job.climb_from_projection(&rows).unwrap();
+        assert_eq!(device.climb(&job, 0, &rows).unwrap(), expected);
+        let uploads = device.dispatch_stats().objective_uploads;
+        assert_eq!(device.climb(&job, 0, &rows).unwrap(), expected);
+        assert_eq!(device.dispatch_stats().objective_uploads, uploads);
+    }
+}
