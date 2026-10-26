@@ -310,6 +310,28 @@ impl AttackPlugboardDomain {
         self.alphabet == alphabet.symbols
     }
 
+    /// Refine a validated domain with sound stop deductions. Removing every mutable
+    /// symbol is legal internally even though request domains must be nonempty.
+    pub(crate) fn with_deductions(&self, pairs: &[(usize, usize)], selfs: &[usize]) -> Self {
+        let mut refined = self.clone();
+        for &(a, b) in pairs {
+            let pair = (self.alphabet[a], self.alphabet[b]);
+            if !refined
+                .fixed_pairs
+                .iter()
+                .any(|&(x, y)| (x, y) == pair || (y, x) == pair)
+            {
+                refined.fixed_pairs.push(pair);
+            }
+        }
+        refined.symbols.retain(|c| {
+            !refined.fixed_pairs.iter().any(|&(a, b)| *c == a || *c == b)
+                && !selfs.iter().any(|&i| self.alphabet[i] == *c)
+        });
+        debug_assert!(refined.fixed_pairs.len() <= refined.max_pairs);
+        refined
+    }
+
     /// Mutable endpoints in source order; never includes a known fixed endpoint.
     pub fn symbols(&self) -> &[char] {
         &self.symbols
@@ -333,6 +355,8 @@ pub enum AttackKind {
     HillClimb,
     /// Empty/single seed policy; no seed generation is provided here.
     PartialExhaustion,
+    /// Deductive crib test followed by a constrained finishing climb.
+    Bombe,
 }
 
 /// Explicit empty/single seed selection, preserving the supplied mask order.
@@ -358,7 +382,7 @@ pub(crate) fn attack_passes_shape(passes: &[String]) -> Result<(), Vec<SearchDia
     let stages = passes.get(1..).unwrap_or_default();
     let valid = passes
         .first()
-        .is_some_and(|pass| matches!(pass.as_str(), "hill_climb" | "partial_exhaustion"))
+        .is_some_and(|pass| matches!(pass.as_str(), "hill_climb" | "partial_exhaustion" | "bombe"))
         && stages.iter().enumerate().all(|(index, stage)| {
             matches!(stage.as_str(), "reswapping" | "trie" | "measure")
                 && !stages[..index].contains(stage)
@@ -392,6 +416,7 @@ pub struct AttackSettings {
     initialization: AttackInitialization,
     stages: Vec<AttackStage>,
     stage_measure_explicit: Vec<bool>,
+    crib: Option<(String, Option<usize>)>,
 }
 
 impl AttackSettings {
@@ -458,6 +483,11 @@ impl AttackSettings {
                 "hold",
                 "start",
                 "seeds",
+                if settings.get("kind").and_then(Value::as_str) == Some("bombe") {
+                    "crib"
+                } else {
+                    "start"
+                },
                 "reswapping",
                 "trie",
                 "measure",
@@ -472,10 +502,52 @@ impl AttackSettings {
                 child(PATH, "kind"),
             )]);
         }
-        let (kind, forbidden) = if kind == "hill_climb" {
-            (AttackKind::HillClimb, "seeds")
+        let (kind, forbidden) = match kind {
+            "hill_climb" => (AttackKind::HillClimb, "seeds"),
+            "bombe" => (AttackKind::Bombe, "start"),
+            _ => (AttackKind::PartialExhaustion, "start"),
+        };
+        let crib = if kind == AttackKind::Bombe {
+            if settings.contains_key("seeds") {
+                return Err(vec![invalid(
+                    "member is forbidden for the selected attack kind",
+                    child(PATH, "seeds"),
+                )]);
+            }
+            let path = child(PATH, "crib");
+            let fields = object(required(settings, "crib", PATH)?, &path)?;
+            allow_keys(fields, &["text", "position"], &path)?;
+            let text = required_string(fields, "text", &path)?;
+            if text.is_empty() || text.chars().any(|c| alphabet.index_of(c).is_none()) {
+                return Err(vec![invalid_search_space(
+                    "crib must be nonempty runtime-alphabet text",
+                    child(&path, "text"),
+                )]);
+            }
+            let position = fields
+                .get("position")
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .and_then(|p| usize::try_from(p).ok())
+                        .ok_or_else(|| {
+                            vec![invalid_search_space(
+                                "position must be a nonnegative integer",
+                                child(&path, "position"),
+                            )]
+                        })
+                })
+                .transpose()?;
+            Some((text.to_owned(), position))
         } else {
-            (AttackKind::PartialExhaustion, "start")
+            if settings.contains_key("crib") {
+                return Err(vec![SearchDiagnostic::new(
+                    "unknown_field",
+                    "field \"crib\" is not allowed here",
+                    child(PATH, "crib"),
+                )]);
+            }
+            None
         };
         if settings.contains_key(forbidden) {
             return Err(vec![invalid(
@@ -536,7 +608,9 @@ impl AttackSettings {
                     )]
                 })
             })?;
-        let initialization = if kind == AttackKind::PartialExhaustion {
+        let initialization = if kind == AttackKind::Bombe {
+            AttackInitialization::Start(Vec::new())
+        } else if kind == AttackKind::PartialExhaustion {
             AttackInitialization::Seeds(parse_seed_policy(
                 required(settings, "seeds", PATH)?,
                 domain,
@@ -642,7 +716,15 @@ impl AttackSettings {
             initialization,
             stages,
             stage_measure_explicit,
+            crib,
         })
+    }
+
+    /// Supplied crib text and optional fixed scalar position (without normalization).
+    pub fn crib(&self) -> Option<(&str, Option<usize>)> {
+        self.crib
+            .as_ref()
+            .map(|(text, position)| (text.as_str(), *position))
     }
 
     /// Validated settings-fragment kind.

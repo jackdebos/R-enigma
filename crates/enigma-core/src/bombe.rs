@@ -2,8 +2,78 @@
 //!
 //! Indices are already validated/normalized by the caller; no text normalization is
 //! performed here. Menus and facts are built once, scratch is reused across settings.
-// The module is intentionally not wired into attack requests until T5.
-#![allow(dead_code)]
+/// Immutable admission-time menus and facts shared by outer workers.
+#[derive(Debug)]
+pub(crate) struct Plan {
+    pub(crate) positions: Vec<usize>,
+    pub(crate) menus: Vec<Menu>,
+    pub(crate) facts: Facts,
+    pub(crate) row_length: usize,
+}
+
+impl Plan {
+    pub(crate) fn build(
+        request: &crate::SearchRequest,
+        domain: &crate::AttackPlugboardDomain,
+        settings: &crate::AttackSettings,
+    ) -> Result<Self, Vec<crate::SearchDiagnostic>> {
+        let (crib, position) = settings.crib().expect("bombe settings");
+        let alphabet = request.definition().alphabet();
+        let indices = |text: &str| {
+            text.chars()
+                .map(|c| alphabet.index_of(c))
+                .collect::<Option<Vec<_>>>()
+        };
+        let text = indices(request.text()).expect("validated request text");
+        // Detached settings may come from another alphabet; the gate must recheck
+        // the crib rather than rely on settings-fragment provenance.
+        let crib = indices(crib).ok_or_else(|| {
+            vec![crate::SearchDiagnostic::new(
+                "invalid_search_space",
+                "crib contains a symbol outside the machine alphabet",
+                "/job/attack/crib/text",
+            )]
+        })?;
+        let positions = admissible_positions(&text, &crib, position).map_err(|error| {
+            let (member, message) = match error {
+                CribError::Empty => ("/text", "crib must not be empty".to_owned()),
+                CribError::TooLong => ("/text", "crib is longer than ciphertext".to_owned()),
+                CribError::Position => ("/position", "crib position exceeds ciphertext".to_owned()),
+                CribError::Crash { index } => {
+                    ("/position", format!("crib crashes at text index {index}"))
+                }
+                _ => ("", "no admissible crib position".to_owned()),
+            };
+            vec![crate::SearchDiagnostic::new(
+                "invalid_search_space",
+                message,
+                format!("/job/attack/crib{member}"),
+            )]
+        })?;
+        let menus = positions
+            .iter()
+            .map(|&p| Menu::new(alphabet.len(), &crib, &text, p).expect("admitted position"))
+            .collect();
+        let mutable = alphabet
+            .symbols
+            .iter()
+            .map(|c| domain.symbols().contains(c))
+            .collect::<Vec<_>>();
+        let fixed = domain
+            .fixed_pairs()
+            .iter()
+            .map(|&(a, b)| (alphabet.index_of(a).unwrap(), alphabet.index_of(b).unwrap()))
+            .collect::<Vec<_>>();
+        let facts = Facts::new(&mutable, &fixed, domain.max_pairs()).expect("validated domain");
+        let row_length = positions.last().unwrap() + crib.len();
+        Ok(Self {
+            positions,
+            menus,
+            facts,
+            row_length,
+        })
+    }
+}
 
 const UNKNOWN: usize = usize::MAX;
 

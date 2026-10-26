@@ -339,11 +339,13 @@ mod tests {
         let domain = AttackPlugboardDomain::parse_json(&alphabet, &[('F', 'E')], json).unwrap();
         let pairs = [start, &[('E', 'F')]].concat();
         let result = AttackResult {
+            crib: None,
             held_tail: crate::attack_hold::tests::tail_fixture(),
             termination: Completed,
             counters: crate::AttackProgress(CounterSnapshot::default()),
             evaluations_used: 5,
             best: Some(AttackBest {
+                crib_position: None,
                 configuration: crate::TransformConfiguration::new(Vec::new(), pairs),
                 mutable_plugboard: start.to_vec(),
                 plaintext: "old".into(),
@@ -868,11 +870,13 @@ mod tests {
                             let configuration =
                                 TransformConfiguration::new(slots.clone(), start.to_vec());
                             let result = AttackResult {
+                                crib: None,
                                 held_tail: Vec::new(),
                                 termination: Completed,
                                 counters: crate::AttackProgress(CounterSnapshot::default()),
                                 evaluations_used: 5,
                                 best: Some(AttackBest {
+                                    crib_position: None,
                                     configuration,
                                     mutable_plugboard: start.to_vec(),
                                     plaintext: "old".into(),

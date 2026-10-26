@@ -82,6 +82,10 @@ pub struct ProgressCounters {
     climbs_started: String,
     climbs_completed: String,
     outers_completed: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bombe_settings: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bombe_stops: Option<String>,
 }
 
 impl From<AttackProgress> for ProgressCounters {
@@ -92,6 +96,8 @@ impl From<AttackProgress> for ProgressCounters {
             climbs_started: progress.climbs_started().to_string(),
             climbs_completed: progress.climbs_completed().to_string(),
             outers_completed: progress.outers_completed().to_string(),
+            bombe_settings: progress.0.bombe.map(|counts| counts.0.to_string()),
+            bombe_stops: progress.0.bombe.map(|counts| counts.1.to_string()),
         }
     }
 }
@@ -99,6 +105,8 @@ impl From<AttackProgress> for ProgressCounters {
 /// Wire-only committed winner, projected without changing runtime ordering or scores.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct BestResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    crib_position: Option<String>,
     configuration: WinningConfiguration,
     mutable_plugboard: Vec<(char, char)>,
     plaintext: String,
@@ -108,6 +116,26 @@ pub struct BestResult {
     incomplete: bool,
     final_objective_ascent: bool,
     neighborhood_exhausted: bool,
+}
+
+/// Wire-only summary of crib placement and deductive work.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CribResult {
+    text: String,
+    positions: Vec<String>,
+    settings: String,
+    stops: String,
+}
+
+impl From<&crate::AttackCribResult> for CribResult {
+    fn from(crib: &crate::AttackCribResult) -> Self {
+        Self {
+            text: crib.text().to_owned(),
+            positions: crib.positions().iter().map(usize::to_string).collect(),
+            settings: crib.settings().to_string(),
+            stops: crib.stops().to_string(),
+        }
+    }
 }
 
 /// Wire-only finalist with the same nine winner fields and its own history.
@@ -207,6 +235,7 @@ impl From<&AttackBest> for BestResult {
     fn from(best: &AttackBest) -> Self {
         let configuration = best.configuration();
         Self {
+            crib_position: best.crib_position().map(|p| p.to_string()),
             configuration: WinningConfiguration {
                 slots: configuration
                     .slots()
@@ -273,6 +302,9 @@ pub enum Event {
     },
     /// Final committed search winner and factual whole-run snapshot.
     Result {
+        /// Crib-only summary; omitted for ciphertext-only attacks.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        crib: Option<CribResult>,
         /// Final ordered finalists; empty only when no winner is retained.
         hold: Vec<HoldResult>,
         /// Started stages in pipeline order, including on runtime failure.
@@ -375,13 +407,17 @@ impl Event {
 
     /// Projects an owned runtime result without clocks, I/O or execution orchestration.
     pub fn result(result: &AttackResult, elapsed_ms: u128) -> Self {
-        Self::result_snapshot(
+        let mut event = Self::result_snapshot(
             result.best(),
             result.counters(),
             result.stages(),
             result.hold().map(HoldResult::from).collect(),
             elapsed_ms,
-        )
+        );
+        if let Self::Result { crib, .. } = &mut event {
+            *crib = result.crib().map(CribResult::from);
+        }
+        event
     }
 
     fn result_snapshot(
@@ -392,6 +428,7 @@ impl Event {
         elapsed_ms: u128,
     ) -> Self {
         Self::Result {
+            crib: None,
             hold,
             stages: stages.iter().map(StageResult::from).collect(),
             best: best.map(|best| Box::new(BestResult::from(best))),
@@ -453,8 +490,13 @@ impl Event {
                 diagnostics,
             },
         };
+        let mut result =
+            Self::result_snapshot(best, error.counters(), error.stages(), hold, elapsed_ms);
+        if let Self::Result { crib, .. } = &mut result {
+            *crib = error.crib().map(CribResult::from);
+        }
         Ok((
-            Self::result_snapshot(best, error.counters(), error.stages(), hold, elapsed_ms),
+            result,
             Self::Error {
                 code: "internal_error".to_owned(),
                 message,
@@ -969,6 +1011,7 @@ mod tests {
             climbs_started: 11,
             climbs_completed: 7,
             outers_completed: 3,
+            bombe: None,
         });
         assert_eq!(
             encoded(&Event::progress(progress, 23)),
@@ -999,6 +1042,7 @@ mod tests {
                 climbs_started: climbs,
                 climbs_completed: climbs,
                 outers_completed: climbs,
+                bombe: None,
             });
             let event = Event::progress(progress, elapsed);
             let timestamp = "caller timestamp unchanged";
@@ -1287,6 +1331,8 @@ mod tests {
                         PrivateCounter::ClimbsStarted => PublicCounter::ClimbsStarted,
                         PrivateCounter::ClimbsCompleted => PublicCounter::ClimbsCompleted,
                         PrivateCounter::OutersCompleted => PublicCounter::OutersCompleted,
+                        PrivateCounter::BombeSettings => PublicCounter::BombeSettings,
+                        PrivateCounter::BombeStops => PublicCounter::BombeStops,
                     };
                     assert_eq!(cause.overflow(), Some(expected));
                 }
@@ -1343,6 +1389,7 @@ mod tests {
                         climbs_started: u128::MAX,
                         climbs_completed: u128::MAX - 1,
                         outers_completed: u128::MAX - 2,
+                        bombe: None,
                     }),
                     best: Ok(None),
                 });

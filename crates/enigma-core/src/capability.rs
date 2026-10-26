@@ -80,6 +80,7 @@ impl Capabilities {
         Self {
             passes: vec![
                 PassSupport::new("hill_climb", false),
+                PassSupport::new("bombe", false),
                 PassSupport::new("partial_exhaustion", false),
                 PassSupport::new("reswapping", false),
                 PassSupport::new("trie", false),

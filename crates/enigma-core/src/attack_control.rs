@@ -10,6 +10,7 @@ pub(super) struct CounterSnapshot {
     pub(super) climbs_started: u128,
     pub(super) climbs_completed: u128,
     pub(super) outers_completed: u128,
+    pub(super) bombe: Option<(u64, u64)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,6 +20,8 @@ pub(super) enum CounterOverflow {
     ClimbsStarted,
     ClimbsCompleted,
     OutersCompleted,
+    BombeSettings,
+    BombeStops,
 }
 
 impl std::fmt::Display for CounterOverflow {
@@ -120,6 +123,17 @@ impl AttackControl {
         add!(climbs_started, ClimbsStarted);
         add!(climbs_completed, ClimbsCompleted);
         add!(outers_completed, OutersCompleted);
+        if let Some((settings, stops)) = local.bombe {
+            let (prior_settings, prior_stops) = merged.bombe.unwrap_or_default();
+            merged.bombe = Some((
+                prior_settings
+                    .checked_add(settings)
+                    .ok_or(CounterOverflow::BombeSettings)?,
+                prior_stops
+                    .checked_add(stops)
+                    .ok_or(CounterOverflow::BombeStops)?,
+            ));
+        }
         self.counters = merged;
         let completed = merged.evaluations_completed;
         // Skip the grid points inside this block. Stages retain their original
@@ -158,6 +172,28 @@ impl AttackControl {
     pub(super) fn poll_cancellation(&mut self, requested: bool) -> bool {
         self.cancelled |= requested;
         self.cancelled
+    }
+
+    pub(super) fn enable_bombe(&mut self) {
+        self.counters.bombe.get_or_insert((0, 0));
+    }
+
+    pub(super) fn record_bombe_setting(&mut self) -> Result<(), CounterOverflow> {
+        let counters = self.counters.bombe.get_or_insert((0, 0));
+        counters.0 = counters
+            .0
+            .checked_add(1)
+            .ok_or(CounterOverflow::BombeSettings)?;
+        Ok(())
+    }
+
+    pub(super) fn record_bombe_stop(&mut self) -> Result<(), CounterOverflow> {
+        let counters = self.counters.bombe.get_or_insert((0, 0));
+        counters.1 = counters
+            .1
+            .checked_add(1)
+            .ok_or(CounterOverflow::BombeStops)?;
+        Ok(())
     }
 
     pub(super) fn record_evaluation_admitted(&mut self) -> Result<(), CounterOverflow> {
@@ -339,6 +375,38 @@ mod tests {
     }
 
     #[test]
+    fn bombe_counters_are_checked_and_block_merges_are_transactional() {
+        let mut control = AttackControl::with_counters(CounterSnapshot {
+            bombe: Some((u64::MAX, u64::MAX)),
+            ..Default::default()
+        });
+        let before = control.snapshot();
+        assert_eq!(
+            control.record_bombe_setting(),
+            Err(CounterOverflow::BombeSettings)
+        );
+        assert_eq!(
+            control.record_bombe_stop(),
+            Err(CounterOverflow::BombeStops)
+        );
+        assert_eq!(control.snapshot(), before);
+        for (counts, expected) in [
+            ((1, 0), CounterOverflow::BombeSettings),
+            ((0, 1), CounterOverflow::BombeStops),
+        ] {
+            assert_eq!(
+                control.merge_block(CounterSnapshot {
+                    evaluations_completed: 1,
+                    bombe: Some(counts),
+                    ..Default::default()
+                }),
+                Err(expected)
+            );
+            assert_eq!(control.snapshot(), before);
+        }
+    }
+
+    #[test]
     fn zero_snapshot_is_a_retained_copy() {
         let mut control = AttackControl::default();
         let retained = control.snapshot();
@@ -398,6 +466,7 @@ mod tests {
             climbs_started: 1,
             climbs_completed: 1,
             outers_completed: 1,
+            bombe: None,
         };
         let mut observer = Recorder::default();
         control.notify(&mut observer);
@@ -439,6 +508,7 @@ mod tests {
                     climbs_started: u128::MAX,
                     climbs_completed: u128::MAX,
                     outers_completed: u128::MAX,
+                    bombe: None,
                 },
                 ..AttackControl::default()
             };

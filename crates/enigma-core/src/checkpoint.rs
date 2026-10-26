@@ -169,11 +169,17 @@ pub(crate) mod record {
         pub(crate) climbs_started: Decimal<u128>,
         pub(crate) climbs_completed: Decimal<u128>,
         pub(crate) outers_completed: Decimal<u128>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(crate) bombe_settings: Option<Decimal<u64>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(crate) bombe_stops: Option<Decimal<u64>>,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub(crate) struct Entry {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(crate) crib_position: Option<Decimal<usize>>,
         pub(crate) configuration: Configuration,
         pub(crate) mutable_plugboard: Vec<(char, char)>,
         pub(crate) plaintext: String,
@@ -227,6 +233,7 @@ pub(crate) mod record {
     impl Entry {
         pub(crate) fn capture(best: &crate::AttackBest) -> Self {
             Self {
+                crib_position: best.crib_position.map(Decimal),
                 configuration: Configuration {
                     slots: best
                         .configuration
@@ -270,6 +277,7 @@ pub(crate) mod record {
             let measured = self.score.measured_q32.0;
             let ranking = self.score.ranking_q32.0;
             Ok(crate::AttackBest {
+                crib_position: self.crib_position.map(|p| p.0),
                 configuration,
                 mutable_plugboard: self.mutable_plugboard.clone(),
                 plaintext: self.plaintext.clone(),
@@ -293,6 +301,8 @@ pub(crate) mod record {
                 climbs_started: Decimal(c.climbs_started),
                 climbs_completed: Decimal(c.climbs_completed),
                 outers_completed: Decimal(c.outers_completed),
+                bombe_settings: c.bombe.map(|counts| Decimal(counts.0)),
+                bombe_stops: c.bombe.map(|counts| Decimal(counts.1)),
             }
         }
     }
@@ -304,6 +314,10 @@ pub(crate) mod record {
                 climbs_started: c.climbs_started.0,
                 climbs_completed: c.climbs_completed.0,
                 outers_completed: c.outers_completed.0,
+                bombe: c
+                    .bombe_settings
+                    .zip(c.bombe_stops)
+                    .map(|(settings, stops)| (settings.0, stops.0)),
             }
         }
     }
@@ -327,6 +341,9 @@ pub(crate) mod record {
                 if version != 1 {
                     return Err(CheckpointError(format!("unsupported {name} {version}")));
                 }
+            }
+            if self.counters.bombe_settings.is_some() != self.counters.bombe_stops.is_some() {
+                return Err(CheckpointError("incomplete bombe counters".into()));
             }
             for entry in self.best.iter().chain(&self.hold) {
                 crate::selection::parse_measures(std::slice::from_ref(&entry.score.measure))

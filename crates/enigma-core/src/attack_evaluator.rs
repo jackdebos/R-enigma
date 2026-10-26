@@ -215,6 +215,7 @@ pub(crate) fn spike_dense_units(
 /// No row reference escapes a trial, so eviction drops the old payload before building.
 pub(super) struct RunPreparation<'a> {
     owner: &'a crate::AttackRequest,
+    pub(super) bombe: RefCell<(crate::bombe::Scratch, Vec<u32>)>,
     latest: RefCell<Option<(u128, OnceCell<Option<Prepared>>)>>,
 }
 
@@ -222,6 +223,7 @@ impl<'a> RunPreparation<'a> {
     pub(super) fn new(owner: &'a crate::AttackRequest) -> Self {
         Self {
             owner,
+            bombe: RefCell::new((crate::bombe::Scratch::default(), Vec::new())),
             latest: RefCell::new(None),
         }
     }
@@ -232,9 +234,20 @@ impl<'a> RunPreparation<'a> {
         outer_index: u128,
         objective: MeasureId,
     ) -> TrialEvaluator<'a> {
+        self.evaluator_in_domain(initial, self.owner.domain(), outer_index, objective)
+    }
+
+    /// Keep the board-free row cache while binding a stop-specific fixed/mutable domain.
+    pub(super) fn evaluator_in_domain(
+        &'a self,
+        initial: &'a ResolvedConfiguration,
+        domain: &'a AttackPlugboardDomain,
+        outer_index: u128,
+        objective: MeasureId,
+    ) -> TrialEvaluator<'a> {
         let mut evaluator = TrialEvaluator::new(
             initial,
-            self.owner.domain(),
+            domain,
             self.owner.text(),
             Direction::Decrypt,
             objective,

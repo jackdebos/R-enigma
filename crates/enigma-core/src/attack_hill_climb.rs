@@ -17,6 +17,7 @@ use std::ops::ControlFlow;
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
 mod accelerator_executor;
+mod bombe_executor;
 
 type MutableBoard = Vec<(char, char)>;
 
@@ -90,6 +91,7 @@ impl DirectOuterOutcome {
             })
             .collect();
         Ok(crate::AttackBest {
+            crib_position: None,
             configuration: crate::TransformConfiguration::new(slots, pairs),
             mutable_plugboard,
             plaintext: current.plaintext,
@@ -264,7 +266,9 @@ pub(crate) mod block_snapshot {
             // Reuse hold insertion and compare: never silently repair invalid input.
             let mut hold = crate::attack_hold::AttackHold::new(capacity);
             for entry in &record.hold {
-                restore_raw(request, entry)?;
+                if request.settings().kind() != crate::AttackKind::Bombe {
+                    restore_raw(request, entry)?;
+                }
                 hold.offer(entry.restore()?);
             }
             let ordered: Vec<_> = hold.entries().iter().map(Entry::capture).collect();
@@ -277,7 +281,11 @@ pub(crate) mod block_snapshot {
             if record.progress_last_emitted.0 > record.counters.evaluations_completed.0 {
                 return Err(fail("progress_last_emitted exceeds completed evaluations"));
             }
-            let best = match record.best.as_ref().filter(|_| capacity == 1) {
+            let bombe = request.settings().kind() == crate::AttackKind::Bombe;
+            if bombe != record.counters.bombe_settings.is_some() {
+                return Err(fail("checkpoint counter kind mismatch"));
+            }
+            let best = match record.best.as_ref().filter(|_| capacity == 1 && !bombe) {
                 Some(entry) => Some(restore_raw(request, entry)?),
                 None => None,
             };
@@ -291,7 +299,7 @@ pub(crate) mod block_snapshot {
                     used: record.evaluations_used.0,
                 },
                 best,
-                acceptance: DirectAcceptance((capacity > 1).then_some(hold)),
+                acceptance: DirectAcceptance((capacity > 1 || bombe).then_some(hold)),
             })
         }
     }
@@ -491,6 +499,54 @@ impl crate::AttackRequest {
                 .expect("one key")
                 .1
                 .map_err(|_| CheckpointError("entry outer key failed to resolve".into()))?;
+            if self.settings().kind() == crate::AttackKind::Bombe {
+                let position = entry
+                    .crib_position
+                    .ok_or_else(|| CheckpointError("missing crib position".into()))?
+                    .0;
+                let (fixed_initial, domain) = self
+                    .bombe_context(&initial, position, entry.start_index.0)
+                    .map_err(|e| CheckpointError(e.to_string()))?;
+                let best = entry.restore()?;
+                let score = preparation
+                    .evaluator_in_domain(
+                        &fixed_initial,
+                        &domain,
+                        index,
+                        self.settings().final_measure(),
+                    )
+                    .evaluate(&best.mutable_plugboard)
+                    .map_err(|e| CheckpointError(e.to_string()))?;
+                let raw = DirectOuterOutcome {
+                    initial: fixed_initial,
+                    outer_index: index,
+                    start_index: best.start_index,
+                    climb: ClimbOutcome {
+                        current: Some(ScoredBoard {
+                            board: best.mutable_plugboard,
+                            plaintext: score.0,
+                            score: score.1,
+                        }),
+                        incomplete: best.incomplete,
+                        cancelled: false,
+                        final_objective_ascent: best.final_objective_ascent,
+                        neighborhood_exhausted: best.neighborhood_exhausted,
+                    },
+                };
+                let mut projected = raw
+                    .project(&domain, self.settings().final_measure())
+                    .map_err(|e| CheckpointError(e.to_string()))?;
+                projected.crib_position = Some(position);
+                if crate::checkpoint::record::Entry::capture(&projected) != *entry {
+                    return Err(CheckpointError(
+                        "entry key, plaintext or score mismatch".into(),
+                    ));
+                }
+                continue;
+            }
+            if entry.crib_position.is_some() {
+                return Err(CheckpointError("unexpected crib position".into()));
+            }
             let raw = block_snapshot::restore_raw(self, entry)?;
             if initial != raw.initial || entry.score.measure != self.settings().final_measure().id()
             {
@@ -587,13 +643,21 @@ impl crate::AttackRequest {
         mut cancel_requested: impl FnMut() -> bool,
         mut checkpoint: Option<&mut dyn FnMut(CheckpointSnapshot<'_>)>,
     ) -> Result<crate::AttackResult, crate::AttackRunError> {
-        let state = restored.unwrap_or_else(|| block_snapshot::BlockPhaseSnapshot {
+        let mut state = restored.unwrap_or_else(|| block_snapshot::BlockPhaseSnapshot {
             next_outer: self.outer_plan().selected_range().0,
             allowance: EvaluationAllowance { used: 0 },
             control: AttackControl::with_progress_every(self.settings().progress_every()),
             best: None,
             acceptance: DirectAcceptance::new(self.settings().hold_capacity()),
         });
+        if self.settings().kind() == crate::AttackKind::Bombe {
+            state.control.enable_bombe();
+            if state.acceptance.0.is_none() {
+                state.acceptance.0 = Some(crate::attack_hold::AttackHold::new(
+                    self.settings().hold_capacity(),
+                ));
+            }
+        }
         let block_snapshot::BlockPhaseSnapshot {
             next_outer,
             mut allowance,
@@ -666,7 +730,12 @@ impl crate::AttackRequest {
                     );
                 }
             }
+            result.crib = self.bombe_summary(result.counters);
             Ok(result)
+        })
+        .map_err(|error| {
+            let crib = self.bombe_summary(error.counters());
+            error.with_crib(crib)
         })
     }
 
@@ -707,13 +776,36 @@ impl crate::AttackRequest {
                 self.domain().fixed_pairs().to_vec(),
             )
             .resolve(self.definition());
+            let candidate = best
+                .crib_position
+                .map(|position| {
+                    initial
+                        .as_ref()
+                        .map_err(|_| {
+                            TrialEvaluationError::Invariant("winning slots failed to resolve")
+                        })
+                        .and_then(|initial| self.bombe_context(initial, position, best.start_index))
+                })
+                .transpose();
+            let domain = candidate
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref)
+                .map_or(self.domain(), |(_, domain)| domain);
             // Resolution failure surfaces only after the stage's first admission.
-            let initial = || {
-                (initial.as_ref())
-                    .map_err(|_| RunPayload::Invariant("winning slots failed to resolve"))
+            let initial = || match candidate.as_ref() {
+                Ok(Some((initial, _))) => Ok(initial),
+                Ok(None) => initial
+                    .as_ref()
+                    .map_err(|_| RunPayload::Invariant("winning slots failed to resolve")),
+                Err(_) => Err(RunPayload::Invariant(
+                    "winning crib setting failed to restore",
+                )),
             };
             let outer_index = best.outer_index;
-            let evaluator = |initial, measure| preparation.evaluator(initial, outer_index, measure);
+            let evaluator = |initial, measure| {
+                preparation.evaluator_in_domain(initial, domain, outer_index, measure)
+            };
             result = if let crate::space::AttackStage::Reswapping { measure } = *stage {
                 // Retain one lazy scorer for this resolved stage/finalist. Construction
                 // does no traversal; resolution errors still surface after admission.
@@ -722,7 +814,7 @@ impl crate::AttackRequest {
                     result,
                     measure,
                     self.definition().alphabet(),
-                    self.domain(),
+                    domain,
                     accounting,
                     &mut cancel_requested,
                     (
@@ -922,6 +1014,7 @@ impl DirectRunOutcome {
             DirectRunTermination::Cancelled => AttackTermination::Cancelled,
         };
         Ok(crate::AttackResult {
+            crib: None,
             held_tail: Vec::new(),
             stages: Vec::new(),
             termination,
@@ -974,6 +1067,10 @@ pub(crate) struct DirectRunOutcome {
 
 #[derive(Debug)]
 pub(crate) enum DirectRunError {
+    Bombe {
+        start_index: Option<u128>,
+        source: Box<DirectRunError>,
+    },
     Accelerator(crate::AcceleratorError),
     UnsupportedAccelerator(crate::ClimbUnsupported),
     Resolution(Vec<crate::SearchDiagnostic>),
@@ -982,6 +1079,12 @@ pub(crate) enum DirectRunError {
     #[cfg(test)]
     MissingOuter,
     Projection(ProjectionError),
+}
+
+impl From<TrialEvaluationError> for DirectRunError {
+    fn from(error: TrialEvaluationError) -> Self {
+        Self::Climb(DirectClimbError::Evaluation(error))
+    }
 }
 
 impl From<ObservedClimbError> for DirectRunError {
@@ -2095,14 +2198,22 @@ struct ControlledDirectError {
 impl ControlledDirectError {
     fn project(self, domain: &AttackPlugboardDomain, measure: MeasureId) -> crate::AttackRunError {
         use crate::attack_result::RunPayload;
-        let start_index = match &self.source {
+        let (source, bombe_index) = match self.source {
+            DirectRunError::Bombe {
+                start_index,
+                source,
+            } => (*source, Some(start_index)),
+            source => (source, None),
+        };
+        let start_index = bombe_index.unwrap_or_else(|| match &source {
             DirectRunError::Resolution(_) => None,
             #[cfg(test)]
             DirectRunError::MissingOuter => None,
             _ => self.outer_index.map(|_| 0),
-        };
+        });
         let mut projection_error = None;
-        let source = match self.source {
+        let source = match source {
+            DirectRunError::Bombe { .. } => RunPayload::Invariant("nested bombe error"),
             DirectRunError::Projection(error) => {
                 projection_error = Some(error);
                 RunPayload::Invariant("accepted best projection failed")
@@ -2523,6 +2634,7 @@ fn run_worker_block<T, E>(
 
 /// A worker's finished block, owned until the coordinator commits it in key order.
 enum PhaseBlock {
+    Bombe(BlockOutcome<Vec<crate::AttackBest>, DirectRunError>),
     Direct(BlockOutcome<DirectOuterOutcome, DirectRunError>),
     Partial(BlockOutcome<ControlledPartialOutcome, ControlledPartialError>),
 }
@@ -2530,6 +2642,7 @@ enum PhaseBlock {
 impl PhaseBlock {
     fn failed(&self) -> bool {
         match self {
+            Self::Bombe(outcome) => outcome.error.is_some(),
             Self::Direct(outcome) => outcome.error.is_some(),
             Self::Partial(outcome) => outcome.error.is_some(),
         }
@@ -2768,7 +2881,9 @@ impl crate::AttackRequest {
         plan: &crate::attack_blocks::OuterPlan<'_>,
         block: OuterBlock,
     ) -> PhaseBlock {
-        if self.settings().kind() == crate::AttackKind::PartialExhaustion {
+        if self.settings().kind() == crate::AttackKind::Bombe {
+            PhaseBlock::Bombe(self.run_bombe_block(preparation, plan, block))
+        } else if self.settings().kind() == crate::AttackKind::PartialExhaustion {
             PhaseBlock::Partial(self.run_partial_block(preparation, plan, block))
         } else {
             PhaseBlock::Direct(self.run_direct_block(preparation, plan, block))
@@ -2804,7 +2919,22 @@ impl crate::AttackRequest {
         let run = (|| {
             let start_outer = next_outer;
             let mut commit = |control: &mut AttackControl, block: OuterBlock, outcome| {
+                let mut bombe_offers = Vec::new();
                 let (accounting, candidates, error) = match outcome {
+                    PhaseBlock::Bombe(outcome) => {
+                        bombe_offers = outcome.outers.into_iter().flatten().collect();
+                        let error = outcome.error.map(|(index, error)| {
+                            let source = match error {
+                                BlockFailure::Resolution(source) => {
+                                    DirectRunError::Resolution(source)
+                                }
+                                BlockFailure::Climb(source) => source,
+                                BlockFailure::Counter(source) => DirectRunError::from(source),
+                            };
+                            Ok((index, source))
+                        });
+                        (outcome.accounting, Vec::new(), error)
+                    }
                     PhaseBlock::Partial(outcome) => {
                         let mut candidates = Vec::new();
                         for mut outer in outcome.outers {
@@ -2873,6 +3003,13 @@ impl crate::AttackRequest {
                         counters: control.snapshot(),
                     }
                     .project(self.domain(), measure));
+                }
+                for offer in bombe_offers {
+                    acceptance
+                        .0
+                        .as_mut()
+                        .expect("bombe uses projected hold")
+                        .offer(offer);
                 }
                 for candidate in candidates {
                     if candidate.climb.current.is_none() {
@@ -3517,13 +3654,18 @@ impl<'a> BoundClimbScoring<'a> {
     }
 
     fn with_preparation(mut self, preparation: &'a RunPreparation<'a>, outer_index: u128) -> Self {
-        self.initial_evaluator = preparation.evaluator(
+        self.initial_evaluator = preparation.evaluator_in_domain(
             self.initial,
+            self.domain,
             outer_index,
             self.initial_evaluator.objective(),
         );
-        self.final_evaluator =
-            preparation.evaluator(self.initial, outer_index, self.final_evaluator.objective());
+        self.final_evaluator = preparation.evaluator_in_domain(
+            self.initial,
+            self.domain,
+            outer_index,
+            self.final_evaluator.objective(),
+        );
         self
     }
 
@@ -3970,6 +4112,7 @@ mod tests {
                                 climbs_started: 128 * if pe { 7 } else { 1 },
                                 climbs_completed: 128 * if pe { 7 } else { 1 },
                                 outers_completed: 128,
+                                bombe: None,
                             }
                         );
                         assert!(stopped
@@ -4082,6 +4225,7 @@ mod tests {
         for block in plan.blocks() {
             let outcome = request.run_phase_block(&preparation, &plan, block);
             let (accounting, candidates) = match outcome {
+                PhaseBlock::Bombe(_) => unreachable!("HC/PE fixture"),
                 PhaseBlock::Direct(outcome) => {
                     assert!(outcome.error.is_none());
                     (outcome.accounting, outcome.outers)
@@ -4516,6 +4660,7 @@ mod tests {
                 ran: Some(Box::new(|_, block, outcome| {
                     if block.index == 1 {
                         match outcome {
+                            PhaseBlock::Bombe(_) => unreachable!("HC/PE fixture"),
                             PhaseBlock::Direct(outcome) => {
                                 outcome.error =
                                     Some((block.start, BlockFailure::Resolution(vec![])))
@@ -5386,6 +5531,7 @@ mod tests {
                                     }
                                     if block.index == 3 {
                                         match outcome {
+                                            PhaseBlock::Bombe(_) => unreachable!("HC/PE fixture"),
                                             PhaseBlock::Direct(outcome) => fail(block, outcome),
                                             PhaseBlock::Partial(outcome) => fail(block, outcome),
                                         }
@@ -6917,6 +7063,7 @@ mod tests {
             climbs_started: u128::MAX,
             climbs_completed: u128::MAX - 1,
             outers_completed: u128::MAX - 2,
+            bombe: None,
         };
         for (termination, expected) in [
             (
@@ -7700,6 +7847,7 @@ mod tests {
             climbs_started: 2,
             climbs_completed: 2,
             outers_completed: 1,
+            bombe: None,
         };
         let request = partial_scheduler_request(false, |_| {});
         let (run, _, control) = controlled_partial_outer_probe(&request, prior, Some(12));
@@ -7864,6 +8012,8 @@ mod tests {
                         crate::AttackCounterOverflow::ClimbsCompleted,
                     CounterOverflow::OutersCompleted =>
                         crate::AttackCounterOverflow::OutersCompleted,
+                    CounterOverflow::BombeSettings => crate::AttackCounterOverflow::BombeSettings,
+                    CounterOverflow::BombeStops => crate::AttackCounterOverflow::BombeStops,
                 })
             );
         }
@@ -7949,6 +8099,7 @@ mod tests {
                 climbs_started: 2,
                 climbs_completed: 1,
                 outers_completed: 1,
+                bombe: None,
             };
             let mut control = AttackControl::with_counters(prior);
             let mut recorder = Recorder::default();
@@ -8004,6 +8155,7 @@ mod tests {
             climbs_started: 2,
             climbs_completed: 1,
             outers_completed: 1,
+            bombe: None,
         };
         let mut control = AttackControl::with_counters(prior);
         let mut allowance = EvaluationAllowance { used: 7 };
@@ -9120,6 +9272,7 @@ mod tests {
             climbs_started: 3,
             climbs_completed: 3,
             outers_completed: 2,
+            bombe: None,
         };
         let error = DirectRunOutcome {
             termination: DirectRunTermination::Completed,
@@ -9217,6 +9370,7 @@ mod tests {
                 climbs_started: u128::MAX,
                 climbs_completed: u128::MAX - 1,
                 outers_completed: u128::MAX - 2,
+                bombe: None,
             };
             let null = projection_run(None, termination)
                 .project(counters, request.domain(), MeasureId::Ic)
@@ -9368,6 +9522,7 @@ mod tests {
             climbs_started: u128::MAX,
             climbs_completed: u128::MAX - 1,
             outers_completed: u128::MAX - 2,
+            bombe: None,
         };
         let project = |source, outer_index| {
             ControlledDirectError {
@@ -9776,6 +9931,9 @@ mod tests {
                 CounterOverflow::ClimbsStarted => before.climbs_started = u128::MAX,
                 CounterOverflow::ClimbsCompleted => before.climbs_completed = u128::MAX,
                 CounterOverflow::OutersCompleted => before.outers_completed = u128::MAX,
+                CounterOverflow::BombeSettings | CounterOverflow::BombeStops => {
+                    unreachable!("HC/PE fixture")
+                }
             }
             let mut control = AttackControl::with_counters(before);
             let mut observer = Recorder::default();
@@ -10486,6 +10644,7 @@ mod tests {
             climbs_started: 5,
             climbs_completed: 4,
             outers_completed: u128::MAX,
+            bombe: None,
         };
         let (result, used, recorder, _) = controlled_seed_probe(&context, counters, |_| false);
         let result = result.unwrap().seeds;

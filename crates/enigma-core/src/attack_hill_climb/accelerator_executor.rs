@@ -269,6 +269,7 @@ impl crate::AttackRequest {
                 climbs_started: 1,
                 climbs_completed: 1,
                 outers_completed: 0,
+                bombe: None,
             })
             .map_err(DirectRunError::Counter)?;
         Ok(ClimbOutcome {

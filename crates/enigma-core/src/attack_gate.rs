@@ -17,6 +17,8 @@ pub struct AttackGate {
     outer_total: u128,
     outer_selected: u128,
     starts_per_outer: u128,
+    pub(crate) bombe: Option<crate::bombe::Plan>,
+    bombe_settings: Option<u64>,
 }
 
 fn failure(code: &'static str, message: &str, path: &str) -> Vec<SearchDiagnostic> {
@@ -43,6 +45,7 @@ impl AttackGate {
         let expected = match settings.kind() {
             AttackKind::HillClimb => "hill_climb",
             AttackKind::PartialExhaustion => "partial_exhaustion",
+            AttackKind::Bombe => "bombe",
         };
         if passes[0] != expected {
             return Err(failure(
@@ -117,8 +120,65 @@ impl AttackGate {
                 ));
             }
         }
+        let bombe = if settings.kind() == AttackKind::Bombe {
+            let definition = request.definition();
+            let reflector = definition
+                .slots()
+                .iter()
+                .find(|slot| slot.role() == crate::SlotRole::Reflector);
+            let supported = reflector.is_some_and(|slot| {
+                let fixed = request
+                    .configuration()
+                    .slots()
+                    .iter()
+                    .find(|s| s.id() == slot.id())
+                    .and_then(|s| s.wheel())
+                    .or(slot.wheel());
+                let variable = request
+                    .space()
+                    .slots()
+                    .iter()
+                    .find(|s| s.id() == slot.id())
+                    .and_then(|s| s.wheels());
+                let names: Vec<&str> = fixed.map_or_else(
+                    || {
+                        variable
+                            .unwrap_or(slot.allowed_wheels())
+                            .iter()
+                            .map(String::as_str)
+                            .collect()
+                    },
+                    |name| vec![name],
+                );
+                let zero = alphabet.symbols[0];
+                names.iter().all(|name| {
+                    let wheel = definition
+                        .wheels()
+                        .iter()
+                        .find(|wheel| wheel.name() == *name)
+                        .expect("validated wheel");
+                    alphabet
+                        .symbols
+                        .iter()
+                        .all(|&c| wheel.forward(c, zero, zero) != Some(c))
+                })
+            });
+            if !supported {
+                return Err(failure(
+                    "unsupported_topology",
+                    "bombe requires a reflector without fixed points",
+                    "/machine",
+                ));
+            }
+            Some(crate::bombe::Plan::build(request, domain, settings)?)
+        } else {
+            None
+        };
         // Settings carry no originating domain identity: recheck branch data, not provenance.
         let starts_per_outer = match (settings.kind(), settings.start(), settings.seed_policy()) {
+            (AttackKind::Bombe, Some([]), None) => {
+                bombe.as_ref().expect("bombe plan").positions.len() as u128
+            }
             (AttackKind::HillClimb, Some(start), None) => {
                 let mut occupied: HashSet<char> = domain
                     .fixed_pairs()
@@ -263,11 +323,32 @@ impl AttackGate {
             .space()
             .limit()
             .map_or(available, |limit| available.min(u128::from(limit)));
+        let bombe_settings = bombe
+            .as_ref()
+            .map(|_| {
+                outer_selected
+                    .checked_mul(starts_per_outer)
+                    .and_then(|count| u64::try_from(count).ok())
+                    .ok_or_else(|| {
+                        failure(
+                            "resource_limit",
+                            "bombe setting count exceeds u64",
+                            "/job/space",
+                        )
+                    })
+            })
+            .transpose()?;
         Ok(Self {
             outer_total,
             outer_selected,
             starts_per_outer,
+            bombe,
+            bombe_settings,
         })
+    }
+    /// Selected outer-key/crib-position settings, absent for ciphertext-only attacks.
+    pub fn bombe_settings(&self) -> Option<u64> {
+        self.bombe_settings
     }
     /// Full unsliced slot-only outer cardinality.
     pub fn outer_total(&self) -> u128 {

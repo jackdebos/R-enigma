@@ -8,6 +8,14 @@ use crate::{MeasureId, MeasuredScore, TransformConfiguration};
 pub struct AttackProgress(pub(crate) CounterSnapshot);
 
 impl AttackProgress {
+    /// Crib settings tested; zero for ciphertext-only attacks.
+    pub fn bombe_settings(&self) -> u64 {
+        self.0.bombe.map_or(0, |counts| counts.0)
+    }
+    /// Consistent crib settings; zero for ciphertext-only attacks.
+    pub fn bombe_stops(&self) -> u64 {
+        self.0.bombe.map_or(0, |counts| counts.1)
+    }
     /// Evaluations admitted after allowance charging.
     pub fn evaluations_admitted(&self) -> u64 {
         self.0.evaluations_admitted
@@ -44,6 +52,7 @@ pub enum AttackTermination {
 /// Owned final-scored committed winner, never a provisional neighborhood trial.
 #[derive(Debug)]
 pub struct AttackBest {
+    pub(crate) crib_position: Option<usize>,
     pub(crate) configuration: TransformConfiguration,
     pub(crate) mutable_plugboard: Vec<(char, char)>,
     pub(crate) plaintext: String,
@@ -59,6 +68,10 @@ pub struct AttackBest {
 }
 
 impl AttackBest {
+    /// Scalar index of the winning stop's crib, absent for ciphertext-only attacks.
+    pub fn crib_position(&self) -> Option<usize> {
+        self.crib_position
+    }
     /// Initial slot key and complete winning board, in topology/alphabet order.
     pub fn configuration(&self) -> &TransformConfiguration {
         &self.configuration
@@ -152,6 +165,7 @@ impl AttackStageResult {
 /// ```
 #[derive(Debug)]
 pub struct AttackResult {
+    pub(crate) crib: Option<AttackCribResult>,
     pub(crate) termination: AttackTermination,
     pub(crate) counters: AttackProgress,
     pub(crate) evaluations_used: u64,
@@ -159,6 +173,34 @@ pub struct AttackResult {
     // Finalists after `best` in final order, each with its own stage history.
     pub(crate) held_tail: Vec<AttackBest>,
     pub(crate) stages: Vec<AttackStageResult>,
+}
+
+/// Crib placement and deductive-work summary of a Bombe run.
+#[derive(Clone, Debug)]
+pub struct AttackCribResult {
+    pub(crate) text: String,
+    pub(crate) positions: Vec<usize>,
+    pub(crate) settings: u64,
+    pub(crate) stops: u64,
+}
+
+impl AttackCribResult {
+    /// Supplied, unnormalized crib.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+    /// Admissible scalar positions in ascending order.
+    pub fn positions(&self) -> &[usize] {
+        &self.positions
+    }
+    /// Number of tested outer-key/position settings.
+    pub fn settings(&self) -> u64 {
+        self.settings
+    }
+    /// Number of consistent stops.
+    pub fn stops(&self) -> u64 {
+        self.stops
+    }
 }
 
 /// Borrowed finalist and its own committed stage history.
@@ -180,6 +222,10 @@ impl<'a> AttackHoldEntry<'a> {
 }
 
 impl AttackResult {
+    /// Deductive-work summary, absent for ciphertext-only attacks.
+    pub fn crib(&self) -> Option<&AttackCribResult> {
+        self.crib.as_ref()
+    }
     /// Finalists in final order, with the winner first; empty without a winner.
     pub fn hold(&self) -> impl Iterator<Item = AttackHoldEntry<'_>> {
         self.best.iter().flat_map(move |best| {
@@ -245,6 +291,10 @@ pub enum AttackCounterOverflow {
     ClimbsCompleted,
     /// Completed outer accounting.
     OutersCompleted,
+    /// Tested crib setting accounting.
+    BombeSettings,
+    /// Consistent crib stop accounting.
+    BombeStops,
 }
 
 #[derive(Debug)]
@@ -330,6 +380,8 @@ impl AttackRunSource {
             RunPayload::Counter(Private::ClimbsStarted) => AttackCounterOverflow::ClimbsStarted,
             RunPayload::Counter(Private::ClimbsCompleted) => AttackCounterOverflow::ClimbsCompleted,
             RunPayload::Counter(Private::OutersCompleted) => AttackCounterOverflow::OutersCompleted,
+            RunPayload::Counter(Private::BombeSettings) => AttackCounterOverflow::BombeSettings,
+            RunPayload::Counter(Private::BombeStops) => AttackCounterOverflow::BombeStops,
             _ => return None,
         })
     }
@@ -368,7 +420,25 @@ impl std::error::Error for AttackRunSource {
 /// fn replace(error: &mut enigma_core::AttackRunError) { error.outer_index = None; }
 /// ```
 #[derive(Debug)]
-pub struct AttackRunError(Box<AttackRunErrorData>);
+pub struct AttackRunError(Box<AttackRunErrorState>);
+
+#[derive(Debug)]
+struct AttackRunErrorState {
+    data: AttackRunErrorData,
+    crib: Option<AttackCribResult>,
+}
+
+impl std::ops::Deref for AttackRunErrorState {
+    type Target = AttackRunErrorData;
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+impl std::ops::DerefMut for AttackRunErrorState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.data
+    }
+}
 
 /// Private complete envelope; boxing preserves the public result signature.
 #[derive(Debug)]
@@ -409,7 +479,17 @@ impl AttackRunError {
         &self.0.stages
     }
     pub(crate) fn new(data: AttackRunErrorData) -> Self {
-        Self(Box::new(data))
+        Self(Box::new(AttackRunErrorState { data, crib: None }))
+    }
+
+    pub(crate) fn with_crib(mut self, crib: Option<AttackCribResult>) -> Self {
+        self.0.crib = crib;
+        self
+    }
+
+    /// Crib-only summary retained independently of winner projection.
+    pub fn crib(&self) -> Option<&AttackCribResult> {
+        self.0.crib.as_ref()
     }
 
     pub(crate) fn with_held(mut self, head: Option<AttackBest>, tail: Vec<AttackBest>) -> Self {
@@ -632,6 +712,7 @@ pub(crate) mod tests {
             AttackTermination::Cancelled,
         ] {
             let result = AttackResult {
+                crib: None,
                 held_tail: Vec::new(),
                 termination,
                 stages: Vec::new(),
@@ -641,6 +722,7 @@ pub(crate) mod tests {
                     climbs_started: u128::MAX,
                     climbs_completed: u128::MAX - 1,
                     outers_completed: u128::MAX - 2,
+                    bombe: None,
                 }),
                 evaluations_used: u64::MAX,
                 best: None,

@@ -112,6 +112,7 @@ pub(crate) mod tests {
 
     fn candidate(key: &str, ranking: i128, outer_index: u128, start_index: u128) -> AttackBest {
         AttackBest {
+            crib_position: None,
             configuration: TransformConfiguration::new(
                 vec![SlotConfiguration::new("rotor", key, 'A', 'A')],
                 vec![('A', 'B'), ('C', 'D')],

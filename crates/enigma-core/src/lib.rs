@@ -64,8 +64,9 @@ pub use attack_execution::ExecutionOptions;
 pub use attack_gate::AttackGate;
 pub use attack_hill_climb::{CheckpointReason, CheckpointSnapshot, ResumedAttack};
 pub use attack_result::{
-    AttackBest, AttackCounterOverflow, AttackHoldEntry, AttackProgress, AttackResult,
-    AttackRunCategory, AttackRunError, AttackRunSource, AttackStageResult, AttackTermination,
+    AttackBest, AttackCounterOverflow, AttackCribResult, AttackHoldEntry, AttackProgress,
+    AttackResult, AttackRunCategory, AttackRunError, AttackRunSource, AttackStageResult,
+    AttackTermination,
 };
 mod binding;
 mod bombe;

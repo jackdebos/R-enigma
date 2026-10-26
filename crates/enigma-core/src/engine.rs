@@ -52,6 +52,7 @@ struct ResolvedSlot {
 #[cfg(test)]
 thread_local! {
     pub(crate) static ROW_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static ROW_LENGTHS: std::cell::RefCell<Option<Vec<usize>>> = const { std::cell::RefCell::new(None) };
 }
 
 impl Engine {
@@ -183,7 +184,14 @@ impl Engine {
         mut emit: impl FnMut(usize) -> bool,
     ) -> Result<(), ModelError> {
         #[cfg(test)]
-        ROW_BUILDS.with(|count| count.set(count.get() + 1));
+        {
+            ROW_BUILDS.with(|count| count.set(count.get() + 1));
+            ROW_LENGTHS.with(|lengths| {
+                if let Some(lengths) = &mut *lengths.borrow_mut() {
+                    lengths.push(length);
+                }
+            });
+        }
         let size = self.topology.alphabet().len();
         let mut offsets = vec![0; self.slots.len()];
         for _ in 0..length {

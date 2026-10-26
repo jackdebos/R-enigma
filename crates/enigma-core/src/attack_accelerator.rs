@@ -103,6 +103,8 @@ impl std::error::Error for AcceleratorError {}
 /// Typed reason an exact climb job cannot be expressed by this interface.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClimbUnsupported {
+    /// Deductive crib testing is CPU-only.
+    Bombe,
     /// Only direct hill climbing is supported.
     PartialExhaustion,
     /// Byte rows require at most 256 symbols.
@@ -119,6 +121,7 @@ pub enum ClimbUnsupported {
 impl std::fmt::Display for ClimbUnsupported {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Bombe => f.write_str("bombe is CPU-only"),
             Self::PartialExhaustion => f.write_str("partial exhaustion"),
             Self::AlphabetTooLarge => f.write_str("alphabet exceeds 256 symbols"),
             Self::RowDataLimit => f.write_str("text exceeds accelerator row data limit"),
@@ -396,6 +399,9 @@ impl AttackRequest {
     /// Check eligibility without evaluations, progress events or outer-key work.
     /// Finalist stages are CPU-owned and do not restrict the outer objectives.
     pub fn climb_job(&self) -> Result<ClimbJob<'_>, ClimbUnsupported> {
+        if self.settings().kind() == AttackKind::Bombe {
+            return Err(ClimbUnsupported::Bombe);
+        }
         if self.settings().kind() != AttackKind::HillClimb {
             return Err(ClimbUnsupported::PartialExhaustion);
         }
