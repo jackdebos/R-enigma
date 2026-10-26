@@ -19,6 +19,7 @@ func TestBombeRejectsBeforeLaunch(t *testing.T) {
 	for _, tc := range []struct{ settings, code, field, message string }{
 		{`"method":"bombe","crib":"Z","backend":"gpu"`, "backend_unavailable", "settings/backend", "The crib attack runs on the CPU only."},
 		{`"method":"bombe","crib":"!"`, "invalid_settings", "settings/crib", "Invalid attack setting."},
+		{`"method":"bombe","crib":"h e"`, "invalid_settings", "settings/crib", "Invalid attack setting."},
 		{`"method":"bombe","crib":"Z","crib_position":-1`, "invalid_settings", "settings/crib_position", "Invalid attack setting."},
 	} {
 		for _, route := range []string{"/api/attack/preview", "/api/attack"} {
@@ -60,7 +61,7 @@ func TestRealBombeAttack(t *testing.T) {
 	path := realEnginePath(t)
 	s, u, c := engineServer(t, filepath.Join(t.TempDir(), "config.json"))
 	engineRequest(t, s, u, c, "POST", pathBody(path), 200, "")
-	body := `{"model":"enigma-i","reflector":"B","slots":[{"id":"left","wheel":"I","ring":"A","position":"A"},{"id":"middle","wheel":"II","ring":"A","position":"A"},{"id":"right","wheel":"III","ring":"A","position":null}],"plugboard":{"known":[],"search":false},"text":"ILBDA","settings":{"method":"bombe","crib":" h e l l o ","crib_position":0,"threads":1,"stages":[]}}`
+	body := `{"model":"enigma-i","reflector":"B","slots":[{"id":"left","wheel":"I","ring":"A","position":"A"},{"id":"middle","wheel":"II","ring":"A","position":"A"},{"id":"right","wheel":"III","ring":"A","position":null}],"plugboard":{"known":[],"search":false},"text":"ILBDA","settings":{"method":"bombe","crib":"HELLO","crib_position":0,"threads":1,"stages":[]}}`
 	preview(t, body)
 	attackCall(t, s, u, c, "POST", "/api/attack", body, 202, "")
 	v := waitAttack(t, s, u, c, "completed", 10*time.Second)

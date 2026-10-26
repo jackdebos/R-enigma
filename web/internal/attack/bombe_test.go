@@ -8,7 +8,7 @@ import (
 
 func TestBombeRequest(t *testing.T) {
 	for _, position := range []string{"", `,"crib_position":0`, `,"crib_position":1`} {
-		plan := build(t, strings.TrimSuffix(designB("ABCDEF"), "}")+`,"settings":{"method":"bombe","crib":" z y\tX\n","stages":[]`+position+`}}`)
+		plan := build(t, strings.TrimSuffix(designB("ABCDEF"), "}")+`,"settings":{"method":"bombe","crib":"ZYX","stages":[]`+position+`}}`)
 		job := asAny(t, plan.Request).(map[string]any)["job"].(map[string]any)
 		crib := map[string]any{"text": "ZYX"}
 		if position != "" {
@@ -33,6 +33,10 @@ func TestBombeValidation(t *testing.T) {
 		{`"method":"bombe"`, "crib"},
 		{`"method":"bombe","crib":" \n"`, "crib"},
 		{`"method":"bombe","crib":"é"`, "crib"},
+		{`"method":"bombe","crib":"zy"`, "crib"},
+		{`"method":"bombe","crib":"Z Y"`, "crib"},
+		{`"method":"bombe","crib":" ZY"`, "crib"},
+		{`"method":"bombe","crib":"ZY\n"`, "crib"},
 		{`"method":"bombe","crib":"Z!"`, "crib"},
 		{`"method":"bombe","crib":"ZZZZZZZ"`, "crib"},
 		{`"method":"bombe","crib":"ZZ","crib_position":-1`, "crib_position"},

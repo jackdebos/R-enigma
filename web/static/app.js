@@ -553,8 +553,11 @@ function renderAttack() {
   if (attackState.advanced.method === 'bombe') {
     attackInput(controls, 'crib', attackState.advanced.crib || '', value => { attackState.advanced.crib = value; attackChanged(); });
     attackInput(controls, 'crib_position', attackState.advanced.crib_position ?? '', value => { attackState.advanced.crib_position = value; attackChanged(); }, { type: 'number', min: 0 });
+    const cribErrors = element('div'); cribErrors.id = 'attack-crib-errors'; cribErrors.setAttribute('role', 'alert');
+    const cribUppercase = element('button', t('uppercase')); cribUppercase.type = 'button'; cribUppercase.id = 'attack-crib-uppercase';
+    cribUppercase.addEventListener('click', () => { attackState.advanced.crib = (attackState.advanced.crib || '').toUpperCase(); $('attack-crib').value = attackState.advanced.crib; attackChanged(); });
     const warning = element('p', undefined, 'notice'); warning.id = 'attack-crib-warning';
-    warning.setAttribute('role', 'status'); controls.append(warning);
+    warning.setAttribute('role', 'status'); controls.append(cribErrors, cribUppercase, warning);
   }
   const rotors = element('div', undefined, 'rotors');
   attackState.slots.forEach((slot, i) => {
@@ -648,6 +651,14 @@ function renderCribWarning() {
   const info = cribInfo(attackState.advanced.crib || '');
   warning.hidden = !info.short;
   warning.textContent = t('crib_short');
+  const errors = $('attack-crib-errors'); errors.replaceChildren(); errors.hidden = !info.offending.length;
+  if (info.offending.length) {
+    errors.append(element('p', t('crib_invalid_intro')));
+    const list = element('ul', undefined, 'offending-list');
+    for (const { character, position } of info.offending) list.append(element('li', t('offending', { character: characterLabel(character), position })));
+    errors.append(list);
+  }
+  $('attack-crib-uppercase').hidden = !info.hasLowercase;
 }
 function groupedNumber(value) {
   try { return BigInt(value ?? 0).toLocaleString(language); } catch { return String(value ?? 0); }
@@ -672,7 +683,8 @@ function updateAttackAvailability() {
   if (!$('attack-start')) return;
   const ready = Boolean(savedEngine?.configured && savedEngine?.compatible);
   $('attack-controls').disabled = attackBusy;
-  $('attack-start').disabled = !ready || engineBusy || attackBusy || attackLast?.status === 'running' || previewPending || !preview || Boolean(previewFailure) || checkText(attackState.text).offending.length > 0;
+  $('attack-start').disabled = !ready || engineBusy || attackBusy || attackLast?.status === 'running' || previewPending || !preview || Boolean(previewFailure) || checkText(attackState.text).offending.length > 0
+    || (attackState.advanced.method === 'bombe' && cribInfo(attackState.advanced.crib || '').offending.length > 0);
   $('attack-action-error').textContent = attackFailure ? attackIssue(attackFailure) : '';
 }
 async function attackAction(path, body = {}) {

@@ -7,7 +7,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"unicode"
 
 	"criptografia-enigma/web/internal/tables"
 )
@@ -151,12 +150,7 @@ func Build(models []Model, in Input, cpus int) (Plan, *Issue) {
 		if settings.Crib == nil {
 			return plan, invalid("crib")
 		}
-		text := strings.Map(func(r rune) rune {
-			if unicode.IsSpace(r) || r == '\uFEFF' {
-				return -1
-			}
-			return r
-		}, strings.ToUpper(*settings.Crib))
+		text := *settings.Crib
 		if text == "" || len(text) > len([]rune(in.Text)) {
 			return plan, invalid("crib")
 		}

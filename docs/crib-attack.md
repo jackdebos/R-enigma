@@ -44,9 +44,9 @@ The crib attack is a new pass on the attack branch of
   every finishing climb starts from the stop's facts (§5).
 - `crib` is required, an object with exactly `text` and optional `position`:
   - `text`: nonempty string of runtime-alphabet symbols, one crib per request.
-    The engine does not normalize: no case folding, no space removal. Clients
-    normalize before sending (the web uppercases and removes whitespace, as it does
-    for the message).
+    The engine does not normalize: no case folding, no space removal. The web
+    does not either: like the message, the crib is sent as typed and the user
+    converts it with an uppercase button.
   - `position`: optional nonnegative integer, the 0-based index in `job.text` of the
     crib's first symbol. Omitted means every admissible position (§2).
 - Any crib length is accepted. Short cribs produce many false stops and long runs;
@@ -180,8 +180,9 @@ and exit 1; there is no silent CPU fallback. A GPU bombe is later work.
 
 The attack page method choice gains the crib attack. Choosing it shows:
 
-- a crib field, normalized like the message (uppercase, whitespace removed);
-  symbols outside the alphabet are an error shown before launch;
+- a crib field with the message's exact-text rule: nothing is converted
+  automatically, an uppercase button is offered, and symbols outside the alphabet
+  (spaces included) are an error shown before launch;
 - an optional position field;
 - a warning when the crib has fewer than 14 letters;
 - a default ring domain with the right ring unknown and the other rings at A,

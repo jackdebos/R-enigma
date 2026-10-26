@@ -405,11 +405,12 @@ keeps both forms and the machine result intact.
   parameter has a `?` explanation, including the usually unhelpful left-ring
   search and how many best candidates hold retains.
 - The method selector offers HC, PE and **Crib attack (bombe) / Ataque con crib**.
-  Choosing bombe shows one crib field and an optional 0-based position. The crib is
-  uppercased and whitespace removed before validation; ciphertext keeps its existing
-  exact-text rule. Invalid crib symbols are rejected before launch with
-  `invalid_settings` at `settings/crib` (position errors at `settings/crib_position`).
-  A warning below 14 normalized letters does not block starting. Choosing bombe sets
+  Choosing bombe shows one crib field and an optional 0-based position. The crib follows
+  the ciphertext's exact-text rule: it is sent as typed, never uppercased or stripped
+  of spaces automatically; an uppercase button appears when it has lowercase letters,
+  and offending symbols (spaces included) are listed and block starting. The server
+  rejects them with `invalid_settings` at `settings/crib` (position errors at
+  `settings/crib_position`). A warning below 14 letters does not block starting. Choosing bombe sets
   the right ring unknown and every other ring (including M4 Greek) to A; these remain
   editable in Advanced. Loading saved input preserves its ring choices. Choosing
   bombe selects CPU and disables the GPU option; direct GPU API requests are rejected,

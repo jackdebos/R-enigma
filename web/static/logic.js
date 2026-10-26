@@ -1,11 +1,7 @@
 // Pure form logic: no browser state or DOM access.
-export function normalizeCrib(text) {
-  return text.toUpperCase().replace(/\s/gu, '');
-}
-
+// The crib is sent exactly as typed, like the message: nothing is converted.
 export function cribInfo(text) {
-  text = normalizeCrib(text);
-  return { text, short: Array.from(text).length < 14, offending: checkText(text).offending };
+  return { text, short: Array.from(text).length < 14, ...checkText(text) };
 }
 
 // Apply recommendations only when choosing the method, never on render/load.
@@ -54,7 +50,6 @@ export function buildAttackBody(state) {
     if (key === 'backend' || key === 'gpu_usage') continue;
     if (key === 'seeds' && state.advanced.method !== 'partial_exhaustion') continue;
     if ((key === 'crib' || key === 'crib_position') && state.advanced.method !== 'bombe') continue;
-    if (key === 'crib') { settings.crib = normalizeCrib(value); continue; }
     if (key === 'tables') {
       const tables = Object.fromEntries(Object.entries(value).filter(([, path]) => path !== ''));
       if (Object.keys(tables).length) settings.tables = tables;

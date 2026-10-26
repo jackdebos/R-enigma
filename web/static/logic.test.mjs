@@ -1,14 +1,16 @@
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
-import { normalizeCrib, cribInfo, selectAttackMethod, checkText, validatePair, buildRequest, lookup, initialLanguage, buildAttackBody, parseAttackInput, estimateDuration, progressInfo, holdEntries, groupFive } from './logic.js';
+import { cribInfo, selectAttackMethod, checkText, validatePair, buildRequest, lookup, initialLanguage, buildAttackBody, parseAttackInput, estimateDuration, progressInfo, holdEntries, groupFive } from './logic.js';
 
-test('crib normalization, short warning and method defaults preserve unrelated state', () => {
-  assert.equal(normalizeCrib(' wet ter\tvor\nhersage\u00a0'), 'WETTERVORHERSAGE');
+test('crib is checked as typed, short warning and method defaults preserve unrelated state', () => {
   for (const [text, short] of [['', true], ['A'.repeat(13), true], ['A'.repeat(14), false]]) {
-    assert.deepEqual(cribInfo(text), { text, short, offending: [] });
+    assert.deepEqual(cribInfo(text), { text, short, offending: [], hasLowercase: false });
   }
-  assert.deepEqual(cribInfo(' é!').offending.map(item => item.character), ['É', '!']);
+  assert.deepEqual(cribInfo('wet ter'), { text: 'wet ter', short: true, offending: ['w', 'e', 't', ' ', 't', 'e', 'r'].map((character, i) => ({ character, position: i + 1 })), hasLowercase: true });
+  assert.deepEqual(cribInfo('WET TER').offending, [{ character: ' ', position: 4 }]);
+  assert.equal(cribInfo('WET TER').hasLowercase, false);
+  assert.deepEqual(cribInfo(' é!').offending.map(item => item.character), [' ', 'é', '!']);
   for (const ids of [['left', 'middle', 'right'], ['greek', 'left', 'middle', 'right']]) {
     const state = { slots: ids.map(id => ({ id, ring: 'Z', position: 'B' })), advanced: { backend: 'gpu', seeds: ['E'], hold: 7 } };
     selectAttackMethod(state, 'bombe');
@@ -21,10 +23,10 @@ test('crib normalization, short warning and method defaults preserve unrelated s
   }
 });
 
-test('bombe payload normalizes only the crib, converts position and omits stale seeds', () => {
+test('bombe payload sends the crib as typed, converts position and omits stale seeds', () => {
   const state = { model: 'enigma-i', reflector: 'B', slots: [], plugboard: [], search: true, text: ' A b\n', advanced: { method: 'bombe', crib: ' z y\n', crib_position: '0', seeds: ['E'] } };
   const before = structuredClone(state);
-  assert.deepEqual(buildAttackBody(state).settings, { method: 'bombe', crib: 'ZY', crib_position: 0, backend: 'cpu', distinct_wheels: true });
+  assert.deepEqual(buildAttackBody(state).settings, { method: 'bombe', crib: ' z y\n', crib_position: 0, backend: 'cpu', distinct_wheels: true });
   assert.equal(buildAttackBody(state).text, state.text);
   assert.deepEqual(state, before);
   state.advanced.crib_position = '';
@@ -36,7 +38,7 @@ test('bombe payload normalizes only the crib, converts position and omits stale 
 test('crib labels, warning and results have bilingual copy', () => {
   for (const lang of ['es', 'en']) {
     const dictionary = JSON.parse(readFileSync(new URL(`./i18n/${lang}.json`, import.meta.url), 'utf8'));
-    for (const key of ['method_bombe', 'crib', 'crib_hint', 'crib_position', 'crib_position_hint', 'crib_short', 'crib_summary', 'result_crib_position', 'bombe_cpu']) assert.ok(dictionary[key]?.trim(), `${lang}/${key}`);
+    for (const key of ['method_bombe', 'crib', 'crib_hint', 'crib_position', 'crib_position_hint', 'crib_short', 'crib_invalid_intro', 'crib_summary', 'result_crib_position', 'bombe_cpu']) assert.ok(dictionary[key]?.trim(), `${lang}/${key}`);
   }
 });
 
