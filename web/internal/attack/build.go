@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"criptografia-enigma/web/internal/tables"
 )
@@ -139,8 +140,68 @@ func Build(models []Model, in Input, cpus int) (Plan, *Issue) {
 		return plan, problem
 	}
 	method := stringDefault(settings.Method, "hill_climb")
-	if method != "hill_climb" && method != "partial_exhaustion" {
+	if method != "hill_climb" && method != "partial_exhaustion" && method != "bombe" {
 		return plan, invalid("method")
+	}
+	if p := ValidateBackendMethod(method, backend); p != nil {
+		return plan, p
+	}
+	var crib map[string]any
+	if method == "bombe" {
+		if settings.Crib == nil {
+			return plan, invalid("crib")
+		}
+		text := strings.Map(func(r rune) rune {
+			if unicode.IsSpace(r) || r == '\uFEFF' {
+				return -1
+			}
+			return r
+		}, strings.ToUpper(*settings.Crib))
+		if text == "" || len(text) > len([]rune(in.Text)) {
+			return plan, invalid("crib")
+		}
+		for _, r := range text {
+			if !slices.Contains(alphabet, string(r)) {
+				return plan, invalid("crib")
+			}
+		}
+		message := []rune(in.Text)
+		admissible := func(p int) bool {
+			if p < 0 || p > len(message)-len(text) {
+				return false
+			}
+			for j, r := range text {
+				if message[p+j] == r {
+					return false
+				}
+			}
+			return true
+		}
+		crib = map[string]any{"text": text}
+		if settings.CribPosition != nil {
+			if !admissible(*settings.CribPosition) {
+				return plan, invalid("crib_position")
+			}
+			crib["position"] = *settings.CribPosition
+		} else {
+			found := false
+			for p := 0; p <= len(message)-len(text); p++ {
+				if admissible(p) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return plan, invalid("crib")
+			}
+		}
+	} else {
+		if settings.Crib != nil {
+			return plan, invalid("crib")
+		}
+		if settings.CribPosition != nil {
+			return plan, invalid("crib_position")
+		}
 	}
 	initial := stringDefault(settings.InitialMeasure, "ic")
 	final := stringDefault(settings.FinalMeasure, "sinkov_trigram")
@@ -176,6 +237,11 @@ func Build(models []Model, in Input, cpus int) (Plan, *Issue) {
 			return plan, invalid("seeds")
 		}
 		attack["start"] = [][]string{}
+	} else if method == "bombe" {
+		if settings.Seeds != nil {
+			return plan, invalid("seeds")
+		}
+		attack["crib"] = crib
 	} else {
 		seeds := map[string]any{"kind": "empty_single", "selection": "all"}
 		if settings.Seeds != nil {

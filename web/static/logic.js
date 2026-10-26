@@ -1,4 +1,22 @@
-// Pure form logic: no browser state, DOM access, or text normalization.
+// Pure form logic: no browser state or DOM access.
+export function normalizeCrib(text) {
+  return text.toUpperCase().replace(/\s/gu, '');
+}
+
+export function cribInfo(text) {
+  text = normalizeCrib(text);
+  return { text, short: Array.from(text).length < 14, offending: checkText(text).offending };
+}
+
+// Apply recommendations only when choosing the method, never on render/load.
+export function selectAttackMethod(state, method) {
+  state.advanced.method = method;
+  delete state.advanced.seeds;
+  if (method === 'bombe') {
+    state.advanced.backend = 'cpu';
+    state.slots.forEach(slot => { slot.ring = slot.id === 'right' ? '' : 'A'; });
+  }
+}
 export function checkText(text) {
   const offending = [];
   let hasLowercase = false;
@@ -29,12 +47,14 @@ export function buildRequest(state) {
 }
 
 export function buildAttackBody(state) {
-  const numeric = new Set(['max_pairs', 'switch_pairs', 'backtrack_pairs', 'hold', 'threads']);
+  const numeric = new Set(['max_pairs', 'switch_pairs', 'backtrack_pairs', 'hold', 'threads', 'crib_position']);
   const settings = {};
   for (const [key, value] of Object.entries(state.advanced || {})) {
     if (value === '' || value === undefined || value === null) continue;
     if (key === 'backend' || key === 'gpu_usage') continue;
     if (key === 'seeds' && state.advanced.method !== 'partial_exhaustion') continue;
+    if ((key === 'crib' || key === 'crib_position') && state.advanced.method !== 'bombe') continue;
+    if (key === 'crib') { settings.crib = normalizeCrib(value); continue; }
     if (key === 'tables') {
       const tables = Object.fromEntries(Object.entries(value).filter(([, path]) => path !== ''));
       if (Object.keys(tables).length) settings.tables = tables;

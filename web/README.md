@@ -224,12 +224,14 @@ Known plugboard pairs are fixed; all remaining letters are mutable. With
 no plugboard search is rejected; a full 13-pair board has no mutable letters and
 is also rejected.
 
-Optional settings (the page exposes distinct wheels directly and the rest in Advanced):
+Optional settings (the page exposes the method, crib and distinct wheels directly; other settings are in Advanced):
 
 | Setting | Default / allowed values |
 | --- | --- |
 | `distinct_wheels` | `true`; boolean. `false` also tries repeated wheels. |
-| `method` | `hill_climb` (empty start); or `partial_exhaustion`. |
+| `method` | `hill_climb` (empty start), `partial_exhaustion`, or CPU-only `bombe` (crib attack). |
+| `crib` | Required for bombe only: one nonempty plaintext fragment, uppercased with whitespace removed; A–Z only, no longer than the ciphertext. No `start`/`seeds` are sent. |
+| `crib_position` | Bombe only: optional nonnegative 0-based integer; omitted tries every admissible position. Out-of-range/crashing fixed positions and no admissible position are rejected before launch. |
 | `seeds` | PE only: omitted selects all empty/single-pair seeds; an array selects seeds touching those unique uppercase mutable letters. |
 | `initial_measure`, `final_measure` | `ic`, `sinkov_trigram`. Measures: `ic`, `entropy`, `sinkov_monogram` through `sinkov_hexagram`, `trie`. |
 | `stages` | `[{"pass":"reswapping","measure":"sinkov_trigram"},{"pass":"measure","measure":"sinkov_trigram"}]`; `[]` disables stages. Each pass occurs at most once. |
@@ -238,7 +240,7 @@ Optional settings (the page exposes distinct wheels directly and the rest in Adv
 | `max_pairs` | 13 when searching; between known pair count and 13. |
 | `hold` | 5; 1–1000. |
 | `threads` | Half the logical CPUs, at least one; explicit values 1–256. Returned separately, not embedded in the engine request. |
-| `backend` | `cpu` (default) or `gpu`; host setting, not part of the engine request. |
+| `backend` | `cpu` (default) or `gpu`; host setting, not part of the engine request. Bombe + GPU is rejected with `backend_unavailable` at `settings/backend` before launch, including resume. |
 | `gpu_usage` | Integer 1–100, default 100; validated and used only with GPU. |
 | `tables` | Measure-to-absolute-file-path map; own files override built-ins. Only used resource measures are allowed. |
 
@@ -396,13 +398,24 @@ keeps both forms and the machine result intact.
   skipped for a faster search. Toggling it refreshes the count and estimate;
   unchecking also tries repeated wheels, with a visible explanation. Errors show
   translated guidance, server message and field.
-- **Advanced** starts collapsed. Except for the explicit backend choice, untouched settings are omitted so the server
+- **Advanced** starts collapsed. Except for the explicit method/backend choices, untouched settings are omitted so the server
   supplies the recommended defaults: hill climb; initial `ic`, final
   `sinkov_trigram`; reswapping then measure stages on `sinkov_trigram`; 13 maximum
   pairs, switching 7, backtracking 5, hold 5 and half the logical CPUs. Every
   parameter has a `?` explanation, including the usually unhelpful left-ring
   search and how many best candidates hold retains.
-- Advanced exposes HC/PE, PE seeds (all or touching chosen letters), initial/final
+- The method selector offers HC, PE and **Crib attack (bombe) / Ataque con crib**.
+  Choosing bombe shows one crib field and an optional 0-based position. The crib is
+  uppercased and whitespace removed before validation; ciphertext keeps its existing
+  exact-text rule. Invalid crib symbols are rejected before launch with
+  `invalid_settings` at `settings/crib` (position errors at `settings/crib_position`).
+  A warning below 14 normalized letters does not block starting. Choosing bombe sets
+  the right ring unknown and every other ring (including M4 Greek) to A; these remain
+  editable in Advanced. Loading saved input preserves its ring choices. Choosing
+  bombe selects CPU and disables the GPU option; direct GPU API requests are rejected,
+  never silently changed to CPU. The summary reports crib text, positions count,
+  settings and stops, and every finalist shows its crib position. HC/PE results are unchanged.
+- Advanced exposes PE seeds (all or touching chosen letters), initial/final
   scores (`ic`, `entropy`, Sinkov monogram through hexagram, `trie`), optional
   reswapping/measure/dictionary stages and their scores, pair thresholds, hold and
   threads, plus CPU (default) / GPU selection next to threads. GPU alone shows

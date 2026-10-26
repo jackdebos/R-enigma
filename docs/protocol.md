@@ -588,8 +588,7 @@ Representability by the definition schema does not imply algorithm support for a
 alphabet, wheel count, stepping rule, or topology.
 
 Stage 3 adds the crib attack (`job.attack.kind = "bombe"`), specified in
-[crib-attack.md](crib-attack.md). Core and CLI execution are implemented; web
-support is pending. The CPU-only attack shares the HC control and finishing-stage
+[crib-attack.md](crib-attack.md). Core, CLI and web support are implemented. The CPU-only attack shares the HC control and finishing-stage
 contracts, with additive crib results and counters (§4.1).
 
 ## 4. Events and validation errors
@@ -1122,6 +1121,11 @@ Advanced settings choose CPU (default, unchanged command line) or GPU, which add
 screen smoother but take longer). Resume uses the currently chosen backend, without
 changing checkpoint identity; GPU unavailability or unsupported attacks display the
 engine error, never silently falling back to CPU.
+The attack page offers HC, PE and CPU-only `bombe` with one normalized crib and an
+optional position, a nonblocking short-crib warning, editable right-ring-unknown
+defaults, and crib summaries/positions in results. Bombe disables GPU in the page;
+the web rejects GPU start/resume requests before launch. See
+[crib attack §9](crib-attack.md#9-web) and [web settings](../web/README.md#attack-preview).
 
 Compatibility: `enigma-web` keeps an explicit list of supported engine versions, as
 printed by `--version` (`enigma <version>` and `protocol version <n>`). It refuses any

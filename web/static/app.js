@@ -1,4 +1,4 @@
-import { checkText, validatePair, buildRequest, lookup, initialLanguage, buildAttackBody, parseAttackInput, estimateDuration, progressInfo, holdEntries, groupFive } from './logic.js';
+import { cribInfo, selectAttackMethod, checkText, validatePair, buildRequest, lookup, initialLanguage, buildAttackBody, parseAttackInput, estimateDuration, progressInfo, holdEntries, groupFive } from './logic.js';
 
 const $ = id => document.getElementById(id);
 const alphabet = Array.from('ABCDEFGHIJKLMNOPQRSTUVWXYZ');
@@ -422,6 +422,7 @@ function attackChanged() {
   const version = ++previewVersion;
   clearTimeout(previewTimer);
   renderAttackTextCheck();
+  renderCribWarning();
   renderAttackPreview();
   updateAttackAvailability();
   previewTimer = setTimeout(() => loadAttackPreview(version), 300);
@@ -460,10 +461,14 @@ function renderAttackAdvanced(parent) {
   details.addEventListener('toggle', () => { advancedOpen = details.open; });
   const fields = element('div', undefined, 'advanced-grid');
   const settings = attackState.advanced;
-  attackSelect(fields, 'method', ['hill_climb', 'partial_exhaustion'], settings.method || 'hill_climb', value => {
-    settings.method = value; delete settings.seeds;
-    attackChanged(); renderAttack();
-  }, { optionKey: 'method' });
+  if (settings.method === 'bombe') {
+    const rings = element('div', undefined, 'advanced-grid');
+    attackState.slots.forEach(slot => {
+      const select = attackSelect(rings, 'ring', alphabet, slot.ring, value => { slot.ring = value; attackChanged(); }, { unknown: true, id: `attack-${slot.id}-ring`, hint: 'attack_ring_hint' });
+      select.previousElementSibling.querySelector('label').textContent = `${t(`slot_${slot.id}`)} · ${t('ring')}`;
+    });
+    details.append(rings);
+  }
   if (settings.method === 'partial_exhaustion') {
     attackSelect(fields, 'seeds', ['all', 'touching'], settings.seeds ? 'touching' : 'all', value => {
       if (value === 'all') delete settings.seeds;
@@ -504,9 +509,13 @@ function renderAttackAdvanced(parent) {
   for (const [key, placeholder, min, max] of [['max_pairs', '13', 0, 13], ['switch_pairs', '7', 0, 13], ['backtrack_pairs', '5', 0, 13], ['hold', '5', 1, 1000], ['threads', t('threads_default'), 1, 256]]) {
     attackInput(numbers, key, settings[key] ?? '', value => { if (value === '') delete settings[key]; else settings[key] = value; attackChanged(); }, { type: 'number', placeholder, min, max });
   }
-  attackSelect(numbers, 'backend', ['cpu', 'gpu'], settings.backend ?? 'cpu', value => {
+  const backend = attackSelect(numbers, 'backend', ['cpu', 'gpu'], settings.backend ?? 'cpu', value => {
     settings.backend = value; attackChanged(); renderAttack();
   }, { optionKey: 'backend' });
+  if (settings.method === 'bombe') {
+    backend.querySelector('[value="gpu"]').disabled = true;
+    numbers.append(element('p', t('bombe_cpu'), 'hint'));
+  }
   if (settings.backend === 'gpu') {
     attackInput(numbers, 'gpu_usage', settings.gpu_usage ?? 100, value => {
       if (value === '') delete settings.gpu_usage; else settings.gpu_usage = value;
@@ -537,10 +546,21 @@ function renderAttack() {
   attackSelect(modelRow, 'model', models.map(model => model.id), attackState.model, value => { chooseAttackModel(value); attackChanged(); renderAttack(); }, { optionKey: 'model' });
   attackSelect(modelRow, 'reflector', model.reflectors, attackState.reflector, value => { attackState.reflector = value; attackChanged(); }, { unknown: true, optionKey: 'reflector' });
   controls.append(modelRow);
+  attackSelect(controls, 'method', ['hill_climb', 'partial_exhaustion', 'bombe'], attackState.advanced.method || 'hill_climb', value => {
+    selectAttackMethod(attackState, value);
+    attackChanged(); renderAttack();
+  }, { optionKey: 'method' });
+  if (attackState.advanced.method === 'bombe') {
+    attackInput(controls, 'crib', attackState.advanced.crib || '', value => { attackState.advanced.crib = value; attackChanged(); });
+    attackInput(controls, 'crib_position', attackState.advanced.crib_position ?? '', value => { attackState.advanced.crib_position = value; attackChanged(); }, { type: 'number', min: 0 });
+    const warning = element('p', undefined, 'notice'); warning.id = 'attack-crib-warning';
+    warning.setAttribute('role', 'status'); controls.append(warning);
+  }
   const rotors = element('div', undefined, 'rotors');
   attackState.slots.forEach((slot, i) => {
     const block = element('div', undefined, 'rotor'); block.append(element('h3', t(`slot_${slot.id}`)));
     for (const [key, values, optionKey] of [['wheel', model.slots[i].allowed_wheels, 'wheel'], ['ring', alphabet], ['position', alphabet]]) {
+      if (key === 'ring' && attackState.advanced.method === 'bombe') continue;
       attackSelect(block, key, values, slot[key], value => { slot[key] = value; attackChanged(); }, {
         unknown: true, optionKey, id: `attack-${slot.id}-${key}`, hint: key === 'ring' ? 'attack_ring_hint' : `${key}_hint`,
       });
@@ -579,7 +599,7 @@ function renderAttack() {
     if (!$('attack-start').disabled) attackAction('/api/attack', buildAttackBody(attackState));
   });
   root.append(form);
-  renderAttackPairs(); renderAttackTextCheck(); renderAttackPreview(); updateAttackAvailability();
+  renderAttackPairs(); renderAttackTextCheck(); renderCribWarning(); renderAttackPreview(); updateAttackAvailability();
 }
 function renderAttackPairs() {
   const root = $('attack-pairs-editor');
@@ -621,6 +641,13 @@ function renderAttackTextCheck() {
     errors.append(list);
   }
   $('attack-uppercase').hidden = !check.hasLowercase;
+}
+function renderCribWarning() {
+  const warning = $('attack-crib-warning');
+  if (!warning) return;
+  const info = cribInfo(attackState.advanced.crib || '');
+  warning.hidden = !info.short;
+  warning.textContent = t('crib_short');
 }
 function groupedNumber(value) {
   try { return BigInt(value ?? 0).toLocaleString(language); } catch { return String(value ?? 0); }
@@ -697,11 +724,14 @@ function renderAttackLast() {
     const details = element('details'); details.append(element('summary', t('engine_stderr')), element('pre', attack.stderr || t('no_stderr'))); root.append(details);
   }
   if (attack.status === 'cancelled') root.append(element('p', t('partial_results'), 'notice'));
+  const crib = attack.result?.crib;
+  if (crib) root.append(element('p', t('crib_summary', { text: crib.text, positions: groupedNumber(crib.positions?.length), settings: groupedNumber(crib.settings), stops: groupedNumber(crib.stops) })));
   const list = element('ol', undefined, 'attack-results');
   for (const entry of holdEntries(attack.result)) {
     const candidate = entry;
     const item = element('li');
     item.append(element('h3', t('candidate_score', { score: candidate.score?.measured ?? '—', measure: candidate.score?.measure ?? '—' })));
+    if (candidate.crib_position !== undefined) item.append(element('p', t('result_crib_position', { position: candidate.crib_position })));
     const slots = candidate.configuration?.slots || [];
     for (const [key, member] of [['wheels', 'wheel'], ['rings', 'ring'], ['positions', 'position']]) {
       item.append(element('p', t(`result_${key}`, { value: slots.map(slot => `${t(`slot_${slot.id}`)}: ${slot[member]}`).join(' · ') })));

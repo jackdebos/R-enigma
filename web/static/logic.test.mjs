@@ -1,7 +1,44 @@
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
-import { checkText, validatePair, buildRequest, lookup, initialLanguage, buildAttackBody, parseAttackInput, estimateDuration, progressInfo, holdEntries, groupFive } from './logic.js';
+import { normalizeCrib, cribInfo, selectAttackMethod, checkText, validatePair, buildRequest, lookup, initialLanguage, buildAttackBody, parseAttackInput, estimateDuration, progressInfo, holdEntries, groupFive } from './logic.js';
+
+test('crib normalization, short warning and method defaults preserve unrelated state', () => {
+  assert.equal(normalizeCrib(' wet ter\tvor\nhersage\u00a0'), 'WETTERVORHERSAGE');
+  for (const [text, short] of [['', true], ['A'.repeat(13), true], ['A'.repeat(14), false]]) {
+    assert.deepEqual(cribInfo(text), { text, short, offending: [] });
+  }
+  assert.deepEqual(cribInfo(' é!').offending.map(item => item.character), ['É', '!']);
+  for (const ids of [['left', 'middle', 'right'], ['greek', 'left', 'middle', 'right']]) {
+    const state = { slots: ids.map(id => ({ id, ring: 'Z', position: 'B' })), advanced: { backend: 'gpu', seeds: ['E'], hold: 7 } };
+    selectAttackMethod(state, 'bombe');
+    assert.deepEqual(state.slots.map(slot => slot.ring), ids.map(id => id === 'right' ? '' : 'A'));
+    assert.ok(state.slots.every(slot => slot.position === 'B'));
+    assert.deepEqual(state.advanced, { method: 'bombe', backend: 'cpu', hold: 7 });
+    state.slots.at(-1).ring = 'V';
+    selectAttackMethod(state, 'hill_climb');
+    assert.equal(state.slots.at(-1).ring, 'V');
+  }
+});
+
+test('bombe payload normalizes only the crib, converts position and omits stale seeds', () => {
+  const state = { model: 'enigma-i', reflector: 'B', slots: [], plugboard: [], search: true, text: ' A b\n', advanced: { method: 'bombe', crib: ' z y\n', crib_position: '0', seeds: ['E'] } };
+  const before = structuredClone(state);
+  assert.deepEqual(buildAttackBody(state).settings, { method: 'bombe', crib: 'ZY', crib_position: 0, backend: 'cpu', distinct_wheels: true });
+  assert.equal(buildAttackBody(state).text, state.text);
+  assert.deepEqual(state, before);
+  state.advanced.crib_position = '';
+  assert.equal(Object.hasOwn(buildAttackBody(state).settings, 'crib_position'), false);
+  state.advanced.method = 'hill_climb';
+  assert.deepEqual(buildAttackBody(state).settings, { method: 'hill_climb', backend: 'cpu', distinct_wheels: true });
+});
+
+test('crib labels, warning and results have bilingual copy', () => {
+  for (const lang of ['es', 'en']) {
+    const dictionary = JSON.parse(readFileSync(new URL(`./i18n/${lang}.json`, import.meta.url), 'utf8'));
+    for (const key of ['method_bombe', 'crib', 'crib_hint', 'crib_position', 'crib_position_hint', 'crib_short', 'crib_summary', 'result_crib_position', 'bombe_cpu']) assert.ok(dictionary[key]?.trim(), `${lang}/${key}`);
+  }
+});
 
 test('text accepts only A-Z, including empty text, without changing input', () => {
   for (const text of ['', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ']) {

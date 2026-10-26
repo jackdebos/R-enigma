@@ -60,6 +60,8 @@ type Settings struct {
 	DistinctWheels *bool             `json:"distinct_wheels"`
 	Method         *string           `json:"method"`
 	Seeds          []string          `json:"seeds"`
+	Crib           *string           `json:"crib"`
+	CribPosition   *int              `json:"crib_position"`
 	InitialMeasure *string           `json:"initial_measure"`
 	FinalMeasure   *string           `json:"final_measure"`
 	Stages         []Stage           `json:"stages"`

@@ -28,6 +28,14 @@ func ResolveBackend(backend *string, usage *int) (string, int, *Issue) {
 	return name, n, nil
 }
 
+// ValidateBackendMethod also guards resume, which does not rebuild the request.
+func ValidateBackendMethod(method, backend string) *Issue {
+	if method == "bombe" && backend == "gpu" {
+		return issue("backend_unavailable", "settings/backend", "The crib attack runs on the CPU only.")
+	}
+	return nil
+}
+
 // DecodeBackend uses the attack decoder's strict types and duplicate-key checks.
 // Empty bodies preserve the existing resume API; an empty object also is valid.
 func DecodeBackend(r io.Reader) (BackendOptions, *Issue) {

@@ -334,6 +334,13 @@ func (s *Server) serveAttack(w http.ResponseWriter, r *http.Request) {
 				options.GPUUsage = &a.view.GPUUsage
 			}
 			plan.Backend, plan.GPUUsage, problem = attack.ResolveBackend(options.Backend, options.GPUUsage)
+			if problem == nil {
+				input, decodeProblem := attack.Decode(bytes.NewReader(a.view.Input))
+				problem = decodeProblem
+				if problem == nil && input.Settings.Method != nil {
+					problem = attack.ValidateBackendMethod(*input.Settings.Method, plan.Backend)
+				}
+			}
 		}
 		if problem != nil {
 			jsonResponse(w, 400, map[string]any{"error": problem})

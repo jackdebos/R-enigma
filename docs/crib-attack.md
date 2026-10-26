@@ -1,6 +1,6 @@
 # Crib attack contract — Stage 3
 
-Status: **Core and CLI implemented; web pending.** This document specifies the `bombe` attack:
+Status: **Core, CLI and web implemented.** This document specifies the `bombe` attack:
 the user supplies a crib (a plaintext fragment believed to be in the message); the
 engine drags it along the ciphertext, runs a deductive Turing-Welchman bombe on every
 declared outer key and admissible crib position, and finishes every stop with the

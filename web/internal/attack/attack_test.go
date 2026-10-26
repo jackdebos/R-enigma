@@ -211,7 +211,7 @@ func TestRejections(t *testing.T) {
 		{"bad ring", strings.Replace(b, `"ring":"V"`, `"ring":"v"`, 1), "invalid_component", "slots/3/ring"},
 		{"reused letter", strings.Replace(b, `"known":[]`, `"known":[["A","B"],["B","C"]]`, 1), "invalid_component", "plugboard/known/1"},
 		{"nothing unknown", `{"model":"enigma-i","reflector":"B","slots":[{"id":"left","wheel":"I","ring":"A","position":"A"},{"id":"middle","wheel":"II","ring":"A","position":"A"},{"id":"right","wheel":"III","ring":"A","position":"A"}],"plugboard":{"known":[],"search":false},"text":"ABC"}`, "nothing_to_search", ""},
-		{"method", withSettings(`{"method":"bombe"}`), "invalid_settings", "settings/method"},
+		{"method", withSettings(`{"method":"unknown"}`), "invalid_settings", "settings/method"},
 		{"seeds on hc", withSettings(`{"seeds":["E"]}`), "invalid_settings", "settings/seeds"},
 		{"seed letter", withSettings(`{"method":"partial_exhaustion","seeds":["e"]}`), "invalid_settings", "settings/seeds"},
 		{"measure", withSettings(`{"final_measure":"sinkov"}`), "invalid_settings", "settings/final_measure"},
