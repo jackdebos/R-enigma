@@ -23,12 +23,16 @@ fn request(width: usize, variant: usize) -> AttackRequest {
         5 => "sinkov_pentagram",
         _ => "sinkov_hexagram",
     };
-    let final_id = if variant == 0 || variant == 12 || variant == 13 {
-        "ic"
-    } else {
-        id
+    let (initial_id, final_id) = match variant {
+        0 | 12 | 13 => ("ic", "ic"),
+        3 => (id, id),
+        // Entropy: switched to, identical, switched from, and long cooperative.
+        14 => ("ic", "entropy"),
+        15 => ("entropy", "entropy"),
+        16 => ("entropy", id),
+        17 => ("entropy", "ic"),
+        _ => ("ic", id),
     };
-    let initial_id = if variant == 3 { id } else { "ic" };
     let mut value = json!({"protocol_version":1,
         "machine":{"definition":{"kind":"custom","value":{
             "alphabet":alphabet,
@@ -75,7 +79,11 @@ fn request(width: usize, variant: usize) -> AttackRequest {
         value["job"]["text"] = json!("AAABACADBBABCDABAAA".repeat(41));
         value["job"]["space"]["limit"] = json!(64);
     }
-    if final_id == "ic" {
+    if variant == 17 {
+        value["job"]["text"] = json!("AAABACADBBABCDABAAA".repeat(41));
+        value["job"]["space"]["limit"] = json!(64);
+    }
+    if initial_id != id && final_id != id {
         return AttackRequest::parse_json(&value.to_string()).unwrap();
     }
     value["job"]["resources"] = json!({id:{"path":"model.json"}});
@@ -164,9 +172,11 @@ fn device_matches_cpu_results_progress_checkpoints_and_geometry() {
     };
     let identity = enigma_core::checkpoint_identity("{}", &Default::default()).unwrap();
     for width in [4, 26, 34] {
-        for variant in 0..14 {
+        for variant in 0..18 {
             // Keep long/multiblock and high-order cases on the small alphabet.
-            if (width == 26 && (variant == 0 || variant >= 7)) || (width == 34 && variant != 1) {
+            if (width == 26 && (variant == 0 || (7..14).contains(&variant) || variant == 17))
+                || (width == 34 && variant != 1 && variant != 15)
+            {
                 continue;
             }
             let request = request(width, variant);
@@ -270,4 +280,52 @@ fn device_matches_cpu_results_progress_checkpoints_and_geometry() {
                 >= stats.work_time.mul_f64(idle_factor)
         );
     }
+}
+
+#[test]
+fn entropy_low_word_carry_is_exact_on_device() {
+    // Find symbol counts whose quotient changes only through the carried low words.
+    let found = (2..400usize).find_map(|n| {
+        let terms = enigma_core::entropy_terms(n).unwrap();
+        (0..=n)
+            .flat_map(|a| (0..=n - a).map(move |b| (a, b)))
+            .find_map(|(a, b)| {
+                let counts = [a, b, n - a - b];
+                let high: i128 = counts.iter().map(|&c| terms[c] >> 16).sum();
+                let total: i128 = counts.iter().map(|&c| terms[c]).sum();
+                (high.div_euclid(n as i128) != total.div_euclid(n as i128 * 65536))
+                    .then_some(counts)
+            })
+    });
+    let counts = found.expect("a carry-sensitive entropy count vector");
+    let Some(gpu) = gpu(25, 1) else { return };
+    let text: String = counts
+        .iter()
+        .zip(["A", "B", "C"])
+        .map(|(&c, s)| s.repeat(c))
+        .collect();
+    // Identity wiring and no pairs: the only score is the text's own entropy.
+    let request = AttackRequest::parse_json(
+        &json!({"protocol_version":1,
+        "machine":{"definition":{"kind":"custom","value":{
+            "alphabet":["A","B","C"],
+            "wheels":[{"name":"r","wiring":["A","B","C"],"turnovers":[]}],
+            "slots":[{"id":"r","role":"rotor","movement":"fixed","wheel":"r"}],
+            "stepping":{"rules":[]}}}},
+        "job":{"kind":"search","configuration":{"slots":[],"plugboard":[]},
+            "text":text,"passes":["hill_climb"],"measures":["entropy"],
+            "space":{"slots":[{"id":"r","positions":["A"],"rings":["A"]}],
+                "plugboard":{"kind":"attack","symbols":["A","B","C"],"max_pairs":0}},
+            "attack":{"kind":"hill_climb","initial_measure":"entropy","final_measure":"entropy",
+                "switch_pairs":0,"backtrack_pairs":0,"hold":1,"start":[]}}})
+        .to_string(),
+    )
+    .unwrap();
+    let run =
+        |options: ExecutionOptions| format!("{:?}", request.run_with(options, |_| {}, || false));
+    assert_eq!(
+        run(ExecutionOptions::serial().with_accelerator(&gpu)),
+        run(ExecutionOptions::serial()),
+        "counts {counts:?}"
+    );
 }

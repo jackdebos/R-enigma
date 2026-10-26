@@ -83,7 +83,27 @@ pub struct DispatchSample {
 #[derive(Default)]
 struct Session {
     pipelines: HashMap<Specialization, wgpu::ComputePipeline>,
+    /// Entropy count tables by text length, built once per accelerator.
+    entropy: HashMap<usize, Arc<Vec<i64>>>,
     stats: DispatchStats,
+}
+
+/// Kernel order code of the entropy objective; n-gram orders are 1-6, IC is 0.
+const ENTROPY_ORDER: usize = 7;
+
+/// Per count `c` in `0..=length`, the exact entropy term split as `[high, low]`
+/// with `term = high * 2^16 + low` and `0 <= low < 2^16`. Summing highs and lows
+/// apart keeps i64 sums, and `floor(total / (N * 2^16)) = floor((highs + (lows >> 16)) / N)`.
+fn entropy_table(length: usize) -> Result<Vec<i64>, GpuError> {
+    let invalid = |_| GpuError::Device("entropy terms exceed the exact i64 split".into());
+    let terms = enigma_core::entropy_terms(length)
+        .map_err(|e| GpuError::Device(format!("entropy terms: {e:?}")))?;
+    let mut table = Vec::with_capacity(2 * terms.len());
+    for term in terms {
+        table.push(i64::try_from(term >> 16).map_err(invalid)?);
+        table.push((term & 0xffff) as i64);
+    }
+    Ok(table)
 }
 
 /// One serialized GPU execution stream. Usage is the dispatch wall-time duty cycle.
@@ -231,6 +251,15 @@ fn objective(
             }
             Ok(order)
         }
+        ClimbObjective::Entropy { length: total } => {
+            // Two i64 words per count 0..=length; highs sum below 2^63 for 1e6 letters.
+            if total != length || length == 0 || (length as u64 + 1) * 16 > max_buffer {
+                return Err(unsupported(
+                    "entropy requires the text length and a storable count table",
+                ));
+            }
+            Ok(ENTROPY_ORDER)
+        }
     }
 }
 
@@ -249,6 +278,7 @@ fn same_objectives(a: ClimbObjective<'_>, b: ClimbObjective<'_>) -> bool {
                 ..
             },
         ) => a == b && x == y,
+        (ClimbObjective::Entropy { .. }, ClimbObjective::Entropy { .. }) => true,
         _ => false,
     }
 }
@@ -381,6 +411,9 @@ impl GpuClimbAccelerator {
         let distinct = |objective| match objective {
             ClimbObjective::Ic { denominator, .. } => denominator.saturating_add(1),
             ClimbObjective::DenseNgram { max_abs, .. } => u128::from(max_abs) * 2 + 2,
+            // Ranking is -measured with 0 <= measured <= B(length) >> 16.
+            ClimbObjective::Entropy { length } => enigma_core::integer_log2_q48(length as u128)
+                .map_or(u128::MAX, |log| (log >> 16) as u128 + 2),
         };
         let scans = distinct(job.initial_objective)
             .saturating_add(distinct(job.final_objective))
@@ -691,6 +724,20 @@ impl GpuClimbAccelerator {
             )));
         }
         let mut session = self.session.lock().unwrap();
+        let entropy = match [job.initial_objective, job.final_objective]
+            .iter()
+            .any(|o| matches!(o, ClimbObjective::Entropy { .. }))
+        {
+            false => None,
+            true => Some(match session.entropy.get(&job.text_length) {
+                Some(table) => Arc::clone(table),
+                None => {
+                    let table = Arc::new(entropy_table(job.text_length)?);
+                    session.entropy.insert(job.text_length, Arc::clone(&table));
+                    table
+                }
+            }),
+        };
         let cache_key = Self::specialization(job, &layout);
         if let std::collections::hash_map::Entry::Vacant(entry) = session.pipelines.entry(cache_key)
         {
@@ -717,6 +764,7 @@ impl GpuClimbAccelerator {
         let weights = |objective| match objective {
             ClimbObjective::Ic { .. } => &[0i64][..],
             ClimbObjective::DenseNgram { weights, .. } => weights,
+            ClimbObjective::Entropy { .. } => entropy.as_deref().map_or(&[0i64][..], |t| t),
         };
         let mut stats = session.stats;
         let mut pending = 0;

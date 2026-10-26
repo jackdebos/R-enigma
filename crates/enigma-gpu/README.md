@@ -31,10 +31,14 @@ that consumes job fields and rows without following the private request owner.
 
 - Alphabets contain 1-256 symbols. Text is bounded by device buffer limits, the
   core 512-KiB-per-key row policy, and a conservative 1,000,000-symbol ceiling.
-- Objectives are IC or dense i64 n-grams of any representable order. Tables must
+- Objectives are IC, entropy or dense i64 n-grams of any representable order. Tables must
   fit a storage binding and u32 indexing; every window sum must fit i64.
   IC uses exact Q32 long division, avoiding an overflowing shifted numerator;
   n-gram division floors negative scores instead of truncating.
+- Entropy needs no logarithm on the device: the host tabulates core's exact term
+  `c * (B(N) - B(c))` for every count `c` (`entropy_terms`), split into a high word
+  and a 16-bit low word. The kernel sums both from the symbol histogram and uses
+  `floor((highs + (lows >> 16)) / N)`, equal to the CPU's `floor(sum / (N * 2^16))`.
 - Fixed pairs, mutable masks, pair capacity, backtracking, one-way switching and
   nonempty starts are honored. Every emitted trial counts, including duplicates.
   Strict improvement and earliest-ordinal ties follow the CPU walker.

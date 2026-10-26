@@ -44,6 +44,21 @@ pub enum ClimbObjective<'a> {
         /// Largest absolute weight, bounding every partial sum.
         max_abs: u64,
     },
+    /// Shannon entropy ranking: `-floor(sum[c>0] terms[c] / (length * 2^16))`,
+    /// where `terms = entropy_terms(length)` and `c` are symbol counts.
+    Entropy {
+        /// Text length, the count total.
+        length: usize,
+    },
+}
+
+/// Exact entropy numerator terms `c * (B(length) - B(c))` for `c` in `0..=length`
+/// (`terms[0] == 0`), with `B = integer_log2_q48`; the CPU measure's own arithmetic.
+pub fn entropy_terms(length: usize) -> Result<Vec<i128>, crate::ScoreError> {
+    let log_length = crate::integer_log2_q48(length as u128)?;
+    std::iter::once(Ok(0))
+        .chain((1..=length).map(|c| crate::measure::entropy_term(c as u128, log_length)))
+        .collect()
 }
 
 /// A bound, machine-independent description shared by every outer in a run.
@@ -111,7 +126,7 @@ pub enum ClimbUnsupported {
     AlphabetTooLarge,
     /// Byte rows or one logical block exceed the bounded row data policy.
     RowDataLimit,
-    /// Entropy, trie or another nonrepresentable objective.
+    /// Trie or another nonrepresentable objective.
     Objective(MeasureId),
     /// No dense integer weight table exists.
     SparseNgram(MeasureId),
@@ -269,6 +284,7 @@ impl ClimbJob<'_> {
                     ..
                 },
             ) => a == b && x == y,
+            (ClimbObjective::Entropy { .. }, ClimbObjective::Entropy { .. }) => true,
             _ => false,
         };
         rows.chunks_exact(stride)
@@ -315,6 +331,20 @@ impl ClimbJob<'_> {
                             }
                             crate::floor_div(i128::from(sum), (plain.len() - order + 1) as i128)
                                 .map_err(|_| fail("invalid n-gram divisor"))
+                        }
+                        ClimbObjective::Entropy { length } => {
+                            if length != plain.len() {
+                                return Err(fail("entropy length differs from the text"));
+                            }
+                            let mut counts = vec![0usize; width];
+                            for s in plain {
+                                counts[s] += 1;
+                            }
+                            crate::measure::entropy(&counts, length as u128)
+                                .map(|score| score.ranking().units())
+                                .map_err(|e| {
+                                    AcceleratorError(format!("projected reference: {e:?}"))
+                                })
                         }
                     }
                 };
@@ -430,6 +460,9 @@ impl AttackRequest {
                     scale: crate::SCALE as u128,
                     denominator: length as u128 * length.saturating_sub(1) as u128,
                 });
+            }
+            if id == MeasureId::Entropy {
+                return Ok(ClimbObjective::Entropy { length });
             }
             if let Some(BoundResource::Ngram(model)) = self.bound_resource(id) {
                 let (weights, max_abs) = model

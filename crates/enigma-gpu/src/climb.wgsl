@@ -20,6 +20,9 @@ const COOP_LETTERS: u32 = {{COOP_LETTERS}}u;
 const COOP_ROUNDS: u32 = {{COOP_ROUNDS}}u;
 // WIDTH rounded up to even keeps the State stride a multiple of eight bytes.
 const COUNT_WORDS: u32 = {{COUNT_WORDS}}u;
+// Order code of the entropy objective (IC is 0, n-grams 1-6). Its weight table
+// holds [high, low] per count: term(count) = high * 2^16 + low, 0 <= low < 2^16.
+const ENTROPY: u32 = 7u;
 // Pending cooperative evaluation kinds.
 const EVAL_NONE: u32 = 0u;
 const EVAL_INITIAL: u32 = 1u;
@@ -90,16 +93,51 @@ fn evaluate(key: u32, mapping: Mapping, phase: u32) -> i64 {
     return score(key, mapping, FINAL_ORDER, 1u);
 }
 
+fn is_ngram(order: u32) -> bool { return order != 0u && order != ENTROPY; }
+
+fn weight(phase: u32, index: u32) -> i64 {
+    if (phase == 0u) { return initial_weights[index]; }
+    return final_weights[index];
+}
+
+// Histogram objectives (IC, entropy) from final symbol counts.
+struct Histogram { pairs: u64, high: i64, low: i64 }
+
+fn add_count(total: ptr<function, Histogram>, count: u32, order: u32, phase: u32) {
+    if (count == 0u) { return; }
+    (*total).pairs += u64(count) * u64(count - 1u);
+    if (order == ENTROPY) {
+        (*total).high += weight(phase, 2u * count);
+        (*total).low += weight(phase, 2u * count + 1u);
+    }
+}
+
+fn histogram_quotient(total: Histogram, order: u32) -> i64 {
+    if (order == ENTROPY) { return entropy_quotient(total.high, total.low); }
+    return ic_quotient(total.pairs);
+}
+
+// Ranking -floor(sum(terms) / (LENGTH * 2^16)), using the exact high/low split:
+// floor((H * 2^16 + L) / (N * 2^16)) = floor((H + floor(L / 2^16)) / N), L >= 0.
+fn entropy_quotient(high: i64, low: i64) -> i64 {
+    let numerator = high + (low >> 16u);
+    let length = i64(LENGTH);
+    var measured = numerator / length;
+    if (numerator < 0li && numerator % length != 0li) { measured -= 1li; }
+    return -measured;
+}
+
 fn score(key: u32, mapping: Mapping, order: u32, phase: u32) -> i64 {
     var counts: array<u32, WIDTH>;
     var small_counts: Mapping;
+    let ngram = is_ngram(order);
     var radix = 1u;
-    for (var i = 1u; i < order; i++) { radix *= WIDTH; }
+    if (ngram) { for (var i = 1u; i < order; i++) { radix *= WIDTH; } }
     var window = 0u;
     var sum = 0li;
     for (var p = 0u; p < LENGTH; p++) {
         let plain = decode(key, mapping, p);
-        if (order == 0u) {
+        if (!ngram) {
             if (PACKED_COUNTS) { put(&small_counts, plain, lookup(small_counts, plain) + 1u); }
             else { counts[plain] += 1u; }
         }
@@ -111,14 +149,14 @@ fn score(key: u32, mapping: Mapping, order: u32, phase: u32) -> i64 {
             }
         }
     }
-    if (order != 0u) { return ngram_quotient(sum, order); }
-    var pairs = 0lu;
+    if (ngram) { return ngram_quotient(sum, order); }
+    var total = Histogram(0lu, 0li, 0li);
     for (var i = 0u; i < WIDTH; i++) {
-        var count = u64(counts[i]);
-        if (PACKED_COUNTS) { count = u64(lookup(small_counts, i)); }
-        if (count > 0lu) { pairs += count * (count - 1lu); }
+        var count = counts[i];
+        if (PACKED_COUNTS) { count = lookup(small_counts, i); }
+        add_count(&total, count, order, phase);
     }
-    return ic_quotient(pairs);
+    return histogram_quotient(total, order);
 }
 
 fn ngram_quotient(sum: i64, order: u32) -> i64 {
@@ -377,16 +415,17 @@ fn partial_score(key: u32, mapping: Mapping, phase: u32, start: u32, end: u32) -
 }
 
 fn chunk(key: u32, mapping: Mapping, order: u32, phase: u32, start: u32, end: u32) -> i64 {
+    let ngram = is_ngram(order);
     var radix = 1u;
-    for (var i = 1u; i < order; i++) { radix *= WIDTH; }
+    if (ngram) { for (var i = 1u; i < order; i++) { radix *= WIDTH; } }
     // Re-decode the order-1 letters before start; every position decodes alone.
     var first = start;
-    if (order > 1u) { first = start - min(start, order - 1u); }
+    if (ngram && order > 1u) { first = start - min(start, order - 1u); }
     var window = 0u;
     var sum = 0li;
     for (var p = first; p < end; p++) {
         let plain = decode(key, mapping, p);
-        if (order == 0u) { atomicAdd(&hist[plain], 1u); }
+        if (!ngram) { atomicAdd(&hist[plain], 1u); }
         else {
             window = (window % radix) * WIDTH + plain;
             if (p >= start && p + 1u >= order) {
@@ -461,13 +500,12 @@ fn cooperative(key: u32, lane: u32) {
         if (lane == 0u) {
             let order = select(INITIAL_ORDER, FINAL_ORDER, phase != 0u);
             var value = 0li;
-            if (order == 0u) {
-                var pairs = 0lu;
+            if (!is_ngram(order)) {
+                var total = Histogram(0lu, 0li, 0li);
                 for (var i = 0u; i < WIDTH; i++) {
-                    let count = u64(atomicLoad(&hist[i]));
-                    if (count > 0lu) { pairs += count * (count - 1lu); }
+                    add_count(&total, atomicLoad(&hist[i]), order, phase);
                 }
-                value = ic_quotient(pairs);
+                value = histogram_quotient(total, order);
             } else {
                 value = ngram_quotient(total + current.partial, order);
             }

@@ -47,7 +47,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 mod attack_accelerator;
 pub use attack_accelerator::{
-    AcceleratedClimb, AcceleratorError, ClimbAccelerator, ClimbJob, ClimbObjective,
+    entropy_terms, AcceleratedClimb, AcceleratorError, ClimbAccelerator, ClimbJob, ClimbObjective,
     ClimbUnsupported, ReferenceClimbAccelerator,
 };
 mod attack_blocks;

@@ -281,18 +281,22 @@ pub(crate) fn index_entropy_iter<I: ExactSizeIterator<Item = u32>>(
     entropy(counts.as_slice(), length)
 }
 
-fn entropy(counts: &[usize], length: u128) -> Result<MeasuredScore, MeasureError> {
+/// One symbol's numerator term `count * (B(length) - B(count))`, for `count > 0`.
+/// Shared with accelerators, which tabulate it per count instead of taking logs.
+pub(crate) fn entropy_term(count: u128, log_length: i128) -> Result<i128, ScoreError> {
+    let difference = log_length
+        .checked_sub(integer_log2_q48(count)?)
+        .ok_or(ScoreError::Overflow)?;
+    let count = i128::try_from(count).map_err(|_| ScoreError::Overflow)?;
+    count.checked_mul(difference).ok_or(ScoreError::Overflow)
+}
+
+pub(crate) fn entropy(counts: &[usize], length: u128) -> Result<MeasuredScore, MeasureError> {
     let log_length = integer_log2_q48(length)?;
     let mut numerator = 0_i128;
     for &count in counts.iter().filter(|&&count| count > 0) {
-        let count = count as u128;
-        let difference = log_length
-            .checked_sub(integer_log2_q48(count)?)
-            .ok_or(ScoreError::Overflow)?;
-        let count = i128::try_from(count).map_err(|_| ScoreError::Overflow)?;
-        let contribution = count.checked_mul(difference).ok_or(ScoreError::Overflow)?;
         numerator = numerator
-            .checked_add(contribution)
+            .checked_add(entropy_term(count as u128, log_length)?)
             .ok_or(ScoreError::Overflow)?;
     }
     let denominator = i128::try_from(length)

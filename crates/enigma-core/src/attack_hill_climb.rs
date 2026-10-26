@@ -5287,31 +5287,89 @@ mod tests {
 
     #[test]
     fn accelerator_ineligible_fails_before_progress() {
-        for entropy in [false, true] {
-            let request = pool_request(!entropy, 1, |job| {
-                if entropy {
-                    job["measures"] = serde_json::json!(["entropy"]);
-                    job["attack"]["initial_measure"] = "entropy".into();
-                    job["attack"]["final_measure"] = "entropy".into();
-                }
+        let request = pool_request(true, 1, |_| {});
+        assert!(request.climb_job().is_err());
+        let mut events = Vec::new();
+        let error = request
+            .run_with(
+                crate::ExecutionOptions::serial()
+                    .with_accelerator(&crate::ReferenceClimbAccelerator),
+                |p| events.push(p),
+                || false,
+            )
+            .unwrap_err();
+        assert!(events.is_empty());
+        assert_eq!(error.evaluations_used(), 0);
+        assert!(error.to_string().contains("partial exhaustion"));
+    }
+
+    #[test]
+    fn accelerated_entropy_objectives_match_cpu_and_projection() {
+        for (initial, last) in [("entropy", "entropy"), ("ic", "entropy"), ("entropy", "ic")] {
+            let request = pool_request(false, 3, |job| {
+                job["measures"] = if initial == last {
+                    serde_json::json!([initial])
+                } else {
+                    serde_json::json!([initial, last])
+                };
+                job["text"] = "ABACADDBCABDDACB".into();
+                job["attack"]["initial_measure"] = initial.into();
+                job["attack"]["final_measure"] = last.into();
+                job["attack"]["start"] = serde_json::json!([]);
+                job["space"]["plugboard"]["max_pairs"] = 2.into();
             });
-            assert!(request.climb_job().is_err());
-            let mut events = Vec::new();
-            let error = request
-                .run_with(
-                    crate::ExecutionOptions::serial()
-                        .with_accelerator(&crate::ReferenceClimbAccelerator),
-                    |p| events.push(p),
-                    || false,
-                )
-                .unwrap_err();
-            assert!(events.is_empty());
-            assert_eq!(error.evaluations_used(), 0);
-            assert!(error.to_string().contains(if entropy {
-                "entropy"
-            } else {
-                "partial exhaustion"
-            }));
+            let job = request.climb_job().unwrap();
+            assert!(matches!(
+                job.final_objective,
+                crate::ClimbObjective::Entropy { length: 16 } | crate::ClimbObjective::Ic { .. }
+            ));
+            let run = |accelerated: bool| {
+                let options = crate::ExecutionOptions::serial();
+                let options = if accelerated {
+                    options.with_accelerator(&crate::ReferenceClimbAccelerator)
+                } else {
+                    options
+                };
+                let mut events = Vec::new();
+                let result = request.run_with(options, |p| events.push(p), || false);
+                (format!("{result:?}"), events)
+            };
+            assert_eq!(run(true), run(false), "{initial} -> {last}");
+            struct Projected;
+            impl crate::ClimbAccelerator for Projected {
+                fn climb(
+                    &self,
+                    job: &crate::ClimbJob<'_>,
+                    first: u128,
+                    rows: &[u8],
+                ) -> Result<Vec<crate::AcceleratedClimb>, crate::AcceleratorError> {
+                    let expected = job.owner.reference_climbs(job, first, rows)?;
+                    assert_eq!(job.climb_from_projection(rows)?, expected);
+                    Ok(expected)
+                }
+            }
+            let options = crate::ExecutionOptions::serial().with_accelerator(&Projected);
+            assert!(request.run_with(options, |_| {}, || false).is_ok());
+        }
+    }
+
+    #[test]
+    fn entropy_terms_reproduce_the_cpu_measure() {
+        for length in [1usize, 2, 7, 232, 1000] {
+            let terms = crate::entropy_terms(length).unwrap();
+            assert_eq!(terms.len(), length + 1);
+            assert_eq!(terms[0], 0);
+            for counts in [vec![length], vec![length / 2, length - length / 2, 0]] {
+                let indices: Vec<u32> = counts
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(s, &c)| std::iter::repeat_n(s as u32, c))
+                    .collect();
+                let expected = crate::measure::index_entropy(3, &indices).unwrap();
+                let numerator: i128 = counts.iter().map(|&c| terms[c]).sum();
+                let measured = crate::floor_div(numerator, length as i128 * 65536).unwrap();
+                assert_eq!(measured, expected.measured().units(), "length {length}");
+            }
         }
     }
 

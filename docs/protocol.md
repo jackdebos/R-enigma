@@ -925,7 +925,7 @@ loading/binding errors retain precedence.
 
 After successful attack resource binding, before checkpoint validation or `started`,
 GPU preflight first projects the climb job. Unsupported attacks (including partial
-exhaustion, entropy/trie objectives, and sparse or i128 n-grams) emit one seq 1
+exhaustion, trie objectives, and sparse or i128 n-grams) emit one seq 1
 `unsupported_job` at `/job/attack`, message
 `--backend gpu does not support this attack: <reason>`, exit 1.
 A `bombe` job instead emits one seq 1 `backend_unavailable` at `/job/attack`,

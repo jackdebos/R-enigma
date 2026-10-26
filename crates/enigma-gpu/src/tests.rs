@@ -183,3 +183,24 @@ fn dispatch_bound_follows_distinct_scores_slices_and_rounds() {
         603_167_669
     );
 }
+
+#[test]
+fn entropy_table_splits_exact_terms_and_objective_checks_length() {
+    for length in [1, 19, 232, 1_000_000] {
+        let terms = enigma_core::entropy_terms(length).unwrap();
+        let table = entropy_table(length).unwrap();
+        assert_eq!(table.len(), 2 * terms.len());
+        for (term, pair) in terms.iter().zip(table.chunks_exact(2)) {
+            assert!((0..1 << 16).contains(&pair[1]));
+            assert_eq!(i128::from(pair[0]) * 65536 + i128::from(pair[1]), *term);
+        }
+    }
+    let entropy = |length| ClimbObjective::Entropy { length };
+    assert_eq!(objective(entropy(19), 4, 19, 1 << 20), Ok(ENTROPY_ORDER));
+    for result in [
+        objective(entropy(18), 4, 19, 1 << 20),
+        objective(entropy(19), 4, 19, 319),
+    ] {
+        assert!(matches!(result, Err(GpuUnsupported::Job(_))));
+    }
+}

@@ -45,9 +45,9 @@ fn request(seed: u64) -> Option<AttackRequest> {
     let text: String = (0..length)
         .map(|_| alphabet[r.next(width)].as_str())
         .collect();
-    let measures = ["ic", "sinkov_bigram", "sinkov_trigram"];
-    let initial = measures[r.next(2)];
-    let last = measures[r.next(3)];
+    let measures = ["ic", "sinkov_bigram", "sinkov_trigram", "entropy"];
+    let initial = [measures[0], measures[1], measures[3]][r.next(3)];
+    let last = measures[r.next(4)];
     let mut symbols: Vec<usize> = (0..width).collect();
     let mut fixed = Vec::new();
     if width >= 4 && r.next(3) == 0 {
@@ -83,7 +83,7 @@ fn request(seed: u64) -> Option<AttackRequest> {
                 "switch_pairs":r.next(4),"backtrack_pairs":r.next(3),"hold":3,"start":start}}});
     let mut resources = std::collections::BTreeMap::new();
     let mut models = Vec::new();
-    for id in names.iter().filter(|id| **id != "ic") {
+    for id in names.iter().filter(|id| order(id) > 0) {
         let n = order(id);
         let entries: Vec<_> = (0..4)
             .map(|_| {
