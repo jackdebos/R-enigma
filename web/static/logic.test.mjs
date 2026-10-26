@@ -214,3 +214,8 @@ test('language uses a valid saved choice, otherwise the browser language', () =>
   assert.equal(initialLanguage('bad', 'ES-es'), 'es');
   assert.equal(initialLanguage(null, 'fr'), 'en');
 });
+
+test('crib keeps BOM and non-breaking space as offending symbols', () => {
+  assert.deepEqual(cribInfo('\uFEFFZ\u00a0Y').offending.map(o => o.position), [1, 3]);
+  assert.equal(cribInfo('\uFEFFZ\u00a0Y').text, '\uFEFFZ\u00a0Y');
+});

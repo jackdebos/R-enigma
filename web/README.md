@@ -230,7 +230,7 @@ Optional settings (the page exposes the method, crib and distinct wheels directl
 | --- | --- |
 | `distinct_wheels` | `true`; boolean. `false` also tries repeated wheels. |
 | `method` | `hill_climb` (empty start), `partial_exhaustion`, or CPU-only `bombe` (crib attack). |
-| `crib` | Required for bombe only: one nonempty plaintext fragment, uppercased with whitespace removed; A–Z only, no longer than the ciphertext. No `start`/`seeds` are sent. |
+| `crib` | Required for bombe only: one nonempty plaintext fragment, sent exactly as typed; A–Z only (lowercase and spaces are rejected at `settings/crib`), no longer than the ciphertext. No `start`/`seeds` are sent. |
 | `crib_position` | Bombe only: optional nonnegative 0-based integer; omitted tries every admissible position. Out-of-range/crashing fixed positions and no admissible position are rejected before launch. |
 | `seeds` | PE only: omitted selects all empty/single-pair seeds; an array selects seeds touching those unique uppercase mutable letters. |
 | `initial_measure`, `final_measure` | `ic`, `sinkov_trigram`. Measures: `ic`, `entropy`, `sinkov_monogram` through `sinkov_hexagram`, `trie`. |

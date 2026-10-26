@@ -1121,7 +1121,7 @@ Advanced settings choose CPU (default, unchanged command line) or GPU, which add
 screen smoother but take longer). Resume uses the currently chosen backend, without
 changing checkpoint identity; GPU unavailability or unsupported attacks display the
 engine error, never silently falling back to CPU.
-The attack page offers HC, PE and CPU-only `bombe` with one normalized crib and an
+The attack page offers HC, PE and CPU-only `bombe` with one crib sent exactly as typed and an
 optional position, a nonblocking short-crib warning, editable right-ring-unknown
 defaults, and crib summaries/positions in results. Bombe disables GPU in the page;
 the web rejects GPU start/resume requests before launch. See
