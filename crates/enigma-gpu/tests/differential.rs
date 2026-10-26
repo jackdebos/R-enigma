@@ -329,3 +329,41 @@ fn entropy_low_word_carry_is_exact_on_device() {
         "counts {counts:?}"
     );
 }
+
+#[test]
+fn entropy_boundaries_and_phase_rescore_match_cpu() {
+    // Singleton text, a zero-count symbol, counts above 255 with cooperative
+    // continuation, and the IC -> entropy terminal rescore.
+    let Some(device) = gpu(25, 1) else { return };
+    let device = device.with_cooperative_geometry(1, 1, 2);
+    for text in ["A".to_owned(), "ABB".to_owned(), "ABB".repeat(400)] {
+        for initial in ["entropy", "ic"] {
+            if text.len() == 1 && initial == "ic" {
+                continue;
+            }
+            let value = json!({"protocol_version":1,
+                "machine":{"definition":{"kind":"custom","value":{
+                    "alphabet":["A","B","C"],
+                    "wheels":[{"name":"r","wiring":["A","B","C"],"turnovers":[]}],
+                    "slots":[{"id":"r","role":"rotor","movement":"fixed","wheel":"r"}],
+                    "stepping":{"rules":[]}}}},
+                "job":{"kind":"search","configuration":{"slots":[],"plugboard":[]},
+                    "text":text,"passes":["hill_climb"],
+                    "measures":if initial == "ic" { vec!["ic","entropy"] } else { vec!["entropy"] },
+                    "space":{"slots":[{"id":"r","positions":["A"],"rings":["A"]}],
+                        "plugboard":{"kind":"attack","symbols":["A","B","C"],"max_pairs":0}},
+                    "attack":{"kind":"hill_climb","initial_measure":initial,"final_measure":"entropy",
+                        "switch_pairs":1,"backtrack_pairs":0,"hold":1,"start":[]}}});
+            let request = AttackRequest::parse_json(&value.to_string()).unwrap();
+            let run = |options: ExecutionOptions| {
+                format!("{:?}", request.run_with(options, |_| {}, || false))
+            };
+            assert_eq!(
+                run(ExecutionOptions::serial().with_accelerator(&device)),
+                run(ExecutionOptions::serial()),
+                "{initial}, n={}",
+                text.len()
+            );
+        }
+    }
+}
