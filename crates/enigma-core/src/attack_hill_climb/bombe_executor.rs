@@ -3,6 +3,21 @@
 use super::*;
 use crate::bombe::Scratch;
 
+/// Test-only runtime faults injected at one outer of `run_bombe_block`.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Fault {
+    /// The finishing climb of this crib rank fails with an evaluation error.
+    Climb { outer: u128, rank: usize },
+    /// Counting this outer as completed overflows.
+    OuterCompleted { outer: u128 },
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAULT: std::cell::Cell<Option<Fault>> = const { std::cell::Cell::new(None) };
+}
+
 impl crate::AttackRequest {
     pub(super) fn bombe_summary(
         &self,
@@ -136,6 +151,10 @@ impl crate::AttackRequest {
                         self.settings().switch_pairs(),
                     )
                     .with_preparation(preparation, index);
+                    #[cfg(test)]
+                    if FAULT.get() == Some(Fault::Climb { outer: index, rank }) {
+                        return Err(TrialEvaluationError::MissingResource(last).into());
+                    }
                     let climb = scoring.climb_accounted(
                         Vec::new(),
                         self.settings().backtrack_pairs(),
@@ -157,6 +176,10 @@ impl crate::AttackRequest {
                 Ok::<_, DirectRunError>(())
             })();
             let run = run.and_then(|()| {
+                #[cfg(test)]
+                if FAULT.get() == Some(Fault::OuterCompleted { outer: index }) {
+                    return Err(DirectRunError::Counter(CounterOverflow::OutersCompleted));
+                }
                 outcome
                     .accounting
                     .transition(AttackControl::record_outer_completed)
@@ -188,12 +211,13 @@ impl crate::AttackRequest {
 
 #[cfg(test)]
 mod tests {
-    use crate::{AttackRequest, Event};
+    use super::{Fault, FAULT};
+    use crate::{AttackCounterOverflow, AttackRequest, AttackRunCategory, Event};
     use serde_json::json;
 
-    #[test]
-    fn rows_cover_only_the_admitted_prefix_once_and_finishing_rows_are_shared() {
-        let mut value = json!({"protocol_version":1,"machine":{"definition":{"kind":"custom","value":{
+    /// One outer whose crib "AA" stops at both admitted positions 0 and 1.
+    fn two_stop_request() -> serde_json::Value {
+        json!({"protocol_version":1,"machine":{"definition":{"kind":"custom","value":{
             "alphabet":["A","B","C","D"],
             "wheels":[{"name":"u","wiring":["B","A","D","C"],"turnovers":[]},
                       {"name":"r","wiring":["A","B","C","D"],"turnovers":[]}],
@@ -205,7 +229,78 @@ mod tests {
             "text":"BBBAAA","passes":["bombe"],"measures":["ic"],
             "space":{"plugboard":{"kind":"attack","symbols":["A","B","C","D"],"max_pairs":0}},
             "attack":{"kind":"bombe","crib":{"text":"AA"},"initial_measure":"ic",
-                "final_measure":"ic","switch_pairs":0,"backtrack_pairs":0}}});
+                "final_measure":"ic","switch_pairs":0,"backtrack_pairs":0}}})
+    }
+
+    fn run_with_fault(fault: Fault) -> (crate::AttackRunError, usize) {
+        let request = AttackRequest::parse_json(&two_stop_request().to_string()).unwrap();
+        let mut checkpoints = 0;
+        FAULT.with(|cell| cell.set(Some(fault)));
+        let run = request.run_with_checkpoints(
+            crate::ExecutionOptions::serial(),
+            |_| {},
+            || false,
+            |_| checkpoints += 1,
+        );
+        FAULT.with(|cell| cell.set(None));
+        (run.unwrap_err(), checkpoints)
+    }
+
+    #[test]
+    fn runtime_error_keeps_the_failing_outers_earlier_stops_without_a_checkpoint() {
+        let request = AttackRequest::parse_json(&two_stop_request().to_string()).unwrap();
+        let clean = request.run(|_| {}, || false).unwrap();
+        let first = clean
+            .hold()
+            .map(|entry| entry.best())
+            .find(|best| best.crib_position() == Some(0))
+            .expect("stop at position 0");
+
+        let (error, checkpoints) = run_with_fault(Fault::Climb { outer: 0, rank: 1 });
+        assert_eq!(error.run_source().category(), AttackRunCategory::Evaluation);
+        assert_eq!(
+            (error.outer_index(), error.start_index()),
+            (Some(0), Some(1))
+        );
+        let held: Vec<_> = error.hold().unwrap().map(|entry| entry.best()).collect();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].crib_position(), Some(0));
+        assert_eq!(held[0].start_index(), 0);
+        assert_eq!(held[0].plaintext(), first.plaintext());
+        assert_eq!(held[0].configuration(), first.configuration());
+        let counters = error.counters();
+        assert_eq!((counters.bombe_settings(), counters.bombe_stops()), (2, 2));
+        assert_eq!(
+            (counters.climbs_started(), counters.outers_completed()),
+            (1, 0)
+        );
+        let crib = error.crib().unwrap();
+        assert_eq!((crib.settings(), crib.stops()), (2, 2));
+        assert_eq!(checkpoints, 0);
+    }
+
+    #[test]
+    fn outer_completion_overflow_discards_that_outers_stops() {
+        let (error, checkpoints) = run_with_fault(Fault::OuterCompleted { outer: 0 });
+        assert_eq!(
+            error.run_source().overflow(),
+            Some(AttackCounterOverflow::OutersCompleted)
+        );
+        assert_eq!((error.outer_index(), error.start_index()), (Some(0), None));
+        assert!(error.best().unwrap().is_none());
+        assert_eq!(error.hold().unwrap().count(), 0);
+        let counters = error.counters();
+        assert_eq!((counters.bombe_settings(), counters.bombe_stops()), (2, 2));
+        assert_eq!(
+            (counters.climbs_started(), counters.outers_completed()),
+            (2, 0)
+        );
+        assert_eq!(checkpoints, 0);
+    }
+
+    #[test]
+    fn rows_cover_only_the_admitted_prefix_once_and_finishing_rows_are_shared() {
+        let mut value = two_stop_request();
         for (crib, expected_lengths, stops) in [("AA", vec![3, 6], 2), ("AC", vec![4], 0)] {
             value["job"]["attack"]["crib"]["text"] = json!(crib);
             crate::engine::ROW_LENGTHS.with(|lengths| *lengths.borrow_mut() = Some(Vec::new()));

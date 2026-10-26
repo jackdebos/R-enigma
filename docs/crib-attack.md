@@ -172,6 +172,11 @@ Cancellation, signals, `--threads` and the cancel file behave as for HC
 ([protocol §5](protocol.md#5-control)). Checkpoints use the outer-block cursor of
 [protocol §6](protocol.md#6-checkpoint-and-resume-task-16). The crib is part of the job,
 so it is part of the checkpoint identity; the counters of §6 are saved and restored.
+On a runtime error the hold keeps the stops of earlier outers and the earlier stops of
+the failing outer, and the counters include the failing outer's partial work; when
+outer-completion accounting overflows, that outer's offers are discarded with it. No
+checkpoint is written for the failing block ([search passes §10.2](search-passes.md#102-entry-rule),
+[protocol §4.1](protocol.md#41-planned-hcpe-search-events--task-127)).
 `--backend gpu` with a `bombe` job fails before work with `backend_unavailable`,
 at `/job/attack`, with message `GPU backend unavailable: the crib attack runs on the CPU only`
 and exit 1; there is no silent CPU fallback. A GPU bombe is later work.
