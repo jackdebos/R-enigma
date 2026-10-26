@@ -67,6 +67,144 @@ fn attack() -> Value {
         "attack":{"kind":"hill_climb","initial_measure":"ic","final_measure":"ic","switch_pairs":1,"backtrack_pairs":0,"start":[]}}})
 }
 
+fn bombe() -> Value {
+    // Tiny fixed scrambler: AA decrypts from each of the three BB windows.
+    json!({"protocol_version":1,"machine":{"definition":{"kind":"custom","value":{
+        "alphabet":["A","B","C","D"],
+        "wheels":[{"name":"u","wiring":["B","A","D","C"],"turnovers":[]},
+                  {"name":"r","wiring":["A","B","C","D"],"turnovers":[]}],
+        "slots":[{"id":"u","role":"reflector","movement":"fixed","wheel":"u"},
+                 {"id":"r","role":"rotor","movement":"fixed","wheel":"r"}],
+        "stepping":{"rules":[]}}}},"job":{"kind":"search",
+        "configuration":{"slots":[{"id":"u","position":"A","ring":"A"},
+            {"id":"r","position":"A","ring":"A"}],"plugboard":[]},
+        "text":"BBBB","passes":["bombe"],"measures":["ic"],
+        "space":{"plugboard":{"kind":"attack","symbols":["A","B","C","D"],"max_pairs":0}},
+        "attack":{"kind":"bombe","crib":{"text":"AA"},"initial_measure":"ic",
+            "final_measure":"ic","switch_pairs":0,"backtrack_pairs":0,"hold":10}}})
+}
+
+#[test]
+fn bombe_human_report_includes_summary_and_finalist_position() {
+    let dir = Scratch::new();
+    let output = dir.run(
+        &["--request", "-", "--no-report", "--threads", "1"],
+        &bombe(),
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stderr, b"");
+    let report = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        report.contains(
+            "Crib:         AA\nPositions:    3 (0, 1, 2)\nSettings:     3\nStops:        3\n\n"
+        ),
+        "{report}"
+    );
+    assert!(report.ends_with("#1  score 4.000000\n    Wheels:     u r\n    Rings:      AA\n    Positions:  AA\n    Plugboard:  none\n    Crib position: 0\n    Plaintext:  AAAA\n"), "{report}");
+    assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
+}
+
+#[test]
+fn bombe_events_include_crib_positions_and_counters() {
+    let dir = Scratch::new();
+    let output = dir.run(
+        &["--request", "-", "--events", "-", "--threads", "1"],
+        &bombe(),
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stderr, b"");
+    let wire = events(&output.stdout);
+    assert_eq!(
+        names(&wire),
+        ["started", "progress", "progress", "result", "done"]
+    );
+    let result = &wire[3];
+    assert_eq!(
+        result["crib"],
+        json!({"text":"AA","positions":["0","1","2"],"settings":"3","stops":"3"})
+    );
+    for candidate in std::iter::once(&result["best"]).chain(result["hold"].as_array().unwrap()) {
+        assert_eq!(candidate["crib_position"], "0");
+    }
+    for (event, settings, stops) in [
+        (&wire[1], "0", "0"),
+        (&wire[2], "3", "3"),
+        (result, "3", "3"),
+    ] {
+        assert_eq!(event["counters"]["bombe_settings"], settings);
+        assert_eq!(event["counters"]["bombe_stops"], stops);
+    }
+    assert_eq!(wire[4]["reason"], "completed");
+    assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
+}
+
+#[test]
+fn bombe_gpu_and_crashing_crib_reject_without_work_or_saved_state() {
+    let dir = Scratch::new();
+    let mut crashing = bombe();
+    crashing["job"]["attack"]["crib"] = json!({"text":"AB","position":1});
+    for (input, extra, code, message, location) in [
+        (
+            bombe(),
+            vec!["--backend", "gpu"],
+            "backend_unavailable",
+            "GPU backend unavailable: the crib attack runs on the CPU only",
+            "/job/attack",
+        ),
+        (
+            crashing,
+            vec![],
+            "invalid_search_space",
+            "crib crashes at text index 2",
+            "/job/attack/crib/position",
+        ),
+    ] {
+        let mut args = vec!["--request", "-", "--events", "-"];
+        args.extend(extra);
+        let output = dir.run(&args, &input);
+        assert_eq!(output.status.code(), Some(1));
+        let mut wire = events(&output.stdout);
+        assert_eq!(wire.len(), 1);
+        wire[0].as_object_mut().unwrap().remove("ts");
+        assert_eq!(
+            wire[0],
+            json!({"event":"error","protocol_version":1,"seq":1,"code":code,"message":message,"location":location})
+        );
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        if code == "backend_unavailable" {
+            assert_eq!(stderr, format!("{code}: {message}\n"));
+        } else {
+            assert_eq!(
+                stderr,
+                format!("{code} at {location}: {message}\n{code}: {message}\n")
+            );
+        }
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn hc_human_report_preserves_exact_non_clock_lines() {
+    let dir = Scratch::new();
+    let output = dir.run(
+        &["--request", "-", "--no-report", "--threads", "1"],
+        &attack(),
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stderr, b"");
+    let report = String::from_utf8(output.stdout).unwrap();
+    let stable = report
+        .lines()
+        .filter(|line| {
+            !["Started:", "Finished:", "Duration:"]
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(stable, "Enigma attack report\nStatus:       completed\nRequest:      stdin\nOuter keys:   2 of 2\nEvaluations:  4\nThreads:      1\nMeasure:      ic\n\n#1  score 2.000000  (gap to #2: 0.000000)\n    Wheels:     r\n    Rings:      A\n    Positions:  A\n    Plugboard:  none\n    Plaintext:  BB\n\n#2  score 2.000000\n    Wheels:     r\n    Rings:      A\n    Positions:  B\n    Plugboard:  none\n    Plaintext:  BB");
+}
+
 #[test]
 fn reports_saved_and_event_mode_opt_in() {
     let dir = Scratch::new();

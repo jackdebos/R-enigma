@@ -139,6 +139,25 @@ pub(crate) fn attack(
         .expect("elapsed")
         / 1000;
     let mut out = format!("Enigma attack report\nStatus:       {status}\nRequest:      {request}\nStarted:      {}\nFinished:     {}\nDuration:     {:02}:{:02}:{:02}\nOuter keys:   {} of {selected}\nEvaluations:  {}\nThreads:      {}\nMeasure:      {measure}\n\n", text(&result["started_at"]), text(&result["finished_at"]), seconds/3600, seconds/60%60, seconds%60, text(&result["counters"]["outers_completed"]), text(&result["counters"]["evaluations_completed"]), text(&result["threads"]));
+    if let Some(crib) = result.get("crib") {
+        let positions = crib["positions"].as_array().expect("crib positions");
+        out.push_str(&format!(
+            "Crib:         {}\nPositions:    {}",
+            text(&crib["text"]),
+            positions.len()
+        ));
+        if !positions.is_empty() && positions.len() <= 10 {
+            out.push_str(&format!(
+                " ({})",
+                positions.iter().map(text).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        out.push_str(&format!(
+            "\nSettings:     {}\nStops:        {}\n\n",
+            text(&crib["settings"]),
+            text(&crib["stops"])
+        ));
+    }
     let hold = result["hold"].as_array().expect("hold");
     if hold.is_empty() {
         out.push_str("No candidates.\n");
@@ -164,6 +183,9 @@ pub(crate) fn attack(
         }
         out.push('\n');
         out.push_str(&key(&candidate["configuration"], "    "));
+        if let Some(position) = candidate.get("crib_position") {
+            out.push_str(&format!("    Crib position: {}\n", text(position)));
+        }
         out.push_str(&grouped("    Plaintext:  ", text(&candidate["plaintext"])));
     }
     if reason == "cancelled" {

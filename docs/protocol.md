@@ -1,6 +1,6 @@
 # Engine Protocol
 
-Status: **Protocol v1 is unpublished; transform and validated HC/PE execution ship
+Status: **Protocol v1 is unpublished; transform and validated HC/PE/bombe execution ship
 in Rust. Legacy search and deferred controls remain unimplemented.** It replaces the former superset-of-`bomm` proposal. It makes no promise to
 accept `bomm` query files unchanged; `bomm` remains a differential oracle. See
 `odd/tasks/enigma-engine.md` for task status. The engine has no UI; the Stage 2 web
@@ -105,7 +105,7 @@ Output:
   -o, --report <name>       save the report to <name>, a new file
       --no-report           do not save a report file
 
-Attacks (hill_climb and partial_exhaustion):
+Attacks (hill_climb, partial_exhaustion and bombe):
   -t, --threads <n>         worker threads, 1 to 256 (default: half the logical
                             CPUs); completed runs give the same result for any <n>
       --backend <cpu|gpu>   execution backend (default: cpu); GPU requires hill_climb
@@ -122,6 +122,7 @@ Other:
 By default progress is drawn on stderr when it is a terminal, and the result is
 printed on stdout and saved as a report in the working directory.
 See docs/protocol.md for the contract.
+The CPU-only bombe crib attack is described in docs/crib-attack.md.
 ```
 
 Relative paths in every option value use the invocation working directory.
@@ -131,7 +132,7 @@ Diagnostics name options by their long form, whichever form was given.
 
 Without `--events -` the process runs in human mode:
 
-- **Attacks** (HC/PE): while the search runs, the progress bar (below) is drawn on
+- **Attacks** (HC/PE/bombe): while the search runs, the progress bar (below) is drawn on
   stderr. At the end stdout receives the report text (§2.4), and the report is saved
   to a file unless `--no-report` is given.
 - **Transform**: stdout receives the transformed text followed by one newline; no bar is
@@ -236,6 +237,22 @@ Measure:      ngram
   argument quoted for a POSIX shell when it contains other than letters, digits or
   `-_./=:`. Otherwise it reads
   `Resume:       not available (run with --checkpoint to make a search resumable)`.
+
+A `bombe` report adds the following block after `Measure` and before the finalists:
+
+```text
+Crib:         AA
+Positions:    3 (0, 1, 2)
+Settings:     3
+Stops:        3
+```
+
+`Positions` is the count of admissible crib positions from `result.crib.positions`;
+when nonempty and at most 10, the 0-based positions are listed in parentheses.
+`Settings` and `Stops` are `result.crib.settings` and `result.crib.stops`.
+Each finalist adds `    Crib position: <position>` before `Plaintext`.
+Short cribs are accepted; the stop count makes their cost visible. HC/PE reports
+are unchanged. See [crib-attack.md §7](crib-attack.md#7-progress-result-report).
 
 A transform report has the header `Enigma transform report`, the `Request`,
 `Started`, `Finished` and `Direction` (`encrypt`/`decrypt`) lines, the key lines
@@ -571,7 +588,9 @@ Representability by the definition schema does not imply algorithm support for a
 alphabet, wheel count, stepping rule, or topology.
 
 Stage 3 adds the crib attack (`job.attack.kind = "bombe"`), specified in
-[crib-attack.md](crib-attack.md); it is designed, not implemented yet.
+[crib-attack.md](crib-attack.md). Core and CLI execution are implemented; web
+support is pending. The CPU-only attack shares the HC control and finishing-stage
+contracts, with additive crib results and counters (§4.1).
 
 ## 4. Events and validation errors
 
@@ -612,8 +631,8 @@ Syntax errors point to the closest available containing path.
 
 ### 4.1 Planned HC/PE search events — Task 12.7
 
-**Current availability (Task12.11):** Transform and validated HC/PE attacks execute
-in the production CLI. HC/PE share the synchronous JSONL adapter and fallible Core
+**Current availability:** Transform and validated HC/PE/bombe attacks execute
+in the production CLI. HC/PE/bombe share the synchronous JSONL adapter and fallible Core
 projections. Legacy search still returns seq1 `unsupported_job` after preflight,
 without work events. All preflight failures remain seq1-only errors.
 `AttackResult::hold()` exposes ordered borrowed entry views; `AttackRunError::hold()`
@@ -630,7 +649,7 @@ optional boxed context. Malformed retained best fails with `RuntimeProjectionErr
 which retains the original runtime cause and separate best-projection cause;
 only genuine absence becomes null. These projection helpers read no clocks and
 perform no I/O or orchestration; the private adapter supplies that boundary.
-One leading attack pass, `hill_climb` or `partial_exhaustion`, is eligible, optionally
+One leading attack pass, `hill_climb`, `partial_exhaustion` or `bombe`, is eligible, optionally
 followed by the executable [Task 13 chained stages](search-passes.md#9-chained-stages--task-13)
 `measure`, `trie` and `reswapping`; recognition of other passes is not support, and
 mixed/deferred/legacy rejection is unchanged. `result.stages` is live: it lists the
@@ -659,7 +678,7 @@ Payloads below supplement the existing event envelope; `done` stays reason-only:
 | `done` | `reason`: `completed`, `outer_slice_end`, or `cancelled` |
 | Runtime `error` | Existing `code`, `message`, `location`; additionally `context` |
 
-`counters` has exactly `evaluations_admitted`, `evaluations_completed`,
+For HC/PE, `counters` has exactly `evaluations_admitted`, `evaluations_completed`,
 `climbs_started`, `climbs_completed`, `outers_completed` with the factual meanings
 in [accounting](search-passes.md#accounting-and-completion). `evaluations_used` in
 Core records charged allowance, not completed work. Charge precedes the checked
@@ -680,6 +699,17 @@ HC and the dense seed index for PE; `outer_index` is absolute, unsliced.
 The three boolean winner flags are independent of each other and of run termination;
 `incomplete` means that winning climb was interrupted. Ties retain earliest
 (outer index, start index). No best means JSON null, never a sentinel key or score.
+
+For `bombe`, progress and result `counters` additionally contain `bombe_settings`
+(settings tested: outer key × admissible crib position) and `bombe_stops` (stops
+found before finishing climbs). `result` additionally contains `crib` with `text`,
+`positions` (admissible 0-based positions, ascending), `settings` and `stops`.
+Each non-null `best` and each `hold` entry adds `crib_position`, the position of its
+stop; `start_index` is its rank among the admissible positions. Counts and positions
+are decimal strings, including every element of `crib.positions`. These fields are
+omitted for HC/PE, whose wire output is unchanged. The request accepts one crib,
+without engine normalization; see [crib-attack.md §1](crib-attack.md#1-request) for
+strict validation, including crashing-position errors before work.
 
 All new search count/index/elapsed fields are canonical unsigned decimal **strings**
 (`0` or a nonzero digit followed by digits), including u64 counts; Q32 fields are
@@ -899,6 +929,9 @@ GPU preflight first projects the climb job. Unsupported attacks (including parti
 exhaustion, entropy/trie objectives, and sparse or i128 n-grams) emit one seq 1
 `unsupported_job` at `/job/attack`, message
 `--backend gpu does not support this attack: <reason>`, exit 1.
+A `bombe` job instead emits one seq 1 `backend_unavailable` at `/job/attack`,
+message `GPU backend unavailable: the crib attack runs on the CPU only`, exit 1,
+before device initialization or any work events. HC/PE GPU behavior is unchanged.
 No suitable adapter (including missing 64-bit integer support), device initialization
 failure, or device-specific job limit emits one seq 1 `backend_unavailable` at `""`,
 message `GPU backend unavailable: <reason>`, exit 1. Stderr is

@@ -441,7 +441,7 @@ Output:
   -o, --report <name>       save the report to <name>, a new file
       --no-report           do not save a report file
 
-Attacks (hill_climb and partial_exhaustion):
+Attacks (hill_climb, partial_exhaustion and bombe):
   -t, --threads <n>         worker threads, 1 to 256 (default: half the logical
                             CPUs); completed runs give the same result for any <n>
       --backend <cpu|gpu>   execution backend (default: cpu); GPU requires hill_climb
@@ -458,6 +458,7 @@ Other:
 By default progress is drawn on stderr when it is a terminal, and the result is
 printed on stdout and saved as a report in the working directory.
 See docs/protocol.md for the contract.
+The CPU-only bombe crib attack is described in docs/crib-attack.md.
 "#
     )
 }
@@ -676,6 +677,16 @@ fn run_attack_presented<'s>(
             let gpu = if backend.choice == Some(Backend::Gpu) {
                 let job = match validated.climb_job() {
                     Ok(job) => job,
+                    // Bombe's CPU-only boundary is a backend capability error;
+                    // retain the existing unsupported_job mapping for HC/PE.
+                    Err(enigma_core::ClimbUnsupported::Bombe) => {
+                        return failure(
+                            out,
+                            "backend_unavailable",
+                            "GPU backend unavailable: the crib attack runs on the CPU only",
+                            "/job/attack",
+                        )
+                    }
                     Err(reason) => {
                         return failure(
                             out,

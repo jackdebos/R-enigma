@@ -1,6 +1,6 @@
 # Crib attack contract — Stage 3
 
-Status: **design, not implemented.** This document specifies the `bombe` attack:
+Status: **Core and CLI implemented; web pending.** This document specifies the `bombe` attack:
 the user supplies a crib (a plaintext fragment believed to be in the message); the
 engine drags it along the ciphertext, runs a deductive Turing-Welchman bombe on every
 declared outer key and admissible crib position, and finishes every stop with the
@@ -161,8 +161,10 @@ evaluations do today.
 - `result` adds a `crib` object: `text`, `positions` (the admissible positions
   tested, ascending), `settings` and `stops`. Each `best`/`hold` entry adds
   `crib_position`, the position its stop came from. Other fields keep their meaning.
-- The human report shows the crib, how many positions were tested, settings and
-  stops, then the finalists as today.
+- The human report shows the crib, how many positions were tested (listing the
+  0-based positions when there are at most 10), settings and stops, then the
+  finalists as today, each with its `Crib position`. See
+  [protocol §2.4](protocol.md#24-reports) for the layout.
 
 ## 8. Control
 
@@ -171,7 +173,8 @@ Cancellation, signals, `--threads` and the cancel file behave as for HC
 [protocol §6](protocol.md#6-checkpoint-and-resume-task-16). The crib is part of the job,
 so it is part of the checkpoint identity; the counters of §6 are saved and restored.
 `--backend gpu` with a `bombe` job fails before work with `backend_unavailable`,
-naming the reason; there is no silent CPU fallback. A GPU bombe is later work.
+at `/job/attack`, with message `GPU backend unavailable: the crib attack runs on the CPU only`
+and exit 1; there is no silent CPU fallback. A GPU bombe is later work.
 
 ## 9. Web
 
