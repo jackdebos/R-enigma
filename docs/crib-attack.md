@@ -86,6 +86,12 @@ the symbols. It splits into connected components. In each component the **test
 symbol** is the symbol with the most edges, ties going to the earliest alphabet
 symbol.
 
+Menus depend only on the position, so Core builds them once, before `started`, and
+shares them across settings, as long as all of them together are estimated to fit in
+64 MiB. A longer text with a long crib can admit more menus than that. Then Core
+keeps none and rebuilds each position's menu where it is used. The menus, stops,
+counters, order and checkpoints are the same either way; only the speed differs.
+
 ## 4. Bombe test on one setting
 
 A **setting** is one resolved outer key of the declared space (every slot's wheel,

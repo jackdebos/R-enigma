@@ -81,9 +81,9 @@ impl crate::AttackRequest {
             .map_err(TrialEvaluationError::Model)?;
         let mut scratch = Scratch::default();
         let width = self.definition().alphabet().len();
-        let menu = &plan.menus[rank];
+        let menu = plan.menu(rank);
         let window = &rows[position * width..(position + menu.edges.len()) * width];
-        if !scratch.test(menu, window, &plan.facts) {
+        if !scratch.test(&menu, window, &plan.facts) {
             return Err(TrialEvaluationError::Invariant(
                 "saved crib setting is not a stop",
             ));
@@ -122,15 +122,15 @@ impl crate::AttackRequest {
                     .scrambler_rows(bombe.row_length, Direction::Decrypt, rows)
                     .map_err(TrialEvaluationError::Model)?;
                 let width = self.definition().alphabet().len();
-                for (rank, (&position, menu)) in
-                    bombe.positions.iter().zip(&bombe.menus).enumerate()
-                {
+                for (rank, &position) in bombe.positions.iter().enumerate() {
                     start_index = Some(rank as u128);
                     outcome
                         .accounting
                         .transition(AttackControl::record_bombe_setting)?;
+                    // Over the admission budget this builds the menu for this use only.
+                    let menu = bombe.menu(rank);
                     let window = &rows[position * width..(position + menu.edges.len()) * width];
-                    if !scratch.test(menu, window, &bombe.facts) {
+                    if !scratch.test(&menu, window, &bombe.facts) {
                         continue;
                     }
                     outcome
@@ -212,8 +212,128 @@ impl crate::AttackRequest {
 #[cfg(test)]
 mod tests {
     use super::{Fault, FAULT};
+    use crate::bombe::{shared_menu_bytes, Menus, MENU_BUDGET};
     use crate::{AttackCounterOverflow, AttackRequest, AttackRunCategory, Event};
     use serde_json::json;
+
+    /// Admits `value` with the shared-menu budget overridden on this thread.
+    fn admit(value: &serde_json::Value, budget: Option<usize>) -> AttackRequest {
+        MENU_BUDGET.with(|cell| cell.set(budget));
+        let request = AttackRequest::parse_json(&value.to_string());
+        MENU_BUDGET.with(|cell| cell.set(None));
+        request.unwrap()
+    }
+
+    fn shared_menus(request: &AttackRequest) -> Option<usize> {
+        match &request.gate().bombe.as_ref().unwrap().menus {
+            Menus::Shared(menus) => Some(menus.len()),
+            Menus::OnDemand { .. } => None,
+        }
+    }
+
+    #[test]
+    fn admission_shares_menus_within_the_budget_and_defers_them_beyond_it() {
+        let value = two_stop_request();
+        // Two admitted positions, a two-letter crib, a four-symbol alphabet.
+        let bytes = shared_menu_bytes(2, 2, 4).unwrap();
+        assert_eq!(shared_menus(&admit(&value, None)), Some(2));
+        assert_eq!(shared_menus(&admit(&value, Some(bytes))), Some(2));
+        assert_eq!(shared_menus(&admit(&value, Some(bytes - 1))), None);
+        assert_eq!(shared_menus(&admit(&value, Some(0))), None);
+        // Long text and long crib: well past the default budget; overflow defers too.
+        assert!(
+            shared_menu_bytes(10_000, 2_000, 26).unwrap() > crate::bombe::MAX_SHARED_MENU_BYTES
+        );
+        assert_eq!(shared_menu_bytes(usize::MAX, 2, 4), None);
+        // Admission diagnostics do not depend on the menu storage.
+        let mut crash = value.clone();
+        crash["job"]["attack"]["crib"]["position"] = json!(2);
+        for budget in [None, Some(0)] {
+            MENU_BUDGET.with(|cell| cell.set(budget));
+            let errors = AttackRequest::parse_json(&crash.to_string()).unwrap_err();
+            MENU_BUDGET.with(|cell| cell.set(None));
+            assert_eq!(
+                (errors[0].code(), errors[0].location(), errors[0].message()),
+                (
+                    "invalid_search_space",
+                    "/job/attack/crib/position",
+                    "crib crashes at text index 3"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn on_demand_menus_give_identical_results_checkpoints_and_stages() {
+        let mut value = two_stop_request();
+        // Four variable rotor dimensions give 256 keys over two blocks, and a stage
+        // re-derives each stop's deductions through `bombe_context`.
+        let definition = &mut value["machine"]["definition"]["value"];
+        for i in 1..4 {
+            definition["slots"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"id":format!("r{i}"),"role":"rotor","movement":"fixed","wheel":"r"}));
+        }
+        let job = &mut value["job"];
+        job["configuration"]["slots"] = json!([{"id":"u","position":"A","ring":"A"}]);
+        job["space"]["slots"] = json!(["r", "r1", "r2", "r3"]
+            .map(|id| json!({"id":id,"positions":["A","B","C","D"],"rings":["A"]})));
+        // Admitted positions 0, 1 and 2 carry different letter pairs, so menus differ.
+        job["text"] = json!("BBDDAA");
+        job["passes"] = json!(["bombe", "measure"]);
+        job["attack"]["hold"] = json!(10);
+        job["attack"]["measure"] = json!({"measure":"ic"});
+        let shared = admit(&value, None);
+        let deferred = admit(&value, Some(0));
+        assert_eq!(shared_menus(&shared), Some(3));
+        assert_eq!(shared_menus(&deferred), None);
+        let wire = |request: &AttackRequest, threads| {
+            let options = crate::ExecutionOptions::with_threads(threads).unwrap();
+            let result = request.run_with(options, |_| {}, || false).unwrap();
+            serde_json::to_value(Event::result(&result, 0)).unwrap()
+        };
+        let expected = wire(&shared, 1);
+        assert!(
+            expected["crib"]["stops"]
+                .as_str()
+                .unwrap()
+                .parse::<u32>()
+                .unwrap()
+                > 1
+        );
+        assert_eq!(expected["crib"]["settings"], "768");
+        assert_eq!(expected["hold"].as_array().unwrap().len(), 10);
+        for threads in [1, 3] {
+            assert_eq!(wire(&shared, threads), expected);
+            assert_eq!(wire(&deferred, threads), expected);
+        }
+        let identity = crate::checkpoint_identity(&value.to_string(), &Default::default()).unwrap();
+        let mut saved = None;
+        let polls = std::cell::Cell::new(0);
+        deferred
+            .run_with_checkpoints(
+                crate::ExecutionOptions::serial(),
+                |_| {},
+                || {
+                    polls.set(polls.get() + 1);
+                    polls.get() > 1
+                },
+                |snapshot| saved = Some(snapshot.record(identity, 0).unwrap()),
+            )
+            .unwrap();
+        let mut record = saved.unwrap();
+        let record = crate::CheckpointRecord::parse_json(&record.seal_json().unwrap()).unwrap();
+        let resumed = deferred
+            .resume(&record)
+            .unwrap()
+            .run_with(crate::ExecutionOptions::serial(), |_| {}, || false)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(Event::result(&resumed, 0)).unwrap(),
+            expected
+        );
+    }
 
     /// One outer whose crib "AA" stops at both admitted positions 0 and 1.
     fn two_stop_request() -> serde_json::Value {

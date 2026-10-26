@@ -2,16 +2,76 @@
 //!
 //! Indices are already validated/normalized by the caller; no text normalization is
 //! performed here. Menus and facts are built once, scratch is reused across settings.
+
+use std::borrow::Cow;
+
+/// Admission keeps every position's menu only while their estimated heap stays
+/// within this bound (the same 64 MiB as the accelerator's byte rows).
+pub(crate) const MAX_SHARED_MENU_BYTES: usize = 64 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override of `MAX_SHARED_MENU_BYTES` for admissions on this thread.
+    pub(crate) static MENU_BUDGET: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn menu_budget() -> usize {
+    #[cfg(test)]
+    if let Some(budget) = MENU_BUDGET.get() {
+        return budget;
+    }
+    MAX_SHARED_MENU_BYTES
+}
+
+/// Upper bound on the heap held by `positions` menus, or `None` on overflow. Per
+/// menu: `crib` edges, each also listed once by its component, plus at most `size`
+/// components whose symbols partition at most `size` symbols:
+/// `crib * (size_of::<Edge>() + size_of::<usize>())
+///  + size * (size_of::<Component>() + size_of::<usize>()) + size_of::<Menu>()`.
+pub(crate) fn shared_menu_bytes(positions: usize, crib: usize, size: usize) -> Option<usize> {
+    use std::mem::size_of;
+    let edges = crib.checked_mul(size_of::<Edge>() + size_of::<usize>())?;
+    let components = size.checked_mul(size_of::<Component>() + size_of::<usize>())?;
+    edges
+        .checked_add(components)?
+        .checked_add(size_of::<Menu>())?
+        .checked_mul(positions)
+}
+
+/// Menus for the admitted positions, in position order.
+#[derive(Debug)]
+pub(crate) enum Menus {
+    /// Built once at admission and shared by every outer.
+    Shared(Vec<Menu>),
+    /// Over budget: each use rebuilds its menu from the crib and text indices.
+    OnDemand {
+        size: usize,
+        crib: Vec<usize>,
+        text: Vec<usize>,
+    },
+}
+
 /// Immutable admission-time menus and facts shared by outer workers.
 #[derive(Debug)]
 pub(crate) struct Plan {
     pub(crate) positions: Vec<usize>,
-    pub(crate) menus: Vec<Menu>,
+    pub(crate) menus: Menus,
     pub(crate) facts: Facts,
     pub(crate) row_length: usize,
 }
 
 impl Plan {
+    /// The menu of the admitted position at `rank`; identical for both storages.
+    pub(crate) fn menu(&self, rank: usize) -> Cow<'_, Menu> {
+        match &self.menus {
+            Menus::Shared(menus) => Cow::Borrowed(&menus[rank]),
+            Menus::OnDemand { size, crib, text } => Cow::Owned(
+                Menu::new(*size, crib, text, self.positions[rank]).expect("admitted position"),
+            ),
+        }
+    }
+
     pub(crate) fn build(
         request: &crate::SearchRequest,
         domain: &crate::AttackPlugboardDomain,
@@ -50,10 +110,27 @@ impl Plan {
                 format!("/job/attack/crib{member}"),
             )]
         })?;
-        let menus = positions
-            .iter()
-            .map(|&p| Menu::new(alphabet.len(), &crib, &text, p).expect("admitted position"))
-            .collect();
+        let row_length = positions.last().unwrap() + crib.len();
+        let fits = shared_menu_bytes(positions.len(), crib.len(), alphabet.len())
+            .is_some_and(|bytes| bytes <= menu_budget());
+        let menus = if fits {
+            Menus::Shared(
+                positions
+                    .iter()
+                    .map(|&p| {
+                        Menu::new(alphabet.len(), &crib, &text, p).expect("admitted position")
+                    })
+                    .collect(),
+            )
+        } else {
+            let mut text = text;
+            text.truncate(row_length);
+            Menus::OnDemand {
+                size: alphabet.len(),
+                crib,
+                text,
+            }
+        };
         let mutable = alphabet
             .symbols
             .iter()
@@ -65,7 +142,6 @@ impl Plan {
             .map(|&(a, b)| (alphabet.index_of(a).unwrap(), alphabet.index_of(b).unwrap()))
             .collect::<Vec<_>>();
         let facts = Facts::new(&mutable, &fixed, domain.max_pairs()).expect("validated domain");
-        let row_length = positions.last().unwrap() + crib.len();
         Ok(Self {
             positions,
             menus,
@@ -132,7 +208,7 @@ pub(crate) struct Edge {
 }
 
 /// An edge-connected set of symbols (isolated alphabet symbols are omitted).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Component {
     pub(crate) symbols: Vec<usize>,
     pub(crate) test_symbol: usize,
@@ -140,7 +216,7 @@ pub(crate) struct Component {
 }
 
 /// Setting-independent multigraph at one admissible crib position.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Menu {
     pub(crate) edges: Vec<Edge>,
     pub(crate) components: Vec<Component>,
