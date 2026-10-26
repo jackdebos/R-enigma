@@ -130,7 +130,8 @@ pub enum ClimbUnsupported {
     Objective(MeasureId),
     /// No dense integer weight table exists.
     SparseNgram(MeasureId),
-    /// Window sums require the production i128 path.
+    /// Window sums require the production i128 path. Unreachable for bound models
+    /// within byte-row texts (pinned by a test); kept as a defensive guard.
     WideNgram(MeasureId),
 }
 impl std::fmt::Display for ClimbUnsupported {
@@ -516,6 +517,21 @@ impl AttackRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_ngram_model_window_sum_fits_i64_within_byte_row_texts() {
+        // The largest weight magnitude any model can bind is the unseen weight
+        // ln(minimum / (2 * total)) with minimum 1 and 250,000 maximal counts.
+        let total = 250_000 * u128::from(u64::MAX);
+        let max_abs = crate::ln_ratio_q32(1, 2 * total)
+            .unwrap()
+            .units()
+            .unsigned_abs();
+        // Byte rows hold at most 1 MiB per key, so no eligible text exceeds 2^20 symbols.
+        assert!(!crate::attack_evaluator::byte_rows_fit((1 << 20) + 1, 1));
+        let max_abs = u64::try_from(max_abs).unwrap();
+        assert!(crate::ngram::fits_i64(1 << 20, max_abs));
+    }
 
     #[test]
     fn dispatch_limits_bound_rows_keys_and_round_only_whole_blocks() {
