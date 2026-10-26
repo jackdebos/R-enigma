@@ -9,8 +9,8 @@ fn request(width: usize, variant: usize) -> AttackRequest {
         .collect();
     let order = match variant {
         8 => 1,
-        9 => 4,
-        10 => 5,
+        9 | 18 | 20 => 4,
+        10 | 19 | 21 => 5,
         11 => 6,
         _ if variant.is_multiple_of(2) => 2,
         _ => 3,
@@ -25,7 +25,7 @@ fn request(width: usize, variant: usize) -> AttackRequest {
     };
     let (initial_id, final_id) = match variant {
         0 | 12 | 13 => ("ic", "ic"),
-        3 => (id, id),
+        3 | 20 | 21 => (id, id),
         // Entropy: switched to, identical, switched from, and long cooperative.
         14 => ("ic", "entropy"),
         15 => ("entropy", "entropy"),
@@ -47,12 +47,15 @@ fn request(width: usize, variant: usize) -> AttackRequest {
                 "plugboard":{"kind":"attack","symbols":alphabet,"max_pairs":width / 2}},
             "attack":{"kind":"hill_climb","initial_measure":initial_id,"final_measure":final_id,
                 "switch_pairs":variant % 3,"backtrack_pairs":variant % 3,"hold":3,"start":[],"progress_every":137}}});
+    if variant == 18 || variant == 19 {
+        value["job"]["attack"]["switch_pairs"] = json!(2);
+    }
     if variant == 4 {
         value["job"]["attack"]["start"] = json!([["D", "C"]]);
         value["job"]["attack"]["switch_pairs"] = json!(width / 2);
         value["job"]["space"]["plugboard"]["max_pairs"] = json!(1);
     }
-    if variant == 5 {
+    if variant == 5 || variant == 19 {
         value["job"]["configuration"]["plugboard"] = json!([["B", "A"]]);
         value["job"]["space"]["plugboard"]["symbols"] = json!(&alphabet[2..]);
     }
@@ -279,6 +282,58 @@ fn device_matches_cpu_results_progress_checkpoints_and_geometry() {
             stats.idle_time + std::time::Duration::from_micros(1)
                 >= stats.work_time.mul_f64(idle_factor)
         );
+    }
+}
+
+#[test]
+fn sparse_ngrams_match_cpu_progress_checkpoints_and_geometries() {
+    let Some(first) = gpu(25, 1) else { return };
+    let Some(second) = gpu(20, 2) else { return };
+    let Some(third) = gpu(20, 3).map(|g| g.with_cooperative_geometry(1, 1, 2)) else {
+        return;
+    };
+    let identity = enigma_core::checkpoint_identity("{}", &Default::default()).unwrap();
+    for variant in 18..=21 {
+        let request = request(26, variant);
+        let run = |accelerator: Option<&dyn ClimbAccelerator>| {
+            let options = ExecutionOptions::with_threads(3).unwrap();
+            let options = accelerator.map_or(options, |a| options.with_accelerator(a));
+            let mut progress = Vec::new();
+            let mut checkpoints = Vec::new();
+            let result = request
+                .run_with_checkpoints(
+                    options,
+                    |p| progress.push(p),
+                    || false,
+                    |s| checkpoints.push(s.record(identity, 0).unwrap()),
+                )
+                .unwrap();
+            (format!("{result:?}"), progress, checkpoints)
+        };
+        let expected = run(None);
+        if variant == 18 {
+            assert!(
+                expected.0.contains("final_objective_ascent: true"),
+                "IC must switch and ascend the sparse objective"
+            );
+        }
+        // Device-free production reference remains supported too.
+        assert_eq!(run(Some(&enigma_core::ReferenceClimbAccelerator)), expected);
+        for device in [&first, &second, &third] {
+            assert_eq!(run(Some(&Audited(device))), expected, "variant={variant}");
+            // The same model survives a second call; tables must remain resident.
+            let uploads = device.dispatch_stats().objective_uploads;
+            assert_eq!(
+                run(Some(&Audited(device))),
+                expected,
+                "cached variant={variant}"
+            );
+            assert_eq!(
+                device.dispatch_stats().objective_uploads,
+                uploads,
+                "weights uploaded again on cache hit"
+            );
+        }
     }
 }
 

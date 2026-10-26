@@ -129,6 +129,49 @@ fn dense_objectives_require_exact_dimensions_bounds_and_device_storage() {
 }
 
 #[test]
+fn sparse_objectives_reject_table_size_before_building_or_device_work() {
+    let model = enigma_core::NgramModel::new(
+        enigma_core::Alphabet::new("ABCDEFGHIJKLMNOPQRSTUVWXYZ".chars().collect()).unwrap(),
+        6,
+        vec![(vec!['A'; 6], 1)],
+    )
+    .unwrap();
+    let sparse = ClimbObjective::SparseNgram {
+        model: &model,
+        order: 6,
+        max_abs: 2_977_044_472,
+    };
+    let bytes = 26u64.pow(6) * 8;
+    assert_eq!(objective(sparse, 26, 10, bytes), Ok(6));
+    let error = objective(sparse, 26, 10, bytes - 1).unwrap_err();
+    assert!(matches!(error, GpuUnsupported::Job(_)));
+    assert!(error.to_string().contains(&bytes.to_string()), "{error}");
+    let wide = enigma_core::NgramModel::new(
+        enigma_core::Alphabet::new(
+            (0..256)
+                .map(|i| char::from_u32(0x400 + i).unwrap())
+                .collect(),
+        )
+        .unwrap(),
+        6,
+        vec![(vec!['\u{400}'; 6], 1)],
+    )
+    .unwrap();
+    let error = objective(
+        ClimbObjective::SparseNgram {
+            model: &wide,
+            order: 6,
+            max_abs: 2_977_044_472,
+        },
+        256,
+        10,
+        u64::MAX,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("u32"), "{error}");
+}
+
+#[test]
 fn dispatch_work_is_bounded_for_any_text_length() {
     let limits = wgpu::Limits::default();
     assert_eq!(

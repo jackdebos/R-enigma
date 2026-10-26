@@ -31,8 +31,11 @@ that consumes job fields and rows without following the private request owner.
 
 - Alphabets contain 1-256 symbols. Text is bounded by device buffer limits, the
   core 512-KiB-per-key row policy, and a conservative 1,000,000-symbol ceiling.
-- Objectives are IC, entropy or dense i64 n-grams of any representable order. Tables must
-  fit a storage binding and u32 indexing; every window sum must fit i64.
+- Objectives are IC, entropy or i64 n-grams, including CPU-sparse models (orders 1-6).
+  Complete tables must fit the device's storage binding/buffer limit and u32
+  indexing; every window sum must fit i64. Preflight names the required byte size
+  when a sparse table exceeds those limits, without allocating the table.
+  The CPU retains its 4 MiB dense-table rule and sparse scoring unchanged.
   IC uses exact Q32 long division, avoiding an overflowing shifted numerator;
   n-gram division floors negative scores instead of truncating.
 - Entropy needs no logarithm on the device: the host tabulates core's exact term
@@ -74,7 +77,18 @@ replayed once. This avoids an alphabet-wide board per reduction lane in LDS.
 
 Rows use an LDS cache only when they fit the device's workgroup storage allowance
 and a 16-KiB cache ceiling; otherwise decoding reads packed global storage.
-Weights always remain in global storage. Alphabets up to 32 symbols use scalar,
+Weights always remain in global storage. CPU-sparse models are materialized once
+as complete i64 tables in alphabet-radix order, with the model's unseen weight in
+every missing slot. Dense, sparse and entropy objective buffers are cached across
+core calls, shared when initial/final objectives are identical, and uploaded in
+awaited chunks of at most 4 MiB under the existing duty cycle. Host sparse tables
+are released after upload. Only the active objectives remain resident, preventing
+accumulation across requests; retained model identity tokens prevent stale address
+reuse. A 26-letter hexagram table contains 308,915,776 entries (2,471,326,208 bytes).
+`dispatch_stats` also reports objective upload count, table build time and host
+upload wall time (including chunk waits/rests; the last queued chunk completes
+with subsequent work).
+Alphabets up to 32 symbols use scalar,
 byte-packed private mappings; wider alphabets keep array mappings. Histograms
 also pack only when text length is <=255, where byte counts cannot overflow.
 Pipelines are also specialized per immutable job shape and cached for the

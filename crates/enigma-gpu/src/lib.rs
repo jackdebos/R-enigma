@@ -69,6 +69,11 @@ pub struct DispatchStats {
     /// queued chunk (also at most 4 MiB) instead travels with the next dispatch.
     pub uploads: u64,
     pub max_upload: Duration,
+    /// Complete objective tables built and uploaded, excluding cache hits.
+    pub objective_uploads: u64,
+    pub table_build_time: Duration,
+    /// Host table upload wall time, including chunk waits and duty-cycle rests.
+    pub table_upload_time: Duration,
 }
 
 /// One dispatch's host timing and bounded work geometry, for opt-in instrumentation.
@@ -83,9 +88,38 @@ pub struct DispatchSample {
 #[derive(Default)]
 struct Session {
     pipelines: HashMap<Specialization, wgpu::ComputePipeline>,
-    /// Entropy count tables by text length, built once per accelerator.
-    entropy: HashMap<usize, Arc<Vec<i64>>>,
+    /// Only the active job's objectives remain resident; host sparse tables are dropped.
+    weights: HashMap<WeightKey, ResidentWeights>,
     stats: DispatchStats,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum WeightKey {
+    Ic,
+    Dense(usize, Vec<i64>),
+    Sparse(usize),
+    Entropy(usize),
+}
+
+impl WeightKey {
+    fn of(objective: ClimbObjective<'_>) -> Self {
+        match objective {
+            ClimbObjective::Ic { .. } => Self::Ic,
+            ClimbObjective::DenseNgram { order, weights, .. } => {
+                Self::Dense(order, weights.to_vec())
+            }
+            ClimbObjective::SparseNgram { model, .. } => {
+                Self::Sparse(Arc::as_ptr(&model.table_identity()) as usize)
+            }
+            ClimbObjective::Entropy { length } => Self::Entropy(length),
+        }
+    }
+}
+
+struct ResidentWeights {
+    buffer: wgpu::Buffer,
+    // Keeps allocation identity unique even if the request/model is dropped.
+    _identity: Option<Arc<()>>,
 }
 
 /// Kernel order code of the entropy objective; n-gram orders are 1-6, IC is 0.
@@ -251,6 +285,41 @@ fn objective(
             }
             Ok(order)
         }
+        ClimbObjective::SparseNgram {
+            model,
+            order,
+            max_abs,
+        } => {
+            if order == 0
+                || order > length
+                || order != model.order()
+                || width != model.alphabet().len()
+            {
+                return Err(unsupported(
+                    "invalid sparse n-gram dimensions or insufficient text",
+                ));
+            }
+            let entries = (width as u64)
+                .checked_pow(order as u32)
+                .ok_or_else(|| unsupported("n-gram table size overflows u64"))?;
+            let bytes = entries
+                .checked_mul(8)
+                .ok_or_else(|| unsupported("n-gram table byte size overflows u64"))?;
+            if entries > u64::from(u32::MAX) {
+                return Err(unsupported(format!(
+                    "n-gram table size {bytes} bytes exceeds u32 indexing"
+                )));
+            }
+            if bytes > max_buffer {
+                return Err(unsupported(format!("n-gram table size {bytes} bytes exceeds device storage buffer limit {max_buffer} bytes")));
+            }
+            if (length - order + 1) as u128 * u128::from(max_abs) > i64::MAX as u128
+                || model.i64_max_abs().is_none_or(|max| max > max_abs)
+            {
+                return Err(unsupported("n-gram window sums do not fit i64"));
+            }
+            Ok(order)
+        }
         ClimbObjective::Entropy { length: total } => {
             // Two i64 words per count 0..=length; highs sum below 2^63 for 1e6 letters.
             if total != length || length == 0 || (length as u64 + 1) * 16 > max_buffer {
@@ -278,6 +347,10 @@ fn same_objectives(a: ClimbObjective<'_>, b: ClimbObjective<'_>) -> bool {
                 ..
             },
         ) => a == b && x == y,
+        (
+            ClimbObjective::SparseNgram { model: a, .. },
+            ClimbObjective::SparseNgram { model: b, .. },
+        ) => std::ptr::eq(a, b),
         (ClimbObjective::Entropy { .. }, ClimbObjective::Entropy { .. }) => true,
         _ => false,
     }
@@ -410,7 +483,8 @@ impl GpuClimbAccelerator {
     fn dispatch_bound(job: &ClimbJob<'_>, layout: &JobLayout, budget: u32) -> u64 {
         let distinct = |objective| match objective {
             ClimbObjective::Ic { denominator, .. } => denominator.saturating_add(1),
-            ClimbObjective::DenseNgram { max_abs, .. } => u128::from(max_abs) * 2 + 2,
+            ClimbObjective::DenseNgram { max_abs, .. }
+            | ClimbObjective::SparseNgram { max_abs, .. } => u128::from(max_abs) * 2 + 2,
             // Ranking is -measured with 0 <= measured <= B(length) >> 16.
             ClimbObjective::Entropy { length } => enigma_core::integer_log2_q48(length as u128)
                 .map_or(u128::MAX, |log| (log >> 16) as u128 + 2),
@@ -710,6 +784,58 @@ impl GpuClimbAccelerator {
         })
     }
 
+    fn resident_weights(
+        &self,
+        objective: ClimbObjective<'_>,
+        key: WeightKey,
+        session: &mut Session,
+        pending: &mut usize,
+        stats: &mut DispatchStats,
+    ) -> Result<wgpu::Buffer, GpuError> {
+        if let Some(resident) = session.weights.get(&key) {
+            return Ok(resident.buffer.clone());
+        }
+        let start = Instant::now();
+        let owned;
+        let weights = match objective {
+            ClimbObjective::Ic { .. } => &[0i64][..],
+            ClimbObjective::DenseNgram { weights, .. } => weights,
+            ClimbObjective::SparseNgram { model, .. } => {
+                owned = model
+                    .complete_i64_table()
+                    .map_err(|e| GpuError::Device(format!("complete n-gram table: {e:?}")))?;
+                &owned
+            }
+            ClimbObjective::Entropy { length } => {
+                owned = entropy_table(length)?;
+                &owned
+            }
+        };
+        stats.table_build_time += start.elapsed();
+        let start = Instant::now();
+        let buffer = self.upload(
+            "objective weights",
+            bytemuck::cast_slice(weights),
+            pending,
+            stats,
+        )?;
+        stats.table_upload_time += start.elapsed();
+        stats.objective_uploads += 1;
+        let identity = match objective {
+            ClimbObjective::SparseNgram { model, .. } => Some(model.table_identity()),
+            _ => None,
+        };
+        session.weights.insert(
+            key,
+            ResidentWeights {
+                buffer: buffer.clone(),
+                _identity: identity,
+            },
+        );
+        // `owned` is released here, not retained for the accelerator's lifetime.
+        Ok(buffer)
+    }
+
     fn run(&self, job: &ClimbJob<'_>, rows: &[u8]) -> Result<Vec<AcceleratedClimb>, GpuError> {
         let layout = self.layout(job).map_err(GpuError::Unsupported)?;
         let width = job.alphabet_size;
@@ -724,20 +850,27 @@ impl GpuClimbAccelerator {
             )));
         }
         let mut session = self.session.lock().unwrap();
-        let entropy = match [job.initial_objective, job.final_objective]
-            .iter()
-            .any(|o| matches!(o, ClimbObjective::Entropy { .. }))
-        {
-            false => None,
-            true => Some(match session.entropy.get(&job.text_length) {
-                Some(table) => Arc::clone(table),
-                None => {
-                    let table = Arc::new(entropy_table(job.text_length)?);
-                    session.entropy.insert(job.text_length, Arc::clone(&table));
-                    table
-                }
-            }),
-        };
+        let initial_key = WeightKey::of(job.initial_objective);
+        let final_key = WeightKey::of(job.final_objective);
+        session
+            .weights
+            .retain(|key, _| *key == initial_key || *key == final_key);
+        let mut stats = session.stats;
+        let mut pending = 0;
+        let initial = self.resident_weights(
+            job.initial_objective,
+            initial_key,
+            &mut session,
+            &mut pending,
+            &mut stats,
+        )?;
+        let final_weights = self.resident_weights(
+            job.final_objective,
+            final_key,
+            &mut session,
+            &mut pending,
+            &mut stats,
+        )?;
         let cache_key = Self::specialization(job, &layout);
         if let std::collections::hash_map::Entry::Vacant(entry) = session.pipelines.entry(cache_key)
         {
@@ -761,13 +894,6 @@ impl GpuClimbAccelerator {
         for (i, &(a, b)) in job.start_board.iter().enumerate() {
             data[3 * width + i] = u32::from(a) | (u32::from(b) << 8);
         }
-        let weights = |objective| match objective {
-            ClimbObjective::Ic { .. } => &[0i64][..],
-            ClimbObjective::DenseNgram { weights, .. } => weights,
-            ClimbObjective::Entropy { .. } => entropy.as_deref().map_or(&[0i64][..], |t| t),
-        };
-        let mut stats = session.stats;
-        let mut pending = 0;
         let input = self.upload(
             "input",
             bytemuck::cast_slice(&input),
@@ -775,18 +901,6 @@ impl GpuClimbAccelerator {
             &mut stats,
         )?;
         let data = self.upload("job", bytemuck::cast_slice(&data), &mut pending, &mut stats)?;
-        let initial = self.upload(
-            "initial weights",
-            bytemuck::cast_slice(weights(job.initial_objective)),
-            &mut pending,
-            &mut stats,
-        )?;
-        let final_weights = self.upload(
-            "final weights",
-            bytemuck::cast_slice(weights(job.final_objective)),
-            &mut pending,
-            &mut stats,
-        )?;
         let mut results = Vec::with_capacity(rows.len() / stride);
         for batch in rows.chunks(stride * layout.keys_per_dispatch) {
             let keys = batch.len() / stride;

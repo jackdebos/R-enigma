@@ -925,7 +925,8 @@ loading/binding errors retain precedence.
 
 After successful attack resource binding, before checkpoint validation or `started`,
 GPU preflight first projects the climb job. Unsupported attacks (including partial
-exhaustion, trie objectives, and sparse or i128 n-grams) emit one seq 1
+exhaustion, trie objectives, and n-gram weights or window sums that cannot fit i64)
+emit one seq 1
 `unsupported_job` at `/job/attack`, message
 `--backend gpu does not support this attack: <reason>`, exit 1.
 A `bombe` job instead emits one seq 1 `backend_unavailable` at `/job/attack`,
@@ -935,6 +936,12 @@ No suitable adapter (including missing 64-bit integer support), device initializ
 failure, or device-specific job limit emits one seq 1 `backend_unavailable` at `""`,
 message `GPU backend unavailable: <reason>`, exit 1. Stderr is
 `<code>: <message>` followed by a newline; no `started` or work events are emitted.
+Sparse CPU n-grams are supported through complete i64 GPU tables: every missing
+gram has the model's unseen weight, in ordered-alphabet radix order. CPU scoring
+and its 4 MiB dense-table admission rule are unchanged. The complete table must
+fit u32 indexing and the device's storage binding/buffer limit; rejection names
+the required table size and occurs during device-specific preflight above.
+Tables stay resident across batches; host copies are released after chunked upload.
 There is never silent CPU fallback. Runtime GPU failures use the existing terminal
 `internal_error` with source kind `accelerator` (§4.1), exit 1; the previous checkpoint
 stays valid.
@@ -1171,3 +1178,7 @@ not checkpoint identity. CPU and GPU commit the same ordered logical blocks, cou
 progress, hold and checkpoint content. Checkpoints resume across backends (for jobs
 the selected backend supports), with unchanged search results. A GPU failure never
 silently switches backend; the last valid checkpoint may be resumed with either.
+N-gram objectives use exact complete i64 GPU tables even when the CPU model is
+sparse, subject to u32 indexing and the device's storage binding/buffer limit (§5).
+Table caching, chunked uploads and host-copy lifetime are execution details, not
+checkpoint fields or changes to CPU scoring.

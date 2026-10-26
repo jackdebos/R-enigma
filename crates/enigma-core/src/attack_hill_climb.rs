@@ -4768,21 +4768,35 @@ mod tests {
     }
 
     fn accelerator_ngram_request(order: usize, identical: bool) -> crate::AttackRequest {
-        let id = if order == 3 {
-            "sinkov_trigram"
+        let id = match order {
+            4 => "sinkov_quadgram",
+            3 => "sinkov_trigram",
+            _ => "sinkov_bigram",
+        };
+        let alphabet: Vec<_> = ('A'..)
+            .take(if order >= 4 { 26 } else { 4 })
+            .map(|s| s.to_string())
+            .collect();
+        let wiring: Vec<_> = if order >= 4 {
+            (0..alphabet.len())
+                .map(|i| alphabet[(i * 3 + 1) % alphabet.len()].clone())
+                .collect()
         } else {
-            "sinkov_bigram"
+            ["B", "D", "A", "C"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
         };
         let initial = if identical { id } else { "ic" };
         let model = serde_json::json!({"resource_version":1,"kind":"ngram",
-            "alphabet":["A","B","C","D"],"order":order,
+            "alphabet":alphabet,"order":order,
             "entries":[{"gram":vec!["A"; order],"count":31},
                 {"gram":vec!["B"; order],"count":7}]})
         .to_string();
         let value = serde_json::json!({"protocol_version":1,
             "machine":{"definition":{"kind":"custom","value":{
-                "alphabet":["A","B","C","D"],
-                "wheels":[{"name":"r","wiring":["B","D","A","C"],"turnovers":[]}],
+                "alphabet":alphabet,
+                "wheels":[{"name":"r","wiring":wiring,"turnovers":[]}],
                 "slots":[{"id":"r","role":"rotor","movement":"movable","wheel":"r"}],
                 "stepping":{"rules":[{"when":{"always":true},"advance":["r"]}]}}}},
             "job":{"kind":"search","configuration":{"slots":[],"plugboard":[]},
@@ -4801,6 +4815,38 @@ mod tests {
                 model.as_str(),
             )]))
             .unwrap()
+    }
+
+    #[test]
+    fn sparse_accelerator_matches_cpu_and_projection() {
+        struct Projected;
+        impl crate::ClimbAccelerator for Projected {
+            fn climb(
+                &self,
+                job: &crate::ClimbJob<'_>,
+                first: u128,
+                rows: &[u8],
+            ) -> Result<Vec<crate::AcceleratedClimb>, crate::AcceleratorError> {
+                let expected = job.owner.reference_climbs(job, first, rows)?;
+                assert_eq!(job.climb_from_projection(rows)?, expected);
+                Ok(expected)
+            }
+        }
+        for identical in [false, true] {
+            let request = accelerator_ngram_request(4, identical);
+            let run = |a: Option<&dyn crate::ClimbAccelerator>| {
+                let options = crate::ExecutionOptions::serial();
+                let options = a.map_or(options, |a| options.with_accelerator(a));
+                let mut progress = Vec::new();
+                let result = request
+                    .run_with(options, |p| progress.push(p), || false)
+                    .unwrap();
+                (format!("{result:?}"), progress)
+            };
+            let expected = run(None);
+            assert_eq!(run(Some(&crate::ReferenceClimbAccelerator)), expected);
+            assert_eq!(run(Some(&Projected)), expected);
+        }
     }
 
     #[test]

@@ -44,6 +44,15 @@ pub enum ClimbObjective<'a> {
         /// Largest absolute weight, bounding every partial sum.
         max_abs: u64,
     },
+    /// A CPU-sparse model, materialized as a complete i64 table only by the device.
+    SparseNgram {
+        /// Immutable model in the job's ordered alphabet.
+        model: &'a crate::NgramModel,
+        /// Symbols per window.
+        order: usize,
+        /// Largest absolute weight, bounding every partial sum.
+        max_abs: u64,
+    },
     /// Shannon entropy ranking: `-floor(sum[c>0] terms[c] / (length * 2^16))`,
     /// where `terms = entropy_terms(length)` and `c` are symbol counts.
     Entropy {
@@ -128,7 +137,7 @@ pub enum ClimbUnsupported {
     RowDataLimit,
     /// Trie or another nonrepresentable objective.
     Objective(MeasureId),
-    /// No dense integer weight table exists.
+    /// Model weights cannot be represented in a complete i64 table.
     SparseNgram(MeasureId),
     /// Window sums require the production i128 path. Unreachable for bound models
     /// within byte-row texts (pinned by a test); kept as a defensive guard.
@@ -285,6 +294,10 @@ impl ClimbJob<'_> {
                     ..
                 },
             ) => a == b && x == y,
+            (
+                ClimbObjective::SparseNgram { model: a, .. },
+                ClimbObjective::SparseNgram { model: b, .. },
+            ) => std::ptr::eq(a, b),
             (ClimbObjective::Entropy { .. }, ClimbObjective::Entropy { .. }) => true,
             _ => false,
         };
@@ -332,6 +345,19 @@ impl ClimbJob<'_> {
                             }
                             crate::floor_div(i128::from(sum), (plain.len() - order + 1) as i128)
                                 .map_err(|_| fail("invalid n-gram divisor"))
+                        }
+                        ClimbObjective::SparseNgram { model, order, .. } => {
+                            if model.alphabet().len() != width || order != model.order() {
+                                return Err(fail("invalid sparse model dimensions"));
+                            }
+                            let text: String =
+                                plain.iter().map(|&s| model.alphabet().symbols[s]).collect();
+                            model
+                                .score(&text)
+                                .map(|s| s.ranking().units())
+                                .map_err(|e| {
+                                    AcceleratorError(format!("projected reference: {e:?}"))
+                                })
                         }
                         ClimbObjective::Entropy { length } => {
                             if length != plain.len() {
@@ -466,18 +492,27 @@ impl AttackRequest {
                 return Ok(ClimbObjective::Entropy { length });
             }
             if let Some(BoundResource::Ngram(model)) = self.bound_resource(id) {
-                let (weights, max_abs) = model
-                    .dense_parts()
+                let dense = model.dense_parts();
+                let max_abs = dense
+                    .map(|(_, max)| max)
+                    .or_else(|| model.i64_max_abs())
                     .ok_or(ClimbUnsupported::SparseNgram(id))?;
                 let order = model.order();
                 let windows = length.saturating_sub(order - 1);
                 if !crate::ngram::fits_i64(windows as u128, max_abs) {
                     return Err(ClimbUnsupported::WideNgram(id));
                 }
-                return Ok(ClimbObjective::DenseNgram {
-                    order,
-                    weights,
-                    max_abs,
+                return Ok(match dense {
+                    Some((weights, _)) => ClimbObjective::DenseNgram {
+                        order,
+                        weights,
+                        max_abs,
+                    },
+                    None => ClimbObjective::SparseNgram {
+                        model,
+                        order,
+                        max_abs,
+                    },
                 });
             }
             Err(ClimbUnsupported::Objective(id))

@@ -54,6 +54,17 @@ impl std::error::Error for NgramError {
     }
 }
 
+/// Failure to materialize a complete accelerator table; CPU scoring is unaffected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NgramTableError {
+    /// The complete table's dimensions or byte size overflow usize.
+    SizeOverflow,
+    /// The host could not reserve the complete table.
+    Allocation,
+    /// At least one weight cannot be represented by i64.
+    WideWeight,
+}
+
 /// Immutable validated sparse model; log weights are computed once at construction.
 #[derive(Debug)]
 pub struct NgramModel {
@@ -64,6 +75,7 @@ pub struct NgramModel {
     unseen: FixedScore,
     total: u128,
     minimum: u64,
+    table_identity: std::sync::Arc<()>,
 }
 
 impl NgramModel {
@@ -133,6 +145,7 @@ impl NgramModel {
             unseen,
             total,
             minimum,
+            table_identity: std::sync::Arc::new(()),
         })
     }
 
@@ -155,6 +168,38 @@ impl NgramModel {
     /// Minimum listed positive count used for the unseen floor.
     pub fn minimum_count(&self) -> u64 {
         self.minimum
+    }
+
+    /// Complete radix-alphabet i64 table, including this model's unseen weight
+    /// in every missing slot. Fallible allocation; does not change CPU admission.
+    pub fn complete_i64_table(&self) -> Result<Vec<i64>, NgramTableError> {
+        let entries = self
+            .alphabet
+            .len()
+            .checked_pow(self.order as u32)
+            .filter(|n| n.checked_mul(std::mem::size_of::<i64>()).is_some())
+            .ok_or(NgramTableError::SizeOverflow)?;
+        DenseWeights::table(&self.alphabet, &self.weights, self.unseen, entries)
+            .map(|(table, _)| table)
+    }
+
+    /// Largest absolute representable weight, without materializing a table.
+    pub fn i64_max_abs(&self) -> Option<u64> {
+        self.weights
+            .values()
+            .chain(std::iter::once(&self.unseen))
+            .try_fold(0, |max, w| {
+                i64::try_from(w.units())
+                    .ok()
+                    .map(|w| max.max(w.unsigned_abs()))
+            })
+    }
+
+    /// Stable allocation identity for resident accelerator caches. Retaining this
+    /// token prevents address reuse after a request (and its model) is dropped.
+    #[doc(hidden)]
+    pub fn table_identity(&self) -> std::sync::Arc<()> {
+        std::sync::Arc::clone(&self.table_identity)
     }
 
     /// Score every overlapping scalar window using prequantized natural logs.
@@ -368,14 +413,33 @@ impl DenseWeights {
         deny_reservation: bool,
     ) -> Option<Self> {
         let (entries, high) = dense_dimensions(alphabet.len(), order)?;
-        // Any weight outside i64 keeps the model on exact sparse scoring.
-        let narrow = |weight: FixedScore| i64::try_from(weight.units()).ok();
+        if deny_reservation {
+            return None;
+        }
+        let (weights, max_abs) = Self::table(alphabet, sparse, unseen, entries).ok()?;
+        Some(Self {
+            weights,
+            max_abs,
+            high,
+        })
+    }
+
+    // Shared with complete accelerator tables: identical fill, radix and narrowing.
+    fn table(
+        alphabet: &Alphabet,
+        sparse: &HashMap<Vec<char>, FixedScore>,
+        unseen: FixedScore,
+        entries: usize,
+    ) -> Result<(Vec<i64>, u64), NgramTableError> {
+        let narrow = |weight: FixedScore| {
+            i64::try_from(weight.units()).map_err(|_| NgramTableError::WideWeight)
+        };
         let unseen = narrow(unseen)?;
         let mut max_abs = unseen.unsigned_abs();
         let mut weights = Vec::new();
-        if deny_reservation || weights.try_reserve_exact(entries).is_err() {
-            return None;
-        }
+        weights
+            .try_reserve_exact(entries)
+            .map_err(|_| NgramTableError::Allocation)?;
         weights.resize(entries, unseen);
         for (gram, &weight) in sparse {
             let key = gram.iter().fold(0, |key, &symbol| {
@@ -385,11 +449,7 @@ impl DenseWeights {
             max_abs = max_abs.max(weight.unsigned_abs());
             weights[key] = weight;
         }
-        Some(Self {
-            weights,
-            max_abs,
-            high,
-        })
+        Ok((weights, max_abs))
     }
 }
 
@@ -417,6 +477,50 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn complete_i64_table_preserves_sparse_unseen_radix_and_scores() {
+        let alphabet = Alphabet::new("ABCDEFGHIJKLMNOPQRSTUVWXYZ".chars().collect()).unwrap();
+        let model = NgramModel::new(
+            alphabet,
+            4,
+            vec![(vec!['B', 'C', 'D', 'E'], 7), (vec!['A'; 4], 1)],
+        )
+        .unwrap();
+        assert!(
+            model.dense_parts().is_none(),
+            "CPU dense policy must not change"
+        );
+        let table = model.complete_i64_table().unwrap();
+        assert_eq!(table.len(), 26usize.pow(4));
+        let key = ((26 + 2) * 26 + 3) * 26 + 4;
+        assert_eq!(
+            table[key],
+            model.score("BCDE").unwrap().ranking().units() as i64
+        );
+        assert_eq!(
+            table[0],
+            model.score("AAAA").unwrap().ranking().units() as i64
+        );
+        let unseen = model.score("ZZZZ").unwrap().ranking().units() as i64;
+        assert!(table
+            .iter()
+            .enumerate()
+            .all(|(i, &w)| i == 0 || i == key || w == unseen));
+        let text = "BCDEAAAABCDZZZZ";
+        let sum: i128 = text
+            .as_bytes()
+            .windows(4)
+            .map(|w| {
+                let key = w.iter().fold(0, |k, &s| k * 26 + (s - b'A') as usize);
+                i128::from(table[key])
+            })
+            .sum();
+        assert_eq!(
+            floor_div(sum, (text.len() - 3) as i128).unwrap(),
+            model.score(text).unwrap().ranking().units()
+        );
     }
 
     #[test]
