@@ -410,7 +410,9 @@ keeps both forms and the machine result intact.
   of spaces automatically; an uppercase button appears when it has lowercase letters,
   and offending symbols (spaces included) are listed and block starting. The server
   rejects them with `invalid_settings` at `settings/crib` (position errors at
-  `settings/crib_position`). A warning below 14 letters does not block starting. Choosing bombe sets
+  `settings/crib_position`). A warning below 14 letters does not block starting. The bombe estimate counts the
+  scrambler rows and crib tests per setting; finishing climbs on stops are not included,
+  so short cribs with many stops take longer than shown. Choosing bombe sets
   the right ring unknown and every other ring (including M4 Greek) to A; these remain
   editable in Advanced. Loading saved input preserves its ring choices. Choosing
   bombe selects CPU and disables the GPU option; direct GPU API requests are rejected,

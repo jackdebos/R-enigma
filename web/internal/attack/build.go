@@ -146,6 +146,9 @@ func Build(models []Model, in Input, cpus int) (Plan, *Issue) {
 		return plan, p
 	}
 	var crib map[string]any
+	// Bombe cost per outer key: the scrambler rows up to the last admissible
+	// position plus the crib, and one crib-length test per admissible position.
+	var bombeWork float64
 	if method == "bombe" {
 		if settings.Crib == nil {
 			return plan, invalid("crib")
@@ -177,17 +180,18 @@ func Build(models []Model, in Input, cpus int) (Plan, *Issue) {
 				return plan, invalid("crib_position")
 			}
 			crib["position"] = *settings.CribPosition
+			bombeWork = float64(*settings.CribPosition + 2*len(text))
 		} else {
-			found := false
+			positions, last := 0, 0
 			for p := 0; p <= len(message)-len(text); p++ {
 				if admissible(p) {
-					found = true
-					break
+					positions, last = positions+1, p
 				}
 			}
-			if !found {
+			if positions == 0 {
 				return plan, invalid("crib")
 			}
+			bombeWork = float64(last + len(text) + positions*len(text))
 		}
 	} else {
 		if settings.Crib != nil {
@@ -360,6 +364,11 @@ func Build(models []Model, in Input, cpus int) (Plan, *Issue) {
 	if method == "partial_exhaustion" {
 		factor = peFactor
 	}
-	plan.EstimateSeconds = count * secondsPerKey * float64(factor) * float64(letters) / referenceLength / float64(threads)
+	if method == "bombe" {
+		// Finishing climbs on stops are not included: their number is unknown before the run.
+		plan.EstimateSeconds = count * bombeWork * bombeSecondsPerLetter / float64(threads)
+	} else {
+		plan.EstimateSeconds = count * secondsPerKey * float64(factor) * float64(letters) / referenceLength / float64(threads)
+	}
 	return plan, nil
 }

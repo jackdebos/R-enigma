@@ -6,6 +6,21 @@ import (
 	"testing"
 )
 
+func TestBombeEstimate(t *testing.T) {
+	// 17576 outer keys (three unknown positions); ZYX is admissible at 0..3 in ABCDEF, so the bombe reads
+	// 6 row letters (last position 3 + 3) and tests 4 positions of 3 letters.
+	for _, c := range []struct {
+		position string
+		work     float64
+	}{{"", 6 + 4*3}, {`,"crib_position":1`, 4 + 1*3}} {
+		plan := build(t, strings.TrimSuffix(designB("ABCDEF"), "}")+`,"settings":{"method":"bombe","crib":"ZYX","threads":2`+c.position+`}}`)
+		want := 17576 * c.work * bombeSecondsPerLetter / 2
+		if plan.EstimateSeconds < want*0.999 || plan.EstimateSeconds > want*1.001 {
+			t.Fatalf("position %q: estimate=%g want %g", c.position, plan.EstimateSeconds, want)
+		}
+	}
+}
+
 func TestBombeRequest(t *testing.T) {
 	for _, position := range []string{"", `,"crib_position":0`, `,"crib_position":1`} {
 		plan := build(t, strings.TrimSuffix(designB("ABCDEF"), "}")+`,"settings":{"method":"bombe","crib":"ZYX","stages":[]`+position+`}}`)

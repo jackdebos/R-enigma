@@ -7,6 +7,8 @@ const (
 	secondsPerKey   = 0.004235
 	peFactor        = 20
 	referenceLength = 232
+	// Measured on the reference computer with Weierud 1941 cribs (L15).
+	bombeSecondsPerLetter = 1.3e-6
 )
 
 type Model struct {
