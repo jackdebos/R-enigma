@@ -730,3 +730,42 @@ fn sparse_cache_changes_models_after_drop() {
         assert_eq!(device.dispatch_stats().objective_uploads, uploads);
     }
 }
+
+#[test]
+fn trie_zero_prefix_unicode_and_empty_match_score() {
+    // Zero and negative terminals, a prefix inside a longer word, a non-ASCII
+    // symbol and texts with no match, against the projection oracle.
+    use enigma_core::{Alphabet, ClimbObjective, TrieModel};
+    let Some(device) = gpu(25, 1) else { return };
+    let owner = request(4, 0);
+    let model = TrieModel::new(
+        Alphabet::new(vec!['🙂', 'B', 'A']).unwrap(),
+        vec![
+            (vec!['A'], 0),
+            (vec!['A', 'B'], -7),
+            (vec!['B', 'A'], 3),
+            (vec!['A', 'B', 'A'], 11),
+        ],
+    )
+    .unwrap();
+    for (input, raw) in [
+        (vec![2, 1, 2], 7i128),
+        (vec![2], 0),
+        (vec![0], 0),
+        (vec![1, 2], 3),
+    ] {
+        let mut job = owner.climb_job().unwrap();
+        job.alphabet_size = 3;
+        job.text_length = input.len();
+        job.input = input;
+        job.mutable_mask = vec![true; 3];
+        job.max_pairs = 0;
+        job.starts = vec![vec![]];
+        job.initial_objective = ClimbObjective::Trie { model: &model };
+        job.final_objective = job.initial_objective;
+        let rows: Vec<u8> = (0..job.text_length).flat_map(|_| 0..3u8).collect();
+        let actual = device.climb(&job, 0, &rows).unwrap();
+        assert_eq!(actual[0].score_units, raw << 32);
+        assert_eq!(actual, job.climb_from_projection(&rows).unwrap());
+    }
+}

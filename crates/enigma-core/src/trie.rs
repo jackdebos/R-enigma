@@ -206,7 +206,8 @@ impl TrieModel {
     }
 
     /// Flatten without changing node identity; preserve signed/zero terminals.
-    /// Constructor budgets guarantee all offsets and children fit u32.
+    /// Constructor budgets guarantee all offsets and children fit u32, and the
+    /// constructor rejects alphabets over 256 scalars, so symbol indices fit u8.
     pub fn flatten(&self) -> Result<FlatTrie, TrieError> {
         if self.nodes.len() > MAX_NODES {
             return Err(TrieError::NodeLimit {
