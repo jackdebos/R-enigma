@@ -363,7 +363,9 @@ The Attack view below exposes these routes without requiring hand-written JSON.
   machine controls. A rejected candidate does not replace an already saved engine.
 - Choose the model, reflector and one wheel, ring and start position for each slot.
   Slots follow catalog order, including the Greek wheel on M4. The small `?` buttons
-  open short explanations, including the distinction between ring and position.
+  show short explanations while hovered or focused (Tab, or a tap on touch screens)
+  and hide them when the pointer or focus leaves or on Escape, including the
+  distinction between ring and position.
   Each CSS letter window shows only its chosen **initial** position: no animation,
   stepping simulation, or final rotor state is implied.
 - Add or remove plugboard pairs using the two letter selectors. Used letters cannot

@@ -31,11 +31,14 @@ fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
 .path-row input { min-width: 0; flex: 1; }
 .model-row { gap: 2rem; flex-wrap: wrap; }
 .field-heading { display: flex; align-items: baseline; gap: .5rem; margin: .4rem 0; }
-.help { position: relative; font-weight: normal; }
-.help summary { display: grid; place-items: center; width: 1.35rem; height: 1.35rem; border: 1px solid #8a9d91; border-radius: 50%; cursor: pointer; font-size: .85rem; list-style: none; }
-.help summary::-webkit-details-marker { display: none; }
-.help[open] { z-index: 2; }
-.help p { position: absolute; top: 1.3rem; left: -2rem; width: min(17rem, 65vw); margin: .5rem 0; padding: .85rem; border: 1px solid #8a9d91; border-radius: .4rem; background: #fcfcf7; box-shadow: 0 4px 12px #24363124; }
+.help { position: relative; display: inline-block; font-weight: normal; }
+.help button { display: grid; place-items: center; width: 1.35rem; height: 1.35rem; padding: 0; border-radius: 50%; background: transparent; color: inherit; font-size: .85rem; }
+.help button:hover:not(:disabled) { background: #e5dec0; }
+.help .hint { display: none; position: absolute; z-index: 2; top: calc(100% + .5rem); left: -2rem; width: min(17rem, 65vw); padding: .85rem; border: 1px solid #8a9d91; border-radius: .4rem; background: #fcfcf7; box-shadow: 0 4px 12px #24363124; }
+/* Bridges the gap so the pointer can move from the button onto the hint. */
+.help .hint::before { content: ''; position: absolute; left: 0; right: 0; top: -.6rem; height: .6rem; }
+/* focus-visible, not focus: a mouse click must not pin the hint open. */
+.help:not(.dismissed):hover .hint, .help:not(.dismissed) button:focus-visible + .hint { display: block; }
 .rotors { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 1rem; margin: 1.5rem 0; }
 .rotor { border-radius: .6rem; border: 1px solid #b7c4b6; background: #e1e7dc; padding: 1rem; }
 .rotor select { width: 100%; }

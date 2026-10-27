@@ -80,13 +80,22 @@ function showEngine(state) {
   else message('engine-status', 'engine_missing');
 }
 
-// Native details provides keyboard-accessible, local help without inline handlers.
+// Help shows while hovered or focused (keyboard, touch tap); Escape hides it
+// until the pointer or focus leaves. CSS owns visibility, without inline handlers.
+let helpCount = 0;
 function help(labelKey, hintKey) {
-  const details = element('details', undefined, 'help');
-  const summary = element('summary', t('help_symbol'));
-  summary.setAttribute('aria-label', t('help_label', { name: t(labelKey) }));
-  details.append(summary, element('p', t(hintKey), 'hint'));
-  return details;
+  const wrapper = element('span', undefined, 'help');
+  const button = element('button', t('help_symbol'));
+  button.type = 'button';
+  button.setAttribute('aria-label', t('help_label', { name: t(labelKey) }));
+  const hint = element('span', t(hintKey), 'hint');
+  hint.id = `help-${++helpCount}`;
+  hint.setAttribute('role', 'tooltip');
+  button.setAttribute('aria-describedby', hint.id);
+  wrapper.addEventListener('keydown', event => { if (event.key === 'Escape') wrapper.classList.add('dismissed'); });
+  for (const leave of ['mouseleave', 'focusout']) wrapper.addEventListener(leave, () => wrapper.classList.remove('dismissed'));
+  wrapper.append(button, hint);
+  return wrapper;
 }
 function heading(container, key, hintKey) {
   const row = element('div', undefined, 'field-heading');
