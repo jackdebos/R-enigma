@@ -840,3 +840,102 @@ Deliberate departures from pinned bomm:
   scoring), and are re-checked after stages.
 - Capacity is bounded by 1000; re-ranking is tiered by polish state because scores
   from different measures are not comparable.
+
+## 11. Rewirable reflector (UKW-D) — Stage 5
+
+Status: **specified, not implemented** (plan `odd/tasks/enigma-wwii-machines.md`,
+T9–T13). Protocol [§3.1](protocol.md#31-machine-definition) and
+[§3.2](protocol.md#32-configuration-and-transform) define the rewirable wheel
+and its `pairs` key; this section defines how an attack searches that key.
+
+### 11.1 Notation and machines
+
+Pairs use the engine's contact notation, the same one used by every other
+wheel wiring in the catalog: Bletchley Park (BP) notation, contacts
+`ABCDEFGHIJKLMNOPQRSTUVWXYZ` clockwise, with BP `BO` wired permanently.
+German key sheets label the same contacts `A-ZXWVUTSRQPON-MLKIHGFEDCB`
+(hyphens are the fixed contacts); converting a German sheet is a client
+concern, documented in [historical catalog](historical-catalog.md), never an
+engine alias. UKW-D is offered by separate bundled machines (`enigma-i-ukwd`,
+`enigma-m3-ukwd`, and `enigma-kd` in T12), so the `enigma-i`/`enigma-m3`
+catalog bytes and their checkpoints do not change. The M4 replaced UKW-B and
+the Greek wheel with UKW-D, which is structurally `enigma-m3-ukwd`. The
+historical setting of the UKW-D slot is position `A`, ring `A`; other values
+are representable but non-historical, as for the ETW.
+
+### 11.2 Request
+
+A searched wiring is declared in the attack branch only, on the slot domain:
+
+```text
+space.slots[] := {"id": SLOT_ID, "pairs": {"kind":"attack"}, ...}
+job.attack.reflector_starts := INTEGER   (1 to 1000000)
+```
+
+`pairs` is allowed only for a slot whose wheel is rewirable (protocol §3.1),
+exactly once per such slot, and conflicts with a fixed `pairs` in
+`configuration` (`invalid_search_space`, as for any double coverage). A known
+wiring is given in `configuration` and needs no new attack setting.
+`reflector_starts` is required when a wiring is searched and forbidden
+otherwise (`invalid_request` at `/job/attack/reflector_starts`). Partially known
+wirings are not supported in this stage: the wiring is either fully fixed or
+fully searched. The legacy subset branch rejects `pairs` domains with
+`invalid_search_space`.
+
+Supported passes: `hill_climb` only, followed by optional chained stages (§9)
+and hold (§10). `partial_exhaustion` and `bombe` with a searched wiring fail
+before work with `unsupported_pass` at `/job/passes`. Chained stages keep the
+winning wiring fixed and polish the plugboard only.
+
+### 11.3 Starts
+
+Per outer key, start `s` (0-based, `s < reflector_starts`) builds its initial
+wiring deterministically, with no RNG state: list the free symbols (alphabet
+minus fixed pairs) in alphabet order; shuffle with Fisher–Yates from the last
+index `i` down to 1, swapping `i` with `j = next() mod (i + 1)`; pair elements
+`(0,1)`, `(2,3)`, … . `next()` is SplitMix64 seeded with `s`: `state +=
+0x9E3779B97F4A7C15; z = state; z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9;
+z = (z ^ (z >> 27)) * 0x94D049BB133111EB; return z ^ (z >> 31)` (wrapping u64
+arithmetic). The modulo bias is accepted and fixed by this definition.
+`best.start_index` is the reflector start `s`. Each start restores the direct
+`start` board, the initial objective phase and the initial positions; nothing
+carries over between starts.
+
+### 11.4 Wiring neighborhood
+
+Let W be the committed wiring's free pairs, each oriented `(a,b)` with
+`alphabet_index(a) < alphabet_index(b)` and sorted by `a`. For every two pairs
+`(a,b)` before `(c,d)` in that order, evaluate two trials, in this order:
+`(a,c)+(b,d)`, then `(a,d)+(b,c)`. With 12 free pairs this is 132 trials.
+Selection follows §5: every trial from the same committed state, greatest
+strict ranking improvement wins, ties keep the first trial, no plateau or
+worsening moves. Each trial is one evaluation (§6).
+
+### 11.5 Alternating climb
+
+For one start: (1) climb the plugboard (§5, §6) with W fixed; (2) climb W
+(§11.4) with the board fixed, using the objective of the current phase; if
+step 2 committed at least one move, repeat from step 1, otherwise stop. The
+objective phase is the single §6 phase driven by board cardinality, shared by
+both steps. Final rescoring (§6) happens once, after the alternation stops.
+Termination: every committed move strictly improves the score of the current
+phase over a finite space. A board with no legal moves (for example
+`max_pairs: 0`, as on KD) makes step 1 a no-op, so the climb is the wiring
+climb alone.
+
+### 11.6 Results, checkpoint and backend
+
+`best.configuration` and every hold entry carry the winning `pairs` in the
+UKW-D slot entry, oriented and sorted like plugboard pairs; it is a complete
+transform key. `mutable_plugboard` is unchanged. The human report prints the
+wiring next to the reflector slot. Checkpoints need no new member or version:
+`best`/`hold` already carry the complete key, resume re-decrypts it (protocol
+§6.4), and identity already binds the request and the catalog content.
+
+Searching the wiring is CPU-only. `--backend gpu` with a searched wiring emits
+one seq 1 `backend_unavailable` at `/job/attack`, message
+`GPU backend unavailable: the UKW-D wiring search runs on the CPU only`, exit 1,
+before device initialization. With a **known** wiring the GPU plugboard attack
+is supported unchanged, because the CPU prepares rows from the resolved
+reflector. Deferred options (L13): a hybrid where the CPU climbs W and the GPU
+climbs the board on rows prepared per wiring, or a GPU kernel that climbs W.

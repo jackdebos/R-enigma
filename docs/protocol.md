@@ -391,6 +391,12 @@ exactly `alphabet`, `wheels`, `slots`, and `stepping`:
   alphabet symbol for each input symbol; the inverse is derived. `turnovers` contains
   distinct alphabet symbols and refers to displayed pre-step positions, not ring-adjusted
   positions. A wheel used in a reflector slot must be involutive.
+  A **rewirable** wheel (UKW-D, Stage 5, specified but not yet implemented) replaces
+  `wiring` with `rewirable: {"fixed_pairs": [[SYMBOL,SYMBOL],...]}`: disjoint pairs
+  wired permanently (possibly empty), leaving an even, nonzero number of free symbols.
+  Its key wiring is supplied by the configuration (§3.2) and completes an involution.
+  A rewirable wheel is allowed only in a reflector slot, and a slot that admits it
+  admits no other wheel. See [search-passes §11](search-passes.md#11-rewirable-reflector-ukw-d--stage-5).
 - `slots`: non-empty array in physical left-to-right order. Each slot has exactly `id`,
   `role`, `movement`, and exactly one of `wheel` or `allowed_wheels`. IDs are unique,
   stable, non-empty strings. `role` is `rotor` or `reflector`; `movement` is `fixed` or
@@ -420,7 +426,11 @@ bundled content.
 exactly `slots` and `plugboard`: `slots` has exactly one entry per definition slot in
 definition order, each with exactly `id`, `wheel`, `position`, and `ring`. The ID must
 match its structural slot; wheel must equal a structurally fixed `wheel` or belong to
-`allowed_wheels`; `position` and `ring` are each one alphabet symbol. `plugboard` is
+`allowed_wheels`; `position` and `ring` are each one alphabet symbol. A slot whose wheel is rewirable
+(§3.1) also requires `pairs`: exactly one disjoint pair per two free symbols, never
+touching a fixed pair, so fixed and given pairs pair every alphabet symbol; `pairs` is
+`unknown_field` on any other slot. The completed involution is then used like any
+wheel wiring, with that slot's position and ring. `plugboard` is
 required, including when empty, and is an array of disjoint two-symbol pairs.
 Self-pairs, duplicate endpoints, and symbols outside the alphabet are invalid. No
 required value is omitted or defaulted; even structurally fixed wheels are explicitly
@@ -432,7 +442,8 @@ only the **known fixed choices**. Fixed and variable assignments are reconciled 
 enumeration.
 
 `configuration.slots` is an array of partial slot facts. Each entry is an object with
-exactly `id` plus any subset of `wheel`, `position`, and `ring`; `id` is required, must
+exactly `id` plus any subset of `wheel`, `position`, `ring` and, on a rewirable slot,
+`pairs`; `id` is required, must
 name a definition slot, and every entry must name a distinct slot (array order is
 insignificant). A present member is a fixed key fact and is checked for admissibility
 exactly as in a transform. Position and ring are key dimensions for every slot. A wheel
@@ -483,7 +494,9 @@ already complete.
   slot, and is unique. `wheels` is allowed only for a slot with `allowed_wheels` and is
   a non-empty unique subset of that slot's admissible wheels; `positions` and `rings`
   are non-empty unique arrays of alphabet symbols. At least one of the three members
-  must be present.
+  must be present. On a rewirable slot (§3.1) the attack branch also accepts
+  `pairs: {"kind":"attack"}`, a searched wiring
+  ([search-passes §11](search-passes.md#112-request)), which then counts as a member.
 - `plugboard`: the retained Task 9 subset branch is an object with exactly `candidates` and `size`. `candidates` is a non-empty
   unique array of disjoint two-symbol pairs drawn from the alphabet; `size` is a
   positive integer no greater than `candidates.len()`, the number of additional pairs
@@ -938,6 +951,11 @@ and emit one seq 1
 A `bombe` job instead emits one seq 1 `backend_unavailable` at `/job/attack`,
 message `GPU backend unavailable: the crib attack runs on the CPU only`, exit 1,
 before device initialization or any work events.
+An attack that searches a UKW-D wiring likewise emits one seq 1 `backend_unavailable`
+at `/job/attack`, message
+`GPU backend unavailable: the UKW-D wiring search runs on the CPU only`, exit 1
+([search-passes §11.6](search-passes.md#116-results-checkpoint-and-backend)); a known
+wiring keeps GPU support.
 No suitable adapter (including missing 64-bit integer support), device initialization
 failure, or device-specific job limit emits one seq 1 `backend_unavailable` at `""`,
 message `GPU backend unavailable: <reason>`, exit 1. Stderr is
