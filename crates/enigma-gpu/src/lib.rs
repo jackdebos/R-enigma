@@ -99,6 +99,7 @@ enum WeightKey {
     Dense(usize, Vec<i64>),
     Sparse(usize),
     Entropy(usize),
+    Trie(usize),
 }
 
 impl WeightKey {
@@ -112,6 +113,9 @@ impl WeightKey {
                 Self::Sparse(Arc::as_ptr(&model.table_identity()) as usize)
             }
             ClimbObjective::Entropy { length } => Self::Entropy(length),
+            ClimbObjective::Trie { model } => {
+                Self::Trie(Arc::as_ptr(&model.table_identity()) as usize)
+            }
         }
     }
 }
@@ -124,6 +128,28 @@ struct ResidentWeights {
 
 /// Kernel order code of the entropy objective; n-gram orders are 1-6, IC is 0.
 const ENTROPY_ORDER: usize = 7;
+const TRIE_ORDER: usize = 8;
+
+// One buffer per objective reuses the existing bindings: [depth, edges_base],
+// [edge_start, edge_count, signed terminal-or-zero] per node, [symbol, child] per edge.
+fn trie_table(model: &enigma_core::TrieModel) -> Result<Vec<i64>, GpuError> {
+    let flat = model
+        .flatten()
+        .map_err(|e| GpuError::Device(format!("flatten trie: {e}")))?;
+    let mut table = Vec::with_capacity(model.flattened_bytes() as usize / 8);
+    table.extend([flat.max_depth as i64, (2 + 3 * flat.nodes.len()) as i64]);
+    for node in flat.nodes {
+        table.extend([
+            i64::from(node.edge_start),
+            i64::from(node.edge_count),
+            i64::from(node.terminal.unwrap_or(0)),
+        ]);
+    }
+    for edge in flat.edges {
+        table.extend([i64::from(edge.symbol), i64::from(edge.child)]);
+    }
+    Ok(table)
+}
 
 /// Per count `c` in `0..=length`, the exact entropy term split as `[high, low]`
 /// with `term = high * 2^16 + low` and `0 <= low < 2^16`. Summing highs and lows
@@ -320,6 +346,17 @@ fn objective(
             }
             Ok(order)
         }
+        ClimbObjective::Trie { model } => {
+            if model.alphabet().len() != width
+                || length == 0
+                || model.flattened_bytes() > max_buffer
+            {
+                return Err(unsupported(
+                    "trie dimensions or flattened table exceed device storage buffer limit",
+                ));
+            }
+            Ok(TRIE_ORDER)
+        }
         ClimbObjective::Entropy { length: total } => {
             // Two i64 words per count 0..=length; highs sum below 2^63 for 1e6 letters.
             if total != length || length == 0 || (length as u64 + 1) * 16 > max_buffer {
@@ -351,6 +388,9 @@ fn same_objectives(a: ClimbObjective<'_>, b: ClimbObjective<'_>) -> bool {
             ClimbObjective::SparseNgram { model: a, .. },
             ClimbObjective::SparseNgram { model: b, .. },
         ) => std::ptr::eq(a, b),
+        (ClimbObjective::Trie { model: a }, ClimbObjective::Trie { model: b }) => {
+            std::ptr::eq(a, b)
+        }
         (ClimbObjective::Entropy { .. }, ClimbObjective::Entropy { .. }) => true,
         _ => false,
     }
@@ -468,8 +508,29 @@ impl GpuClimbAccelerator {
             let budget = budget as usize;
             ((geometry.letters / budget).max(1), geometry.rounds * budget)
         });
+        // Keep short trie trials in independent lanes: cooperation serializes
+        // their action search. Depth still bounds slices and concurrent keys.
+        // Exceptionally deep trials need cooperation even in short texts, so
+        // a single lane's worst-case walk cannot monopolize the display.
+        let depth = [job.initial_objective, job.final_objective]
+            .into_iter()
+            .map(|o| match o {
+                ClimbObjective::Trie { model } => model.max_depth().min(job.text_length),
+                _ => 1,
+            })
+            .max()
+            .unwrap_or(1);
+        let work_length = job.text_length.saturating_mul(depth);
+        if depth > 1 && (layout.cooperative.is_some() || work_length > 16_384) {
+            layout.cooperative = Some((
+                (geometry.letters / budget as usize / depth).max(1),
+                (geometry.rounds * budget as usize / depth).max(1),
+            ));
+        }
+        layout.keys_per_dispatch = layout.keys_per_dispatch.min((512 / depth).max(1));
         if layout.cooperative.is_none() {
-            layout.keys_per_dispatch = layout.keys_per_dispatch.min(sliced_keys(job.text_length));
+            layout.keys_per_dispatch = layout.keys_per_dispatch.min(sliced_keys(work_length));
+            layout.pair_slice = bounded_pair_slice(32 * (1024 / work_length).clamp(1, 4), budget);
         }
         Ok(layout)
     }
@@ -485,6 +546,10 @@ impl GpuClimbAccelerator {
     fn dispatch_bound(job: &ClimbJob<'_>, layout: &JobLayout, budget: u32) -> u64 {
         let distinct = |objective| match objective {
             ClimbObjective::Ic { denominator, .. } => denominator.saturating_add(1),
+            ClimbObjective::Trie { model } => {
+                let bound = job.text_length as u128 * model.max_depth() as u128 * (1u128 << 31);
+                2 * bound + 2
+            }
             ClimbObjective::DenseNgram { max_abs, .. }
             | ClimbObjective::SparseNgram { max_abs, .. } => u128::from(max_abs) * 2 + 2,
             // Ranking is -measured with 0 <= measured <= B(length) >> 16.
@@ -814,6 +879,10 @@ impl GpuClimbAccelerator {
                     .map_err(|e| GpuError::Device(format!("complete n-gram table: {e:?}")))?;
                 &owned
             }
+            ClimbObjective::Trie { model } => {
+                owned = trie_table(model)?;
+                &owned
+            }
             ClimbObjective::Entropy { length } => {
                 owned = entropy_table(length)?;
                 &owned
@@ -831,6 +900,7 @@ impl GpuClimbAccelerator {
         stats.objective_uploads += 1;
         let identity = match objective {
             ClimbObjective::SparseNgram { model, .. } => Some(model.table_identity()),
+            ClimbObjective::Trie { model } => Some(model.table_identity()),
             _ => None,
         };
         session.weights.insert(
@@ -1071,7 +1141,16 @@ impl GpuClimbAccelerator {
                                 .collect(),
                             evaluations,
                             final_objective_ascent: record[8] != 0,
-                            score_units: i128::from(signed(0)),
+                            // Trie climbs compare raw i64 sums, never Q32-scaled
+                            // i64 (which can overflow). Positive scaling preserves
+                            // all strict comparisons and ties. Phases never compare
+                            // unlike units: a switch rescore replaces current.score.
+                            score_units: i128::from(signed(0))
+                                * if layout.final_order == TRIE_ORDER {
+                                    1i128 << 32
+                                } else {
+                                    1
+                                },
                         });
                     }
                     break;

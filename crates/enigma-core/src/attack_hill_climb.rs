@@ -5511,6 +5511,65 @@ mod tests {
     }
 
     #[test]
+    fn accelerated_trie_objectives_match_cpu_and_projection() {
+        struct Projected;
+        impl crate::ClimbAccelerator for Projected {
+            fn climb(
+                &self,
+                job: &crate::ClimbJob<'_>,
+                first: u128,
+                rows: &[u8],
+            ) -> Result<Vec<crate::AcceleratedClimb>, crate::AcceleratorError> {
+                let expected = job.owner.reference_climbs(job, first, rows)?;
+                assert_eq!(job.climb_from_projection(rows)?, expected);
+                Ok(expected)
+            }
+        }
+        let identity = crate::checkpoint_identity("{}", &Default::default()).unwrap();
+        for pe in [false, true] {
+            for (initial, last) in [("trie", "trie"), ("ic", "trie"), ("trie", "ic")] {
+                let request = direct_request_with(serde_json::json!([]), true, pe, |job| {
+                    job["attack"]["initial_measure"] = initial.into();
+                    job["attack"]["final_measure"] = last.into();
+                    job["text"] = "ABACABAC".into();
+                });
+                let run = |accelerator: Option<&dyn crate::ClimbAccelerator>| {
+                    let options = crate::ExecutionOptions::serial();
+                    let options = accelerator.map_or(options, |a| options.with_accelerator(a));
+                    let mut progress = Vec::new();
+                    let mut records = Vec::new();
+                    let result = request
+                        .run_with_checkpoints(
+                            options,
+                            |p| progress.push(p),
+                            || false,
+                            |s| records.push(s.record(identity, 0).unwrap()),
+                        )
+                        .unwrap();
+                    (format!("{result:?}"), progress, records)
+                };
+                let expected = run(None);
+                let actual = run(Some(&Projected));
+                assert_eq!(actual, expected, "pe={pe} {initial}->{last}");
+                for (records, options) in [
+                    (
+                        &expected.2,
+                        crate::ExecutionOptions::serial().with_accelerator(&Projected),
+                    ),
+                    (&actual.2, crate::ExecutionOptions::serial()),
+                ] {
+                    let result = request
+                        .resume(&records[0])
+                        .unwrap()
+                        .run_with(options, |_| {}, || false)
+                        .unwrap();
+                    assert_eq!(format!("{result:?}"), expected.0);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn accelerated_entropy_objectives_match_cpu_and_projection() {
         for (initial, last) in [("entropy", "entropy"), ("ic", "entropy"), ("entropy", "ic")] {
             let request = pool_request(false, 3, |job| {

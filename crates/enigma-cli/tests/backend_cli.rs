@@ -10,7 +10,7 @@ impl Scratch {
     fn new() -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.scratch/t5")
+            .join("../../.scratch/t6")
             .join(format!(
                 "enigma-backend-{}-{}",
                 std::process::id(),
@@ -214,7 +214,19 @@ fn explicit_cpu_preserves_default_attack_events() {
     assert_eq!(events(&cpu).last().unwrap()["reason"], "completed");
 }
 #[test]
-fn gpu_trie_is_rejected_before_started() {
+fn gpu_row_limit_is_rejected_before_started() {
+    let dir = Scratch::new();
+    let mut input = attack();
+    input["job"]["text"] = json!("A".repeat(262145));
+    rejection(
+        &dir.run(&["--backend", "gpu"], &input),
+        "unsupported_job",
+        "--backend gpu does not support this attack: text exceeds accelerator row data limit",
+        "/job/attack",
+    );
+}
+#[test]
+fn gpu_trie_matches_cpu_or_reports_unavailability() {
     let dir = Scratch::new();
     std::fs::write(
         dir.0.join("words.json"),
@@ -228,12 +240,7 @@ fn gpu_trie_is_rejected_before_started() {
     input["job"]["resources"] = json!({"trie":{"path":"words.json"}});
     input["job"]["attack"]["initial_measure"] = json!("trie");
     input["job"]["attack"]["final_measure"] = json!("trie");
-    rejection(
-        &dir.run(&["--backend", "gpu"], &input),
-        "unsupported_job",
-        "--backend gpu does not support this attack: unsupported objective trie",
-        "/job/attack",
-    );
+    gpu_matches_cpu_in(&dir, &input);
 }
 #[test]
 fn gpu_partial_exhaustion_matches_cpu_or_reports_unavailability() {
@@ -255,7 +262,10 @@ fn gpu_at_low_usage_matches_cpu_or_reports_unavailability() {
 }
 
 fn gpu_matches_cpu(input: &Value) {
-    let dir = Scratch::new();
+    gpu_matches_cpu_in(&Scratch::new(), input);
+}
+
+fn gpu_matches_cpu_in(dir: &Scratch, input: &Value) {
     let gpu = dir.run(
         &["--backend", "gpu", "--gpu-usage", "20", "--threads", "1"],
         input,

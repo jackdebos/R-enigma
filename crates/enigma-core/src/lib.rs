@@ -104,7 +104,7 @@ pub use score::{
 
 pub use measure::{index_of_coincidence, shannon_entropy, MeasureError, MeasuredScore};
 pub use ngram::{NgramError, NgramModel, NgramTableError};
-pub use trie::{TrieError, TrieModel};
+pub use trie::{FlatTrie, FlatTrieEdge, FlatTrieNode, TrieError, TrieModel};
 
 pub use candidate::CandidateIterator;
 pub use capability::{Capabilities, CapabilityPolicy, PassSupport};

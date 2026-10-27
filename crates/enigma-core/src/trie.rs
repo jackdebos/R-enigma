@@ -63,6 +63,38 @@ pub struct TrieModel {
     nodes: Vec<Node>,
     entry_count: usize,
     max_word_length: usize,
+    identity: std::sync::Arc<()>,
+}
+
+/// One flattened node; edges are ordered by alphabet index, not Unicode scalar.
+#[derive(Debug)]
+pub struct FlatTrieNode {
+    /// First edge in `FlatTrie::edges`.
+    pub edge_start: u32,
+    /// Number of children.
+    pub edge_count: u32,
+    /// Complete word weight, including zero and negative weights.
+    pub terminal: Option<i32>,
+}
+
+/// One alphabet-indexed sparse edge.
+#[derive(Debug)]
+pub struct FlatTrieEdge {
+    /// Ordered alphabet index.
+    pub symbol: u8,
+    /// Target node index.
+    pub child: u32,
+}
+
+/// Validated device-independent sparse trie projection, rooted at node zero.
+#[derive(Debug)]
+pub struct FlatTrie {
+    /// Root-inclusive nodes.
+    pub nodes: Vec<FlatTrieNode>,
+    /// Contiguous sorted child ranges.
+    pub edges: Vec<FlatTrieEdge>,
+    /// Longest word length.
+    pub max_depth: usize,
 }
 
 impl TrieModel {
@@ -138,6 +170,7 @@ impl TrieModel {
             nodes,
             entry_count,
             max_word_length,
+            identity: std::sync::Arc::new(()),
         })
     }
 
@@ -154,6 +187,58 @@ impl TrieModel {
     /// Number of trie nodes, including the root and shared prefixes once.
     pub fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Stable allocation identity; retaining it prevents address reuse after model drop.
+    pub fn table_identity(&self) -> std::sync::Arc<()> {
+        std::sync::Arc::clone(&self.identity)
+    }
+
+    /// Longest validated word, at most 256 symbols.
+    pub fn max_depth(&self) -> usize {
+        self.max_word_length
+    }
+
+    /// Serialized accelerator size: two i64 header words, three per node, two per edge.
+    /// Every non-root node has exactly one incoming edge.
+    pub fn flattened_bytes(&self) -> u64 {
+        16 + self.nodes.len() as u64 * 24 + self.nodes.len().saturating_sub(1) as u64 * 16
+    }
+
+    /// Flatten without changing node identity; preserve signed/zero terminals.
+    /// Constructor budgets guarantee all offsets and children fit u32.
+    pub fn flatten(&self) -> Result<FlatTrie, TrieError> {
+        if self.nodes.len() > MAX_NODES {
+            return Err(TrieError::NodeLimit {
+                index: self.entry_count.saturating_sub(1),
+            });
+        }
+        let mut flat = FlatTrie {
+            nodes: Vec::with_capacity(self.nodes.len()),
+            edges: Vec::with_capacity(self.nodes.len() - 1),
+            max_depth: self.max_word_length,
+        };
+        for node in &self.nodes {
+            let mut children: Vec<_> = node
+                .children
+                .iter()
+                .map(|&(symbol, child)| FlatTrieEdge {
+                    symbol: self
+                        .alphabet
+                        .index_of(symbol)
+                        .expect("validated trie symbol") as u8,
+                    child: child as u32,
+                })
+                .collect();
+            children.sort_unstable_by_key(|edge| edge.symbol);
+            flat.nodes.push(FlatTrieNode {
+                edge_start: flat.edges.len() as u32,
+                edge_count: children.len() as u32,
+                terminal: node.weight,
+            });
+            flat.edges.extend(children);
+        }
+        Ok(flat)
     }
 
     /// Sum every complete match at every scalar start, including prefixes and overlaps.
@@ -222,6 +307,31 @@ mod tests {
 
     fn model(words: &[(&str, i32)]) -> TrieModel {
         TrieModel::new(alphabet(), entries(words)).unwrap()
+    }
+
+    #[test]
+    fn flattened_edges_follow_alphabet_order_and_keep_terminals_and_limits() {
+        let trie = TrieModel::new(
+            Alphabet::new(vec!['B', 'A']).unwrap(),
+            entries(&[("A", 0), ("AB", -7), ("B", i32::MIN)]),
+        )
+        .unwrap();
+        let flat = trie.flatten().unwrap();
+        assert_eq!(flat.max_depth, 2);
+        assert_eq!(flat.nodes.len(), trie.node_count());
+        assert_eq!(flat.edges.len() + 1, flat.nodes.len());
+        let root = &flat.nodes[0];
+        assert_eq!(root.terminal, None);
+        let edges =
+            &flat.edges[root.edge_start as usize..(root.edge_start + root.edge_count) as usize];
+        assert_eq!(edges.iter().map(|e| e.symbol).collect::<Vec<_>>(), [0, 1]);
+        assert_eq!(flat.nodes[edges[0].child as usize].terminal, Some(i32::MIN));
+        assert_eq!(flat.nodes[edges[1].child as usize].terminal, Some(0));
+        assert_eq!(trie.flattened_bytes(), 16 + 24 * 4 + 16 * 3);
+        let longest = model(&[(&"A".repeat(256), i32::MAX)]).flatten().unwrap();
+        assert_eq!(longest.max_depth, 256);
+        assert_eq!(longest.nodes.len(), 257);
+        assert!(TrieModel::with_limits(alphabet(), entries(&[("AB", 1)]), 1, 2).is_err());
     }
 
     #[test]

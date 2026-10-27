@@ -111,6 +111,74 @@ fn malformed_projection_is_rejected_with_typed_reasons() {
 }
 
 #[test]
+fn trie_objective_checks_device_storage_and_depth_aware_dispatch_bounds() {
+    let model = enigma_core::TrieModel::new(
+        enigma_core::Alphabet::new(vec!['D', 'C', 'B', 'A']).unwrap(),
+        vec![(vec!['A'; 256], i32::MIN), (vec!['A'], i32::MAX)],
+    )
+    .unwrap();
+    let trie = ClimbObjective::Trie { model: &model };
+    let bytes = model.flattened_bytes();
+    assert_eq!(objective(trie, 4, 2048, bytes), Ok(TRIE_ORDER));
+    assert!(objective(trie, 4, 2048, bytes - 1).is_err());
+    assert!(objective(trie, 3, 2048, bytes).is_err());
+    let table = trie_table(&model).unwrap();
+    assert_eq!(table.len() as u64 * 8, bytes);
+    assert_eq!(table[0], 256);
+    assert!(table.contains(&i64::from(i32::MIN)));
+    let owner = request(2048);
+    let mut job = owner.climb_job().unwrap();
+    job.initial_objective = trie;
+    job.final_objective = trie;
+    assert!(same_objectives(trie, trie));
+    assert!(!same_objectives(
+        trie,
+        ClimbObjective::Entropy { length: 2048 }
+    ));
+    for length in [1024, 2048] {
+        job.text_length = length;
+        job.input.resize(length, 0);
+        for budget in 1..=4 {
+            let layout = GpuClimbAccelerator::bounded_layout(
+                &job,
+                &wgpu::Limits::default(),
+                budget,
+                COOPERATIVE,
+            )
+            .unwrap();
+            assert_eq!(layout.cooperative, Some((1, 1)));
+            assert_eq!(layout.keys_per_dispatch, 2);
+            assert!(GpuClimbAccelerator::dispatch_bound(&job, &layout, budget) > 1_000_000);
+        }
+    }
+}
+
+#[test]
+fn short_trie_uses_depth_bounded_sliced_trials() {
+    let model = enigma_core::TrieModel::new(
+        enigma_core::Alphabet::new(vec!['A', 'B', 'C', 'D']).unwrap(),
+        vec![(vec!['A'; 8], 7)],
+    )
+    .unwrap();
+    let owner = request(232);
+    let mut job = owner.climb_job().unwrap();
+    job.final_objective = ClimbObjective::Trie { model: &model };
+    for budget in 1..=4 {
+        let layout = GpuClimbAccelerator::bounded_layout(
+            &job,
+            &wgpu::Limits::default(),
+            budget,
+            COOPERATIVE,
+        )
+        .unwrap();
+        assert_eq!(layout.cooperative, None);
+        assert_eq!(layout.keys_per_dispatch, 64);
+        assert_eq!(layout.pair_slice, bounded_pair_slice(32, budget));
+        assert!(GpuClimbAccelerator::dispatch_bound(&job, &layout, budget) > 1);
+    }
+}
+
+#[test]
 fn dense_objectives_require_exact_dimensions_bounds_and_device_storage() {
     let weights = [-8; 16];
     let dense = |max_abs| ClimbObjective::DenseNgram {

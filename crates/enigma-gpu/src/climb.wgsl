@@ -23,6 +23,7 @@ const COUNT_WORDS: u32 = {{COUNT_WORDS}}u;
 // Order code of the entropy objective (IC is 0, n-grams 1-6). Its weight table
 // holds [high, low] per count: term(count) = high * 2^16 + low, 0 <= low < 2^16.
 const ENTROPY: u32 = 7u;
+const TRIE: u32 = 8u;
 // Pending cooperative evaluation kinds.
 const EVAL_NONE: u32 = 0u;
 const EVAL_INITIAL: u32 = 1u;
@@ -93,7 +94,7 @@ fn evaluate(key: u32, mapping: Mapping, phase: u32) -> i64 {
     return score(key, mapping, FINAL_ORDER, 1u);
 }
 
-fn is_ngram(order: u32) -> bool { return order != 0u && order != ENTROPY; }
+fn is_ngram(order: u32) -> bool { return order > 0u && order < ENTROPY; }
 
 fn weight(phase: u32, index: u32) -> i64 {
     if (phase == 0u) { return initial_weights[index]; }
@@ -127,7 +128,40 @@ fn entropy_quotient(high: i64, low: i64) -> i64 {
     return -measured;
 }
 
+// Each lane owns start positions, not decoded positions: walks may cross its
+// range. Every terminal (including prefixes and overlapping words) contributes.
+// Raw sums fit i64; the host scales the final trie score to Q32 in i128.
+fn trie_chunk(key: u32, mapping: Mapping, phase: u32, start: u32, end: u32) -> i64 {
+    let depth = u32(weight(phase, 0u));
+    let edges = u32(weight(phase, 1u));
+    var sum = 0li;
+    for (var p = start; p < end; p++) {
+        var node = 0u;
+        for (var q = p; q < min(LENGTH, p + depth); q++) {
+            let symbol = decode(key, mapping, q);
+            let base = 2u + 3u * node;
+            let first = u32(weight(phase, base));
+            let count = u32(weight(phase, base + 1u));
+            var lo = first;
+            var hi = first + count;
+            loop {
+                if (lo >= hi) { break; }
+                let mid = lo + (hi - lo) / 2u;
+                if (u32(weight(phase, edges + 2u * mid)) < symbol) { lo = mid + 1u; }
+                else { hi = mid; }
+            }
+            if (lo == first + count) { break; }
+            let edge = edges + 2u * lo;
+            if (u32(weight(phase, edge)) != symbol) { break; }
+            node = u32(weight(phase, edge + 1u));
+            sum += weight(phase, 2u + 3u * node + 2u);
+        }
+    }
+    return sum;
+}
+
 fn score(key: u32, mapping: Mapping, order: u32, phase: u32) -> i64 {
+    if (order == TRIE) { return trie_chunk(key, mapping, phase, 0u, LENGTH); }
     var counts: array<u32, WIDTH>;
     var small_counts: Mapping;
     let ngram = is_ngram(order);
@@ -419,6 +453,7 @@ fn partial_score(key: u32, mapping: Mapping, phase: u32, start: u32, end: u32) -
 }
 
 fn chunk(key: u32, mapping: Mapping, order: u32, phase: u32, start: u32, end: u32) -> i64 {
+    if (order == TRIE) { return trie_chunk(key, mapping, phase, start, end); }
     let ngram = is_ngram(order);
     var radix = 1u;
     if (ngram) { for (var i = 1u; i < order; i++) { radix *= WIDTH; } }
@@ -504,7 +539,9 @@ fn cooperative(key: u32, lane: u32) {
         if (lane == 0u) {
             let order = select(INITIAL_ORDER, FINAL_ORDER, phase != 0u);
             var value = 0li;
-            if (!is_ngram(order)) {
+            if (order == TRIE) {
+                value = total + current.partial;
+            } else if (!is_ngram(order)) {
                 var total = Histogram(0lu, 0li, 0li);
                 for (var i = 0u; i < WIDTH; i++) {
                     add_count(&total, atomicLoad(&hist[i]), order, phase);

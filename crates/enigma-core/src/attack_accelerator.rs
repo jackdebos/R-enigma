@@ -53,6 +53,11 @@ pub enum ClimbObjective<'a> {
         /// Largest absolute weight, bounding every partial sum.
         max_abs: u64,
     },
+    /// Sparse weighted dictionary; score is the raw match sum times 2^32.
+    Trie {
+        /// Immutable dictionary in the job's ordered alphabet.
+        model: &'a crate::TrieModel,
+    },
     /// Shannon entropy ranking: `-floor(sum[c>0] terms[c] / (length * 2^16))`,
     /// where `terms = entropy_terms(length)` and `c` are symbol counts.
     Entropy {
@@ -134,7 +139,7 @@ pub enum ClimbUnsupported {
     AlphabetTooLarge,
     /// Byte rows or one logical block exceed the bounded row data policy.
     RowDataLimit,
-    /// Trie or another nonrepresentable objective.
+    /// A nonrepresentable objective.
     Objective(MeasureId),
     /// Model weights cannot be represented in a complete i64 table.
     SparseNgram(MeasureId),
@@ -301,6 +306,9 @@ impl ClimbJob<'_> {
                 ClimbObjective::SparseNgram { model: a, .. },
                 ClimbObjective::SparseNgram { model: b, .. },
             ) => std::ptr::eq(a, b),
+            (ClimbObjective::Trie { model: a }, ClimbObjective::Trie { model: b }) => {
+                std::ptr::eq(a, b)
+            }
             (ClimbObjective::Entropy { .. }, ClimbObjective::Entropy { .. }) => true,
             _ => false,
         };
@@ -353,6 +361,19 @@ impl ClimbJob<'_> {
                         ClimbObjective::SparseNgram { model, order, .. } => {
                             if model.alphabet().len() != width || order != model.order() {
                                 return Err(fail("invalid sparse model dimensions"));
+                            }
+                            let text: String =
+                                plain.iter().map(|&s| model.alphabet().symbols[s]).collect();
+                            model
+                                .score(&text)
+                                .map(|s| s.ranking().units())
+                                .map_err(|e| {
+                                    AcceleratorError(format!("projected reference: {e:?}"))
+                                })
+                        }
+                        ClimbObjective::Trie { model } => {
+                            if model.alphabet().len() != width {
+                                return Err(fail("invalid trie dimensions"));
                             }
                             let text: String =
                                 plain.iter().map(|&s| model.alphabet().symbols[s]).collect();
@@ -492,6 +513,9 @@ impl AttackRequest {
             if id == MeasureId::Entropy {
                 return Ok(ClimbObjective::Entropy { length });
             }
+            if let Some(BoundResource::Trie(model)) = self.bound_resource(id) {
+                return Ok(ClimbObjective::Trie { model });
+            }
             if let Some(BoundResource::Ngram(model)) = self.bound_resource(id) {
                 let dense = model.dense_parts();
                 let max_abs = dense
@@ -557,6 +581,16 @@ impl AttackRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_trie_match_sum_fits_i64_within_byte_row_texts() {
+        // At most 256 complete prefixes at each of <=2^20 starts. Includes i32::MIN.
+        let bound = (1u128 << 20) * 256 * (1u128 << 31);
+        assert_eq!(bound, 1u128 << 59);
+        assert!(bound < i64::MAX as u128);
+        assert!(bound * crate::SCALE as u128 > i64::MAX as u128);
+        assert!(!crate::attack_evaluator::byte_rows_fit((1 << 20) + 1, 1));
+    }
 
     #[test]
     fn every_ngram_model_window_sum_fits_i64_within_byte_row_texts() {

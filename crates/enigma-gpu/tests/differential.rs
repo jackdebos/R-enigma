@@ -35,6 +35,9 @@ fn request_with_kind(width: usize, variant: usize, partial: bool) -> AttackReque
         15 => ("entropy", "entropy"),
         16 => ("entropy", id),
         17 => ("entropy", "ic"),
+        22 => ("trie", "ic"),
+        23 => ("ic", "trie"),
+        24..=26 => ("trie", "trie"),
         _ => ("ic", id),
     };
     let mut value = json!({"protocol_version":1,
@@ -111,6 +114,55 @@ fn request_with_kind(width: usize, variant: usize, partial: bool) -> AttackReque
             value["job"]["space"]["plugboard"]["symbols"] = json!(["A", "B", "C", "D"]);
             value["job"]["space"]["plugboard"]["max_pairs"] = json!(2);
         }
+    }
+    if initial_id == "trie" || final_id == "trie" {
+        if variant == 24 {
+            // A committed checkpoint before the final outer: cross-backend
+            // resume must actually perform more trie climbing, including PE.
+            value["job"]["space"]["limit"] = json!(129);
+        }
+        if variant == 25 {
+            value["job"]["text"] = json!("AAABACADBBABCDABAAA".repeat(81));
+            value["job"]["space"]["limit"] = json!(1);
+        }
+        if variant == 26 {
+            // A worst-depth walk at every start, including cross-lane overlap.
+            value["job"]["text"] = json!("A".repeat(2048));
+            value["machine"]["definition"]["value"]["wheels"][0]["wiring"] = json!(alphabet);
+            value["job"]["space"]["limit"] = json!(1);
+            value["job"]["space"]["plugboard"]["max_pairs"] = json!(0);
+        }
+        let mut entries = vec![
+            json!({"word":["A"],"weight":3}),
+            json!({"word":["A","A"],"weight":-2}),
+            json!({"word":["A","B"],"weight":7}),
+            json!({"word":["B","A"],"weight":-5}),
+            json!({"word":["A","A","A"],"weight":11}),
+        ];
+        let word: Vec<_> = if variant == 26 {
+            vec!["A"; 256]
+        } else {
+            value["job"]["text"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .take(256)
+                .map(|c| &alphabet[(c as u8 - b'A') as usize])
+                .map(|s| s.as_str())
+                .collect()
+        };
+        entries.push(json!({"word":word,"weight":i32::MIN}));
+        value["job"]["resources"] = json!({"trie":{"path":"words.json"}});
+        let model =
+            json!({"resource_version":1,"kind":"dictionary","alphabet":alphabet,"entries":entries})
+                .to_string();
+        return ParsedAttackRequest::parse_json(&value.to_string())
+            .unwrap()
+            .bind_resources(&std::collections::BTreeMap::from([(
+                "trie".into(),
+                model.as_str(),
+            )]))
+            .unwrap();
     }
     if initial_id != id && final_id != id {
         return AttackRequest::parse_json(&value.to_string()).unwrap();
@@ -421,6 +473,62 @@ fn partial_exhaustion_matches_every_seed_progress_checkpoints_and_resume() {
 }
 
 #[test]
+fn trie_matches_cpu_every_seed_progress_checkpoints_resume_and_geometries() {
+    let Some(first) = gpu(25, 1) else { return };
+    let Some(second) = gpu(20, 2) else { return };
+    let Some(third) = gpu(20, 3).map(|g| g.with_cooperative_geometry(1, 1, 2)) else {
+        return;
+    };
+    let identity = enigma_core::checkpoint_identity("{}", &Default::default()).unwrap();
+    for partial in [false, true] {
+        for variant in 22..=26 {
+            let request = request_with_kind(4, variant, partial);
+            let run = |a: Option<&dyn ClimbAccelerator>| {
+                let options = ExecutionOptions::serial();
+                let options = a.map_or(options, |a| options.with_accelerator(a));
+                let mut progress = Vec::new();
+                let mut records = Vec::new();
+                let result = request
+                    .run_with_checkpoints(
+                        options,
+                        |p| progress.push(p),
+                        || false,
+                        |s| records.push(s.record(identity, 0).unwrap()),
+                    )
+                    .unwrap();
+                (format!("{result:?}"), progress, records)
+            };
+            let expected = run(None);
+            assert_eq!(run(Some(&enigma_core::ReferenceClimbAccelerator)), expected);
+            for device in [&first, &second, &third] {
+                let actual = run(Some(&Audited(device)));
+                assert_eq!(actual, expected, "partial={partial} variant={variant}");
+                let uploads = device.dispatch_stats().objective_uploads;
+                assert_eq!(run(Some(&Audited(device))), expected);
+                assert_eq!(device.dispatch_stats().objective_uploads, uploads);
+                for (records, options) in [
+                    (
+                        &expected.2,
+                        ExecutionOptions::serial().with_accelerator(device),
+                    ),
+                    (&actual.2, ExecutionOptions::serial()),
+                ] {
+                    let resumed = request
+                        .resume(&records[0])
+                        .unwrap()
+                        .run_with(options, |_| {}, || false)
+                        .unwrap();
+                    assert_eq!(format!("{resumed:?}"), expected.0);
+                }
+            }
+        }
+    }
+    for device in [&first, &second, &third] {
+        eprintln!("trie differential: {:?}", device.dispatch_stats());
+    }
+}
+
+#[test]
 fn sparse_ngrams_match_cpu_progress_checkpoints_and_geometries() {
     let Some(first) = gpu(25, 1) else { return };
     let Some(second) = gpu(20, 2) else { return };
@@ -555,6 +663,37 @@ fn entropy_boundaries_and_phase_rescore_match_cpu() {
                 text.len()
             );
         }
+    }
+}
+
+#[test]
+fn trie_cache_changes_models_after_drop_and_scales_extreme_weights() {
+    use enigma_core::{Alphabet, ClimbObjective, TrieModel};
+    let Some(device) = gpu(25, 1) else { return };
+    let owner = request(4, 0);
+    let rows: Vec<u8> = (0..8).flat_map(|_| 0..4u8).collect();
+    for weight in [i32::MIN, i32::MAX, 0] {
+        let model = TrieModel::new(
+            Alphabet::new("ABCD".chars().collect()).unwrap(),
+            vec![(vec!['A'], weight), (vec!['A'; 2], -3)],
+        )
+        .unwrap();
+        let objective = ClimbObjective::Trie { model: &model };
+        let mut job = owner.climb_job().unwrap();
+        job.text_length = 8;
+        job.input = vec![0; 8];
+        job.max_pairs = 0;
+        job.initial_objective = objective;
+        job.final_objective = objective;
+        let expected = job.climb_from_projection(&rows).unwrap();
+        assert_eq!(
+            expected[0].score_units,
+            (i128::from(weight) * 8 - 3 * 7) << 32
+        );
+        assert_eq!(device.climb(&job, 0, &rows).unwrap(), expected);
+        let uploads = device.dispatch_stats().objective_uploads;
+        assert_eq!(device.climb(&job, 0, &rows).unwrap(), expected);
+        assert_eq!(device.dispatch_stats().objective_uploads, uploads);
     }
 }
 

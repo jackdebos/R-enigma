@@ -926,9 +926,10 @@ loading/binding errors retain precedence.
 
 After successful attack resource binding, before checkpoint validation or `started`,
 GPU preflight first projects the climb job. Hill climbing and partial exhaustion
-support IC, entropy and dense/sparse n-gram objectives. Unsupported attacks
-(including trie objectives and n-gram weights or window sums that cannot fit i64)
-emit one seq 1
+support IC, entropy, dense/sparse n-grams and weighted trie objectives, as initial,
+final or both climb objectives. Alphabets over 256 symbols, texts beyond the row
+data limit, and n-gram weights or window sums that cannot fit i64 remain unsupported
+and emit one seq 1
 `unsupported_job` at `/job/attack`, message
 `--backend gpu does not support this attack: <reason>`, exit 1.
 A `bombe` job instead emits one seq 1 `backend_unavailable` at `/job/attack`,
@@ -943,6 +944,10 @@ gram has the model's unseen weight, in ordered-alphabet radix order. CPU scoring
 and its 4 MiB dense-table admission rule are unchanged. The complete table must
 fit u32 indexing and the device's storage binding/buffer limit; rejection names
 the required table size and occurs during device-specific preflight above.
+For example, a 26-letter hexagram table needs 2,471,326,208 bytes and is rejected
+on a 2 GiB binding limit. Flattened trie models must also fit device limits.
+Trie walks add every complete prefix and overlapping match at each start, with no
+base score in climb objectives; finalist trie stages remain CPU-owned.
 Tables stay resident across batches; host copies are released after chunked upload.
 Partial exhaustion climbs every filtered empty/single seed independently in runtime
 alphabet order, offering each eligible outcome to hold in CPU order. Fixed pairs,
@@ -1190,4 +1195,7 @@ silently switches backend; the last valid checkpoint may be resumed with either.
 N-gram objectives use exact complete i64 GPU tables even when the CPU model is
 sparse, subject to u32 indexing and the device's storage binding/buffer limit (§5).
 Table caching, chunked uploads and host-copy lifetime are execution details, not
-checkpoint fields or changes to CPU scoring.
+checkpoint fields or changes to CPU scoring. Trie climb objectives sum every
+signed complete match, including prefixes and overlaps, with identical strict
+comparisons, ties and final Q32 units. Depth-aware dispatch geometry and flattened
+trie caching likewise do not affect counters, progress or checkpoint identity.

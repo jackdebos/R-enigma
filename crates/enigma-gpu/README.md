@@ -31,7 +31,7 @@ that consumes job fields and rows without following the private request owner.
 
 - Alphabets contain 1-256 symbols. Text is bounded by device buffer limits, the
   core 512-KiB-per-key row policy, and a conservative 1,000,000-symbol ceiling.
-- Objectives are IC, entropy or i64 n-grams, including CPU-sparse models (orders 1-6).
+- Initial/final objectives are IC, entropy, weighted trie or i64 n-grams, including CPU-sparse models (orders 1-6).
   Complete tables must fit the device's storage binding/buffer limit and u32
   indexing; every window sum must fit i64. Preflight names the required byte size
   when a sparse table exceeds those limits, without allocating the table.
@@ -42,6 +42,20 @@ that consumes job fields and rows without following the private request owner.
   `c * (B(N) - B(c))` for every count `c` (`entropy_terms`), split into a high word
   and a 16-bit low word. The kernel sums both from the symbol histogram and uses
   `floor((highs + (lows >> 16)) / N)`, equal to the CPU's `floor(sum / (N * 2^16))`.
+- Trie objectives use alphabet-index-sorted sparse edges and signed i32 terminals.
+  Every complete match contributes at every start, including prefixes and overlaps;
+  there is no base score. The kernel compares raw i64 sums (at most 2^59 in
+  magnitude within byte-row texts); multiplying by positive 2^32 preserves strict
+  improvement and ties. The host converts the final score to i128 Q32 and core
+  checks it. A phase switch replaces the score by rescoring, never comparing
+  unlike units. Flattened buffers are cached by retained model identity, with
+  host copies dropped after upload. Device storage limits apply at preflight.
+  Short texts use independent whole-trial lanes, with slices and workgroup
+  counts bounded by text length times maximum trie depth. Cooperation is reserved
+  for texts over 1024 symbols or worst-case walks over 16,384 symbol visits per
+  trial. Cooperative lanes own start positions and may decode beyond their range;
+  depth-aware start/round/workgroup bounds keep long-word dispatches short.
+  Finalist trie stages stay on the CPU, unchanged.
 - Hill climbing and partial exhaustion are supported. PE uses core's ordered
   empty/single seeds (`all` or `touching`), sharing prepared rows per outer key.
   Every seed's terminal score is checked by core and every eligible seed enters
@@ -86,7 +100,7 @@ Rows use an LDS cache only when they fit the device's workgroup storage allowanc
 and a 16-KiB cache ceiling; otherwise decoding reads packed global storage.
 Weights always remain in global storage. CPU-sparse models are materialized once
 as complete i64 tables in alphabet-radix order, with the model's unseen weight in
-every missing slot. Dense, sparse and entropy objective buffers are cached across
+every missing slot. Dense, sparse, entropy and trie objective buffers are cached across
 core calls, shared when initial/final objectives are identical, and uploaded in
 awaited chunks of at most 4 MiB under the existing duty cycle. Host sparse tables
 are released after upload. Only the active objectives remain resident, preventing
