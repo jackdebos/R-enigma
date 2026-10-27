@@ -137,7 +137,7 @@ func TestDistinctWheelsOffOriginalBytes(t *testing.T) {
 func TestRealEngineDistinctWheelsCount(t *testing.T) {
 	path := os.Getenv("ENIGMA_TEST_BIN")
 	if path == "" {
-		t.Skip("set ENIGMA_TEST_BIN to an engine 0.2.0 binary to compare preview and started counts")
+		t.Skip("set ENIGMA_TEST_BIN to an engine 0.3.0 binary to compare preview and started counts")
 	}
 	path, err := filepath.Abs(path)
 	if err != nil {

@@ -3,6 +3,18 @@ import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import { cribInfo, selectAttackMethod, checkText, validatePair, buildRequest, lookup, initialLanguage, buildAttackBody, parseAttackInput, estimateDuration, progressInfo, holdEntries, groupFive } from './logic.js';
 
+test('settable reflector values survive transform and attack saved-input round trips', () => {
+  for (const model of ['enigma-railway', 'enigma-g312', 'enigma-g260']) {
+    const state = { model, reflector: 'UKW', reflector_ring: 'D', reflector_position: 'J', slots: [], plugboard: [], search: false, text: 'ABC', advanced: {} };
+    assert.equal(buildRequest(state).reflector_ring, 'D');
+    assert.equal(buildRequest(state).reflector_position, 'J');
+    const body = buildAttackBody({ ...state, reflector_position: '' });
+    assert.equal(body.reflector_ring, 'D');
+    assert.equal(body.reflector_position, null);
+    assert.deepEqual(buildAttackBody(parseAttackInput(body)), body);
+  }
+});
+
 test('crib is checked as typed, short warning and method defaults preserve unrelated state', () => {
   for (const [text, short] of [['', true], ['A'.repeat(13), true], ['A'.repeat(14), false]]) {
     assert.deepEqual(cribInfo(text), { text, short, offending: [], hasLowercase: false });

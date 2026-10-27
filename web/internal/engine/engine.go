@@ -23,7 +23,7 @@ type Version struct {
 }
 
 // This is the single compatibility list. Update only after testing the new engine.
-var supported = [...]Version{{Version: "0.2.0", Protocol: 1}}
+var supported = [...]Version{{Version: "0.3.0", Protocol: 1}}
 
 // Issue is a stable machine-readable failure with a short user-facing explanation.
 type Issue struct {

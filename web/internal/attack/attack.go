@@ -12,9 +12,12 @@ const (
 )
 
 type Model struct {
-	ID         string
-	Reflectors []string
-	Slots      []Slot
+	SettableReflector bool
+	FixedETW          bool
+	NoPlugboard       bool
+	ID                string
+	Reflectors        []string
+	Slots             []Slot
 }
 type Slot struct {
 	ID     string
@@ -41,12 +44,14 @@ type Plan struct {
 	Resources       []Resource      `json:"resources"`
 }
 type Input struct {
-	Model     string      `json:"model"`
-	Reflector *string     `json:"reflector"`
-	Slots     []InputSlot `json:"slots"`
-	Plugboard Plugboard   `json:"plugboard"`
-	Text      string      `json:"text"`
-	Settings  Settings    `json:"settings"`
+	Model             string      `json:"model"`
+	Reflector         *string     `json:"reflector"`
+	ReflectorRing     *string     `json:"reflector_ring,omitempty"`
+	ReflectorPosition *string     `json:"reflector_position,omitempty"`
+	Slots             []InputSlot `json:"slots"`
+	Plugboard         Plugboard   `json:"plugboard"`
+	Text              string      `json:"text"`
+	Settings          Settings    `json:"settings"`
 }
 type InputSlot struct {
 	ID       string  `json:"id"`

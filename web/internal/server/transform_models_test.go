@@ -13,7 +13,7 @@ func TestTransformUsesRememberedEngine(t *testing.T) {
 	s, u, c := engineServer(t, filepath.Join(dir, "config.json"))
 	path := engineScript(t, dir, "engine", goodVersion, 0700)
 	engineRequest(t, s, u, c, "POST", pathBody(path), 200, "")
-	if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf 'enigma 0.2.0\\nprotocol version 1\\n'\n"), 0700); err != nil {
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf 'enigma 0.3.0\\nprotocol version 1\\n'\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
 	r := httptest.NewRequest("POST", "/api/transform", strings.NewReader(form))
@@ -64,7 +64,7 @@ func TestTransformNavalModels(t *testing.T) {
 			if model == "enigma-m4" {
 				check = `grep -q '"id":"reflector","wheel":"Thin-C","ring":"A","position":"A"},{"id":"greek","wheel":"Gamma","ring":"Z","position":"B"}' || exit 8`
 			}
-			script := "if [ \"$1\" = --version ]; then printf 'enigma 0.2.0\\nprotocol version 1\\n'; exit; fi\n" + check + "\nprintf '%s\\n' '" + successEvents + "'"
+			script := "if [ \"$1\" = --version ]; then printf 'enigma 0.3.0\\nprotocol version 1\\n'; exit; fi\n" + check + "\nprintf '%s\\n' '" + successEvents + "'"
 			path := engineScript(t, dir, "engine", script, 0700)
 			engineRequest(t, s, u, c, "POST", pathBody(path), 200, "")
 			body := strings.Replace(form, "enigma-i", model, 1)

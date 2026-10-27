@@ -32,10 +32,16 @@ export function validatePair(pairs, first, second) {
   return null;
 }
 
+function reflectorSettings(state, unknown = false) {
+  if (!Object.hasOwn(state, 'reflector_ring')) return {};
+  return Object.fromEntries(['reflector_ring', 'reflector_position'].map(key => [key, unknown ? state[key] || null : state[key] ?? '']));
+}
+
 export function buildRequest(state) {
   return {
     model: state.model,
     reflector: state.reflector,
+    ...reflectorSettings(state),
     slots: state.slots.map(({ id, wheel, ring, position }) => ({ id, wheel, ring, position })),
     plugboard: state.plugboard.map(pair => [...pair]),
     text: state.text,
@@ -61,6 +67,7 @@ export function buildAttackBody(state) {
   return {
     model: state.model,
     reflector: state.reflector || null,
+    ...reflectorSettings(state, true),
     slots: state.slots.map(({ id, wheel, ring, position }) => ({ id, wheel: wheel || null, ring: ring || null, position: position || null })),
     plugboard: { known: state.plugboard.map(pair => [...pair]), search: state.search },
     text: state.text,
@@ -70,7 +77,7 @@ export function buildAttackBody(state) {
 
 export function parseAttackInput(input) {
   return {
-    model: input.model, reflector: input.reflector || '',
+    model: input.model, reflector: input.reflector || '', ...reflectorSettings(input),
     slots: input.slots.map(slot => Object.fromEntries(Object.entries(slot).map(([key, value]) => [key, value ?? '']))),
     plugboard: input.plugboard.known.map(pair => [...pair]), search: input.plugboard.search,
     distinctWheels: input.settings?.distinct_wheels ?? true,

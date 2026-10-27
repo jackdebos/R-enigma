@@ -78,7 +78,7 @@ func engineRequest(t *testing.T, s *server.Server, u *url.URL, c *http.Cookie, m
 	} else if reply.Error == nil || reply.Error.Code != code || reply.Error.Message == "" || reply.Compatible {
 		t.Fatalf("error response: %+v", reply)
 	}
-	if len(reply.Supported) != 1 || reply.Supported[0].Version != "0.2.0" || reply.Supported[0].Protocol != 1 {
+	if len(reply.Supported) != 1 || reply.Supported[0].Version != "0.3.0" || reply.Supported[0].Protocol != 1 {
 		t.Fatalf("supported: %+v", reply.Supported)
 	}
 	return reply
@@ -97,7 +97,7 @@ func pathBody(path string) string {
 	return string(b)
 }
 
-const goodVersion = "[ \"$#\" -eq 1 ] && [ \"$1\" = --version ] || exit 9\nprintf 'enigma 0.2.0\\nprotocol version 1\\n'"
+const goodVersion = "[ \"$#\" -eq 1 ] && [ \"$1\" = --version ] || exit 9\nprintf 'enigma 0.3.0\\nprotocol version 1\\n'"
 
 func TestEnginePersistenceAndRejectedUpdates(t *testing.T) {
 	dir := t.TempDir()
@@ -112,7 +112,7 @@ func TestEnginePersistenceAndRejectedUpdates(t *testing.T) {
 	}
 	good := engineScript(t, dir, "good engine", goodVersion, 0700)
 	reply := engineRequest(t, s, u, c, "POST", pathBody(good), 200, "")
-	if !reply.Configured || !reply.Compatible || reply.Path != good || reply.Version != "0.2.0" || reply.Protocol != 1 {
+	if !reply.Configured || !reply.Compatible || reply.Path != good || reply.Version != "0.3.0" || reply.Protocol != 1 {
 		t.Fatalf("success: %+v", reply)
 	}
 	validated, err := s.ValidatedEnginePath(context.Background())
@@ -172,8 +172,9 @@ func TestEngineValidationErrors(t *testing.T) {
 		{"extra-line", engineScript(t, dir, "extra", goodVersion+"\necho extra", 0700), "not_enigma"},
 		{"old", engineScript(t, dir, "old", "printf 'enigma 0.0.9\\nprotocol version 1\\n'", 0700), "unsupported_version"},
 		{"previous", engineScript(t, dir, "previous", "printf 'enigma 0.1.0\\nprotocol version 1\\n'", 0700), "unsupported_version"},
-		{"new", engineScript(t, dir, "new", "printf 'enigma 0.3.0\\nprotocol version 1\\n'", 0700), "unsupported_version"},
-		{"protocol", engineScript(t, dir, "protocol", "printf 'enigma 0.2.0\\nprotocol version 2\\n'", 0700), "unsupported_version"},
+		{"previous-catalog", engineScript(t, dir, "previous-catalog", "printf 'enigma 0.2.0\\nprotocol version 1\\n'", 0700), "unsupported_version"},
+		{"new", engineScript(t, dir, "new", "printf 'enigma 0.4.0\\nprotocol version 1\\n'", 0700), "unsupported_version"},
+		{"protocol", engineScript(t, dir, "protocol", "printf 'enigma 0.3.0\\nprotocol version 2\\n'", 0700), "unsupported_version"},
 		{"bounded", engineScript(t, dir, "bounded", "while :; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; done", 0700), "not_enigma"},
 		{"timeout", engineScript(t, dir, "timeout", "exec sleep 7", 0700), "timeout"},
 	}
@@ -186,7 +187,7 @@ func TestEngineValidationErrors(t *testing.T) {
 			if time.Since(start) > 6500*time.Millisecond {
 				t.Fatal("validation exceeded bounded deadline")
 			}
-			if tc.code == "unsupported_version" && (reply.Error.Found == nil || len(reply.Error.Supported) != 1 || reply.Error.Supported[0].Version != "0.2.0" || reply.Error.Supported[0].Protocol != 1 || reply.Version == "" || reply.Protocol == 0) {
+			if tc.code == "unsupported_version" && (reply.Error.Found == nil || len(reply.Error.Supported) != 1 || reply.Error.Supported[0].Version != "0.3.0" || reply.Error.Supported[0].Protocol != 1 || reply.Version == "" || reply.Protocol == 0) {
 				t.Fatalf("unsupported details: %+v", reply)
 			}
 			if _, err := os.Stat(config); !os.IsNotExist(err) {
@@ -243,7 +244,7 @@ func TestRealEngine(t *testing.T) {
 	path := realEnginePath(t)
 	s, u, c := engineServer(t, filepath.Join(t.TempDir(), "config.json"))
 	got := engineRequest(t, s, u, c, "POST", pathBody(path), 200, "")
-	if !got.Compatible || got.Version != "0.2.0" || got.Protocol != 1 {
+	if !got.Compatible || got.Version != "0.3.0" || got.Protocol != 1 {
 		t.Fatalf("real engine: %+v", got)
 	}
 }

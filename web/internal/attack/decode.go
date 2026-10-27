@@ -86,7 +86,7 @@ func validateShape(v any, t reflect.Type, path string) *Issue {
 		return issue("invalid_request", field, "Missing member or invalid field type.")
 	}
 	if v == nil {
-		if path == "reflector" || strings.HasPrefix(path, "slots/") && (strings.HasSuffix(path, "/wheel") || strings.HasSuffix(path, "/ring") || strings.HasSuffix(path, "/position")) {
+		if path == "reflector" || path == "reflector_ring" || path == "reflector_position" || strings.HasPrefix(path, "slots/") && (strings.HasSuffix(path, "/wheel") || strings.HasSuffix(path, "/ring") || strings.HasSuffix(path, "/position")) {
 			return nil
 		}
 		return bad(path)
@@ -103,14 +103,14 @@ func validateShape(v any, t reflect.Type, path string) *Issue {
 		fields := map[string]reflect.Type{}
 		for i := 0; i < t.NumField(); i++ {
 			f := t.Field(i)
-			name := f.Tag.Get("json")
+			name := strings.Split(f.Tag.Get("json"), ",")[0]
 			fields[name] = f.Type
 			child := name
 			if path != "" {
 				child = path + "/" + name
 			}
 			value, present := obj[name]
-			required := t == reflect.TypeOf(Input{}) && name != "settings" || t == reflect.TypeOf(InputSlot{}) || t == reflect.TypeOf(Plugboard{}) || t == reflect.TypeOf(Stage{}) && name == "pass"
+			required := t == reflect.TypeOf(Input{}) && name != "settings" && name != "reflector_ring" && name != "reflector_position" || t == reflect.TypeOf(InputSlot{}) || t == reflect.TypeOf(Plugboard{}) || t == reflect.TypeOf(Stage{}) && name == "pass"
 			if !present {
 				if required {
 					return bad(child)

@@ -34,7 +34,7 @@ func TestTransform(t *testing.T) {
 			dir := t.TempDir()
 			s, u, c := engineServer(t, filepath.Join(dir, "config.json"))
 			capture := filepath.Join(dir, "request.json")
-			script := "if [ \"$1\" = --version ]; then printf 'enigma 0.2.0\\nprotocol version 1\\n'; exit; fi\n[ \"$*\" = '--events - --request -' ] || exit 8\ncat > '" + capture + "'\n" + tc.script
+			script := "if [ \"$1\" = --version ]; then printf 'enigma 0.3.0\\nprotocol version 1\\n'; exit; fi\n[ \"$*\" = '--events - --request -' ] || exit 8\ncat > '" + capture + "'\n" + tc.script
 			path := engineScript(t, dir, "engine with spaces", script, 0700)
 			engineRequest(t, s, u, c, "POST", pathBody(path), 200, "")
 			r := httptest.NewRequest("POST", "/api/transform", strings.NewReader(form))
@@ -174,10 +174,10 @@ func TestMachines(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &reply); err != nil {
 		t.Fatal(err)
 	}
-	if len(reply.Models) != 3 {
+	if len(reply.Models) != 6 {
 		t.Fatalf("catalog=%s", w.Body.String())
 	}
-	for i, m := range reply.Models {
+	for i, m := range reply.Models[:3] {
 		if m.ID != []string{"enigma-i", "enigma-m3", "enigma-m4"}[i] || m.DefinitionID != m.ID || !m.Plugboard {
 			t.Fatalf("model=%+v", m)
 		}

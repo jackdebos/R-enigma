@@ -81,7 +81,7 @@ func configureAttack(t *testing.T, script string) (*server.Server, *url.URL, *ht
 	t.Helper()
 	dir := t.TempDir()
 	s, u, c := engineServer(t, filepath.Join(dir, "config.json"))
-	prefix := "if [ \"$1\" = --version ]; then printf 'enigma 0.2.0\\nprotocol version 1\\n'; exit; fi\n"
+	prefix := "if [ \"$1\" = --version ]; then printf 'enigma 0.3.0\\nprotocol version 1\\n'; exit; fi\n"
 	path := engineScript(t, dir, "engine", prefix+script, 0700)
 	engineRequest(t, s, u, c, "POST", pathBody(path), 200, "")
 	t.Cleanup(func() {

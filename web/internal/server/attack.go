@@ -29,7 +29,8 @@ func buildAttack(body io.Reader) (attack.Input, attack.Plan, *attack.Issue) {
 	if problem == nil {
 		models := []attack.Model{}
 		for _, catalog := range machineCatalog() {
-			model := attack.Model{ID: catalog.DefinitionID, Reflectors: catalog.Reflectors}
+			model := attack.Model{ID: catalog.DefinitionID, Reflectors: catalog.Reflectors,
+				SettableReflector: catalog.SettableReflector, FixedETW: len(catalog.FixedSlots) > 0, NoPlugboard: !catalog.Plugboard}
 			for _, slot := range catalog.Slots {
 				model.Slots = append(model.Slots, attack.Slot{ID: slot.ID, Wheels: slot.AllowedWheels})
 			}

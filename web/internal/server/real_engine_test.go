@@ -10,7 +10,7 @@ func realEnginePath(t *testing.T) string {
 	t.Helper()
 	path := os.Getenv("ENIGMA_TEST_BIN")
 	if path == "" {
-		t.Skip("set ENIGMA_TEST_BIN to an engine 0.2.0 binary to run real-engine tests")
+		t.Skip("set ENIGMA_TEST_BIN to an engine 0.3.0 binary to run real-engine tests")
 	}
 	path, err := filepath.Abs(path)
 	if err != nil {

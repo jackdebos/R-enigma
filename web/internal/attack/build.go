@@ -82,8 +82,13 @@ func Build(models []Model, in Input, cpus int) (Plan, *Issue) {
 		return nil
 	}
 	a := "A"
-	// Reflectors have fixed ring and position even when their wheel is unknown.
-	if p := addSlot("reflector", in.Reflector, &a, &a, model.Reflectors, ""); p != nil {
+	ring, position := &a, &a
+	if model.SettableReflector {
+		ring, position = in.ReflectorRing, in.ReflectorPosition
+	} else if in.ReflectorRing != nil || in.ReflectorPosition != nil {
+		return plan, issue("invalid_request", "", "This model has no settable reflector.")
+	}
+	if p := addSlot("reflector", in.Reflector, ring, position, model.Reflectors, "reflector_"); p != nil {
 		p.Field = "reflector"
 		return plan, p
 	}
@@ -95,6 +100,15 @@ func Build(models []Model, in Input, cpus int) (Plan, *Issue) {
 		if p := addSlot(s.ID, s.Wheel, s.Ring, s.Position, model.Slots[i].Wheels, field); p != nil {
 			return plan, p
 		}
+	}
+	if model.FixedETW {
+		etw := "ETW"
+		if p := addSlot("etw", &etw, &a, &a, []string{etw}, ""); p != nil {
+			return plan, p
+		}
+	}
+	if model.NoPlugboard && (len(in.Plugboard.Known) > 0 || in.Plugboard.Search) {
+		return plan, component("plugboard")
 	}
 	var distinctIDs []string
 	if in.Settings.DistinctWheels == nil || *in.Settings.DistinctWheels {
@@ -222,6 +236,9 @@ func Build(models []Model, in Input, cpus int) (Plan, *Issue) {
 		if bound.value < bound.low || bound.value > bound.high {
 			return plan, invalid(bound.name)
 		}
+	}
+	if model.NoPlugboard && settings.MaxPairs != nil && *settings.MaxPairs != 0 {
+		return plan, invalid("max_pairs")
 	}
 	if !in.Plugboard.Search {
 		maxPairs = knownCount

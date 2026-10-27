@@ -125,6 +125,8 @@ function chooseModel(id) {
   const model = models.find(model => model.id === id);
   state.model = id;
   state.reflector = model.reflectors[0];
+  delete state.reflector_ring; delete state.reflector_position;
+  if (model.settable_reflector) { state.reflector_ring = 'A'; state.reflector_position = 'A'; }
   state.slots = model.slots.map((slot, i) => ({
     id: slot.id, wheel: slot.allowed_wheels[slot.id === 'greek' ? 0 : (i - (model.slots[0].id === 'greek' ? 1 : 0))], ring: 'A', position: 'A',
   }));
@@ -139,6 +141,13 @@ function renderMachine() {
   for (const id of ['model-field', 'reflector-field', 'rotors', 'plugboard-heading']) $(id).replaceChildren();
   selectField($('model-field'), { id: 'model', key: 'model', hint: 'model_hint', values: models.map(model => model.id), value: state.model, optionKey: 'model', change: chooseModel });
   selectField($('reflector-field'), { id: 'reflector', key: 'reflector', hint: 'reflector_hint', values: model.reflectors, value: state.reflector, optionKey: 'reflector', change: value => { state.reflector = value; } });
+  if (model.settable_reflector) {
+    for (const key of ['ring', 'position']) selectField($('reflector-field'), {
+      id: `reflector-${key}`, key, hint: `reflector_${key}_hint`, values: alphabet, value: state[`reflector_${key}`],
+      change: value => { state[`reflector_${key}`] = value; },
+    });
+  }
+  $('machine-plugboard').hidden = !model.plugboard;
   state.slots.forEach((slot, i) => {
     const block = element('div', undefined, 'rotor');
     block.append(element('h3', t(`slot_${slot.id}`)));
@@ -370,7 +379,8 @@ function chooseAttackModel(id) {
     slots: model.slots.map((slot, i) => ({ id: slot.id,
       wheel: slot.allowed_wheels[slot.id === 'greek' ? 0 : i - (model.slots[0].id === 'greek' ? 1 : 0)],
       ring: 'A', position: '',
-    })), plugboard: [], search: true, distinctWheels: true, text: attackState?.text || '', advanced: {},
+    })), plugboard: [], search: model.plugboard, distinctWheels: true, text: attackState?.text || '', advanced: {},
+    ...(model.settable_reflector ? { reflector_ring: 'A', reflector_position: '' } : {}),
   };
 }
 function attackIssue(failure) {
@@ -478,7 +488,7 @@ function renderAttackAdvanced(parent) {
     });
     details.append(rings);
   }
-  if (settings.method === 'partial_exhaustion') {
+  if (settings.method === 'partial_exhaustion' && models.find(model => model.id === attackState.model).plugboard) {
     attackSelect(fields, 'seeds', ['all', 'touching'], settings.seeds ? 'touching' : 'all', value => {
       if (value === 'all') delete settings.seeds;
       else settings.seeds = [];
@@ -516,6 +526,7 @@ function renderAttackAdvanced(parent) {
   details.append(fields, stages);
   const numbers = element('div', undefined, 'advanced-grid');
   for (const [key, placeholder, min, max] of [['max_pairs', '13', 0, 13], ['switch_pairs', '7', 0, 13], ['backtrack_pairs', '5', 0, 13], ['hold', '5', 1, 1000], ['threads', t('threads_default'), 1, 256]]) {
+    if (!models.find(model => model.id === attackState.model).plugboard && ['max_pairs', 'switch_pairs', 'backtrack_pairs'].includes(key)) continue;
     attackInput(numbers, key, settings[key] ?? '', value => { if (value === '') delete settings[key]; else settings[key] = value; attackChanged(); }, { type: 'number', placeholder, min, max });
   }
   const backend = attackSelect(numbers, 'backend', ['cpu', 'gpu'], settings.backend ?? 'cpu', value => {
@@ -554,6 +565,11 @@ function renderAttack() {
   const modelRow = element('div', undefined, 'model-row');
   attackSelect(modelRow, 'model', models.map(model => model.id), attackState.model, value => { chooseAttackModel(value); attackChanged(); renderAttack(); }, { optionKey: 'model' });
   attackSelect(modelRow, 'reflector', model.reflectors, attackState.reflector, value => { attackState.reflector = value; attackChanged(); }, { unknown: true, optionKey: 'reflector' });
+  if (model.settable_reflector) {
+    for (const key of ['ring', 'position']) attackSelect(modelRow, key, alphabet, attackState[`reflector_${key}`], value => {
+      attackState[`reflector_${key}`] = value; attackChanged();
+    }, { unknown: true, id: `attack-reflector-${key}`, hint: `reflector_${key}_hint` });
+  }
   controls.append(modelRow);
   attackSelect(controls, 'method', ['hill_climb', 'partial_exhaustion', 'bombe'], attackState.advanced.method || 'hill_climb', value => {
     selectAttackMethod(attackState, value);
@@ -581,9 +597,11 @@ function renderAttack() {
   });
   controls.append(rotors);
   attackCheckbox(controls, 'distinct_wheels', attackState.distinctWheels, checked => { attackState.distinctWheels = checked; attackChanged(); });
-  heading(controls, 'plugboard', 'attack_plugboard_hint');
-  const pairs = element('div'); pairs.id = 'attack-pairs-editor'; controls.append(pairs);
-  attackCheckbox(controls, 'search_plugboard', attackState.search, checked => { attackState.search = checked; attackChanged(); });
+  if (model.plugboard) {
+    heading(controls, 'plugboard', 'attack_plugboard_hint');
+    const pairs = element('div'); pairs.id = 'attack-pairs-editor'; controls.append(pairs);
+    attackCheckbox(controls, 'search_plugboard', attackState.search, checked => { attackState.search = checked; attackChanged(); });
+  }
   const textRow = element('div', undefined, 'field-heading');
   const textLabel = element('label', t('ciphertext')); textLabel.htmlFor = 'attack-text';
   textRow.append(textLabel, help('ciphertext', 'ciphertext_hint'));
@@ -615,6 +633,7 @@ function renderAttack() {
 }
 function renderAttackPairs() {
   const root = $('attack-pairs-editor');
+  if (!root) return;
   const previous = [$('attack-first')?.value, $('attack-second')?.value];
   root.replaceChildren();
   const row = element('div', undefined, 'pairs-editor');

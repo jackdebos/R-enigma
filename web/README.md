@@ -1,7 +1,7 @@
 # enigma-web
 
 A separate, local web client for the Rust Enigma engine. The embedded bilingual
-machine page configures Enigma I, M3 and M4 and starts encryption or decryption
+machine page configures Enigma I, M3, M4, Railway, G-312 and G-260 and starts encryption or decryption
 explicitly, using the separately installed Rust engine. No framework, build step,
 CDN, external font, image, or JavaScript package installation is needed.
 
@@ -77,7 +77,7 @@ Other methods return 405 (`Allow: GET, POST`). Requests must contain one JSON ob
 with a string `path`, no unknown fields, and at most 16 KiB. Responses have this shape:
 
 ```json
-{"configured":true,"path":"/absolute/path/to/enigma","version":"0.2.0","protocol":1,"compatible":true,"error":null,"supported":[{"version":"0.2.0","protocol":1}]}
+{"configured":true,"path":"/absolute/path/to/enigma","version":"0.3.0","protocol":1,"compatible":true,"error":null,"supported":[{"version":"0.3.0","protocol":1}]}
 ```
 
 An unconfigured response has `configured:false`, empty path/version, protocol 0,
@@ -101,8 +101,9 @@ Version stdout must be exactly two lines: `enigma <version>` and
 `protocol version <n>` (a final newline is optional). Stderr is discarded. Probes
 have a five-second timeout and a 100 ms pipe-drain limit, so inherited output pipes
 cannot hold the request open indefinitely. Supported pairs are exact, not minimums:
-**engine 0.2.0, protocol 1**. The attack builder sends the new distinct-wheel
-constraint by default, so engine 0.1.0 is no longer supported. Older and newer
+**engine 0.3.0, protocol 1**. The page advertises Railway and G catalog IDs
+introduced in 0.3.0, so 0.2.0 is no longer supported (even though its I/M3/M4
+requests remain compatible). Engine 0.1.0 also lacks the distinct-wheel constraint. Older and newer
 engines are refused. To support another engine, test its CLI/protocol contract, update the single `supported` list in
 `internal/engine/engine.go` plus tests and this document, then release the web client.
 
@@ -118,7 +119,7 @@ For tests/headless smoke checks only, set **`ENIGMA_WEB_CONFIG`** to a temporary
 config-file path before launching the binary. This overrides the user config location;
 no new command-line flag is exposed. Tests inject their own config path and create
 fake engines under `t.TempDir()`. Optional real-engine tests use `ENIGMA_TEST_BIN`
-(an absolute path to engine 0.2.0) and skip with a message when unset or unavailable.
+(an absolute path to engine 0.3.0) and skip with a message when unset or unavailable.
 `Server.ValidatedEnginePath(ctx)` is the reusable boundary for jobs: it uses the remembered startup/save validation result without probing or
 re-reading the config. Startup validates the saved engine once, before printing
 the URL; missing or invalid configuration does not prevent the server starting,
@@ -132,7 +133,11 @@ the path again to refresh compatibility state.
 These routes use the same cookie authentication and Host/Origin guards:
 
 - `GET /api/machines`: `{"models":[{"id":"enigma-i","definition_id":"enigma-i","reflectors":["B","C"],"slots":[{"id":"left","allowed_wheels":["I","II","III","IV","V"]},...],"plugboard":true},...]}`.
-  Models are `enigma-i`, `enigma-m3`, `enigma-m4`. Slots are in definition order,
+  Models are `enigma-i`, `enigma-m3`, `enigma-m4`, `enigma-railway`,
+  `enigma-g312`, `enigma-g260`. Railway/G have `plugboard:false`,
+  `settable_reflector:true`, reflector `UKW`, and `fixed_slots` containing
+  `{"id":"etw","wheel":"ETW","ring":"A","position":"A"}`. The fixed ETW is
+  not shown in either editable form and is inserted by the server. Editable slots are in definition order,
   **excluding the separately selected reflector**: left/middle/right for I and M3;
   greek/left/middle/right for M4. M3/M4 moving slots admit I–VIII; M4 Greek admits
   Beta/Gamma and its reflectors are Thin-B/Thin-C. Sources are
@@ -146,8 +151,16 @@ Example body (all members required, no unknown fields, maximum 1 MiB):
 {"model":"enigma-i","reflector":"B","slots":[{"id":"left","wheel":"I","ring":"A","position":"A"},{"id":"middle","wheel":"II","ring":"A","position":"A"},{"id":"right","wheel":"III","ring":"A","position":"A"}],"plugboard":[],"text":"HELLO"}
 ```
 
+Railway/G transform bodies additionally require `reflector_ring` and
+`reflector_position` (uppercase A–Z), and `plugboard:[]`. Attack bodies accept
+these same reflector fields with `null` meaning search A–Z; omitted fields also
+mean unknown on these models. I/M3/M4 omit both fields and keep reflector A/A.
+Railway's reflector is settable but stationary; G's is settable and moves.
+ETW must not be supplied in `slots`: it is always inserted at A/A. Cable editors
+and cable-count settings are hidden for models without a plugboard.
+
 Slots must follow catalog order; rings/positions and disjoint plugboard endpoints
-must be uppercase A–Z. The server inserts the reflector slot with ring/position A,
+must be uppercase A–Z. The server inserts the reflector slot (A/A for I/M3/M4),
 uses bundled definition IDs and direction `encrypt` (these reflected machines are
 reciprocal, so the same operation also decrypts from the same initial settings).
 It does not impose distinct-wheel or historical operational-key restrictions that
@@ -219,6 +232,12 @@ request bytes and product count, including repeats. If known wheels already repe
 the default preview rejects the input with `invalid_settings` at
 `settings/distinct_wheels`; choose different wheels, mark one unknown, or turn the
 setting off. The builder never changes the input.
+Railway/G attacks require `plugboard:{"known":[],"search":false}` and at least
+one unknown key dimension. Their engine request still uses the required attack
+plugboard branch with A–Z `symbols` and `max_pairs:0`; a supplied nonzero
+`settings.max_pairs` is rejected. Reflector rings/positions participate in preview
+counts just like rotor dimensions.
+
 Known plugboard pairs are fixed; all remaining letters are mutable. With
 `search:false`, the pair cap equals the known pair count. A fully known key with
 no plugboard search is rejected; a full 13-pair board has no mutable letters and
@@ -477,11 +496,11 @@ gofmt -l .
 ```
 
 To include real-engine tests (including preview count versus
-`started.outers_selected`), build engine 0.2.0 with `cargo build -p enigma-cli`
+`started.outers_selected`), build engine 0.3.0 with `cargo build --release`
 from the repository root, then run from `web/`:
 
 ```sh
-ENIGMA_TEST_BIN="$(cd .. && pwd)/target/debug/enigma" go test ./...
+ENIGMA_TEST_BIN="$(cd .. && pwd)/target/release/enigma" go test ./...
 ```
 
 The formatting check should print nothing. HTTP tests use `net/http/httptest` without
@@ -503,6 +522,19 @@ also cover unknown-to-null conversion, changed-only advanced settings, exact tex
 saved-input round trips, duration unit boundaries, decimal-string progress and
 ETA, hold/best extraction and five-symbol grouping. Browser end-to-end checks are
 separate; Node tests need no DOM, browser, framework or packages.
+
+Optional Railway browser smoke (requires Google Chrome at `/usr/bin/google-chrome`):
+
+```sh
+# From the repository root, after cargo build --release:
+(cd web && go build -o ../target/enigma-web ./cmd/enigma-web)
+node web/e2e/wwii.mjs
+```
+
+This transforms the independent Railway vector and starts a 26-key attack through
+page controls, comparing preview and engine counts. It also checks hidden ETW and
+plugboard controls, Spanish rerendering and script/CSP errors. The script prints
+its system-temp scratch path and retains it for manual removal.
 
 ## Architecture and next steps
 
