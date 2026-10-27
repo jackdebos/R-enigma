@@ -152,7 +152,7 @@ func TestAttackBackendResume(t *testing.T) {
 func TestAttackBackendErrors(t *testing.T) {
 	for _, tc := range []struct{ code, message string }{
 		{"backend_unavailable", "GPU backend unavailable: no suitable adapter"},
-		{"unsupported_job", "--backend gpu does not support this attack: partial exhaustion"},
+		{"unsupported_job", "--backend gpu does not support this attack: unsupported objective trie"},
 	} {
 		t.Run(tc.code, func(t *testing.T) {
 			raw, _ := json.Marshal(map[string]string{"event": "error", "code": tc.code, "message": tc.message})

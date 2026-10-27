@@ -85,13 +85,13 @@ fn increasing_scan_budget_still_bounds_dispatch_work() {
 fn malformed_projection_is_rejected_with_typed_reasons() {
     let request = request(19);
     let limits = wgpu::Limits::default();
-    for variant in 0..7 {
+    for variant in 0..9 {
         let mut job = request.climb_job().unwrap();
         match variant {
             0 => job.alphabet_size = 257,
             1 => job.input[0] = 255,
             2 => job.mutable_mask.clear(),
-            3 => job.start_board = vec![(0, 1), (1, 2)],
+            3 => job.starts = vec![vec![(0, 1), (1, 2)]],
             4 => job.max_pairs = 3,
             5 => {
                 job.initial_objective = ClimbObjective::Ic {
@@ -99,7 +99,9 @@ fn malformed_projection_is_rejected_with_typed_reasons() {
                     denominator: 342,
                 }
             }
-            _ => job.text_length = 1_000_001,
+            6 => job.text_length = 1_000_001,
+            7 => job.starts.clear(),
+            _ => job.starts.push(vec![(255, 0)]),
         }
         assert!(matches!(
             GpuClimbAccelerator::layout_for(&job, &limits),
@@ -225,6 +227,28 @@ fn dispatch_bound_follows_distinct_scores_slices_and_rounds() {
         GpuClimbAccelerator::dispatch_bound(&job, &layout, 1),
         603_167_669
     );
+}
+
+#[test]
+fn multi_start_jobs_bound_workgroups_not_outer_keys() {
+    let request = request(19);
+    let mut job = request.climb_job().unwrap();
+    let limits = wgpu::Limits {
+        max_compute_workgroups_per_dimension: 17,
+        ..Default::default()
+    };
+    let layout = GpuClimbAccelerator::bounded_layout(&job, &limits, 1, COOPERATIVE).unwrap();
+    let bound = GpuClimbAccelerator::dispatch_bound(&job, &layout, 1);
+    job.starts = vec![vec![]; 1000];
+    let layout = GpuClimbAccelerator::bounded_layout(&job, &limits, 1, COOPERATIVE).unwrap();
+    assert_eq!(layout.keys_per_dispatch, 17);
+    // Concurrent seeds have independent state and the same per-climb liveness bound.
+    assert_eq!(GpuClimbAccelerator::dispatch_bound(&job, &layout, 1), bound);
+    let limits = wgpu::Limits {
+        max_storage_buffer_binding_size: 1024,
+        ..limits
+    };
+    assert!(GpuClimbAccelerator::layout_for(&job, &limits).is_err());
 }
 
 #[test]

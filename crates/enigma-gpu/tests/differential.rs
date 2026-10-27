@@ -3,6 +3,10 @@ use enigma_gpu::{GpuClimbAccelerator, GpuError, GpuUnsupported};
 use serde_json::json;
 
 fn request(width: usize, variant: usize) -> AttackRequest {
+    request_with_kind(width, variant, false)
+}
+
+fn request_with_kind(width: usize, variant: usize, partial: bool) -> AttackRequest {
     let alphabet: Vec<_> = ('A'..).take(width).map(|s| s.to_string()).collect();
     let wiring: Vec<_> = (0..width)
         .map(|i| alphabet[(i * 3 + 1) % width].clone())
@@ -85,6 +89,28 @@ fn request(width: usize, variant: usize) -> AttackRequest {
     if variant == 17 {
         value["job"]["text"] = json!("AAABACADBBABCDABAAA".repeat(41));
         value["job"]["space"]["limit"] = json!(64);
+    }
+    if partial {
+        value["job"]["passes"] = json!(["partial_exhaustion"]);
+        value["job"]["attack"]["kind"] = json!("partial_exhaustion");
+        value["job"]["attack"]
+            .as_object_mut()
+            .unwrap()
+            .remove("start");
+        value["job"]["attack"]["seeds"] = if variant == 6 {
+            json!({"kind":"empty_single","selection":"touching","symbols":["D","A"]})
+        } else {
+            json!({"kind":"empty_single","selection":"all"})
+        };
+        value["job"]["attack"]["hold"] = json!(if variant == 0 { 1 } else { 5 });
+        value["job"]["space"]["limit"] = json!(if variant == 0 && width == 4 { 129 } else { 1 });
+        if variant == 5 {
+            value["job"]["space"]["plugboard"]["max_pairs"] = json!(1);
+        }
+        if width == 26 {
+            value["job"]["space"]["plugboard"]["symbols"] = json!(["A", "B", "C", "D"]);
+            value["job"]["space"]["plugboard"]["max_pairs"] = json!(2);
+        }
     }
     if initial_id != id && final_id != id {
         return AttackRequest::parse_json(&value.to_string()).unwrap();
@@ -281,6 +307,115 @@ fn device_matches_cpu_results_progress_checkpoints_and_geometry() {
         assert!(
             stats.idle_time + std::time::Duration::from_micros(1)
                 >= stats.work_time.mul_f64(idle_factor)
+        );
+    }
+}
+
+#[test]
+fn partial_exhaustion_matches_every_seed_progress_checkpoints_and_resume() {
+    let Some(first) = gpu(25, 1) else { return };
+    let Some(second) = gpu(20, 2) else { return };
+    let Some(third) = gpu(20, 3).map(|g| g.with_cooperative_geometry(1, 1, 2)) else {
+        return;
+    };
+    let identity = enigma_core::checkpoint_identity("{}", &Default::default()).unwrap();
+    for (width, variant) in [
+        (4, 0),
+        (4, 3),
+        (4, 5),
+        (4, 6),
+        (4, 7),
+        (4, 12),
+        (4, 13),
+        (4, 14),
+        (4, 15),
+        (4, 16),
+        (26, 18),
+        (26, 20),
+        (34, 0),
+    ] {
+        let request = request_with_kind(width, variant, true);
+        let run = |accelerator: Option<&dyn ClimbAccelerator>| {
+            let cpu = ExecutionOptions::with_threads(3).unwrap();
+            let options = accelerator.map_or(cpu, |a| cpu.with_accelerator(a));
+            let mut events = Vec::new();
+            let mut records = Vec::new();
+            let result = request
+                .run_with_checkpoints(
+                    options,
+                    |p| events.push(p),
+                    || false,
+                    |s| records.push(s.record(identity, 0).unwrap()),
+                )
+                .unwrap();
+            (format!("{result:?}"), events, records)
+        };
+        let expected = run(None);
+        for device in [&first, &second, &third] {
+            let actual = run(Some(&Audited(device)));
+            assert_eq!(actual, expected, "width={width} variant={variant}");
+            if variant == 0 {
+                for (records, options) in [
+                    (
+                        &expected.2,
+                        ExecutionOptions::serial().with_accelerator(device),
+                    ),
+                    (&actual.2, ExecutionOptions::serial()),
+                ] {
+                    let resumed = request
+                        .resume(&records[0])
+                        .unwrap()
+                        .run_with(options, |_| {}, || false)
+                        .unwrap();
+                    assert_eq!(format!("{resumed:?}"), expected.0);
+                }
+            }
+        }
+    }
+    struct Corrupt<'a>(&'a GpuClimbAccelerator);
+    impl ClimbAccelerator for Corrupt<'_> {
+        fn climb(
+            &self,
+            job: &enigma_core::ClimbJob<'_>,
+            first: u128,
+            rows: &[u8],
+        ) -> Result<Vec<enigma_core::AcceleratedClimb>, enigma_core::AcceleratorError> {
+            let mut results = self.0.climb(job, first, rows)?;
+            // A non-first seed must also pass core's guard, even if hold drops it.
+            results[1].score_units += 1;
+            Ok(results)
+        }
+    }
+    let mut checkpoints = 0;
+    let error = request_with_kind(4, 12, true)
+        .run_with_checkpoints(
+            ExecutionOptions::serial().with_accelerator(&Corrupt(&first)),
+            |_| {},
+            || false,
+            |_| checkpoints += 1,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("terminal score mismatch"));
+    assert_eq!(error.evaluations_used(), 0);
+    assert_eq!(error.counters().outers_completed(), 0);
+    assert_eq!(checkpoints, 0);
+    let Some(limited) = gpu(25, 1).map(|g| g.with_dispatch_limit(1)) else {
+        return;
+    };
+    let error = request_with_kind(4, 3, true)
+        .run_with(
+            ExecutionOptions::serial().with_accelerator(&limited),
+            |_| {},
+            || false,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("provable bound of 1 dispatches"));
+    assert_eq!(error.counters().outers_completed(), 0);
+    for device in [&first, &second, &third] {
+        let stats = device.dispatch_stats();
+        eprintln!(
+            "PE device differential: {} dispatches, max {:?}",
+            stats.dispatches, stats.max_dispatch
         );
     }
 }

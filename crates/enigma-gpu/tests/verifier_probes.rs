@@ -81,6 +81,19 @@ fn request(seed: u64) -> Option<AttackRequest> {
                 "plugboard":{"kind":"attack","symbols":symbols.iter().map(|&s| alphabet[s].clone()).collect::<Vec<_>>(),"max_pairs":max_pairs}},
             "attack":{"kind":"hill_climb","initial_measure":initial,"final_measure":last,
                 "switch_pairs":r.next(4),"backtrack_pairs":r.next(3),"hold":3,"start":start}}});
+    if width <= 8 && r.next(3) == 0 {
+        value["job"]["passes"] = json!(["partial_exhaustion"]);
+        value["job"]["attack"]["kind"] = json!("partial_exhaustion");
+        value["job"]["attack"]
+            .as_object_mut()
+            .unwrap()
+            .remove("start");
+        value["job"]["attack"]["seeds"] = if r.next(2) == 0 {
+            json!({"kind":"empty_single","selection":"all"})
+        } else {
+            json!({"kind":"empty_single","selection":"touching","symbols":[alphabet[symbols[0]]]})
+        };
+    }
     let mut resources = std::collections::BTreeMap::new();
     let mut models = Vec::new();
     for id in names.iter().filter(|id| order(id) > 0) {

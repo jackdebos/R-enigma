@@ -108,7 +108,8 @@ Output:
 Attacks (hill_climb, partial_exhaustion and bombe):
   -t, --threads <n>         worker threads, 1 to 256 (default: half the logical
                             CPUs); completed runs give the same result for any <n>
-      --backend <cpu|gpu>   execution backend (default: cpu); GPU requires hill_climb
+      --backend <cpu|gpu>   execution backend (default: cpu); GPU supports hill_climb
+                             and partial_exhaustion (supported objectives only)
       --gpu-usage <n>       GPU duty cycle, 1 to 100 (default: 100); requires
                             --backend gpu
   -c, --checkpoint <path>   save checkpoints to a new file
@@ -924,14 +925,15 @@ Existing `--cancel-file`, `--threads` and checkpoint-option messages retain prec
 loading/binding errors retain precedence.
 
 After successful attack resource binding, before checkpoint validation or `started`,
-GPU preflight first projects the climb job. Unsupported attacks (including partial
-exhaustion, trie objectives, and n-gram weights or window sums that cannot fit i64)
+GPU preflight first projects the climb job. Hill climbing and partial exhaustion
+support IC, entropy and dense/sparse n-gram objectives. Unsupported attacks
+(including trie objectives and n-gram weights or window sums that cannot fit i64)
 emit one seq 1
 `unsupported_job` at `/job/attack`, message
 `--backend gpu does not support this attack: <reason>`, exit 1.
 A `bombe` job instead emits one seq 1 `backend_unavailable` at `/job/attack`,
 message `GPU backend unavailable: the crib attack runs on the CPU only`, exit 1,
-before device initialization or any work events. HC/PE GPU behavior is unchanged.
+before device initialization or any work events.
 No suitable adapter (including missing 64-bit integer support), device initialization
 failure, or device-specific job limit emits one seq 1 `backend_unavailable` at `""`,
 message `GPU backend unavailable: <reason>`, exit 1. Stderr is
@@ -942,6 +944,9 @@ and its 4 MiB dense-table admission rule are unchanged. The complete table must
 fit u32 indexing and the device's storage binding/buffer limit; rejection names
 the required table size and occurs during device-specific preflight above.
 Tables stay resident across batches; host copies are released after chunked upload.
+Partial exhaustion climbs every filtered empty/single seed independently in runtime
+alphabet order, offering each eligible outcome to hold in CPU order. Fixed pairs,
+`all`/`touching` selection, tie order and per-seed counters match the CPU.
 There is never silent CPU fallback. Runtime GPU failures use the existing terminal
 `internal_error` with source kind `accelerator` (§4.1), exit 1; the previous checkpoint
 stays valid.
@@ -1173,6 +1178,10 @@ The engine has no UI; the Stage 2 web client is the separate program of §8.
 Progress uses completed work units. A cursor identifies a resumable position without a
 CPU loop counter. Scores are independent per candidate. Thread counts, workgroup sizes,
 and dispatch geometry are not protocol fields; backend metadata is informational only.
+Hill climbing and partial exhaustion share ordered, per-seed accelerator results;
+core verifies every terminal score, including seeds not retained by hold. PE uses
+the same block-boundary checkpoint cursor (`next_outer`) and result `start_index`
+as the CPU; no backend-specific seed cursor is added.
 Backend choice (`--backend`) and GPU duty cycle (`--gpu-usage`) are host configuration,
 not checkpoint identity. CPU and GPU commit the same ordered logical blocks, counters,
 progress, hold and checkpoint content. Checkpoints resume across backends (for jobs

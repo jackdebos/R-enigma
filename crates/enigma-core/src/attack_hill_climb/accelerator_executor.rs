@@ -48,8 +48,7 @@ impl crate::AttackRequest {
                                 self.settings().final_measure(),
                                 self.bound_resource(self.settings().final_measure()),
                             );
-                            key.rows =
-                                evaluator.byte_rows(self.settings().start().expect("direct start"));
+                            key.rows = evaluator.byte_rows(self.settings().start().unwrap_or(&[]));
                         }
                     }
                 });
@@ -142,6 +141,7 @@ impl crate::AttackRequest {
                     accelerator.climb(&job, first.start, &rows)
                 };
                 let results = results.and_then(|results| {
+                    let count = count * job.starts.len();
                     if results.len() == count {
                         Ok(results)
                     } else {
@@ -184,6 +184,56 @@ impl crate::AttackRequest {
                             (key.index, key.initial)
                         })
                         .collect();
+                    if self.settings().seed_policy().is_some() {
+                        let preparation = RunPreparation::new(self);
+                        let outcome =
+                            run_worker_block(initials.into_iter(), |initial, index, accounting| {
+                                let rows = payloads
+                                    .pop_front()
+                                    .expect("one payload per key")
+                                    .map_err(|e| ControlledPartialError {
+                                        outer_index: index,
+                                        seed_index: None,
+                                        source: ControlledPartialSource::Climb(
+                                            ObservedClimbError::Evaluation(e),
+                                        ),
+                                        best: None,
+                                        held: None,
+                                    })?;
+                                // Validate every seed, including losers, before accounting this outer.
+                                let mut climbs = Vec::with_capacity(job.starts.len());
+                                for seed in 0..job.starts.len() {
+                                    let result = results.next().expect("one result per seed");
+                                    let climb = self
+                                        .rebuild_accelerated(&job, &initial, &rows, &result)
+                                        .map_err(|error| ControlledPartialError {
+                                            outer_index: index,
+                                            seed_index: Some(seed as u128),
+                                            source: ControlledPartialSource::Accelerator(error),
+                                            best: None,
+                                            held: None,
+                                        })?;
+                                    climbs.push((climb, result.evaluations));
+                                }
+                                let mut climbs = climbs.into_iter();
+                                self.climb_partial_outer_prepared(
+                                    &preparation,
+                                    (initial, index),
+                                    accounting,
+                                    &mut (),
+                                    self.settings().hold_capacity(),
+                                    |_, _, _, accounting, _| {
+                                        let (climb, evaluations) =
+                                            climbs.next().expect("CPU seed order");
+                                        Self::account_accelerated(evaluations, accounting)?;
+                                        Ok(climb)
+                                    },
+                                )
+                            });
+                        commit(control, block, PhaseBlock::Partial(outcome))?;
+                        termination = DirectRunTermination::Completed;
+                        continue;
+                    }
                     let outcome =
                         run_worker_block(initials.into_iter(), |initial, index, accounting| {
                             let rows = payloads.pop_front().expect("one payload per key").map_err(
@@ -191,7 +241,9 @@ impl crate::AttackRequest {
                             )?;
                             let result = results.next().expect("one result per prepared key");
                             let climb = self
-                                .rebuild_accelerated(&job, &initial, &rows, result, accounting)?;
+                                .rebuild_accelerated(&job, &initial, &rows, &result)
+                                .map_err(DirectRunError::Accelerator)?;
+                            Self::account_accelerated(result.evaluations, accounting)?;
                             Ok(DirectOuterOutcome {
                                 initial,
                                 outer_index: index,
@@ -214,9 +266,8 @@ impl crate::AttackRequest {
         job: &ClimbJob<'_>,
         initial: &ResolvedConfiguration,
         rows: &[u8],
-        result: AcceleratedClimb,
-        accounting: &mut BlockAccounting,
-    ) -> Result<ClimbOutcome, DirectRunError> {
+        result: &AcceleratedClimb,
+    ) -> Result<ClimbOutcome, AcceleratorError> {
         let symbols = &initial.topology().alphabet().symbols;
         let board: Vec<_> = result
             .board
@@ -226,11 +277,7 @@ impl crate::AttackRequest {
                     .get(a as usize)
                     .zip(symbols.get(b as usize))
                     .map(|(&a, &b)| (a, b))
-                    .ok_or_else(|| {
-                        DirectRunError::Accelerator(AcceleratorError(
-                            "terminal board index outside alphabet".into(),
-                        ))
-                    })
+                    .ok_or_else(|| AcceleratorError("terminal board index outside alphabet".into()))
             })
             .collect::<Result<_, _>>()?;
         let evaluator = TrialEvaluator::new(
@@ -243,35 +290,15 @@ impl crate::AttackRequest {
         )
         .with_byte_rows(&job.input, rows);
         let (plaintext, score) = evaluator.evaluate(&board).map_err(|error| {
-            DirectRunError::Accelerator(AcceleratorError(format!(
-                "terminal board re-scoring failed: {error}"
-            )))
+            AcceleratorError(format!("terminal board re-scoring failed: {error}"))
         })?;
         if score.ranking().units() != result.score_units {
-            return Err(DirectRunError::Accelerator(AcceleratorError(format!(
+            return Err(AcceleratorError(format!(
                 "terminal score mismatch: accelerator {}, CPU {}",
                 result.score_units,
                 score.ranking().units()
-            ))));
+            )));
         }
-        accounting.used =
-            accounting
-                .used
-                .checked_add(result.evaluations)
-                .ok_or(DirectRunError::Counter(
-                    CounterOverflow::EvaluationsAdmitted,
-                ))?;
-        accounting
-            .control
-            .merge_block(crate::attack_control::CounterSnapshot {
-                evaluations_admitted: result.evaluations,
-                evaluations_completed: result.evaluations,
-                climbs_started: 1,
-                climbs_completed: 1,
-                outers_completed: 0,
-                bombe: None,
-            })
-            .map_err(DirectRunError::Counter)?;
         Ok(ClimbOutcome {
             current: Some(ScoredBoard {
                 board,
@@ -283,6 +310,30 @@ impl crate::AttackRequest {
             final_objective_ascent: result.final_objective_ascent,
             neighborhood_exhausted: true,
         })
+    }
+
+    fn account_accelerated(
+        evaluations: u64,
+        accounting: &mut BlockAccounting,
+    ) -> Result<(), ObservedClimbError> {
+        accounting.used =
+            accounting
+                .used
+                .checked_add(evaluations)
+                .ok_or(ObservedClimbError::Counter(
+                    CounterOverflow::EvaluationsAdmitted,
+                ))?;
+        accounting
+            .control
+            .merge_block(crate::attack_control::CounterSnapshot {
+                evaluations_admitted: evaluations,
+                evaluations_completed: evaluations,
+                climbs_started: 1,
+                climbs_completed: 1,
+                outers_completed: 0,
+                bombe: None,
+            })
+            .map_err(ObservedClimbError::Counter)
     }
 
     pub(crate) fn reference_climbs(
@@ -303,11 +354,34 @@ impl crate::AttackRequest {
         };
         plan.keys(block)
             .zip(rows.chunks_exact(stride))
-            .map(|((_, initial), rows)| {
+            .flat_map(|(key, rows)| {
+                job.starts
+                    .iter()
+                    .map(move |start| (key.clone(), rows, start))
+            })
+            .map(|((_, initial), rows, start)| {
                 let initial = initial.map_err(|e| AcceleratorError(format!("{e:?}")))?;
-                let (mut scoring, start) = self
-                    .direct_scoring(&initial)
-                    .map_err(|e| AcceleratorError(format!("{e:?}")))?;
+                let mut scoring = BoundClimbScoring::new(
+                    &initial,
+                    self.domain(),
+                    self.text(),
+                    (
+                        self.settings().initial_measure(),
+                        self.bound_resource(self.settings().initial_measure()),
+                    ),
+                    (
+                        self.settings().final_measure(),
+                        self.bound_resource(self.settings().final_measure()),
+                    ),
+                    self.settings().switch_pairs(),
+                );
+                let start = start
+                    .iter()
+                    .map(|&(a, b)| {
+                        let symbols = &initial.topology().alphabet().symbols;
+                        (symbols[a as usize], symbols[b as usize])
+                    })
+                    .collect();
                 scoring.initial_evaluator =
                     scoring.initial_evaluator.with_byte_rows(&job.input, rows);
                 scoring.final_evaluator = scoring.final_evaluator.with_byte_rows(&job.input, rows);

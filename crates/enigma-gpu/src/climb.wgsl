@@ -1,5 +1,5 @@
 // Specialized dimensions are checked on the host before pipeline creation.
-// One 128-lane workgroup/key; reduction order is (score descending, ordinal ascending).
+// One 128-lane workgroup/(key, seed); reduction is (score descending, ordinal ascending).
 const WIDTH: u32 = {{WIDTH}}u;
 const CACHE_WORDS: u32 = {{CACHE_WORDS}}u;
 const CACHE_ROWS: bool = {{CACHE_ROWS}};
@@ -37,8 +37,8 @@ alias Mapping = {{MAPPING_TYPE}};
 struct Params {
     keys: u32, length: u32, width: u32, row_words: u32,
     max_pairs: u32, backtrack: u32, switch_pairs: u32, fixed_count: u32,
-    start_len: u32, identical: u32, initial_order: u32, final_order: u32,
-    budget: u32, pair_slice: u32, lane_actions: u32, padding1: u32,
+    seeds: u32, identical: u32, initial_order: u32, final_order: u32,
+    budget: u32, pair_slice: u32, lane_actions: u32, first_seed: u32,
 }
 // Host wire layout: 24 header words, WIDTH map words, WIDTH ordered-pair words,
 // COUNT_WORDS partial histogram words. Cooperative mode alone uses partial..counts;
@@ -59,7 +59,7 @@ struct Trial { mapping: Mapping, links: u32, valid: bool }
 @group(0) @binding(2) var<storage, read> rows: array<u32>;
 @group(0) @binding(3) var<storage, read> initial_weights: array<i64>;
 @group(0) @binding(4) var<storage, read> final_weights: array<i64>;
-// fixed mask, mutable mask, starting mapping, ordered starting pairs.
+// Fixed mask, mutable mask, then per seed: length, mapping, ordered pairs.
 @group(0) @binding(5) var<storage, read> job: array<u32>;
 @group(0) @binding(6) var<storage, read_write> states: array<State>;
 // Keys of this batch that finished; the only per-dispatch readback.
@@ -239,8 +239,11 @@ fn endpoints(pair_index: u32) -> vec2<u32> {
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index) lane: u32) {
-    let key = group.x;
-    if (lane == 0u) { current = states[key]; }
+    let state = group.x;
+    let ordinal = params.first_seed + state;
+    let key = ordinal / params.seeds;
+    let seed = ordinal % params.seeds;
+    if (lane == 0u) { current = states[state]; }
     if (workgroupUniformLoad(&current.done) != 0u) { return; }
     if (CACHE_ROWS) {
         for (var i = lane; i < params.row_words; i += 128u) {
@@ -250,12 +253,13 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index
     workgroupBarrier();
     if (lane == 0u) {
         if (current.initialized == 0u) {
+            let base = 2u * WIDTH + seed * (2u * WIDTH + 1u);
             for (var i = 0u; i < WIDTH; i++) {
-                current.mapping[i] = job[2u * WIDTH + i];
-                current.board[i] = job[3u * WIDTH + i];
+                current.mapping[i] = job[base + 1u + i];
+                current.board[i] = job[base + 1u + WIDTH + i];
             }
-            current.board_len = params.start_len;
-            current.pairs = params.fixed_count + params.start_len;
+            current.board_len = job[base];
+            current.pairs = params.fixed_count + current.board_len;
             current.phase = u32(current.pairs >= params.switch_pairs);
             if (COOPERATIVE) { start_evaluation(EVAL_INITIAL); }
             else {
@@ -269,7 +273,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index
     // The host emits only the specialized path: unused workgroup storage of the
     // other path would otherwise still be allocated and zero-initialized.
     {{CLIMB}}(key, lane);
-    if (lane == 0u) { states[key] = current; }
+    if (lane == 0u) { states[state] = current; }
 }
 
 // Short texts: each lane evaluates whole trials of a bounded scan slice.

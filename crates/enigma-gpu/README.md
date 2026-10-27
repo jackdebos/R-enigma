@@ -42,21 +42,28 @@ that consumes job fields and rows without following the private request owner.
   `c * (B(N) - B(c))` for every count `c` (`entropy_terms`), split into a high word
   and a 16-bit low word. The kernel sums both from the symbol histogram and uses
   `floor((highs + (lows >> 16)) / N)`, equal to the CPU's `floor(sum / (N * 2^16))`.
+- Hill climbing and partial exhaustion are supported. PE uses core's ordered
+  empty/single seeds (`all` or `touching`), sharing prepared rows per outer key.
+  Every seed's terminal score is checked by core and every eligible seed enters
+  hold in CPU order, with identical counters, progress and cross-backend checkpoints.
 - Fixed pairs, mutable masks, pair capacity, backtracking, one-way switching and
   nonempty starts are honored. Every emitted trial counts, including duplicates.
   Strict improvement and earliest-ordinal ties follow the CPU walker.
 - An untouched start retains its supplied pair order and orientation. A committed
   winner uses the walker's canonical alphabet-index order, with fixed pairs omitted.
-- Core calls and hardware batches contain up to 512 keys (one 128-thread
-  workgroup each), exposing enough key-level parallelism for all 36 RX 580 CUs.
+- Core calls contain up to 512 keys; hardware batches contain up to 512
+  (key, seed) climbs, one 128-thread workgroup each. This also bounds batches
+  when a single outer has more seeds than the device's workgroup dimension limit.
   Core's 64-MiB row cap and device limits can reduce that; tails may be smaller.
   Uploads contain only the active batch. Four workgroups in Stage A were a
   conservative safety setting, not four keys per compute unit.
 
 ## Resumption and display sharing
 
-Each 128-lane workgroup owns one key. A dispatch processes at most `scan_budget`
-scan slices per key. The base slice is `32 * clamp(1024 / text_length, 1, 4)`
+Each 128-lane workgroup owns one (key, seed). Seeds have independent persistent
+states and share their key's rows. The watchdog bound applies per concurrent climb,
+not multiplied by the number of seeds; host batches bound the total workgroups.
+A dispatch processes at most `scan_budget` scan slices per climb. The base slice is `32 * clamp(1024 / text_length, 1, 4)`
 lexicographic symbol pairs (about 1024 decoded letters per lane and slice); the
 effective slice is `base / scan_budget`, rounded down to a multiple of 32 when it
 is at least 32, and never below 1. A full 128-pair slice gives each lane one whole

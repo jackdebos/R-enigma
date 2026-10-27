@@ -1179,6 +1179,7 @@ struct ControlledPartialOutcome {
 #[derive(Debug, PartialEq, Eq)]
 enum ControlledPartialSource {
     UnsupportedPass,
+    Accelerator(crate::AcceleratorError),
     Climb(ObservedClimbError),
     /// Eager seed projection invariant, distinct from evaluation failures.
     Projection(ProjectionError),
@@ -1348,6 +1349,9 @@ impl ControlledPartialRunError {
         use crate::attack_result::RunPayload;
         let mut projection_error = None;
         let source = match self.source {
+            ControlledPartialRunSource::Climb(ControlledPartialSource::Accelerator(error)) => {
+                RunPayload::Accelerator(error)
+            }
             ControlledPartialRunSource::Climb(ControlledPartialSource::Projection(error)) => {
                 projection_error = Some(error);
                 RunPayload::Invariant("seed projection failed")
@@ -2385,10 +2389,16 @@ impl<'a> SeedCursor<'a> {
         policy: &'a crate::AttackSeedPolicy,
     ) -> Result<Self, crate::attack_evaluator::TrialBoardError> {
         validated_trial_board(initial, domain, &[])?;
+        Ok(Self::bound(initial.topology().alphabet(), domain, policy))
+    }
+
+    fn bound(
+        alphabet: &crate::Alphabet,
+        domain: &AttackPlugboardDomain,
+        policy: &'a crate::AttackSeedPolicy,
+    ) -> Self {
         // Linear storage only, in runtime alphabet order, never declaration order.
-        let symbols = initial
-            .topology()
-            .alphabet()
+        let symbols = alphabet
             .symbols
             .iter()
             .copied()
@@ -2400,14 +2410,14 @@ impl<'a> SeedCursor<'a> {
                     .any(|&(a, b)| a == *symbol || b == *symbol)
             })
             .collect();
-        Ok(Self {
+        Self {
             symbols,
             policy,
             next_pair: (0, 1),
             next_index: 0,
             empty_pending: true,
             singles_allowed: domain.fixed_pairs().len() < domain.max_pairs(),
-        })
+        }
     }
 
     fn indexed(&mut self, board: MutableBoard) -> (u128, MutableBoard) {
@@ -3156,6 +3166,16 @@ impl crate::AttackRequest {
                 climb,
             })
         })
+    }
+
+    pub(crate) fn accelerator_starts(&self) -> Vec<MutableBoard> {
+        if let Some(policy) = self.settings().seed_policy() {
+            SeedCursor::bound(self.definition().alphabet(), self.domain(), policy)
+                .map(|(_, board)| board)
+                .collect()
+        } else {
+            vec![self.settings().start().expect("direct start").to_vec()]
+        }
     }
 
     fn run_partial_block(
@@ -5332,8 +5352,149 @@ mod tests {
     }
 
     #[test]
+    fn partial_accelerator_matches_cpu_checkpoints_and_cross_resume() {
+        struct Projected;
+        impl crate::ClimbAccelerator for Projected {
+            fn climb(
+                &self,
+                job: &crate::ClimbJob<'_>,
+                first: u128,
+                rows: &[u8],
+            ) -> Result<Vec<crate::AcceleratedClimb>, crate::AcceleratorError> {
+                let projected = job.climb_from_projection(rows)?;
+                assert_eq!(
+                    projected,
+                    crate::ClimbAccelerator::climb(
+                        &crate::ReferenceClimbAccelerator,
+                        job,
+                        first,
+                        rows
+                    )?
+                );
+                Ok(projected)
+            }
+        }
+        let identity = crate::checkpoint_identity("{}", &Default::default()).unwrap();
+        for variant in 0..6 {
+            let request = pool_request(true, if variant == 0 { 1 } else { 5 }, |job| {
+                job["space"]["offset"] = 3.into();
+                job["space"]["limit"] = 129.into();
+                job["space"]["plugboard"]["max_pairs"] = 2.into();
+                job["attack"]["progress_every"] = 137.into();
+                if variant == 1 {
+                    job["attack"]["seeds"] = serde_json::json!({"kind":"empty_single","selection":"touching","symbols":["C","A"]});
+                }
+                if variant == 2 || variant == 3 {
+                    job["configuration"]["plugboard"] = serde_json::json!([["B", "A"]]);
+                    job["space"]["plugboard"]["symbols"] = serde_json::json!(["D", "C"]);
+                    if variant == 3 {
+                        job["space"]["plugboard"]["max_pairs"] = 1.into();
+                    }
+                }
+                if variant == 4 {
+                    job["attack"]["initial_measure"] = "entropy".into();
+                    job["attack"]["final_measure"] = "entropy".into();
+                    job["measures"] = serde_json::json!(["entropy"]);
+                }
+                if variant == 5 {
+                    job["space"]["plugboard"]["max_pairs"] = 0.into();
+                }
+            });
+            let cpu = crate::ExecutionOptions::serial();
+            let accelerated = cpu.with_accelerator(&crate::ReferenceClimbAccelerator);
+            let run = |options| {
+                let mut events = Vec::new();
+                let mut records = Vec::new();
+                let result = request
+                    .run_with_checkpoints(
+                        options,
+                        |p| events.push(p),
+                        || false,
+                        |s| records.push(s.record(identity, 0).unwrap()),
+                    )
+                    .unwrap();
+                (format!("{result:?}"), events, records)
+            };
+            let starts = request.climb_job().unwrap().starts;
+            assert_eq!(starts.len(), [7, 6, 2, 1, 7, 1][variant]);
+            if variant == 1 {
+                assert_eq!(
+                    starts,
+                    vec![
+                        vec![],
+                        vec![(0, 1)],
+                        vec![(0, 2)],
+                        vec![(0, 3)],
+                        vec![(1, 2)],
+                        vec![(2, 3)]
+                    ]
+                );
+            }
+            let expected = run(cpu);
+            let actual = run(accelerated);
+            assert_eq!(actual, expected, "variant {variant}");
+            assert_eq!(run(cpu.with_accelerator(&Projected)), expected);
+            for (records, options) in [(&expected.2, accelerated), (&actual.2, cpu)] {
+                for record in records {
+                    let resumed = request
+                        .resume(record)
+                        .unwrap()
+                        .run_with(options, |_| {}, || false)
+                        .unwrap();
+                    assert_eq!(format!("{resumed:?}"), expected.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partial_accelerator_checks_nonfirst_seed_score_before_commit() {
+        struct Corrupt;
+        impl crate::ClimbAccelerator for Corrupt {
+            fn climb(
+                &self,
+                job: &crate::ClimbJob<'_>,
+                first: u128,
+                rows: &[u8],
+            ) -> Result<Vec<crate::AcceleratedClimb>, crate::AcceleratorError> {
+                let mut results = crate::ClimbAccelerator::climb(
+                    &crate::ReferenceClimbAccelerator,
+                    job,
+                    first,
+                    rows,
+                )?;
+                results[1].score_units += 1;
+                Ok(results)
+            }
+        }
+        let request = pool_request(true, 5, |_| {});
+        let mut records = 0;
+        let mut events = Vec::new();
+        let error = request
+            .run_with_checkpoints(
+                crate::ExecutionOptions::serial().with_accelerator(&Corrupt),
+                |p| events.push(p),
+                || false,
+                |_| records += 1,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("terminal score mismatch"));
+        assert_eq!(error.outer_index(), Some(0));
+        assert_eq!(error.start_index(), Some(1));
+        assert_eq!(error.evaluations_used(), 0);
+        assert_eq!(error.counters().evaluations_admitted(), 0);
+        assert_eq!(error.counters().evaluations_completed(), 0);
+        assert_eq!(error.counters().climbs_started(), 0);
+        assert_eq!(error.counters().climbs_completed(), 0);
+        assert_eq!(error.counters().outers_completed(), 0);
+        assert_eq!(records, 0);
+    }
+
+    #[test]
     fn accelerator_ineligible_fails_before_progress() {
-        let request = pool_request(true, 1, |_| {});
+        let request = pool_request(false, 1, |job| {
+            job["text"] = "AB".repeat(131073).into();
+        });
         assert!(request.climb_job().is_err());
         let mut events = Vec::new();
         let error = request
@@ -5346,7 +5507,7 @@ mod tests {
             .unwrap_err();
         assert!(events.is_empty());
         assert_eq!(error.evaluations_used(), 0);
-        assert!(error.to_string().contains("partial exhaustion"));
+        assert!(error.to_string().contains("row data limit"));
     }
 
     #[test]

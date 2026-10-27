@@ -9,15 +9,30 @@ struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let path = PathBuf::from("/var/tmp").join(format!(
-            "enigma-backend-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir(&path).unwrap();
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.scratch/t5")
+            .join(format!(
+                "enigma-backend-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+        std::fs::create_dir_all(&path).unwrap();
         Self(path)
     }
     fn run(&self, args: &[&str], input: &Value) -> Output {
+        let stored = || {
+            let mut files: Vec<_> = std::fs::read_dir(&self.0)
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    let contents = std::fs::read(&path).unwrap();
+                    (path, contents)
+                })
+                .collect();
+            files.sort();
+            files
+        };
+        let before = stored();
         let mut child = Command::new(env!("CARGO_BIN_EXE_enigma"))
             .current_dir(&self.0)
             .env_remove("ENIGMA_TEST_CHECKPOINT_INTERVAL_MS")
@@ -37,8 +52,8 @@ impl Scratch {
             assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
         }
         let output = child.wait_with_output().unwrap();
-        // Every invocation here is report-free and must leave no stored state.
-        assert_eq!(std::fs::read_dir(&self.0).unwrap().count(), 0);
+        // Report-free invocations must leave resources unchanged and no new state.
+        assert_eq!(stored(), before);
         output
     }
 }
@@ -199,7 +214,29 @@ fn explicit_cpu_preserves_default_attack_events() {
     assert_eq!(events(&cpu).last().unwrap()["reason"], "completed");
 }
 #[test]
-fn gpu_partial_exhaustion_is_rejected_before_started() {
+fn gpu_trie_is_rejected_before_started() {
+    let dir = Scratch::new();
+    std::fs::write(
+        dir.0.join("words.json"),
+        json!({"resource_version":1,"kind":"dictionary",
+        "alphabet":["A","B"],"entries":[{"word":["A"],"weight":1}]})
+        .to_string(),
+    )
+    .unwrap();
+    let mut input = attack();
+    input["job"]["measures"] = json!(["trie"]);
+    input["job"]["resources"] = json!({"trie":{"path":"words.json"}});
+    input["job"]["attack"]["initial_measure"] = json!("trie");
+    input["job"]["attack"]["final_measure"] = json!("trie");
+    rejection(
+        &dir.run(&["--backend", "gpu"], &input),
+        "unsupported_job",
+        "--backend gpu does not support this attack: unsupported objective trie",
+        "/job/attack",
+    );
+}
+#[test]
+fn gpu_partial_exhaustion_matches_cpu_or_reports_unavailability() {
     let mut input = attack();
     input["job"]["passes"] = json!(["partial_exhaustion"]);
     input["job"]["attack"]
@@ -208,19 +245,20 @@ fn gpu_partial_exhaustion_is_rejected_before_started() {
         .remove("start");
     input["job"]["attack"]["kind"] = json!("partial_exhaustion");
     input["job"]["attack"]["seeds"] = json!({"kind":"empty_single","selection":"all"});
-    rejection(
-        &Scratch::new().run(&["--backend", "gpu"], &input),
-        "unsupported_job",
-        "--backend gpu does not support this attack: partial exhaustion",
-        "/job/attack",
-    );
+    input["job"]["attack"]["hold"] = json!(3);
+    gpu_matches_cpu(&input);
 }
+
 #[test]
 fn gpu_at_low_usage_matches_cpu_or_reports_unavailability() {
+    gpu_matches_cpu(&attack());
+}
+
+fn gpu_matches_cpu(input: &Value) {
     let dir = Scratch::new();
     let gpu = dir.run(
         &["--backend", "gpu", "--gpu-usage", "20", "--threads", "1"],
-        &attack(),
+        input,
     );
     let observed = events(&gpu);
     if observed[0]["code"] == "backend_unavailable" {
@@ -237,7 +275,7 @@ fn gpu_at_low_usage_matches_cpu_or_reports_unavailability() {
         String::from_utf8_lossy(&gpu.stderr)
     );
     assert_eq!(gpu.stderr, b"");
-    let cpu = dir.run(&["--backend", "cpu", "--threads", "1"], &attack());
+    let cpu = dir.run(&["--backend", "cpu", "--threads", "1"], input);
     assert_eq!(cpu.status.code(), Some(0));
     assert_eq!(cpu.stderr, b"");
     assert_eq!(observed, events(&cpu));

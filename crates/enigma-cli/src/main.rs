@@ -444,7 +444,8 @@ Output:
 Attacks (hill_climb, partial_exhaustion and bombe):
   -t, --threads <n>         worker threads, 1 to 256 (default: half the logical
                             CPUs); completed runs give the same result for any <n>
-      --backend <cpu|gpu>   execution backend (default: cpu); GPU requires hill_climb
+      --backend <cpu|gpu>   execution backend (default: cpu); GPU supports hill_climb
+                             and partial_exhaustion (supported objectives only)
       --gpu-usage <n>       GPU duty cycle, 1 to 100 (default: 100); requires
                             --backend gpu
   -c, --checkpoint <path>   save checkpoints to a new file

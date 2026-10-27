@@ -474,7 +474,9 @@ impl GpuClimbAccelerator {
         Ok(layout)
     }
 
-    /// Provable upper bound on dispatches until every key of a batch finishes.
+    /// Provable upper bound on dispatches until every (key, seed) of a batch finishes.
+    /// Seeds advance concurrently, each with its own state; their count does not
+    /// multiply this bound. Host batches cap workgroups exactly as for single starts.
     /// Each committed winner strictly raises the phase objective's score, so a
     /// climb has at most `distinct(initial) + distinct(final) + 2` scans. Every
     /// unfinished key consumes `scan_budget` slices (sliced) or a fixed number of
@@ -530,27 +532,33 @@ impl GpuClimbAccelerator {
         if job.max_pairs > width / 2
             || job.backtrack_pairs > u32::MAX as usize
             || job.switch_pairs > u32::MAX as usize
-            || job.fixed_pairs.len() + job.start_board.len() > job.max_pairs
+            || job.starts.is_empty()
+            || job
+                .starts
+                .iter()
+                .any(|start| job.fixed_pairs.len() + start.len() > job.max_pairs)
         {
             return Err(unsupported("pair counts or thresholds exceed job limits"));
         }
-        let mut seen = vec![false; width];
-        for (fixed, pairs) in [(true, &job.fixed_pairs), (false, &job.start_board)] {
-            for &(a, b) in pairs {
-                let (a, b) = (a as usize, b as usize);
-                if a >= width
-                    || b >= width
-                    || a == b
-                    || seen[a]
-                    || seen[b]
-                    || (!fixed && (!job.mutable_mask[a] || !job.mutable_mask[b]))
-                {
-                    return Err(unsupported(
-                        "fixed/start board is not a disjoint legal involution",
-                    ));
+        for start in &job.starts {
+            let mut seen = vec![false; width];
+            for (fixed, pairs) in [(true, &job.fixed_pairs), (false, start)] {
+                for &(a, b) in pairs {
+                    let (a, b) = (a as usize, b as usize);
+                    if a >= width
+                        || b >= width
+                        || a == b
+                        || seen[a]
+                        || seen[b]
+                        || (!fixed && (!job.mutable_mask[a] || !job.mutable_mask[b]))
+                    {
+                        return Err(unsupported(
+                            "fixed/start board is not a disjoint legal involution",
+                        ));
+                    }
+                    seen[a] = true;
+                    seen[b] = true;
                 }
-                seen[a] = true;
-                seen[b] = true;
             }
         }
         let max_buffer = limits
@@ -563,7 +571,7 @@ impl GpuClimbAccelerator {
         if stride > 512 * 1024
             || row_words as u64 * 4 > max_buffer
             || length as u64 * 4 > max_buffer
-            || width as u64 * 16 > max_buffer
+            || (2 * width + job.starts.len() * (2 * width + 1)) as u64 * 4 > max_buffer
         {
             return Err(unsupported(
                 "text rows exceed the device/core storage buffer limit",
@@ -878,21 +886,29 @@ impl GpuClimbAccelerator {
         }
         let pipeline = &session.pipelines[&cache_key];
         let input: Vec<u32> = job.input.iter().map(|&s| u32::from(s)).collect();
-        let mut data = vec![0u32; width * 4];
+        // Shared masks, then one [length, mapping, ordered board] record per seed.
+        let seed_words = 2 * width + 1;
+        let mut data = vec![0u32; 2 * width + job.starts.len() * seed_words];
         for i in 0..width {
             data[width + i] = u32::from(job.mutable_mask[i]);
-            data[2 * width + i] = i as u32;
         }
         for &(a, b) in &job.fixed_pairs {
             data[a as usize] = 1;
             data[b as usize] = 1;
         }
-        for &(a, b) in job.fixed_pairs.iter().chain(&job.start_board) {
-            data[2 * width + a as usize] = u32::from(b);
-            data[2 * width + b as usize] = u32::from(a);
-        }
-        for (i, &(a, b)) in job.start_board.iter().enumerate() {
-            data[3 * width + i] = u32::from(a) | (u32::from(b) << 8);
+        for (seed, start) in job.starts.iter().enumerate() {
+            let base = 2 * width + seed * seed_words;
+            data[base] = start.len() as u32;
+            for i in 0..width {
+                data[base + 1 + i] = i as u32;
+            }
+            for &(a, b) in job.fixed_pairs.iter().chain(start) {
+                data[base + 1 + a as usize] = u32::from(b);
+                data[base + 1 + b as usize] = u32::from(a);
+            }
+            for (i, &(a, b)) in start.iter().enumerate() {
+                data[base + 1 + width + i] = u32::from(a) | (u32::from(b) << 8);
+            }
         }
         let input = self.upload(
             "input",
@@ -901,10 +917,16 @@ impl GpuClimbAccelerator {
             &mut stats,
         )?;
         let data = self.upload("job", bytemuck::cast_slice(&data), &mut pending, &mut stats)?;
-        let mut results = Vec::with_capacity(rows.len() / stride);
-        for batch in rows.chunks(stride * layout.keys_per_dispatch) {
-            let keys = batch.len() / stride;
-            let mut packed = vec![0u8; keys * layout.row_words * 4];
+        let total = rows.len() / stride * job.starts.len();
+        let mut results = Vec::with_capacity(total);
+        // Bound workgroups, not outer keys: even one outer may have >512 seeds.
+        // Each batch uploads the distinct keys it uses; seeds share their key's rows.
+        for first in (0..total).step_by(layout.keys_per_dispatch) {
+            let keys = (total - first).min(layout.keys_per_dispatch);
+            let first_outer = first / job.starts.len();
+            let last_outer = (first + keys - 1) / job.starts.len();
+            let batch = &rows[first_outer * stride..(last_outer + 1) * stride];
+            let mut packed = vec![0u8; (last_outer - first_outer + 1) * layout.row_words * 4];
             for (key, bytes) in batch.chunks_exact(stride).enumerate() {
                 packed[key * layout.row_words * 4..key * layout.row_words * 4 + stride]
                     .copy_from_slice(bytes);
@@ -918,14 +940,14 @@ impl GpuClimbAccelerator {
                 job.backtrack_pairs as u32,
                 job.switch_pairs as u32,
                 job.fixed_pairs.len() as u32,
-                job.start_board.len() as u32,
+                job.starts.len() as u32,
                 u32::from(layout.identical),
                 layout.initial_order as u32,
                 layout.final_order as u32,
                 self.scan_budget,
                 layout.pair_slice as u32,
                 lane_actions(layout.pair_slice),
-                0,
+                (first % job.starts.len()) as u32,
             ];
             let state_words = state_words(width);
             let size = (keys * state_words * 4) as u64;

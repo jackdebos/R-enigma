@@ -91,8 +91,9 @@ pub struct ClimbJob<'a> {
     pub backtrack_pairs: usize,
     /// Switch permanently to the final objective at this total pair count.
     pub switch_pairs: usize,
-    /// Ordered mutable starting pairs (fixed pairs excluded).
-    pub start_board: Vec<(u8, u8)>,
+    /// Ordered mutable starts (fixed pairs excluded), shared by every outer.
+    /// Hill climb has one start; PE uses the CPU's filtered empty/single seed order.
+    pub starts: Vec<Vec<(u8, u8)>>,
     /// Objective before the switch.
     pub initial_objective: ClimbObjective<'a>,
     /// Objective after the switch and for terminal scoring.
@@ -100,7 +101,7 @@ pub struct ClimbJob<'a> {
     pub(crate) owner: &'a AttackRequest,
 }
 
-/// Exact terminal facts for one outer key, in dispatch order.
+/// Exact terminal facts for one (outer key, start), in key-major/start order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcceleratedClimb {
     /// Mutable pairs in the exact order/orientation committed by the CPU walker.
@@ -129,8 +130,6 @@ impl std::error::Error for AcceleratorError {}
 pub enum ClimbUnsupported {
     /// Deductive crib testing is CPU-only.
     Bombe,
-    /// Only direct hill climbing is supported.
-    PartialExhaustion,
     /// Byte rows require at most 256 symbols.
     AlphabetTooLarge,
     /// Byte rows or one logical block exceed the bounded row data policy.
@@ -147,7 +146,6 @@ impl std::fmt::Display for ClimbUnsupported {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Bombe => f.write_str("bombe is CPU-only"),
-            Self::PartialExhaustion => f.write_str("partial exhaustion"),
             Self::AlphabetTooLarge => f.write_str("alphabet exceeds 256 symbols"),
             Self::RowDataLimit => f.write_str("text exceeds accelerator row data limit"),
             Self::Objective(id) => write!(f, "unsupported objective {}", id.id()),
@@ -163,7 +161,8 @@ impl std::error::Error for ClimbUnsupported {}
 /// `rows` concatenates consecutive keys starting at absolute `first_outer`;
 /// each key has `text_length * alphabet_size` bytes, position-major:
 /// `rows[key * stride + position * alphabet_size + symbol]`.
-/// Return exactly one result per key, or a fatal error. Cancellation is owned by
+/// Return one result per (key, start), key-major then start order, or a fatal error.
+/// Cancellation is owned by
 /// core and polled between bounded dispatches, not inside this synchronous call.
 pub trait ClimbAccelerator: Sync {
     /// Preferred maximum keys per call (not necessarily one hardware dispatch).
@@ -242,7 +241,11 @@ impl ClimbJob<'_> {
                 .collect::<Result<Vec<_>, _>>()
         };
         let fixed = pairs(&self.fixed_pairs)?;
-        let start = pairs(&self.start_board)?;
+        let starts = self
+            .starts
+            .iter()
+            .map(|start| pairs(start))
+            .collect::<Result<Vec<_>, _>>()?;
         let source = serde_json::json!({"kind":"custom","value":{
             "alphabet":symbols,
             "wheels":[{"name":"r","wiring":symbols,"turnovers":[]}],
@@ -302,7 +305,8 @@ impl ClimbJob<'_> {
             _ => false,
         };
         rows.chunks_exact(stride)
-            .map(|rows| {
+            .flat_map(|rows| starts.iter().map(move |start| (rows, start)))
+            .map(|(rows, start)| {
                 let evaluate = |mapping: &[usize], objective| -> Result<i128, AcceleratorError> {
                     let plain: Vec<_> = self
                         .input
@@ -459,9 +463,6 @@ impl AttackRequest {
         if self.settings().kind() == AttackKind::Bombe {
             return Err(ClimbUnsupported::Bombe);
         }
-        if self.settings().kind() != AttackKind::HillClimb {
-            return Err(ClimbUnsupported::PartialExhaustion);
-        }
         let alphabet = self.definition().alphabet();
         let width = alphabet.len();
         if width > 256 {
@@ -541,7 +542,11 @@ impl AttackRequest {
             max_pairs: self.domain().max_pairs(),
             backtrack_pairs: self.settings().backtrack_pairs(),
             switch_pairs: self.settings().switch_pairs(),
-            start_board: pairs(self.settings().start().expect("direct start")),
+            starts: self
+                .accelerator_starts()
+                .iter()
+                .map(|start| pairs(start))
+                .collect(),
             initial_objective: objective(self.settings().initial_measure())?,
             final_objective: objective(self.settings().final_measure())?,
             owner: self,
