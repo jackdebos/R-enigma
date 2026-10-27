@@ -1,0 +1,169 @@
+[
+  {
+    "id": "enigma-railway-nontrivial",
+    "machine": "enigma-railway",
+    "rotor_order": [
+      "3",
+      "2",
+      "1"
+    ],
+    "rings": {
+      "ukw": "D",
+      "rotors": [
+        "F",
+        "C",
+        "P"
+      ]
+    },
+    "positions": {
+      "ukw": "J",
+      "rotors": [
+        "K",
+        "D",
+        "M"
+      ]
+    },
+    "etw": {
+      "position": "A",
+      "ring": "A"
+    },
+    "plaintext": "DIEAUFKLAERUNGSMELDUNGWIRDNOCHHEUTEANSHAUPTQUARTIERUEBERMITTELTXALLEEINHEITENBLEIBENBISZUMMORGENAUFIHRENSTELLUNGEN",
+    "ciphertext": "KCHBOIWAMSLPVTKKUBIWFNPKSKPQVQJMWVGEJNWCWYUZKEHBVOTJMCLISHJWLTFVXGKSIFFDDHHIRCMDYPVLEPPGOLCTDPUPQPNZYCIVZQTUAQLQIR",
+    "simulators": [
+      "Palloks Universal Enigma v2.6.2 (headless extraction)",
+      "Toledo CJ Odenthal enigma.py (Python-3 compatibility port)"
+    ],
+    "agreement": true,
+    "toledo_ciphertext": "KCHBOIWAMSLPVTKKUBIWFNPKSKPQVQJMWVGEJNWCWYUZKEHBVOTJMCLISHJWLTFVXGKSIFFDDHHIRCMDYPVLEPPGOLCTDPUPQPNZYCIVZQTUAQLQIR",
+    "palloks_final_positions_ukw_right_middle_left": "JWJL",
+    "provenance": "External simulators only; no repository engine. See docs/historical-catalog.md, WWII additions. Palloks ciphertext is the reference; Toledo disagreement on G is retained, not reconciled by changing either simulator."
+  },
+  {
+    "id": "enigma-g312-nontrivial",
+    "machine": "enigma-g312",
+    "rotor_order": [
+      "3",
+      "2",
+      "1"
+    ],
+    "rings": {
+      "ukw": "D",
+      "rotors": [
+        "F",
+        "C",
+        "P"
+      ]
+    },
+    "positions": {
+      "ukw": "J",
+      "rotors": [
+        "U",
+        "S",
+        "A"
+      ]
+    },
+    "etw": {
+      "position": "A",
+      "ring": "A"
+    },
+    "plaintext": "DIEAUFKLAERUNGSMELDUNGWIRDNOCHHEUTEANSHAUPTQUARTIERUEBERMITTELTXALLEEINHEITENBLEIBENBISZUMMORGENAUFIHRENSTELLUNGEN",
+    "ciphertext": "WDVTMIAJGOFOXSQBXVEOZJIBUTBSZFKOHYLDKFKMIAUIKWCLBGUCQHVDZTHHNJFKCJYFMKOZXHLSTRDYGAMWAGVCVGSCWLNTSSMFMWHBKNUJZBGYWS",
+    "simulators": [
+      "Palloks Universal Enigma v2.6.2 (headless extraction)",
+      "Toledo CJ Odenthal enigma.py (Python-3 compatibility port)"
+    ],
+    "agreement": false,
+    "toledo_ciphertext": "WDNEBJOVGMFOPLHBXVEYZJIOVRLSZCROHYLPKFENGAUMLBANBLICQHVIRSHNNKQPMGMFMNFSIOXZPRDYGWAWAGVEVGJNSYNRSSMFMPWBKNUUYBGPFJ",
+    "palloks_final_positions_ukw_right_middle_left": "CKPM",
+    "provenance": "External simulators only; no repository engine. See docs/historical-catalog.md, WWII additions. Palloks ciphertext is the reference; Toledo disagreement on G is retained, not reconciled by changing either simulator."
+  },
+  {
+    "id": "enigma-g260-nontrivial",
+    "machine": "enigma-g260",
+    "rotor_order": [
+      "3",
+      "2",
+      "1"
+    ],
+    "rings": {
+      "ukw": "D",
+      "rotors": [
+        "F",
+        "C",
+        "P"
+      ]
+    },
+    "positions": {
+      "ukw": "J",
+      "rotors": [
+        "U",
+        "S",
+        "A"
+      ]
+    },
+    "etw": {
+      "position": "A",
+      "ring": "A"
+    },
+    "plaintext": "DIEAUFKLAERUNGSMELDUNGWIRDNOCHHEUTEANSHAUPTQUARTIERUEBERMITTELTXALLEEINHEITENBLEIBENBISZUMMORGENAUFIHRENSTELLUNGEN",
+    "ciphertext": "GPBDRJQFCKVGHFBHLXJKYIGZGHIDOCVMZWRZCOZMNNWGCTKNOWNIOFMWHJPXWDPACXWFWOUZPLLLLMOCMNHTJKQAZJUITXCESWPBBZBFECMFIMYKLC",
+    "simulators": [
+      "Palloks Universal Enigma v2.6.2 (headless extraction)",
+      "Toledo CJ Odenthal enigma.py (Python-3 compatibility port)"
+    ],
+    "agreement": false,
+    "toledo_ciphertext": "GPNVBYJSCAVGISPHLXJZYIGQMPZDOQTMZWRYCOERQNWEAUFJOLLIOFMDDEPOWSFTNYVFWARRGVNZFMOCMPSTJKQVZJXVXYCLSWPBBOWFECMAZMYYHX",
+    "palloks_final_positions_ukw_right_middle_left": "CKPM",
+    "provenance": "External simulators only; no repository engine. See docs/historical-catalog.md, WWII additions. Palloks ciphertext is the reference; Toledo disagreement on G is retained, not reconciled by changing either simulator."
+  },
+  {
+    "id": "enigma-kd-nontrivial",
+    "machine": "enigma-kd",
+    "rotor_order": [
+      "3",
+      "2",
+      "1"
+    ],
+    "rings": {
+      "ukw": "A",
+      "rotors": [
+        "F",
+        "C",
+        "P"
+      ]
+    },
+    "positions": {
+      "ukw": "A",
+      "rotors": [
+        "K",
+        "Q",
+        "S"
+      ]
+    },
+    "etw": {
+      "position": "A",
+      "ring": "A"
+    },
+    "plaintext": "DIEAUFKLAERUNGSMELDUNGWIRDNOCHHEUTEANSHAUPTQUARTIERUEBERMITTELTXALLEEINHEITENBLEIBENBISZUMMORGENAUFIHRENSTELLUNGEN",
+    "custom_rotors": [
+      "VEZIOJCXKYDUNTWAPLQGBHSFMR",
+      "HGRBSJZETDLVPMQYCXAOKINFUW",
+      "NWLHXGRBYOJSAZDVTPKFQMEUIC"
+    ],
+    "turnovers": [
+      "SUYAEHLNQ",
+      "SUYAEHLNQ",
+      "SUYAEHLNQ"
+    ],
+    "reflector_wiring": "KOTVPNLMJIAGHFBEWYXCZDQSRU",
+    "ciphertext": "XXHNGOOFTIKOUMTXLHWRPEKCXMOYTPNPADVWQIDEEGUOMNECXIDXTQHQCMNDKIROQAOGZQSMZEALPNYPGUJRYXGSEWNMZBSHZLDPCHKXMHNWPCHISC",
+    "simulators": [
+      "Palloks Universal Enigma v2.6.2 (headless extraction)",
+      "Toledo CJ Odenthal enigma.py (Python-3 compatibility port)"
+    ],
+    "agreement": true,
+    "toledo_ciphertext": "XXHNGOOFTIKOUMTXLHWRPEKCXMOYTPNPADVWQIDEEGUOMNECXIDXTQHQCMNDKIROQAOGZQSMZEALPNYPGUJRYXGSEWNMZBSHZLDPCHKXMHNWPCHISC",
+    "palloks_final_positions_ukw_right_middle_left": "ACZG",
+    "provenance": "External simulators only; no repository engine. See docs/historical-catalog.md, WWII additions. Palloks ciphertext is the reference; Toledo disagreement on G is retained, not reconciled by changing either simulator."
+  }
+]
