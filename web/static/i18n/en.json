@@ -59,7 +59,7 @@
   "threads_hint": "How many CPU workers can search together. Leave empty for half your logical CPUs, at least one. A smaller value keeps your computer more responsive (1–256).",
   "threads_default": "Half the logical CPUs",
   "backend": "Execution backend",
-  "backend_hint": "CPU is the default. GPU uses the graphics card for supported hill-climb attacks and never silently falls back to CPU. Resume uses the backend chosen here.",
+  "backend_hint": "CPU is the default. GPU uses the graphics card for hill-climb and partial-exhaustion attacks with supported settings and never silently falls back to CPU. Resume uses the backend chosen here.",
   "backend_cpu": "Processor (CPU)",
   "backend_gpu": "Graphics card (GPU)",
   "gpu_usage": "GPU usage (%)",

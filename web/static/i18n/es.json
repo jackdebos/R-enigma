@@ -59,7 +59,7 @@
   "threads_hint": "Cuántos trabajadores del procesador buscan a la vez. Dejalo vacío para usar la mitad de los procesadores lógicos, al menos uno. Un valor menor deja la computadora más libre (de 1 a 256).",
   "threads_default": "Mitad de los procesadores lógicos",
   "backend": "Dónde ejecutar",
-  "backend_hint": "CPU es la opción predeterminada. GPU usa la placa de video para ataques hill climb compatibles y nunca cambia a CPU automáticamente. Al retomar se usa la opción elegida acá.",
+  "backend_hint": "CPU es la opción predeterminada. GPU usa la placa de video para ataques hill climb y de exhaustión parcial con opciones compatibles y nunca cambia a CPU automáticamente. Al retomar se usa la opción elegida acá.",
   "backend_cpu": "Procesador (CPU)",
   "backend_gpu": "Placa de video (GPU)",
   "gpu_usage": "Uso de GPU (%)",
