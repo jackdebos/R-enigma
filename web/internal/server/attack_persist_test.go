@@ -16,6 +16,35 @@ const progressLog = `{"event":"started","outers_selected":"26"}
 {"event":"done","reason":"completed"}
 `
 
+func TestAttackRestartKeepsNewerProgress(t *testing.T) {
+	for _, tc := range []struct{ name, elapsed, counters, tail, wantElapsed, wantCounters string }{
+		{"resumed", "77", "9", `{"event":"result"}` + "\n" + `{"event":"done","reason":"cancelled"}` + "\n" + `{"event":"started","outers_selected":"26"}` + "\n", "77", "9"},
+		{"legacy_crash", "10", "1", "", "42", "5"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			job := filepath.Join(dir, "attacks", "20261024T120000Z-12345678")
+			if err := os.MkdirAll(job, 0700); err != nil {
+				t.Fatal(err)
+			}
+			for name, data := range map[string]string{
+				"state.json": `{"status":"running","counters":{"outers_completed":"` + tc.counters + `"},"elapsed_ms":"` + tc.elapsed + `"}`,
+				"input.json": attackForm, "checkpoint.json": "checkpoint",
+				"events.jsonl": `{"event":"started","outers_selected":"26"}` + "\n" + `{"event":"progress","counters":{"outers_completed":"5"},"elapsed_ms":"42"}` + "\n" + tc.tail,
+			} {
+				if err := os.WriteFile(filepath.Join(job, name), []byte(data), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			s, u, c := engineServer(t, filepath.Join(dir, "config.json"))
+			v := attackCall(t, s, u, c, "GET", "/api/attack", "", 200, "")
+			if v == nil || v.Status != "interrupted" || !v.Resumable || v.ElapsedMS == nil || *v.ElapsedMS != tc.wantElapsed || string(v.Counters) != `{"outers_completed":"`+tc.wantCounters+`"}` {
+				t.Fatalf("restart: %+v", v)
+			}
+		})
+	}
+}
+
 func TestAttackLogOmitsProgress(t *testing.T) {
 	script := `echo '{"event":"started","outers_selected":"26"}'
 echo '{"event":"progress","counters":{"outers_completed":"0"},"elapsed_ms":"1"}'

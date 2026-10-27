@@ -144,6 +144,7 @@ func (a *attackRun) loadDir(dir string) error {
 		return errors.New("invalid saved attack input")
 	}
 	a.view = v
+	savedCounters, savedElapsed := v.Counters, v.ElapsedMS
 	f, err := os.Open(filepath.Join(dir, "events.jsonl"))
 	if err == nil {
 		scanner := eventScanner(f)
@@ -166,6 +167,15 @@ func (a *attackRun) loadDir(dir string) error {
 		}
 	} else if !os.IsNotExist(err) {
 		return err
+	}
+	// Legacy logs may contain progress older than the saved resumed run.
+	var saved, replayed string
+	_ = json.Unmarshal(savedElapsed, &saved)
+	_ = json.Unmarshal(v.ElapsedMS, &replayed)
+	savedMS, savedErr := strconv.ParseUint(saved, 10, 64)
+	replayedMS, replayedErr := strconv.ParseUint(replayed, 10, 64)
+	if savedErr == nil && replayedErr == nil && savedMS > replayedMS {
+		v.Counters, v.ElapsedMS = savedCounters, savedElapsed
 	}
 	if v.Status == "running" {
 		v.Status = "interrupted"

@@ -333,7 +333,8 @@ including an invalid `progress`, is logged byte for byte. While an attack runs,
 crash it holds counters and elapsed time at most about 5 seconds old. The first
 failed periodic save stops further periodic saves; the final save still reports
 errors. Logs written by earlier versions, which contain every progress event, are
-still read. Restart loads
+still read. Restart keeps the counters and elapsed time from whichever of
+`state.json` and the log has the larger elapsed time. Restart loads
 the newest readable job ID and rebuilds observations from its log; a saved `running`
 state is persisted as `interrupted`. A newer directory whose `state.json` or
 `input.json` is missing or unreadable (for example one left by a failed start) is
