@@ -368,7 +368,10 @@ custom  := {"kind":"custom", "value": DEFINITION_OBJECT}
 ```
 
 The bundled `id` resolves to an immutable catalog entry shipped with the engine. The
-catalog is limited in Stage 1 to historically sourced Enigma I, M3, and M4 definitions.
+catalog includes historically sourced Enigma I (`enigma-i`), M3 (`enigma-m3`),
+M4 (`enigma-m4`), Railway (`enigma-railway`), G-312 (`enigma-g312`), and
+G-260 (`enigma-g260`) definitions. See [historical catalog evidence](historical-catalog.md)
+for sources, exact wiring conventions, ETW/reflector settings, and deferred variants.
 Each bundled definition is JSON conforming to the same `DEFINITION_OBJECT` schema as a
 custom definition. Catalog authors must document authoritative historical sources for
 all included alphabet, wheel wiring/turnover, reflector, slot, and stepping facts, and
@@ -1164,8 +1167,9 @@ Task 17 is the differential-oracle validation task.
 
 ## 10. Version and status
 
-Engine 0.2.0 adds the optional `space.constraints` member under protocol version 1,
-an additive extension like `hold` and chained stages.
+Engine 0.3.0 adds the Railway, G-312, and G-260 bundled catalog ids under
+protocol version 1. Engine 0.2.0 added the optional `space.constraints` member;
+both are additive extensions like `hold` and chained stages.
 
 `protocol_version: 1` denotes this unpublished contract. Unknown
 versions and fields fail before work. Incompatible changes to field meaning,

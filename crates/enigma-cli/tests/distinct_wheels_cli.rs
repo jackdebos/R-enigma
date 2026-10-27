@@ -145,11 +145,11 @@ fn check_keys(events: &[Value], expected: &[Value], offset: usize) {
 }
 
 #[test]
-fn version_020_keeps_protocol_1() {
+fn version_030_keeps_protocol_1() {
     let output = Scratch::new().run(&["--version"], &json!(null));
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(output.stderr, b"");
-    assert_eq!(output.stdout, b"enigma 0.2.0\nprotocol version 1\n");
+    assert_eq!(output.stdout, b"enigma 0.3.0\nprotocol version 1\n");
 }
 
 #[test]

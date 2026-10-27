@@ -166,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "enigma-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ctrlc",
  "enigma-core",
@@ -176,7 +176,7 @@ dependencies = [
 
 [[package]]
 name = "enigma-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -184,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "enigma-gpu"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytemuck",
  "enigma-core",

@@ -1,6 +1,6 @@
 # Historical Enigma catalog evidence
 
-This note separates historical claims from the catalog's JSON representation. The existing three
+This note separates historical claims from the catalog's JSON representation. Bundled
 catalog entries are key-free structural definitions, not daily keys or operational
 instructions. No rotor order, displayed position, ring setting, plugboard, or active key
 is supplied by a definition.
@@ -44,6 +44,18 @@ because of its size limit and is not cited as supporting evidence.
   slots accept I–VIII; a separate fixed `role: "rotor"` Greek slot admits Beta/Gamma
   and is not treated as an entry wheel. The leftmost reflector admits only Thin-B/C.
   Beta/Gamma are modeled as fixed and have no turnover positions.
+- `enigma-railway`, `enigma-g312`, and `enigma-g260` each contain I/II/III,
+  UKW and ETW. Their left-to-right slots are `reflector`, `left`, `middle`,
+  `right`, `etw`; each moving rotor slot accepts I/II/III. The rightmost ETW is
+  a fixed `role: "rotor"` slot with structural wheel `ETW`, using the inverse
+  QWERTZ keyboard-to-rotor map below. Configure its position and ring as A/A;
+  other representable settings are non-historical. The reflector admits UKW and
+  has settable position and ring: it is fixed in Railway but movable in both G
+  entries. Railway uses military double stepping; G uses the nested pre-step
+  carry rules below, including reflector motion and no double step. No active
+  position or ring is supplied by these definitions. `enigma-g228` is deferred
+  because its published rotor-II wiring is invalid and its attribution disputed;
+  no corrected wiring is guessed. See **WWII additions** for sources and vectors.
 - In the existing I/M3/M4 definitions, the entry/ETW wheel is not represented as a slot. Although the cited sources identify
   its alphabet wiring (identity for M3/M4), this engine's generic slot traversal would
   treat a slot as a position/ring-configurable wheel; using a slot for the ETW would
@@ -62,7 +74,7 @@ because of its size limit and is not cited as supporting evidence.
 
 ## Exact sourced wiring details used
 
-The JSON files use the A–Z order and wire permutations as printed in Hamer's rotor
+The I/M3/M4 JSON files use the A–Z order and wire permutations as printed in Hamer's rotor
 wiring table. Turnover positions are the displayed letters in Hamer's turnover table:
 I Q, II E, III V, IV J, V Z, and VI–VIII Z and M. The M4 Greek wiring strings are
 Beta `LEYJVCNIXWPBQMDRTAKZGFUHOS` and Gamma
@@ -71,10 +83,11 @@ are the listed UKW B/C and Thin-B/Thin-C table entries. The catalog parser valid
 these JSON definitions using the same strict schema and structural checks as custom
 embedded definitions; their bundled status does not bypass validation.
 
-## WWII additions: evidence before catalog implementation
+## WWII additions
 
-This section describes entries **being added by the WWII feature**, not entries
-already bundled. T3/T4/T12 will supply catalog JSON. It covers S5/S6/S9; the
+Railway, G-312 and G-260 are bundled as of engine 0.3.0. KD remains planned
+for T12, after UKW-D support; its data below is evidence, not a bundled entry.
+This section covers S5/S6/S9; the
 ETW and G stepping representation follows S7/S8. The fixture contains external
 ciphertexts, not output of this repository's engine. G-228 remains blocked by an
 invalid sourced rotor-II permutation; do not manufacture a corrected wiring.
@@ -122,8 +135,8 @@ Their shared sourced ETW string is `QWERTZUIOASDFGHJKPYXCVBNML`.
 contact J, not Q. On entry use its inverse
 `JWULCMNOHPQZYXIRADKEGVBTSF`; on exit use QWERTZ. Toledo explicitly uses
 `~Permutation("QWERTZUIOASDFGHJKPYXCVBNML")`; Palloks `etq` is the inverse.
-A future rightmost ETW rotor slot must respect traversal direction rather than
-blindly installing QWERTZ as a forward keyboard map. Historical ETW position/ring
+The bundled rightmost ETW rotor slot uses that inverse as its forward map:
+the engine traverses it forward on entry and in reverse on exit. Historical ETW position/ring
 are A/A; other representable settings are non-historical. I/M3/M4 are unchanged.
 
 Turnovers below are **displayed pre-step letters**, not the physical notch
@@ -274,4 +287,5 @@ The seed contains only keys and documented custom equipment, never ciphertext.
 Both runners return ciphertext plus per-letter position traces. Repeat each
 runner twice and compare its outputs byte-for-byte; compare ciphertexts between
 implementations separately (G disagreements are expected and documented).
-These passive documentation/data changes have no meaningful RED/GREEN cycle.
+Source reconciliation and fixture collection are passive documentation/data work;
+the bundled catalog behavior is separately covered by core and CLI vector tests.
