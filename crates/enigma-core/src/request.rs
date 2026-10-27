@@ -334,6 +334,38 @@ pub(crate) fn parse_root(json: &str) -> Result<ParsedRoot, Vec<RequestDiagnostic
 
     let job = required(root, "job", "")?.clone();
 
+    // Until search owns wiring keys, reject an omitted key before either search
+    // branch can admit a candidate containing the definition's placeholder wiring.
+    if job.get("kind").and_then(Value::as_str) == Some("search") {
+        for (slot_index, slot) in definition.slots().iter().enumerate() {
+            let wheel = slot
+                .wheel()
+                .or_else(|| slot.allowed_wheels().first().map(String::as_str));
+            let Some(wheel) =
+                wheel.filter(|wheel| definition.rewirable_fixed_pairs(wheel).is_some())
+            else {
+                continue;
+            };
+            let entry = job
+                .pointer("/configuration/slots")
+                .and_then(Value::as_array)
+                .and_then(|entries| {
+                    entries.iter().enumerate().find(|(_, entry)| {
+                        entry.get("id").and_then(Value::as_str) == Some(slot.id())
+                    })
+                });
+            if entry.is_none_or(|(_, entry)| entry.get("pairs").is_none()) {
+                let index = entry.map_or(slot_index, |(index, _)| index);
+                return Err(vec![ConfigurationDiagnostic::missing_rewirable_pairs(
+                    slot.id(),
+                    wheel,
+                    &format!("/job/configuration/slots/{index}/pairs"),
+                )
+                .into()]);
+            }
+        }
+    }
+
     Ok(ParsedRoot { definition, job })
 }
 
@@ -353,8 +385,13 @@ fn parse_configuration(value: &Value) -> Result<TransformConfiguration, Vec<Requ
     for (index, entry) in entries.iter().enumerate() {
         let entry_path = child(&slots_path, &index.to_string());
         let entry = object(entry, &entry_path)?;
-        exact_keys(entry, &["id", "wheel", "position", "ring"], &entry_path)?;
-        slots.push(SlotConfiguration::new(
+        let fields = if entry.contains_key("pairs") {
+            &["id", "wheel", "position", "ring", "pairs"][..]
+        } else {
+            &["id", "wheel", "position", "ring"][..]
+        };
+        exact_keys(entry, fields, &entry_path)?;
+        let mut slot = SlotConfiguration::new(
             required_string(entry, "id", &entry_path)?,
             required_string(entry, "wheel", &entry_path)?,
             scalar(
@@ -365,7 +402,31 @@ fn parse_configuration(value: &Value) -> Result<TransformConfiguration, Vec<Requ
                 required(entry, "ring", &entry_path)?,
                 &child(&entry_path, "ring"),
             )?,
-        ));
+        );
+        if let Some(value) = entry.get("pairs") {
+            let path = child(&entry_path, "pairs");
+            let values = array(value, &path)?;
+            let mut pairs = Vec::with_capacity(values.len());
+            for (index, value) in values.iter().enumerate() {
+                let path = child(&path, &index.to_string());
+                let pair = array(value, &path)?;
+                if pair.len() != 2 {
+                    return Err(vec![invalid_request(
+                        format!(
+                            "a pair must contain exactly two symbols; got {}",
+                            pair.len()
+                        ),
+                        path,
+                    )]);
+                }
+                pairs.push((
+                    scalar(&pair[0], &child(&path, "0"))?,
+                    scalar(&pair[1], &child(&path, "1"))?,
+                ));
+            }
+            slot = slot.with_pairs(pairs);
+        }
+        slots.push(slot);
     }
 
     let plugboard_path = child(path, "plugboard");

@@ -11,7 +11,9 @@
 //! Diagnostics use request-relative JSON Pointers under `/job/configuration`, matching
 //! the protocol's location example, so the protocol layer can forward them verbatim.
 
-use crate::{Alphabet, Definition, Engine, MachineTopology, ModelError, Plugboard, Slot, Stepping};
+use crate::{
+    Alphabet, Definition, Engine, MachineTopology, ModelError, Plugboard, Slot, Stepping, Wiring,
+};
 use std::fmt;
 
 /// A localized, actionable configuration-resolution diagnostic.
@@ -29,6 +31,14 @@ impl ConfigurationDiagnostic {
             message: message.into(),
             location: location.into(),
         }
+    }
+
+    pub(crate) fn missing_rewirable_pairs(id: &str, wheel: &str, path: &str) -> Self {
+        Self::new(
+            "invalid_slot",
+            format!("slot {id:?} uses rewirable wheel {wheel:?} and requires `pairs`"),
+            path,
+        )
     }
 
     /// Stable machine-readable diagnostic code.
@@ -66,6 +76,7 @@ pub struct SlotConfiguration {
     wheel: String,
     position: char,
     ring: char,
+    pairs: Option<Vec<(char, char)>>,
 }
 
 impl SlotConfiguration {
@@ -81,7 +92,19 @@ impl SlotConfiguration {
             wheel: wheel.into(),
             position,
             ring,
+            pairs: None,
         }
+    }
+
+    /// Supplies the free pairs of a rewirable wheel; resolution validates them.
+    pub fn with_pairs(mut self, pairs: Vec<(char, char)>) -> Self {
+        self.pairs = Some(pairs);
+        self
+    }
+
+    /// Explicit free pairs, or `None` when no wiring key was supplied.
+    pub fn pairs(&self) -> Option<&[(char, char)]> {
+        self.pairs.as_deref()
     }
 
     /// Slot identifier; must match the definition slot at this position.
@@ -150,6 +173,7 @@ impl TransformConfiguration {
         let alphabet = definition.alphabet();
         validate_slot_count(self.slots.len(), definition_slots.len())?;
 
+        let mut wheels = definition.wheels().to_vec();
         let mut slots = Vec::with_capacity(definition_slots.len());
         for (index, (entry, definition_slot)) in self.slots.iter().zip(definition_slots).enumerate()
         {
@@ -211,6 +235,23 @@ impl TransformConfiguration {
                     )]);
                 }
             }
+            let pairs_path = child(&slot_path, "pairs");
+            match (definition.rewirable_fixed_pairs(&entry.wheel), entry.pairs()) {
+                (Some(fixed), Some(pairs)) => {
+                    let wheel = wheels.iter_mut().find(|wheel| wheel.name() == entry.wheel)
+                        .expect("admissible wheel is declared");
+                    *wheel = resolve_rewirable(alphabet, wheel, fixed, pairs, &pairs_path)?;
+                }
+                (Some(_), None) => return Err(vec![ConfigurationDiagnostic::missing_rewirable_pairs(
+                    &entry.id, &entry.wheel, &pairs_path,
+                )]),
+                (None, Some(_)) => return Err(vec![ConfigurationDiagnostic::new(
+                    "unknown_field",
+                    format!("`pairs` is allowed only on a slot whose wheel is rewirable; wheel {:?} is not", entry.wheel),
+                    pairs_path,
+                )]),
+                (None, None) => {}
+            }
             slots.push(Slot::new(
                 entry.id.clone(),
                 entry.wheel.clone(),
@@ -223,7 +264,7 @@ impl TransformConfiguration {
 
         let plugboard = resolve_plugboard(alphabet, &self.plugboard)?;
 
-        let topology = MachineTopology::new(alphabet.clone(), definition.wheels().to_vec(), slots)
+        let topology = MachineTopology::new(alphabet.clone(), wheels, slots)
             .map_err(|error| vec![definition_error(error)])?;
 
         // Stepping is bound only after every slot choice proved admissible, so the rules
@@ -300,6 +341,91 @@ fn validate_slot_count(
         message,
         pointer(&["slots", &first_unmatched.to_string()]),
     )])
+}
+
+/// Completes the validated permanent pairs with a full, disjoint wiring key.
+fn resolve_rewirable(
+    alphabet: &Alphabet,
+    wheel: &Wiring,
+    fixed: &[(char, char)],
+    pairs: &[(char, char)],
+    path: &str,
+) -> Result<Wiring, Vec<ConfigurationDiagnostic>> {
+    let expected = alphabet.len() / 2 - fixed.len();
+    if pairs.len() != expected {
+        return Err(vec![ConfigurationDiagnostic::new(
+            "invalid_slot",
+            format!(
+                "rewirable wheel {:?} needs exactly {expected} pairs; got {}",
+                wheel.name(),
+                pairs.len()
+            ),
+            path,
+        )]);
+    }
+    let mut mapping: Vec<char> = (0..alphabet.len())
+        .map(|index| alphabet.symbol_at(index).expect("index is in alphabet"))
+        .collect();
+    let mut used = std::collections::HashSet::new();
+    for (index, &(a, b)) in pairs.iter().enumerate() {
+        let pair_path = child(path, &index.to_string());
+        for (end, symbol) in [a, b].into_iter().enumerate() {
+            if alphabet.index_of(symbol).is_none() {
+                return Err(vec![ConfigurationDiagnostic::new(
+                    "invalid_symbol",
+                    format!(
+                        "pair symbol {:?} is not in the machine alphabet",
+                        symbol.to_string()
+                    ),
+                    child(&pair_path, &end.to_string()),
+                )]);
+            }
+        }
+        if a == b {
+            return Err(vec![ConfigurationDiagnostic::new(
+                "invalid_plugboard",
+                format!(
+                    "a pair must join two distinct symbols; got {:?} twice",
+                    a.to_string()
+                ),
+                pair_path,
+            )]);
+        }
+        for (end, symbol) in [a, b].into_iter().enumerate() {
+            let location = child(&pair_path, &end.to_string());
+            if fixed.iter().any(|&(a, b)| symbol == a || symbol == b) {
+                return Err(vec![ConfigurationDiagnostic::new(
+                    "invalid_slot",
+                    format!(
+                        "pair endpoint {:?} is wired permanently by wheel {:?}",
+                        symbol.to_string(),
+                        wheel.name()
+                    ),
+                    location,
+                )]);
+            }
+            if !used.insert(symbol) {
+                return Err(vec![ConfigurationDiagnostic::new(
+                    "invalid_plugboard",
+                    format!(
+                        "pair endpoint {:?} is already used by another pair",
+                        symbol.to_string()
+                    ),
+                    location,
+                )]);
+            }
+        }
+    }
+    for &(a, b) in fixed.iter().chain(pairs) {
+        mapping[alphabet.index_of(a).expect("validated symbol")] = b;
+        mapping[alphabet.index_of(b).expect("validated symbol")] = a;
+    }
+    let turnovers: Vec<char> = (0..alphabet.len())
+        .filter_map(|index| alphabet.symbol_at(index))
+        .filter(|&symbol| wheel.at_turnover(symbol))
+        .collect();
+    Wiring::new(wheel.name(), alphabet, &mapping, &turnovers)
+        .map_err(|error| vec![definition_error(error)])
 }
 
 fn resolve_plugboard(

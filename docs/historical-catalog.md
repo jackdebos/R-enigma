@@ -40,6 +40,16 @@ because of its size limit and is not cited as supporting evidence.
   reflector choices without imposing operational restrictions on an order.
 - `enigma-m3` contains rotors I–VIII and UKW B/C. Its three moving slots accept I–VIII;
   the reflector accepts B/C.
+- `enigma-i-ukwd` retains Enigma I's I–V rotors and stepping, replacing B/C
+  with the rewirable UKW-D (`D`); CM-D documents Luftwaffe use from January 1944.
+- `enigma-m3-ukwd` retains M3's I–VIII rotors and stepping, replacing B/C
+  with UKW-D (`D`), as documented by CM-D. It also represents M4 in M3 mode:
+  UKW-D replaces both UKW-B and the Greek wheel, so there is no Greek slot.
+  Both entries use BP contact notation with `BO` permanently wired and require
+  exactly 12 free pairs in the transform key. The historical reflector setting is
+  position A, ring A; other settings are representable but non-historical.
+  For German-sheet conversion see **UKW-D facts** below. The original I/M3
+  catalog bytes are unchanged. UKW-D search remains pending (T10/T11).
 - `enigma-m4` contains rotors I–VIII, Beta/Gamma, and UKW Thin-B/Thin-C. Its moving
   slots accept I–VIII; a separate fixed `role: "rotor"` Greek slot admits Beta/Gamma
   and is not treated as an entry wheel. The leftmost reflector admits only Thin-B/C.
@@ -215,6 +225,10 @@ is fixed at A/A, not ring/position adjustable.
 the German index omits J and Y. Against BP `ABCDEFGHIJKLMNOPQRSTUVWXYZ`, the
 German contact labels are `A-ZXWVUTSRQPON-MLKIHGFEDCB` (hyphens are the fixed
 contacts, not free letters). German labeling runs counterclockwise, BP clockwise.
+To convert a German key sheet, replace each endpoint by the BP letter at the
+same index in these two strings, then supply the 12 converted free pairs;
+the two hyphens correspond to the permanent BP `BO` pair and are not supplied.
+The engine accepts BP symbols only; it does not silently convert German labels.
 CM-D describes Luftwaffe Enigma I use from 1 January 1944, M3/M4 variants (in
 M4 replacing UKW-B plus Beta), and KD. Luftwaffe rewiring was every 7–12 days;
 CM-KD says Mil Amt changed rotor order/rings daily and Grundstellung, **probably

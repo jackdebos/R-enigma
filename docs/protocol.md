@@ -369,8 +369,9 @@ custom  := {"kind":"custom", "value": DEFINITION_OBJECT}
 
 The bundled `id` resolves to an immutable catalog entry shipped with the engine. The
 catalog includes historically sourced Enigma I (`enigma-i`), M3 (`enigma-m3`),
-M4 (`enigma-m4`), Railway (`enigma-railway`), G-312 (`enigma-g312`), and
-G-260 (`enigma-g260`) definitions. See [historical catalog evidence](historical-catalog.md)
+M4 (`enigma-m4`), Railway (`enigma-railway`), G-312 (`enigma-g312`),
+G-260 (`enigma-g260`), and UKW-D variants (`enigma-i-ukwd`, `enigma-m3-ukwd`)
+definitions. See [historical catalog evidence](historical-catalog.md)
 for sources, exact wiring conventions, ETW/reflector settings, and deferred variants.
 Each bundled definition is JSON conforming to the same `DEFINITION_OBJECT` schema as a
 custom definition. Catalog authors must document authoritative historical sources for
@@ -391,7 +392,7 @@ exactly `alphabet`, `wheels`, `slots`, and `stepping`:
   alphabet symbol for each input symbol; the inverse is derived. `turnovers` contains
   distinct alphabet symbols and refers to displayed pre-step positions, not ring-adjusted
   positions. A wheel used in a reflector slot must be involutive.
-  A **rewirable** wheel (UKW-D, Stage 5, specified but not yet implemented) replaces
+  A **rewirable** wheel (UKW-D, Stage 5; transform implemented, search pending) replaces
   `wiring` with `rewirable: {"fixed_pairs": [[SYMBOL,SYMBOL],...]}`: disjoint pairs
   wired permanently (possibly empty), leaving an even, nonzero number of free symbols.
   Its key wiring is supplied by the configuration (§3.2) and completes an involution.
@@ -1185,7 +1186,8 @@ Task 17 is the differential-oracle validation task.
 
 ## 10. Version and status
 
-Engine 0.3.0 adds the Railway, G-312, and G-260 bundled catalog ids under
+Engine 0.3.0 adds the Railway, G-312, G-260, and I/M3 UKW-D bundled catalog ids
+and rewirable-wheel transforms (UKW-D search remains pending) under
 protocol version 1. Engine 0.2.0 added the optional `space.constraints` member;
 both are additive extensions like `hold` and chained stages.
 

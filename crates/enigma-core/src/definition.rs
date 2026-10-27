@@ -157,6 +157,8 @@ pub(crate) fn bundled_catalog_json(id: &str) -> Option<&'static str> {
     match id {
         "enigma-i" => Some(include_str!("../catalog/enigma-i.json")),
         "enigma-m3" => Some(include_str!("../catalog/enigma-m3.json")),
+        "enigma-i-ukwd" => Some(include_str!("../catalog/enigma-i-ukwd.json")),
+        "enigma-m3-ukwd" => Some(include_str!("../catalog/enigma-m3-ukwd.json")),
         "enigma-m4" => Some(include_str!("../catalog/enigma-m4.json")),
         "enigma-railway" => Some(include_str!("../catalog/enigma-railway.json")),
         "enigma-g312" => Some(include_str!("../catalog/enigma-g312.json")),
@@ -170,6 +172,7 @@ pub(crate) fn bundled_catalog_json(id: &str) -> Option<&'static str> {
 pub struct Definition {
     alphabet: Alphabet,
     wheels: Vec<Wiring>,
+    rewirable: Vec<(String, Vec<(char, char)>)>,
     slots: Vec<DefinitionSlot>,
     stepping_rules: Vec<StepRule>,
 }
@@ -179,9 +182,18 @@ impl Definition {
     pub fn alphabet(&self) -> &Alphabet {
         &self.alphabet
     }
-    /// Declared wheels in source order.
+    /// Declared wheels in source order. A rewirable wheel appears with a placeholder
+    /// involution that configuration resolution replaces with the key wiring.
     pub fn wheels(&self) -> &[Wiring] {
         &self.wheels
+    }
+    /// Permanently wired pairs of a rewirable wheel (UKW-D), or `None` when `wheel`
+    /// has a fixed wiring or is not declared.
+    pub fn rewirable_fixed_pairs(&self, wheel: &str) -> Option<&[(char, char)]> {
+        self.rewirable
+            .iter()
+            .find(|(name, _)| name == wheel)
+            .map(|(_, fixed)| fixed.as_slice())
     }
     /// Physical left-to-right slot admissibility constraints.
     pub fn slots(&self) -> &[DefinitionSlot] {
@@ -284,10 +296,16 @@ fn parse_definition(value: &Value, path: &str) -> Result<Definition, Vec<Definit
     }
     let mut wheels = Vec::with_capacity(wheel_values.len());
     let mut wheel_names = std::collections::HashSet::new();
+    let mut rewirable = Vec::new();
     for (index, value) in wheel_values.iter().enumerate() {
         let wheel_path = child(&wheels_path, &index.to_string());
         let item = object(value, &wheel_path)?;
-        exact_keys(item, &["name", "wiring", "turnovers"], &wheel_path)?;
+        let wiring_key = if item.contains_key("rewirable") {
+            "rewirable"
+        } else {
+            "wiring"
+        };
+        exact_keys(item, &["name", wiring_key, "turnovers"], &wheel_path)?;
         let name_path = child(&wheel_path, "name");
         let name = required_string(item, "name", &wheel_path)?;
         if name.is_empty() {
@@ -299,38 +317,23 @@ fn parse_definition(value: &Value, path: &str) -> Result<Definition, Vec<Definit
                 name_path,
             )]);
         }
-        let wiring_path = child(&wheel_path, "wiring");
-        let wiring_values = array(required(item, "wiring", &wheel_path)?, &wiring_path)?;
-        if wiring_values.len() != alphabet.len() {
-            return Err(vec![invalid(
-                format!(
-                    "wiring has {} entries; expected {} alphabet symbols",
-                    wiring_values.len(),
-                    alphabet.len()
-                ),
+        let wiring_path = child(&wheel_path, wiring_key);
+        let mapping = if wiring_key == "rewirable" {
+            let fixed = parse_rewirable(
+                required(item, "rewirable", &wheel_path)?,
+                &alphabet,
                 &wiring_path,
-            )]);
-        }
-        let mut mapping = Vec::with_capacity(wiring_values.len());
-        let mut wiring_symbols = std::collections::HashSet::new();
-        for (symbol_index, value) in wiring_values.iter().enumerate() {
-            let symbol_path = child(&wiring_path, &symbol_index.to_string());
-            let symbol = scalar(value, &symbol_path)?;
-            if alphabet.index_of(symbol).is_none() {
-                return Err(vec![invalid(
-                    format!("wiring symbol {symbol:?} is outside the alphabet"),
-                    symbol_path,
-                )]);
-            }
-            if !wiring_symbols.insert(symbol) {
-                return Err(vec![DefinitionDiagnostic::new(
-                    "invalid_wiring",
-                    format!("wiring output {symbol:?} is repeated"),
-                    symbol_path,
-                )]);
-            }
-            mapping.push(symbol);
-        }
+            )?;
+            let mapping = rewirable_placeholder(&alphabet, &fixed);
+            rewirable.push((name.to_owned(), fixed));
+            mapping
+        } else {
+            parse_wiring(
+                required(item, "wiring", &wheel_path)?,
+                &alphabet,
+                &wiring_path,
+            )?
+        };
         let turnover_path = child(&wheel_path, "turnovers");
         let turnover_values = array(required(item, "turnovers", &wheel_path)?, &turnover_path)?;
         let mut turnovers = Vec::with_capacity(turnover_values.len());
@@ -463,6 +466,7 @@ fn parse_definition(value: &Value, path: &str) -> Result<Definition, Vec<Definit
             allowed_wheels,
         });
     }
+    validate_rewirable_slots(&slots, &rewirable, &slots_path)?;
     validate_slot_structure(&slots, &alphabet, &wheels, &wheel_names, &slots_path)?;
 
     let stepping_path = child(path, "stepping");
@@ -532,9 +536,179 @@ fn parse_definition(value: &Value, path: &str) -> Result<Definition, Vec<Definit
     Ok(Definition {
         alphabet,
         wheels,
+        rewirable,
         slots,
         stepping_rules: rules,
     })
+}
+
+fn parse_wiring(
+    value: &Value,
+    alphabet: &Alphabet,
+    wiring_path: &str,
+) -> Result<Vec<char>, Vec<DefinitionDiagnostic>> {
+    let wiring_values = array(value, wiring_path)?;
+    if wiring_values.len() != alphabet.len() {
+        return Err(vec![invalid(
+            format!(
+                "wiring has {} entries; expected {} alphabet symbols",
+                wiring_values.len(),
+                alphabet.len()
+            ),
+            wiring_path,
+        )]);
+    }
+    let mut mapping = Vec::with_capacity(wiring_values.len());
+    let mut wiring_symbols = std::collections::HashSet::new();
+    for (symbol_index, value) in wiring_values.iter().enumerate() {
+        let symbol_path = child(wiring_path, &symbol_index.to_string());
+        let symbol = scalar(value, &symbol_path)?;
+        if alphabet.index_of(symbol).is_none() {
+            return Err(vec![invalid(
+                format!("wiring symbol {symbol:?} is outside the alphabet"),
+                symbol_path,
+            )]);
+        }
+        if !wiring_symbols.insert(symbol) {
+            return Err(vec![DefinitionDiagnostic::new(
+                "invalid_wiring",
+                format!("wiring output {symbol:?} is repeated"),
+                symbol_path,
+            )]);
+        }
+        mapping.push(symbol);
+    }
+    Ok(mapping)
+}
+
+/// Parses `{"fixed_pairs": [...]}`: disjoint permanent pairs leaving an even, nonzero
+/// number of free symbols for the configured key wiring.
+fn parse_rewirable(
+    value: &Value,
+    alphabet: &Alphabet,
+    path: &str,
+) -> Result<Vec<(char, char)>, Vec<DefinitionDiagnostic>> {
+    let item = object(value, path)?;
+    exact_keys(item, &["fixed_pairs"], path)?;
+    let pairs_path = child(path, "fixed_pairs");
+    let values = array(required(item, "fixed_pairs", path)?, &pairs_path)?;
+    let mut used = std::collections::HashSet::new();
+    let mut fixed = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        let pair_path = child(&pairs_path, &index.to_string());
+        let pair = array(value, &pair_path)?;
+        if pair.len() != 2 {
+            return Err(vec![invalid(
+                format!(
+                    "a fixed pair must contain exactly two symbols; got {}",
+                    pair.len()
+                ),
+                pair_path,
+            )]);
+        }
+        let mut ends = ['\0'; 2];
+        for (end, value) in pair.iter().enumerate() {
+            let symbol_path = child(&pair_path, &end.to_string());
+            let symbol = scalar(value, &symbol_path)?;
+            if alphabet.index_of(symbol).is_none() {
+                return Err(vec![invalid(
+                    format!(
+                        "fixed pair symbol {:?} is outside the alphabet",
+                        symbol.to_string()
+                    ),
+                    symbol_path,
+                )]);
+            }
+            if !used.insert(symbol) {
+                return Err(vec![invalid(
+                    format!("fixed pair endpoint {:?} is repeated", symbol.to_string()),
+                    symbol_path,
+                )]);
+            }
+            ends[end] = symbol;
+        }
+        fixed.push((ends[0], ends[1]));
+    }
+    let free = alphabet.len() - 2 * fixed.len();
+    if free == 0 || !free.is_multiple_of(2) {
+        return Err(vec![invalid(
+            format!("a rewirable wheel needs an even, nonzero number of free symbols; got {free}"),
+            pairs_path,
+        )]);
+    }
+    Ok(fixed)
+}
+
+/// A structurally valid involution standing in for a rewirable wheel until a
+/// configuration supplies its key pairs: fixed pairs plus free symbols paired in
+/// alphabet order. Resolution always replaces it; it never encrypts.
+fn rewirable_placeholder(alphabet: &Alphabet, fixed: &[(char, char)]) -> Vec<char> {
+    let mut mapping: Vec<char> = (0..alphabet.len())
+        .map(|index| alphabet.symbol_at(index).expect("index is in alphabet"))
+        .collect();
+    let fixed_index = |symbol: char| alphabet.index_of(symbol).expect("validated symbol");
+    for &(a, b) in fixed {
+        mapping[fixed_index(a)] = b;
+        mapping[fixed_index(b)] = a;
+    }
+    let free: Vec<usize> = (0..alphabet.len())
+        .filter(|&index| {
+            !fixed
+                .iter()
+                .any(|&(a, b)| fixed_index(a) == index || fixed_index(b) == index)
+        })
+        .collect();
+    for chunk in free.chunks(2) {
+        let (a, b) = (chunk[0], chunk[1]);
+        mapping[a] = alphabet.symbol_at(b).expect("index is in alphabet");
+        mapping[b] = alphabet.symbol_at(a).expect("index is in alphabet");
+    }
+    mapping
+}
+
+/// A rewirable wheel may only be a reflector, and its slot admits no other wheel, so a
+/// slot's key either always or never carries `pairs`.
+fn validate_rewirable_slots(
+    slots: &[DefinitionSlot],
+    rewirable: &[(String, Vec<(char, char)>)],
+    path: &str,
+) -> Result<(), Vec<DefinitionDiagnostic>> {
+    let is_rewirable = |name: &str| rewirable.iter().any(|(wheel, _)| wheel == name);
+    for (index, slot) in slots.iter().enumerate() {
+        let slot_path = child(path, &index.to_string());
+        let choices: Vec<(&str, String)> = match &slot.wheel {
+            Some(wheel) => vec![(wheel.as_str(), child(&slot_path, "wheel"))],
+            None => slot
+                .allowed_wheels
+                .iter()
+                .enumerate()
+                .map(|(choice, wheel)| {
+                    (
+                        wheel.as_str(),
+                        child(&child(&slot_path, "allowed_wheels"), &choice.to_string()),
+                    )
+                })
+                .collect(),
+        };
+        for (wheel, wheel_path) in &choices {
+            if !is_rewirable(wheel) {
+                continue;
+            }
+            if slot.role != SlotRole::Reflector {
+                return Err(vec![invalid(
+                    format!("rewirable wheel {wheel:?} is allowed only in a reflector slot"),
+                    wheel_path.clone(),
+                )]);
+            }
+            if choices.len() > 1 {
+                return Err(vec![invalid(
+                    format!("a slot admitting rewirable wheel {wheel:?} must admit no other wheel"),
+                    wheel_path.clone(),
+                )]);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_slot_structure(

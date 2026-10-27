@@ -1,0 +1,25 @@
+{
+  "alphabet": ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"],
+  "wheels": [
+    {"name": "I", "wiring": ["E", "K", "M", "F", "L", "G", "D", "Q", "V", "Z", "N", "T", "O", "W", "Y", "H", "X", "U", "S", "P", "A", "I", "B", "R", "C", "J"], "turnovers": ["Q"]},
+    {"name": "II", "wiring": ["A", "J", "D", "K", "S", "I", "R", "U", "X", "B", "L", "H", "W", "T", "M", "C", "Q", "G", "Z", "N", "P", "Y", "F", "V", "O", "E"], "turnovers": ["E"]},
+    {"name": "III", "wiring": ["B", "D", "F", "H", "J", "L", "C", "P", "R", "T", "X", "V", "Z", "N", "Y", "E", "I", "W", "G", "A", "K", "M", "U", "S", "Q", "O"], "turnovers": ["V"]},
+    {"name": "IV", "wiring": ["E", "S", "O", "V", "P", "Z", "J", "A", "Y", "Q", "U", "I", "R", "H", "X", "L", "N", "F", "T", "G", "K", "D", "C", "M", "W", "B"], "turnovers": ["J"]},
+    {"name": "V", "wiring": ["V", "Z", "B", "R", "G", "I", "T", "Y", "U", "P", "S", "D", "N", "H", "L", "X", "A", "W", "M", "J", "Q", "O", "F", "E", "C", "K"], "turnovers": ["Z"]},
+    {"name": "VI", "wiring": ["J", "P", "G", "V", "O", "U", "M", "F", "Y", "Q", "B", "E", "N", "H", "Z", "R", "D", "K", "A", "S", "X", "L", "I", "C", "T", "W"], "turnovers": ["Z", "M"]},
+    {"name": "VII", "wiring": ["N", "Z", "J", "H", "G", "R", "C", "X", "M", "Y", "S", "W", "B", "O", "U", "F", "A", "I", "V", "L", "P", "E", "K", "Q", "D", "T"], "turnovers": ["Z", "M"]},
+    {"name": "VIII", "wiring": ["F", "K", "Q", "H", "T", "L", "X", "O", "C", "B", "J", "S", "P", "D", "Z", "R", "A", "M", "E", "W", "N", "I", "U", "Y", "G", "V"], "turnovers": ["Z", "M"]},
+    {"name": "D", "rewirable": {"fixed_pairs": [["B", "O"]]}, "turnovers": []}
+  ],
+  "slots": [
+    {"id": "reflector", "role": "reflector", "movement": "fixed", "wheel": "D"},
+    {"id": "left", "role": "rotor", "movement": "movable", "allowed_wheels": ["I", "II", "III", "IV", "V", "VI", "VII", "VIII"]},
+    {"id": "middle", "role": "rotor", "movement": "movable", "allowed_wheels": ["I", "II", "III", "IV", "V", "VI", "VII", "VIII"]},
+    {"id": "right", "role": "rotor", "movement": "movable", "allowed_wheels": ["I", "II", "III", "IV", "V", "VI", "VII", "VIII"]}
+  ],
+  "stepping": {"rules": [
+    {"when": {"always": true}, "advance": ["right"]},
+    {"when": {"at_turnover": "right"}, "advance": ["middle"]},
+    {"when": {"at_turnover": "middle"}, "advance": ["middle", "left"]}
+  ]}
+}
