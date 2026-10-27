@@ -1,0 +1,22 @@
+{
+  "alphabet": ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"],
+  "wheels": [
+    {"name": "I", "wiring": ["J", "G", "D", "Q", "O", "X", "U", "S", "C", "A", "M", "I", "F", "R", "V", "T", "P", "N", "E", "W", "K", "B", "L", "Z", "Y", "H"], "turnovers": ["N"]},
+    {"name": "II", "wiring": ["N", "T", "Z", "P", "S", "F", "B", "O", "K", "M", "W", "R", "C", "J", "D", "I", "V", "L", "A", "E", "Y", "U", "X", "H", "G", "Q"], "turnovers": ["E"]},
+    {"name": "III", "wiring": ["J", "V", "I", "U", "B", "H", "T", "C", "D", "Y", "A", "K", "E", "Q", "Z", "P", "O", "S", "G", "X", "N", "R", "M", "W", "F", "L"], "turnovers": ["Y"]},
+    {"name": "UKW", "wiring": ["Q", "Y", "H", "O", "G", "N", "E", "C", "V", "P", "U", "Z", "T", "F", "D", "J", "A", "X", "W", "M", "K", "I", "S", "R", "B", "L"], "turnovers": []},
+    {"name": "ETW", "wiring": ["J", "W", "U", "L", "C", "M", "N", "O", "H", "P", "Q", "Z", "Y", "X", "I", "R", "A", "D", "K", "E", "G", "V", "B", "T", "S", "F"], "turnovers": []}
+  ],
+  "slots": [
+    {"id": "reflector", "role": "reflector", "movement": "fixed", "allowed_wheels": ["UKW"]},
+    {"id": "left", "role": "rotor", "movement": "movable", "allowed_wheels": ["I", "II", "III"]},
+    {"id": "middle", "role": "rotor", "movement": "movable", "allowed_wheels": ["I", "II", "III"]},
+    {"id": "right", "role": "rotor", "movement": "movable", "allowed_wheels": ["I", "II", "III"]},
+    {"id": "etw", "role": "rotor", "movement": "fixed", "wheel": "ETW"}
+  ],
+  "stepping": {"rules": [
+    {"when": {"always": true}, "advance": ["right"]},
+    {"when": {"at_turnover": "right"}, "advance": ["middle"]},
+    {"when": {"at_turnover": "middle"}, "advance": ["middle", "left"]}
+  ]}
+}

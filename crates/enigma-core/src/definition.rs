@@ -158,6 +158,9 @@ pub(crate) fn bundled_catalog_json(id: &str) -> Option<&'static str> {
         "enigma-i" => Some(include_str!("../catalog/enigma-i.json")),
         "enigma-m3" => Some(include_str!("../catalog/enigma-m3.json")),
         "enigma-m4" => Some(include_str!("../catalog/enigma-m4.json")),
+        "enigma-railway" => Some(include_str!("../catalog/enigma-railway.json")),
+        "enigma-g312" => Some(include_str!("../catalog/enigma-g312.json")),
+        "enigma-g260" => Some(include_str!("../catalog/enigma-g260.json")),
         _ => None,
     }
 }
@@ -928,7 +931,14 @@ mod tests {
 
     #[test]
     fn bundled_definitions_resolve_through_the_custom_definition_validator() {
-        for id in ["enigma-i", "enigma-m3", "enigma-m4"] {
+        for id in [
+            "enigma-i",
+            "enigma-m3",
+            "enigma-m4",
+            "enigma-railway",
+            "enigma-g312",
+            "enigma-g260",
+        ] {
             let bundled = format!(r#"{{"kind":"bundled","id":"{id}"}}"#);
             let definition = DefinitionSource::parse_json(&bundled)
                 .unwrap()
@@ -936,6 +946,10 @@ mod tests {
                 .unwrap_or_else(|diagnostics| panic!("{id} did not resolve: {diagnostics:?}"));
             assert_eq!(definition.alphabet().len(), 26);
             assert_eq!(definition.slots()[0].id(), "reflector");
+            // WWII shapes and rules are checked exactly in wwii_catalog_matches_sourced_wiring_slots_and_rules.
+            if id == "enigma-railway" || id.starts_with("enigma-g") {
+                continue;
+            }
             assert_eq!(definition.stepping_rules().len(), 3);
             assert_eq!(
                 definition.stepping_rules()[0].condition(),
@@ -968,6 +982,12 @@ mod tests {
             ("enigma-i", include_str!("../catalog/enigma-i.json")),
             ("enigma-m3", include_str!("../catalog/enigma-m3.json")),
             ("enigma-m4", include_str!("../catalog/enigma-m4.json")),
+            (
+                "enigma-railway",
+                include_str!("../catalog/enigma-railway.json"),
+            ),
+            ("enigma-g312", include_str!("../catalog/enigma-g312.json")),
+            ("enigma-g260", include_str!("../catalog/enigma-g260.json")),
         ] {
             let bundle =
                 DefinitionSource::parse_json(&format!(r#"{{"kind":"bundled","id":"{id}"}}"#))
@@ -981,14 +1001,21 @@ mod tests {
                     .unwrap();
             assert_eq!(bundle, custom);
             assert_eq!(bundle.slots()[0].role(), SlotRole::Reflector);
-            assert_eq!(bundle.slots()[0].movement(), Movement::Fixed);
+            assert_eq!(
+                bundle.slots()[0].movement(),
+                if id.starts_with("enigma-g") {
+                    Movement::Movable
+                } else {
+                    Movement::Fixed
+                }
+            );
             if id == "enigma-m4" {
                 assert_eq!(bundle.slots()[1].id(), "greek");
                 assert_eq!(bundle.slots()[1].role(), SlotRole::Rotor);
                 assert_eq!(bundle.slots()[1].movement(), Movement::Fixed);
                 assert_eq!(bundle.slots()[1].allowed_wheels(), &["Beta", "Gamma"]);
                 assert_eq!(bundle.slots()[0].allowed_wheels(), &["Thin-B", "Thin-C"]);
-            } else {
+            } else if id == "enigma-i" || id == "enigma-m3" {
                 assert_eq!(bundle.slots().len(), 4);
                 assert_eq!(bundle.slots()[0].allowed_wheels(), &["B", "C"]);
             }
@@ -1028,6 +1055,261 @@ mod tests {
             assert!(wiring(name).at_turnover('Z'));
             assert!(wiring(name).at_turnover('M'));
             assert!(!wiring(name).at_turnover('A'));
+        }
+    }
+
+    #[test]
+    fn original_catalog_transform_and_attack_behavior_is_preserved() {
+        use crate::{SlotConfiguration as Key, TransformConfiguration};
+        for id in ["enigma-i", "enigma-m3", "enigma-m4"] {
+            let mut slots = vec![Key::new(
+                "reflector",
+                if id == "enigma-m4" { "Thin-B" } else { "B" },
+                'A',
+                'A',
+            )];
+            if id == "enigma-m4" {
+                slots.push(Key::new("greek", "Beta", 'A', 'A'));
+            }
+            slots.extend(
+                [("left", "I"), ("middle", "II"), ("right", "III")]
+                    .map(|(id, wheel)| Key::new(id, wheel, 'A', 'A')),
+            );
+            let mut engine = TransformConfiguration::new(slots, vec![])
+                .resolve(&bundled(id))
+                .unwrap()
+                .into_engine()
+                .unwrap();
+            assert_eq!(
+                engine
+                    .transform("AAAAA", crate::Direction::Encrypt)
+                    .unwrap(),
+                "BDZGO"
+            );
+        }
+        let request = serde_json::json!({"protocol_version":1,
+            "machine":{"definition":{"kind":"bundled","id":"enigma-i"}},
+            "job":{"kind":"search", "configuration":{"slots":[
+                {"id":"reflector","wheel":"B","position":"A","ring":"A"},
+                {"id":"left","wheel":"I","position":"A","ring":"A"},
+                {"id":"middle","wheel":"II","position":"A","ring":"A"},
+                {"id":"right","wheel":"III","position":"A","ring":"A"}],"plugboard":[]},
+                "text":"BDZGO", "passes":["hill_climb"], "measures":["ic"],
+                "space":{"plugboard":{"kind":"attack","symbols":["A","B"],"max_pairs":0}},
+                "attack":{"kind":"hill_climb","initial_measure":"ic","final_measure":"ic","switch_pairs":0,"backtrack_pairs":0,"start":[]}}});
+        let result = crate::AttackRequest::parse_json(&request.to_string())
+            .unwrap()
+            .run(|_| {}, || false)
+            .unwrap();
+        assert_eq!(result.termination(), crate::AttackTermination::Completed);
+        assert_eq!(result.best().unwrap().plaintext(), "AAAAA");
+        assert_eq!(result.evaluations_used(), 1);
+    }
+
+    // Exact WWII values from docs/historical-catalog.md (CM/Toledo reconciliation).
+    const WWII: [(&str, [&str; 4]); 3] = [
+        (
+            "enigma-railway",
+            [
+                "JGDQOXUSCAMIFRVTPNEWKBLZYH",
+                "NTZPSFBOKMWRCJDIVLAEYUXHGQ",
+                "JVIUBHTCDYAKEQZPOSGXNRMWFL",
+                "QYHOGNECVPUZTFDJAXWMKISRBL",
+            ],
+        ),
+        (
+            "enigma-g312",
+            [
+                "DMTWSILRUYQNKFEJCAZBPGXOHV",
+                "HQZGPJTMOBLNCIFDYAWVEUSRKX",
+                "UQNTLSZFMREHDPXKIBVYGJCWOA",
+                "RULQMZJSYGOCETKWDAHNBXPVIF",
+            ],
+        ),
+        (
+            "enigma-g260",
+            [
+                "RCSPBLKQAUMHWYTIFZVGOJNEXD",
+                "WCMIBVPJXAROSGNDLZKEYHUFQT",
+                "FVDHZELSQMAXOKYIWPGCBUJTNR",
+                "IMETCGFRAYSQBZXWLHKDVUPOJN",
+            ],
+        ),
+    ];
+
+    fn bundled(id: &str) -> Definition {
+        DefinitionSource::parse_json(&format!(r#"{{"kind":"bundled","id":"{id}"}}"#))
+            .unwrap()
+            .resolve()
+            .unwrap()
+    }
+
+    #[test]
+    fn wwii_catalog_matches_sourced_wiring_slots_and_rules() {
+        use crate::{StepCondition as C, StepRule};
+        for (id, mappings) in WWII {
+            let definition = bundled(id);
+            let railway = id == "enigma-railway";
+            assert_eq!(
+                (0..definition.alphabet().len())
+                    .map(|i| definition.alphabet().symbol_at(i).unwrap())
+                    .collect::<String>(),
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            );
+            assert_eq!(definition.wheels().len(), 5);
+            for ((name, mapping), turnovers) in ["I", "II", "III", "UKW", "ETW"]
+                .into_iter()
+                .zip(mappings.into_iter().chain(["JWULCMNOHPQZYXIRADKEGVBTSF"]))
+                .zip(if railway {
+                    ["N", "E", "Y", "", ""]
+                } else {
+                    [
+                        "SUVWZABCEFGIKLOPQ",
+                        "STVYZACDFGHKMNQ",
+                        "UWXAEFHKMNR",
+                        "",
+                        "",
+                    ]
+                })
+            {
+                let wheel = definition
+                    .wheels()
+                    .iter()
+                    .find(|wheel| wheel.name() == name)
+                    .unwrap();
+                assert_eq!(
+                    (b'A'..=b'Z')
+                        .map(|c| wheel.forward(char::from(c), 'A', 'A').unwrap())
+                        .collect::<String>(),
+                    mapping,
+                    "{id} {name}"
+                );
+                for symbol in 'A'..='Z' {
+                    assert_eq!(
+                        wheel.at_turnover(symbol),
+                        turnovers.contains(symbol),
+                        "{id} {name} {symbol}"
+                    );
+                }
+            }
+            assert_eq!(definition.slots().len(), 5);
+            for (i, slot) in definition.slots().iter().enumerate() {
+                assert_eq!(
+                    slot.id(),
+                    ["reflector", "left", "middle", "right", "etw"][i]
+                );
+                assert_eq!(
+                    slot.role(),
+                    if i == 0 {
+                        SlotRole::Reflector
+                    } else {
+                        SlotRole::Rotor
+                    }
+                );
+                assert_eq!(
+                    slot.movement(),
+                    if i == 4 || (i == 0 && railway) {
+                        Movement::Fixed
+                    } else {
+                        Movement::Movable
+                    }
+                );
+                if i == 4 {
+                    assert_eq!(slot.wheel(), Some("ETW"));
+                    assert!(slot.allowed_wheels().is_empty());
+                } else {
+                    assert_eq!(slot.wheel(), None);
+                    assert_eq!(
+                        slot.allowed_wheels(),
+                        if i == 0 {
+                            vec!["UKW"]
+                        } else {
+                            vec!["I", "II", "III"]
+                        }
+                    );
+                }
+            }
+            let notch = |slot: &str| C::AtTurnover(slot.to_owned());
+            let rule = |condition, targets: &[&str]| {
+                StepRule::new(condition, targets.iter().map(|s| (*s).to_owned()).collect())
+            };
+            let mut rules = vec![
+                rule(C::Always, &["right"]),
+                rule(notch("right"), &["middle"]),
+            ];
+            if railway {
+                rules.push(rule(notch("middle"), &["middle", "left"]));
+            } else {
+                rules.push(rule(
+                    C::All(vec![notch("right"), notch("middle")]),
+                    &["left"],
+                ));
+                rules.push(rule(
+                    C::All(vec![notch("right"), notch("middle"), notch("left")]),
+                    &["reflector"],
+                ));
+            }
+            assert_eq!(definition.stepping_rules(), rules);
+        }
+    }
+
+    fn wwii_engine(id: &str, positions: &str) -> crate::Engine {
+        use crate::{SlotConfiguration, TransformConfiguration};
+        let slots = ["reflector", "left", "middle", "right", "etw"]
+            .into_iter()
+            .zip(["UKW", "III", "II", "I", "ETW"])
+            .zip(positions.chars().chain(['A']))
+            .zip("DFCPA".chars())
+            .map(|(((id, wheel), position), ring)| {
+                SlotConfiguration::new(id, wheel, position, ring)
+            })
+            .collect();
+        TransformConfiguration::new(slots, vec![])
+            .resolve(&bundled(id))
+            .unwrap()
+            .into_engine()
+            .unwrap()
+    }
+
+    #[test]
+    fn wwii_railway_double_steps_with_fixed_etw_and_settable_reflector() {
+        let mut engine = wwii_engine("enigma-railway", "JKDM");
+        for expected in ["JKDN", "JKEO", "JLFP"] {
+            assert_eq!(
+                engine
+                    .transform("A", crate::Direction::Encrypt)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                engine.positions().iter().collect::<String>(),
+                format!("{expected}A")
+            );
+        }
+    }
+
+    #[test]
+    fn wwii_g_nested_carry_moves_reflector_without_double_step() {
+        for id in ["enigma-g312", "enigma-g260"] {
+            let mut engine = wwii_engine(id, "JUSA");
+            for expected in ["KVTB", "KWUC", "KWVD", "KWVE"] {
+                assert_eq!(
+                    engine
+                        .transform("A", crate::Direction::Encrypt)
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                assert_eq!(
+                    engine.positions().iter().collect::<String>(),
+                    format!("{expected}A")
+                );
+            }
+            // II at S alone must not advance III or UKW; I at D is not a notch.
+            let mut engine = wwii_engine(id, "JUSD");
+            engine.transform("A", crate::Direction::Encrypt).unwrap();
+            assert_eq!(engine.positions(), &['J', 'U', 'S', 'E', 'A']);
         }
     }
 

@@ -1,0 +1,23 @@
+{
+  "alphabet": ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"],
+  "wheels": [
+    {"name": "I", "wiring": ["R", "C", "S", "P", "B", "L", "K", "Q", "A", "U", "M", "H", "W", "Y", "T", "I", "F", "Z", "V", "G", "O", "J", "N", "E", "X", "D"], "turnovers": ["S", "U", "V", "W", "Z", "A", "B", "C", "E", "F", "G", "I", "K", "L", "O", "P", "Q"]},
+    {"name": "II", "wiring": ["W", "C", "M", "I", "B", "V", "P", "J", "X", "A", "R", "O", "S", "G", "N", "D", "L", "Z", "K", "E", "Y", "H", "U", "F", "Q", "T"], "turnovers": ["S", "T", "V", "Y", "Z", "A", "C", "D", "F", "G", "H", "K", "M", "N", "Q"]},
+    {"name": "III", "wiring": ["F", "V", "D", "H", "Z", "E", "L", "S", "Q", "M", "A", "X", "O", "K", "Y", "I", "W", "P", "G", "C", "B", "U", "J", "T", "N", "R"], "turnovers": ["U", "W", "X", "A", "E", "F", "H", "K", "M", "N", "R"]},
+    {"name": "UKW", "wiring": ["I", "M", "E", "T", "C", "G", "F", "R", "A", "Y", "S", "Q", "B", "Z", "X", "W", "L", "H", "K", "D", "V", "U", "P", "O", "J", "N"], "turnovers": []},
+    {"name": "ETW", "wiring": ["J", "W", "U", "L", "C", "M", "N", "O", "H", "P", "Q", "Z", "Y", "X", "I", "R", "A", "D", "K", "E", "G", "V", "B", "T", "S", "F"], "turnovers": []}
+  ],
+  "slots": [
+    {"id": "reflector", "role": "reflector", "movement": "movable", "allowed_wheels": ["UKW"]},
+    {"id": "left", "role": "rotor", "movement": "movable", "allowed_wheels": ["I", "II", "III"]},
+    {"id": "middle", "role": "rotor", "movement": "movable", "allowed_wheels": ["I", "II", "III"]},
+    {"id": "right", "role": "rotor", "movement": "movable", "allowed_wheels": ["I", "II", "III"]},
+    {"id": "etw", "role": "rotor", "movement": "fixed", "wheel": "ETW"}
+  ],
+  "stepping": {"rules": [
+    {"when": {"always": true}, "advance": ["right"]},
+    {"when": {"at_turnover": "right"}, "advance": ["middle"]},
+    {"when": {"all": [{"at_turnover": "right"}, {"at_turnover": "middle"}]}, "advance": ["left"]},
+    {"when": {"all": [{"at_turnover": "right"}, {"at_turnover": "middle"}, {"at_turnover": "left"}]}, "advance": ["reflector"]}
+  ]}
+}
