@@ -308,7 +308,7 @@ attacks/<id>/
   enigma1941-trigram.json     built-in resources, when required
   own-<measure>.json          own resources copied byte-for-byte (maximum 64 MiB)
   state.json                 atomically persisted status and metadata
-  events.jsonl               exact stdout JSONL, appended across runs
+  events.jsonl               engine stdout JSONL without valid progress, appended across runs
   checkpoint.json            engine-owned checkpoint
   cancel-1                   empty marker, only when cancellation is requested
   report-1.txt               engine report; later runs use report-2.txt, etc.
@@ -325,7 +325,15 @@ If a resume cannot launch the engine, the attack keeps its previous status, run 
 and resumability, and the view's `error` explains the launch failure. A start body is
 read before the attack state is locked, so a slow client never delays status polls.
 Own resources are rechecked during copying; text is never normalized. Stdout lines
-are bounded to 64 MiB; an invalid/excessive stream fails the attack. Restart loads
+are bounded to 64 MiB; an invalid/excessive stream fails the attack. Valid `progress`
+events only update the live view polled by the page and are not written to
+`events.jsonl` (a long attack emits hundreds of thousands of them); every other line,
+including an invalid `progress`, is logged byte for byte. While an attack runs,
+`state.json` is also saved at most every 5 seconds when progress arrives, so after a
+crash it holds counters and elapsed time at most about 5 seconds old. The first
+failed periodic save stops further periodic saves; the final save still reports
+errors. Logs written by earlier versions, which contain every progress event, are
+still read. Restart loads
 the newest readable job ID and rebuilds observations from its log; a saved `running`
 state is persisted as `interrupted`. A newer directory whose `state.json` or
 `input.json` is missing or unreadable (for example one left by a failed start) is

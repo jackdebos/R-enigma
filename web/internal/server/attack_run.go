@@ -155,7 +155,7 @@ func (a *attackRun) loadDir(dir string) error {
 				terminal, started, result = false, false, false
 			}
 			// The persisted status is authoritative; replay restores observations.
-			if a.observe(scanner.Bytes(), &terminal, &started, &result) != nil {
+			if _, err := a.observe(scanner.Bytes(), &terminal, &started, &result); err != nil {
 				break
 			}
 		}
@@ -484,41 +484,42 @@ func eventScanner(r io.Reader) *bufio.Scanner {
 	return s
 }
 
-func (a *attackRun) observe(raw []byte, terminal, started, result *bool) error {
+// observe applies one engine event to the view and returns its name.
+func (a *attackRun) observe(raw []byte, terminal, started, result *bool) (string, error) {
 	var e map[string]json.RawMessage
 	if json.Unmarshal(raw, &e) != nil || e == nil || *terminal {
-		return errors.New("invalid attack event stream")
+		return "", errors.New("invalid attack event stream")
 	}
 	var name string
 	if json.Unmarshal(e["event"], &name) != nil {
-		return errors.New("missing event name")
+		return "", errors.New("missing event name")
 	}
 	v := a.view
 	switch name {
 	case "started":
 		if *started {
-			return errors.New("duplicate started event")
+			return name, errors.New("duplicate started event")
 		}
 		*started = true
 		v.Error = nil
 		if len(e["outers_selected"]) == 0 {
-			return errors.New("missing outers_selected")
+			return name, errors.New("missing outers_selected")
 		}
 		v.OutersSelected = e["outers_selected"]
 	case "progress":
 		if !*started || len(e["counters"]) == 0 || len(e["elapsed_ms"]) == 0 {
-			return errors.New("invalid progress event")
+			return name, errors.New("invalid progress event")
 		}
 		v.Counters = e["counters"]
 		v.ElapsedMS = e["elapsed_ms"]
 	case "checkpoint":
 		if !*started {
-			return errors.New("checkpoint before started")
+			return name, errors.New("checkpoint before started")
 		}
 		a.checkpoint = append(json.RawMessage(nil), raw...)
 	case "result":
 		if !*started || *result {
-			return errors.New("invalid result event")
+			return name, errors.New("invalid result event")
 		}
 		*result = true
 		v.Result = append(json.RawMessage(nil), raw...)
@@ -526,34 +527,47 @@ func (a *attackRun) observe(raw []byte, terminal, started, result *bool) error {
 		var reason string
 		_ = json.Unmarshal(e["reason"], &reason)
 		if !*started || !*result || (reason != "completed" && reason != "outer_slice_end" && reason != "cancelled") {
-			return errors.New("invalid done event")
+			return name, errors.New("invalid done event")
 		}
 		*terminal = true
 		a.reason = reason
 	case "error":
 		var code, message string
 		if json.Unmarshal(e["code"], &code) != nil || json.Unmarshal(e["message"], &message) != nil || code == "" || message == "" {
-			return errors.New("invalid error event")
+			return name, errors.New("invalid error event")
 		}
 		v.Error = &engine.Issue{Code: code, Message: message}
 		*terminal = true
 	}
-	return nil
+	return name, nil
 }
+
+// statePersistInterval is how often a running attack saves state.json.
+var statePersistInterval = 5 * time.Second
 
 func (a *attackRun) collect(cmd *exec.Cmd, stdout io.ReadCloser, log *os.File) {
 	terminal, started, result := false, false, false
 	var streamErr error
+	saved, saving := time.Now(), true
 	scanner := eventScanner(stdout)
 	for scanner.Scan() {
 		raw := scanner.Bytes()
-		if _, err := log.Write(raw); err != nil {
-			streamErr = err
-			break
-		}
 		a.mu.Lock()
-		err := a.observe(raw, &terminal, &started, &result)
+		name, err := a.observe(raw, &terminal, &started, &result)
+		// Valid progress only refreshes the view, which state.json saves at
+		// most once per interval; every other line is logged byte for byte.
+		progress := name == "progress" && err == nil
+		if progress && saving && time.Since(saved) >= statePersistInterval {
+			// A failed periodic save stops further ones; the final save reports.
+			saving, saved = a.persist() == nil, time.Now()
+		}
 		a.mu.Unlock()
+		if !progress {
+			if _, e := log.Write(raw); e != nil {
+				streamErr = e
+				break
+			}
+		}
 		if err != nil && streamErr == nil {
 			streamErr = err
 			_ = cmd.Process.Kill()
