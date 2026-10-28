@@ -396,6 +396,15 @@ fn same_objectives(a: ClimbObjective<'_>, b: ClimbObjective<'_>) -> bool {
     }
 }
 
+/// Debug object names stay off unless `WGPU_DEBUG` asks for them: the Vulkan
+/// loader's `vkSetDebugUtilsObjectNameEXT` segfaults while another thread creates
+/// an instance, so concurrent accelerators crashed in debug builds.
+fn instance_descriptor() -> wgpu::InstanceDescriptor {
+    let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+    descriptor.flags.remove(wgpu::InstanceFlags::DEBUG);
+    descriptor.with_env()
+}
+
 impl GpuClimbAccelerator {
     /// Probe the adapter. Invalid options are rejected before touching the device.
     /// No-adapter and missing-int64 outcomes are typed unsupported errors.
@@ -406,8 +415,7 @@ impl GpuClimbAccelerator {
         if !(1..=4).contains(&scan_budget) {
             return Err(GpuError::InvalidScanBudget(scan_budget));
         }
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let instance = wgpu::Instance::new(instance_descriptor());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             ..Default::default()

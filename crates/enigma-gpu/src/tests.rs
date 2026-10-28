@@ -339,3 +339,13 @@ fn entropy_table_splits_exact_terms_and_objective_checks_length() {
         assert!(matches!(result, Err(GpuUnsupported::Job(_))));
     }
 }
+
+#[test]
+fn instance_omits_debug_object_names_unless_requested() {
+    // Debug labels race the Vulkan loader across concurrent instances (SIGSEGV).
+    if std::env::var_os("WGPU_DEBUG").is_none() {
+        assert!(!instance_descriptor()
+            .flags
+            .contains(wgpu::InstanceFlags::DEBUG));
+    }
+}
