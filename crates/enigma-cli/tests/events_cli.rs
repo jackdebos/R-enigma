@@ -426,6 +426,44 @@ fn unwritable_directory_reports_failure() {
 }
 
 #[test]
+fn stdin_collisions_number_the_timestamped_name_once() {
+    let dir = Scratch::new();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let stamps: Vec<_> = (now..now + 30)
+        .map(|second| enigma_core::rfc3339_utc(second).replace(['-', ':'], ""))
+        .collect();
+    for stamp in &stamps {
+        std::fs::write(dir.path(&format!("enigma-{stamp}.report.txt")), b"taken").unwrap();
+    }
+    let output = dir.run(&["--request", "-"], &transform());
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"BDZG\n");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let saved = stamps
+        .iter()
+        .map(|stamp| format!("enigma-{stamp}-2.report.txt"))
+        .find(|name| dir.path(name).exists())
+        .unwrap_or_else(|| panic!("no numbered stdin report: {stderr}"));
+    assert_eq!(
+        stderr,
+        format!(
+            "Report {saved:?} saved successfully in {}\n",
+            dir.0.canonicalize().unwrap().display()
+        )
+    );
+    assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), stamps.len() + 1);
+    for stamp in &stamps {
+        assert_eq!(
+            std::fs::read(dir.path(&format!("enigma-{stamp}.report.txt"))).unwrap(),
+            b"taken"
+        );
+    }
+}
+
+#[test]
 fn timestamp_collisions_increment_without_following_links() {
     let dir = Scratch::new();
     std::fs::write(dir.path("request.json"), transform().to_string()).unwrap();

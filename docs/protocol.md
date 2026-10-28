@@ -276,8 +276,10 @@ directory:
   `enigma-<UTC YYYYMMDDTHHMMSSZ>.report.txt` for stdin;
 - if the default name already exists (any file type, including a dangling symlink),
   the UTC timestamp is inserted before `.report.txt` (`request-b.20261024T120110Z.report.txt`),
-  then `-2`, `-3`, ... after the timestamp until a free name is found; an existing
-  file is never overwritten or followed;
+  then `-2`, `-3`, ... after the timestamp until a free name is found; the stdin
+  name already holds the timestamp, so it only gets `-2`, `-3`, ...
+  (`enigma-20261024T120110Z-2.report.txt`); an existing file is never overwritten
+  or followed;
 - `--report <name>` uses `<name>` exactly, relative to the working directory. If it
   already exists the CLI writes `error: --report file already exists: "<name>"` to
   stderr and exits 2 with empty stdout, before reading the request. The file is still

@@ -265,6 +265,8 @@ impl Context<'_> {
                 .map(str::to_owned)
                 .unwrap_or_else(|| match index {
                     0 => format!("{stem}.report.txt"),
+                    // The stdin stem already holds the timestamp: only number it.
+                    n if self.stdin => format!("{stem}-{}.report.txt", n + 1),
                     1 => format!("{stem}.{timestamp}.report.txt"),
                     n => format!("{stem}.{timestamp}-{n}.report.txt"),
                 });
