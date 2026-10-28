@@ -42,6 +42,9 @@ func Build(models []Model, in Input, cpus int) (Plan, *Issue) {
 	if model == nil {
 		return plan, issue("unknown_model", "model", "Choose a bundled model.")
 	}
+	if !model.RewirableReflector && (in.SearchReflector != nil || in.ReflectorPairs != nil || in.Settings.ReflectorStarts != nil) {
+		return plan, issue("invalid_request", "", "Unknown attack member.")
+	}
 	component := func(field string) *Issue {
 		return issue("invalid_component", field, "Choose an allowed component or uppercase A-Z symbol.")
 	}
@@ -88,9 +91,30 @@ func Build(models []Model, in Input, cpus int) (Plan, *Issue) {
 	} else if in.ReflectorRing != nil || in.ReflectorPosition != nil {
 		return plan, issue("invalid_request", "", "This model has no settable reflector.")
 	}
-	if p := addSlot("reflector", in.Reflector, ring, position, model.Reflectors, "reflector_"); p != nil {
+	reflector := in.Reflector
+	if model.RewirableReflector {
+		d := "D"
+		if reflector == nil {
+			reflector = &d
+		}
+	}
+	if p := addSlot("reflector", reflector, ring, position, model.Reflectors, "reflector_"); p != nil {
 		p.Field = "reflector"
 		return plan, p
+	}
+	if model.RewirableReflector {
+		if in.SearchesReflector() {
+			if in.ReflectorPairs != nil {
+				return plan, component("reflector_pairs")
+			}
+			unknown = true
+			domains = append(domains, map[string]any{"id": "reflector", "pairs": map[string]string{"kind": "attack"}})
+		} else {
+			if !ValidateReflectorPairs(in.ReflectorPairs) {
+				return plan, issue("invalid_component", "reflector_pairs", "UKW-D requires 12 disjoint BP pairs covering A-Z except fixed B/O.")
+			}
+			configs[0]["pairs"] = in.ReflectorPairs
+		}
 	}
 	for i, s := range in.Slots {
 		field := "slots/" + strconv.Itoa(i) + "/"
@@ -158,6 +182,20 @@ func Build(models []Model, in Input, cpus int) (Plan, *Issue) {
 	}
 	if p := ValidateBackendMethod(method, backend); p != nil {
 		return plan, p
+	}
+	if in.SearchesReflector() && method != "hill_climb" {
+		return plan, issue("invalid_settings", "settings/method", "UKW-D wiring search supports hill_climb only; partial exhaustion and crib attack are unavailable.")
+	}
+	if p := ValidateReflectorBackend(in.SearchesReflector(), backend); p != nil {
+		return plan, p
+	}
+	starts := intDefault(settings.ReflectorStarts, 8)
+	if in.SearchesReflector() {
+		if starts < 1 || starts > 1000000 {
+			return plan, invalid("reflector_starts")
+		}
+	} else if settings.ReflectorStarts != nil {
+		return plan, invalid("reflector_starts")
 	}
 	var crib map[string]any
 	// Bombe cost per outer key: the scrambler rows up to the last admissible
@@ -247,6 +285,9 @@ func Build(models []Model, in Input, cpus int) (Plan, *Issue) {
 		return plan, issue("nothing_to_search", "", "Mark at least one key component unknown.")
 	}
 	attack := map[string]any{"kind": method, "initial_measure": initial, "final_measure": final, "switch_pairs": switchPairs, "backtrack_pairs": backtrack, "hold": hold}
+	if in.SearchesReflector() {
+		attack["reflector_starts"] = starts
+	}
 	if method == "hill_climb" {
 		if settings.Seeds != nil {
 			return plan, invalid("seeds")
@@ -386,6 +427,9 @@ func Build(models []Model, in Input, cpus int) (Plan, *Issue) {
 		plan.EstimateSeconds = count * bombeWork * bombeSecondsPerLetter / float64(threads)
 	} else {
 		plan.EstimateSeconds = count * secondsPerKey * float64(factor) * float64(letters) / referenceLength / float64(threads)
+		if in.SearchesReflector() {
+			plan.EstimateSeconds *= float64(starts)
+		}
 	}
 	return plan, nil
 }

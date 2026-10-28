@@ -1,4 +1,4 @@
-import { cribInfo, selectAttackMethod, checkText, validatePair, buildRequest, lookup, initialLanguage, buildAttackBody, parseAttackInput, estimateDuration, progressInfo, holdEntries, groupFive } from './logic.js';
+import { backendSettings, parseUKWD, convertUKWDPairs, ukwDNotations, cribInfo, selectAttackMethod, checkText, validatePair, buildRequest, lookup, initialLanguage, buildAttackBody, parseAttackInput, estimateDuration, progressInfo, holdEntries, groupFive } from './logic.js';
 
 const $ = id => document.getElementById(id);
 const alphabet = Array.from('ABCDEFGHIJKLMNOPQRSTUVWXYZ');
@@ -67,7 +67,7 @@ function updateAvailability() {
   $('blocker').hidden = ready;
   $('machine').hidden = !ready || models.length === 0;
   $('machine').disabled = !ready || working || engineBusy;
-  $('start').disabled = !ready || models.length === 0 || working || engineBusy;
+  $('start').disabled = !ready || models.length === 0 || working || engineBusy || Boolean(wiringError(state));
   $('save').disabled = working || engineBusy;
   $('path').disabled = working || engineBusy;
   $('text').disabled = working;
@@ -131,9 +131,12 @@ function chooseModel(id) {
     id: slot.id, wheel: slot.allowed_wheels[slot.id === 'greek' ? 0 : (i - (model.slots[0].id === 'greek' ? 1 : 0))], ring: 'A', position: 'A',
   }));
   state.plugboard = [];
+  delete state.wiring; delete state.notation; delete state.searchReflector;
+  if (model.rewirable_reflector) { state.wiring = ''; state.notation = 'german'; }
   messages.delete('pair-error');
   $('pair-error').hidden = true;
   renderMachine();
+  updateAvailability();
 }
 function renderMachine() {
   if (!models.length) return;
@@ -147,6 +150,7 @@ function renderMachine() {
       change: value => { state[`reflector_${key}`] = value; },
     });
   }
+  if (model.rewirable_reflector) renderWiring($('reflector-field'), state, 'machine', () => { clearResult(); updateAvailability(); });
   $('machine-plugboard').hidden = !model.plugboard;
   state.slots.forEach((slot, i) => {
     const block = element('div', undefined, 'rotor');
@@ -319,6 +323,7 @@ async function init() {
     renderTextCheck();
     if (textCheck.offending.length) return;
     state.text = $('text').value;
+    if (wiringError(state)) return;
     working = true;
     $('start').textContent = t('working');
     updateAvailability();
@@ -381,12 +386,14 @@ function chooseAttackModel(id) {
       ring: 'A', position: '',
     })), plugboard: [], search: model.plugboard, distinctWheels: true, text: attackState?.text || '', advanced: {},
     ...(model.settable_reflector ? { reflector_ring: 'A', reflector_position: '' } : {}),
+    ...(model.rewirable_reflector ? { wiring: '', notation: 'german', searchReflector: false } : {}),
   };
 }
 function attackIssue(failure) {
   if (failure.network) return t('error_network');
   if (failure.status === 401) return t('error_unauthorized');
   const issue = failure.data?.error || failure;
+  if (dictionaries.en[issue.code]) return t(issue.code);
   const key = issue.field === 'settings/distinct_wheels' ? 'error_distinct_wheels' : `error_${issue.code}`;
   const engineKey = `engine_error_${issue.code}`;
   const reason = dictionaries.en[key] ? t(key) : dictionaries.en[engineKey] ? t(engineKey) : t('error_generic');
@@ -429,6 +436,43 @@ function attackCheckbox(parent, key, checked, change, id = `attack-${key}`) {
   parent.append(row);
   return input;
 }
+function wiringError(form) {
+  if (!models.find(model => model.id === form?.model)?.rewirable_reflector || form.searchReflector) return null;
+  return parseUKWD(form.wiring || '', form.notation || 'german').error;
+}
+function renderWiring(parent, form, prefix, changed) {
+  parent.append(element('p', t('ukwd_fixed'), 'hint'));
+  if (prefix === 'attack') {
+    attackCheckbox(parent, 'search_reflector', form.searchReflector, checked => {
+      form.searchReflector = checked;
+      if (checked) {
+        selectAttackMethod(form, 'hill_climb');
+        delete form.advanced.crib; delete form.advanced.crib_position;
+      }
+      changed(); renderAttack();
+    });
+  }
+  if (form.searchReflector) {
+    parent.append(element('p', t('ukwd_hc'), 'notice'));
+    if (form.advanced.backend === 'gpu') parent.append(element('p', t('ukwd_cpu'), 'notice'));
+    attackInput(parent, 'reflector_starts', form.advanced.reflector_starts ?? '', value => {
+      if (value === '') delete form.advanced.reflector_starts; else form.advanced.reflector_starts = value;
+      changed();
+    }, { type: 'number', min: 1, max: 1000000, placeholder: '8' });
+    return;
+  }
+  const field = element('div');
+  const error = element('p'); error.id = `${prefix}-wiring-error`; error.setAttribute('role', 'alert');
+  const showError = () => { const code = wiringError(form); error.textContent = code ? t(code) : ''; };
+  selectField(field, { id: `${prefix}-notation`, key: 'ukwd_notation', hint: 'ukwd_notation_hint', values: ['german', 'bp'], value: form.notation || 'german', optionKey: 'ukwd', clear: false, change: value => {
+    const parsed = parseUKWD(form.wiring || '', form.notation || 'german');
+    form.notation = value;
+    if (!parsed.error) form.wiring = convertUKWDPairs(parsed.pairs, 'bp', value).map(pair => pair.join('')).join(' ');
+    input.value = form.wiring; showError(); changed();
+  } });
+  const input = attackInput(field, 'ukwd_wiring', form.wiring || '', value => { form.wiring = value; showError(); changed(); }, { id: `${prefix}-wiring` });
+  showError(); field.append(error); parent.append(field);
+}
 function attackChanged() {
   // Resource overrides are meaningful only for measures currently in use.
   if (attackState.advanced.tables) {
@@ -447,8 +491,10 @@ function attackChanged() {
   previewTimer = setTimeout(() => loadAttackPreview(version), 300);
 }
 async function loadAttackPreview(version) {
-  const body = buildAttackBody(attackState);
   try {
+    const localError = wiringError(attackState);
+    if (localError) throw { code: localError };
+    const body = buildAttackBody(attackState);
     const data = await api('/api/attack/preview', body);
     if (version !== previewVersion) return;
     preview = data;
@@ -536,6 +582,7 @@ function renderAttackAdvanced(parent) {
     backend.querySelector('[value="gpu"]').disabled = true;
     numbers.append(element('p', t('bombe_cpu'), 'hint'));
   }
+  if (attackState.searchReflector && settings.backend === 'gpu') numbers.append(element('p', t('ukwd_cpu'), 'notice'));
   if (settings.backend === 'gpu') {
     attackInput(numbers, 'gpu_usage', settings.gpu_usage ?? 100, value => {
       if (value === '') delete settings.gpu_usage; else settings.gpu_usage = value;
@@ -564,14 +611,15 @@ function renderAttack() {
   const controls = element('fieldset'); controls.id = 'attack-controls';
   const modelRow = element('div', undefined, 'model-row');
   attackSelect(modelRow, 'model', models.map(model => model.id), attackState.model, value => { chooseAttackModel(value); attackChanged(); renderAttack(); }, { optionKey: 'model' });
-  attackSelect(modelRow, 'reflector', model.reflectors, attackState.reflector, value => { attackState.reflector = value; attackChanged(); }, { unknown: true, optionKey: 'reflector' });
+  attackSelect(modelRow, 'reflector', model.reflectors, attackState.reflector, value => { attackState.reflector = value; attackChanged(); }, { unknown: !model.rewirable_reflector, optionKey: 'reflector' });
   if (model.settable_reflector) {
     for (const key of ['ring', 'position']) attackSelect(modelRow, key, alphabet, attackState[`reflector_${key}`], value => {
       attackState[`reflector_${key}`] = value; attackChanged();
     }, { unknown: true, id: `attack-reflector-${key}`, hint: `reflector_${key}_hint` });
   }
   controls.append(modelRow);
-  attackSelect(controls, 'method', ['hill_climb', 'partial_exhaustion', 'bombe'], attackState.advanced.method || 'hill_climb', value => {
+  if (model.rewirable_reflector) renderWiring(controls, attackState, 'attack', attackChanged);
+  attackSelect(controls, 'method', attackState.searchReflector ? ['hill_climb'] : ['hill_climb', 'partial_exhaustion', 'bombe'], attackState.advanced.method || 'hill_climb', value => {
     selectAttackMethod(attackState, value);
     attackChanged(); renderAttack();
   }, { optionKey: 'method' });
@@ -711,7 +759,7 @@ function updateAttackAvailability() {
   if (!$('attack-start')) return;
   const ready = Boolean(savedEngine?.configured && savedEngine?.compatible);
   $('attack-controls').disabled = attackBusy;
-  $('attack-start').disabled = !ready || engineBusy || attackBusy || attackLast?.status === 'running' || previewPending || !preview || Boolean(previewFailure) || checkText(attackState.text).offending.length > 0
+  $('attack-start').disabled = !ready || engineBusy || attackBusy || attackLast?.status === 'running' || previewPending || !preview || Boolean(previewFailure) || checkText(attackState.text).offending.length > 0 || Boolean(wiringError(attackState))
     || (attackState.advanced.method === 'bombe' && cribInfo(attackState.advanced.crib || '').offending.length > 0);
   $('attack-action-error').textContent = attackFailure ? attackIssue(attackFailure) : '';
 }
@@ -750,8 +798,7 @@ function renderAttackLast() {
     root.append(element('p', t('cancel_hint'), 'hint'));
   }
   if (['cancelled', 'interrupted'].includes(attack.status) && attack.resumable) action('attack_resume', () => {
-    const { backend, gpu_usage } = buildAttackBody(attackState).settings;
-    attackAction('/api/attack/resume', { backend, ...(backend === 'gpu' ? { gpu_usage } : {}) });
+    attackAction('/api/attack/resume', backendSettings(attackState.advanced));
   });
   if (attack.input) action('load_setup', () => {
     attackState = parseAttackInput(attack.input); attackFailure = null; attackChanged(); renderAttack();
@@ -775,6 +822,10 @@ function renderAttackLast() {
     const slots = candidate.configuration?.slots || [];
     for (const [key, member] of [['wheels', 'wheel'], ['rings', 'ring'], ['positions', 'position']]) {
       item.append(element('p', t(`result_${key}`, { value: slots.map(slot => `${t(`slot_${slot.id}`)}: ${slot[member]}`).join(' · ') })));
+    }
+    for (const slot of slots.filter(slot => slot.pairs)) {
+      const wiring = ukwDNotations(slot.pairs);
+      for (const notation of ['bp', 'german']) item.append(element('p', t(`result_ukwd_${notation}`, { value: wiring[notation] })));
     }
     item.append(element('p', t('result_plugboard', { value: candidate.configuration?.plugboard?.map(pair => pair.join('–')).join(' ') || t('no_pairs') })));
     const plaintext = element('textarea'); plaintext.readOnly = true; plaintext.rows = 4;

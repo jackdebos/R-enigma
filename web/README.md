@@ -1,7 +1,8 @@
 # enigma-web
 
 A separate, local web client for the Rust Enigma engine. The embedded bilingual
-machine page configures Enigma I, M3, M4, Railway, G-312 and G-260 and starts encryption or decryption
+machine page configures Enigma I, M3, M4, Railway, G-312, G-260, KD and the
+I/M3 UKW-D variants and starts encryption or decryption
 explicitly, using the separately installed Rust engine. No framework, build step,
 CDN, external font, image, or JavaScript package installation is needed.
 
@@ -134,7 +135,12 @@ These routes use the same cookie authentication and Host/Origin guards:
 
 - `GET /api/machines`: `{"models":[{"id":"enigma-i","definition_id":"enigma-i","reflectors":["B","C"],"slots":[{"id":"left","allowed_wheels":["I","II","III","IV","V"]},...],"plugboard":true},...]}`.
   Models are `enigma-i`, `enigma-m3`, `enigma-m4`, `enigma-railway`,
-  `enigma-g312`, `enigma-g260`. Railway/G have `plugboard:false`,
+  `enigma-g312`, `enigma-g260`, `enigma-i-ukwd`, `enigma-m3-ukwd`, and
+  `enigma-kd`. The UKW-D models have `rewirable_reflector:true`, reflector `D`,
+  and no editable reflector position/ring. KD has `plugboard:false` and the same
+  fixed ETW as Railway/G. KD uses the FRA wiring; its attribution to Mil Amt is
+  uncertain. `enigma-m3-ukwd` also represents M4 with UKW-D in M3 mode (no Greek
+  wheel). Railway/G have `plugboard:false`,
   `settable_reflector:true`, reflector `UKW`, and `fixed_slots` containing
   `{"id":"etw","wheel":"ETW","ring":"A","position":"A"}`. The fixed ETW is
   not shown in either editable form and is inserted by the server. Editable slots are in definition order,
@@ -165,6 +171,31 @@ uses bundled definition IDs and direction `encrypt` (these reflected machines ar
 reciprocal, so the same operation also decrypts from the same initial settings).
 It does not impose distinct-wheel or historical operational-key restrictions that
 the engine catalog does not enforce.
+
+### UKW-D wiring
+
+For `enigma-i-ukwd`, `enigma-m3-ukwd` and `enigma-kd`, enter exactly 12
+space-separated, disjoint uppercase wiring pairs covering all 24 free contacts.
+The notation selector defaults to **German**. It converts a valid wiring when
+changed; invalid input is preserved for correction. Validation blocks submission
+and explains missing pairs, repeated contacts, malformed pairs and forbidden
+contacts in Spanish or English. The permanent pair must never be entered.
+
+The mapping is BP `ABCDEFGHIJKLMNOPQRSTUVWXYZ` → German
+`A-ZXWVUTSRQPON-MLKIHGFEDCB`: BP B/O are the unlabeled permanent contacts;
+German has no J/Y. For example:
+
+```text
+BP:     AZ CX DW EV FU GT HS IR JQ KP LN MY
+German: AB ZD XE WF VG UH TI SK RL QM PN OC
+```
+
+The browser converts to BP before sending `reflector_pairs:[["A","Z"],...]`
+in the transform or known-wiring attack body. The server validates the BP key
+again and inserts it as `pairs` in the engine's reflector configuration. Neither
+German notation nor notation-selector state reaches the engine. UKW-D position
+and ring are always inserted as A/A, not editable. KD additionally fixes ETW
+A/A and hides all plugboard controls; its attack cap is `max_pairs:0`.
 
 **Text rule:** the text is sent to the engine exactly as typed; nothing is uppercased,
 removed or replaced. The bundled machines use the 26 uppercase letters A–Z, so the
@@ -237,6 +268,24 @@ one unknown key dimension. Their engine request still uses the required attack
 plugboard branch with A–Z `symbols` and `max_pairs:0`; a supplied nonzero
 `settings.max_pairs` is rejected. Reflector rings/positions participate in preview
 counts just like rotor dimensions.
+
+UKW-D attacks also offer **Unknown UKW-D wiring / Cableado UKW-D desconocido**.
+This sends `search_reflector:true` without `reflector_pairs`. The builder fixes
+reflector D/A/A, adds `{"id":"reflector","pairs":{"kind":"attack"}}` to
+`job.space.slots`, and sends `job.attack.reflector_starts`. The starts control
+allows 1–1000000 (default 8); more starts improve recovery chances but cost time,
+and do not guarantee recovery. Wiring alone is a valid unknown dimension.
+Only hill climb is offered for unknown wiring; partial exhaustion and crib
+attack are unavailable, with a visible explanation. Optional finishing stages
+keep the recovered wiring fixed.
+
+**GPU choice:** unknown-wiring search explicitly blocks GPU, rather than silently
+switching to CPU. A visible notice asks the user to select CPU; preview, start
+and resume reject GPU with `backend_unavailable` at `settings/backend`, message
+`GPU backend unavailable: the UKW-D wiring search runs on the CPU only`.
+Known-wiring attacks keep GPU available. `settings.reflector_starts` is forbidden
+for known wiring or non-UKW-D machines. The approximate duration scales with the
+starts count, but is not a calibrated UKW-D benchmark.
 
 Known plugboard pairs are fixed; all remaining letters are mutable. With
 `search:false`, the pair cap equals the known pair count. A fully known key with
@@ -475,6 +524,9 @@ keeps both forms and the machine result intact.
   stderr. The report/checkpoint directory is always shown for a saved attack.
   **Load this setup** explicitly fills the form from the saved original input;
   it never starts an attack or overwrites the form automatically.
+- UKW-D candidates show their found wiring in both BP and German notation,
+  using the engine's winning `configuration.slots[].pairs`. Other machines'
+  transform and attack result displays are unchanged.
 - Ranked results use `result.hold` (or `best` as fallback), showing measured score
   and measure ID, full reflector/slot key in configuration order, complete
   plugboard and plaintext in blocks of five. Each plaintext has a Copy button.
@@ -523,7 +575,7 @@ saved-input round trips, duration unit boundaries, decimal-string progress and
 ETA, hold/best extraction and five-symbol grouping. Browser end-to-end checks are
 separate; Node tests need no DOM, browser, framework or packages.
 
-Optional Railway browser smoke (requires Google Chrome at `/usr/bin/google-chrome`):
+Optional Railway and UKW-D browser smoke (requires Google Chrome at `/usr/bin/google-chrome`):
 
 ```sh
 # From the repository root, after cargo build --release:
@@ -532,9 +584,21 @@ node web/e2e/wwii.mjs
 ```
 
 This transforms the independent Railway vector and starts a 26-key attack through
-page controls, comparing preview and engine counts. It also checks hidden ETW and
-plugboard controls, Spanish rerendering and script/CSP errors. The script prints
-its system-temp scratch path and retains it for manual removal.
+page controls, comparing preview and engine counts. It then enters the L26 Enigma I
+UKW-D vector in German notation and compares the web output with the real CLI and
+external fixture; runs a small unknown-wiring KD attack to completion; and checks
+both result notations, explicit GPU blocking, fixed ETW/reflector controls,
+hidden plugboard controls, Spanish rerendering and script/CSP errors. The script
+prints and removes its fresh system-temp scratch directory. `ENIGMA_WEB_BIN` and
+`ENIGMA_TEST_BIN` can point to temporary web/engine build outputs instead of the
+default `target/enigma-web` and `target/release/enigma`.
+
+`e2e/differential.mjs` compares separately built base/current web binaries using
+`ENIGMA_BASE_WEB_BIN`, `ENIGMA_WEB_BIN` and `ENIGMA_TEST_BIN`. It checks real-engine
+I/M3/M4/Railway/G transform HTTP response bytes (including events, unmodified),
+new-field rejections on sibling models, empty stderr and clean server exits.
+It does not read Git history; prepare the base checkout/build outside the test.
+Both scripts keep config, attack artifacts and Chrome profiles outside the repository.
 
 ## Architecture and next steps
 

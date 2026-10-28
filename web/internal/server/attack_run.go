@@ -347,8 +347,11 @@ func (s *Server) serveAttack(w http.ResponseWriter, r *http.Request) {
 			if problem == nil {
 				input, decodeProblem := attack.Decode(bytes.NewReader(a.view.Input))
 				problem = decodeProblem
-				if problem == nil && input.Settings.Method != nil {
-					problem = attack.ValidateBackendMethod(*input.Settings.Method, plan.Backend)
+				if problem == nil {
+					problem = attack.ValidateReflectorBackend(input.SearchesReflector(), plan.Backend)
+					if problem == nil && input.Settings.Method != nil {
+						problem = attack.ValidateBackendMethod(*input.Settings.Method, plan.Backend)
+					}
 				}
 			}
 		}

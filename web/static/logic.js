@@ -1,4 +1,37 @@
 // Pure form logic: no browser state or DOM access.
+const bpContacts = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+const germanContacts = 'A-ZXWVUTSRQPON-MLKIHGFEDCB';
+
+export function convertUKWDPairs(pairs, from, to) {
+  const source = from === 'bp' ? bpContacts : germanContacts;
+  const target = to === 'bp' ? bpContacts : germanContacts;
+  return pairs.map(pair => pair.map(contact => target[source.indexOf(contact)]));
+}
+
+// Input pairs are free contacts only; BO is supplied by the engine definition.
+export function parseUKWD(text, notation = 'german') {
+  const fail = error => ({ pairs: null, error });
+  const words = text.trim() ? text.trim().split(/\s+/u) : [];
+  if (words.length !== 12) return fail('ukwd_count');
+  if (words.some(pair => Array.from(pair).length !== 2)) return fail('ukwd_pair');
+  const contacts = notation === 'bp' ? 'ACDEFGHIJKLMNPQRSTUVWXYZ' : 'ABCDEFGHIKLMNOPQRSTUVWXZ';
+  const pairs = words.map(pair => Array.from(pair));
+  if (pairs.flat().some(contact => !contacts.includes(contact))) return fail(notation === 'bp' ? 'ukwd_bp_contacts' : 'ukwd_german_contacts');
+  if (new Set(pairs.flat()).size !== 24) return fail('ukwd_reused');
+  return { pairs: convertUKWDPairs(pairs, notation, 'bp'), error: null };
+}
+
+export function ukwDNotations(pairs) {
+  return { bp: pairs.map(pair => pair.join('')).join(' '), german: convertUKWDPairs(pairs, 'bp', 'german').map(pair => pair.join('')).join(' ') };
+}
+
+function wiringSettings(state, attack = false) {
+  if (!['enigma-i-ukwd', 'enigma-m3-ukwd', 'enigma-kd'].includes(state.model)) return {};
+  if (attack && state.searchReflector) return { search_reflector: true };
+  const { pairs, error } = parseUKWD(state.wiring || '', state.notation || 'german');
+  if (error) throw new Error(error);
+  return { reflector_pairs: pairs };
+}
 // The crib is sent exactly as typed, like the message: nothing is converted.
 export function cribInfo(text) {
   return { text, short: Array.from(text).length < 14, ...checkText(text) };
@@ -42,18 +75,25 @@ export function buildRequest(state) {
     model: state.model,
     reflector: state.reflector,
     ...reflectorSettings(state),
+    ...wiringSettings(state),
     slots: state.slots.map(({ id, wheel, ring, position }) => ({ id, wheel, ring, position })),
     plugboard: state.plugboard.map(pair => [...pair]),
     text: state.text,
   };
 }
 
+export function backendSettings(advanced = {}) {
+  const backend = advanced.backend ?? 'cpu';
+  return { backend, ...(backend === 'gpu' ? { gpu_usage: Number(advanced.gpu_usage ?? 100) } : {}) };
+}
+
 export function buildAttackBody(state) {
-  const numeric = new Set(['max_pairs', 'switch_pairs', 'backtrack_pairs', 'hold', 'threads', 'crib_position']);
+  const numeric = new Set(['max_pairs', 'switch_pairs', 'backtrack_pairs', 'hold', 'threads', 'crib_position', 'reflector_starts']);
   const settings = {};
   for (const [key, value] of Object.entries(state.advanced || {})) {
     if (value === '' || value === undefined || value === null) continue;
     if (key === 'backend' || key === 'gpu_usage') continue;
+    if (key === 'reflector_starts' && !state.searchReflector) continue;
     if (key === 'seeds' && state.advanced.method !== 'partial_exhaustion') continue;
     if ((key === 'crib' || key === 'crib_position') && state.advanced.method !== 'bombe') continue;
     if (key === 'tables') {
@@ -61,13 +101,13 @@ export function buildAttackBody(state) {
       if (Object.keys(tables).length) settings.tables = tables;
     } else settings[key] = numeric.has(key) ? Number(value) : structuredClone(value);
   }
-  settings.backend = state.advanced?.backend ?? 'cpu';
-  if (settings.backend === 'gpu') settings.gpu_usage = Number(state.advanced?.gpu_usage ?? 100);
+  Object.assign(settings, backendSettings(state.advanced));
   settings.distinct_wheels = state.distinctWheels ?? true;
   return {
     model: state.model,
     reflector: state.reflector || null,
     ...reflectorSettings(state, true),
+    ...wiringSettings(state, true),
     slots: state.slots.map(({ id, wheel, ring, position }) => ({ id, wheel: wheel || null, ring: ring || null, position: position || null })),
     plugboard: { known: state.plugboard.map(pair => [...pair]), search: state.search },
     text: state.text,
@@ -78,6 +118,7 @@ export function buildAttackBody(state) {
 export function parseAttackInput(input) {
   return {
     model: input.model, reflector: input.reflector || '', ...reflectorSettings(input),
+    ...(input.reflector_pairs || input.search_reflector ? { notation: 'german', wiring: input.reflector_pairs ? ukwDNotations(input.reflector_pairs).german : '', searchReflector: input.search_reflector || false } : {}),
     slots: input.slots.map(slot => Object.fromEntries(Object.entries(slot).map(([key, value]) => [key, value ?? '']))),
     plugboard: input.plugboard.known.map(pair => [...pair]), search: input.plugboard.search,
     distinctWheels: input.settings?.distinct_wheels ?? true,

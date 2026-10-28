@@ -1,7 +1,72 @@
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
-import { cribInfo, selectAttackMethod, checkText, validatePair, buildRequest, lookup, initialLanguage, buildAttackBody, parseAttackInput, estimateDuration, progressInfo, holdEntries, groupFive } from './logic.js';
+import { backendSettings, parseUKWD, convertUKWDPairs, ukwDNotations, cribInfo, selectAttackMethod, checkText, validatePair, buildRequest, lookup, initialLanguage, buildAttackBody, parseAttackInput, estimateDuration, progressInfo, holdEntries, groupFive } from './logic.js';
+
+const bpWiring = 'AZ CX DW EV FU GT HS IR JQ KP LN MY';
+const germanWiring = 'AB ZD XE WF VG UH TI SK RL QM PN OC';
+
+test('UKW-D external vector converts exactly between German and BP, without mutation', () => {
+  const bp = bpWiring.split(' ').map(pair => [...pair]);
+  const german = germanWiring.split(' ').map(pair => [...pair]);
+  assert.deepEqual(parseUKWD(germanWiring), { pairs: bp, error: null });
+  assert.deepEqual(parseUKWD(bpWiring, 'bp'), { pairs: bp, error: null });
+  assert.deepEqual(convertUKWDPairs(bp, 'bp', 'german'), german);
+  assert.deepEqual(convertUKWDPairs(german, 'german', 'bp'), bp);
+  assert.deepEqual(ukwDNotations(bp), { bp: bpWiring, german: germanWiring });
+  assert.equal(bp.map(pair => pair.join('')).join(' '), bpWiring);
+});
+
+test('UKW-D rejects incomplete, reused, fixed, absent and malformed contacts', () => {
+  for (const [text, notation, error] of [
+    ['', 'german', 'ukwd_count'], [germanWiring.split(' ').slice(1).join(' '), 'german', 'ukwd_count'],
+    [germanWiring + ' JY', 'german', 'ukwd_count'],
+    [germanWiring.replace('AB', 'AJ'), 'german', 'ukwd_german_contacts'],
+    [germanWiring.replace('AB', 'AY'), 'german', 'ukwd_german_contacts'],
+    [bpWiring.replace('AZ', 'AB'), 'bp', 'ukwd_bp_contacts'],
+    [bpWiring.replace('AZ', 'AO'), 'bp', 'ukwd_bp_contacts'],
+    [germanWiring.replace('AB', 'AA'), 'german', 'ukwd_reused'],
+    [germanWiring.replace('ZD', 'AD'), 'german', 'ukwd_reused'],
+    [germanWiring.toLowerCase(), 'german', 'ukwd_german_contacts'],
+    [germanWiring.replace('AB', 'A-'), 'german', 'ukwd_german_contacts'],
+    [germanWiring.replace('AB', 'ABC'), 'german', 'ukwd_pair'],
+  ]) {
+    assert.deepEqual(parseUKWD(text, notation), { pairs: null, error }, `${text}/${notation}`);
+  }
+});
+
+test('UKW-D payloads send BP only, unknown wiring round trips and preserves GPU for explicit rejection', () => {
+  for (const model of ['enigma-i-ukwd', 'enigma-m3-ukwd', 'enigma-kd']) {
+    const state = { model, reflector: 'D', slots: [], plugboard: [], search: false, text: 'ABC', advanced: {}, wiring: germanWiring, notation: 'german', searchReflector: false };
+    assert.deepEqual(buildRequest(state).reflector_pairs, parseUKWD(germanWiring).pairs);
+    let body = buildAttackBody(state);
+    assert.deepEqual(body.reflector_pairs, parseUKWD(germanWiring).pairs);
+    assert.deepEqual(buildAttackBody(parseAttackInput(body)), body);
+    state.searchReflector = true;
+    state.advanced = { reflector_starts: '8', backend: 'gpu' };
+    body = buildAttackBody(state);
+    assert.equal(body.search_reflector, true);
+    assert.equal(Object.hasOwn(body, 'reflector_pairs'), false);
+    assert.equal(body.settings.reflector_starts, 8);
+    assert.equal(body.settings.backend, 'gpu');
+    assert.deepEqual(buildAttackBody(parseAttackInput(body)), body);
+    state.searchReflector = false;
+    assert.equal(Object.hasOwn(buildAttackBody(state).settings, 'reflector_starts'), false);
+  }
+});
+
+test('resume host settings do not require a valid wiring in the unrelated current form', () => {
+  assert.deepEqual(backendSettings({ backend: 'gpu', gpu_usage: '37' }), { backend: 'gpu', gpu_usage: 37 });
+  assert.deepEqual(backendSettings({}), { backend: 'cpu' });
+  assert.deepEqual(backendSettings({ backend: 'cpu', gpu_usage: '0' }), { backend: 'cpu' });
+});
+
+test('UKW-D controls, validation and results have bilingual copy', () => {
+  for (const lang of ['es', 'en']) {
+    const dictionary = JSON.parse(readFileSync(new URL(`./i18n/${lang}.json`, import.meta.url), 'utf8'));
+    for (const key of ['ukwd_wiring', 'ukwd_wiring_hint', 'ukwd_notation', 'ukwd_notation_hint', 'ukwd_german', 'ukwd_bp', 'search_reflector', 'search_reflector_hint', 'reflector_starts', 'reflector_starts_hint', 'ukwd_cpu', 'ukwd_hc', 'ukwd_fixed', 'ukwd_count', 'ukwd_pair', 'ukwd_reused', 'ukwd_german_contacts', 'ukwd_bp_contacts', 'result_ukwd_bp', 'result_ukwd_german', 'model_enigma-i-ukwd', 'model_enigma-m3-ukwd', 'model_enigma-kd', 'reflector_D']) assert.ok(dictionary[key]?.trim(), `${lang}/${key}`);
+  }
+});
 
 test('settable reflector values survive transform and attack saved-input round trips', () => {
   for (const model of ['enigma-railway', 'enigma-g312', 'enigma-g260']) {

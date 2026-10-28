@@ -174,7 +174,7 @@ func TestMachines(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &reply); err != nil {
 		t.Fatal(err)
 	}
-	if len(reply.Models) != 6 {
+	if len(reply.Models) != 9 {
 		t.Fatalf("catalog=%s", w.Body.String())
 	}
 	for i, m := range reply.Models[:3] {

@@ -110,7 +110,7 @@ func validateShape(v any, t reflect.Type, path string) *Issue {
 				child = path + "/" + name
 			}
 			value, present := obj[name]
-			required := t == reflect.TypeOf(Input{}) && name != "settings" && name != "reflector_ring" && name != "reflector_position" || t == reflect.TypeOf(InputSlot{}) || t == reflect.TypeOf(Plugboard{}) || t == reflect.TypeOf(Stage{}) && name == "pass"
+			required := t == reflect.TypeOf(Input{}) && name != "settings" && name != "reflector_ring" && name != "reflector_position" && name != "reflector_pairs" && name != "search_reflector" || t == reflect.TypeOf(InputSlot{}) || t == reflect.TypeOf(Plugboard{}) || t == reflect.TypeOf(Stage{}) && name == "pass"
 			if !present {
 				if required {
 					return bad(child)

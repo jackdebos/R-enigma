@@ -12,12 +12,13 @@ const (
 )
 
 type Model struct {
-	SettableReflector bool
-	FixedETW          bool
-	NoPlugboard       bool
-	ID                string
-	Reflectors        []string
-	Slots             []Slot
+	RewirableReflector bool
+	SettableReflector  bool
+	FixedETW           bool
+	NoPlugboard        bool
+	ID                 string
+	Reflectors         []string
+	Slots              []Slot
 }
 type Slot struct {
 	ID     string
@@ -44,6 +45,8 @@ type Plan struct {
 	Resources       []Resource      `json:"resources"`
 }
 type Input struct {
+	ReflectorPairs    [][]string  `json:"reflector_pairs,omitempty"`
+	SearchReflector   *bool       `json:"search_reflector,omitempty"`
 	Model             string      `json:"model"`
 	Reflector         *string     `json:"reflector"`
 	ReflectorRing     *string     `json:"reflector_ring,omitempty"`
@@ -64,22 +67,23 @@ type Plugboard struct {
 	Search bool       `json:"search"`
 }
 type Settings struct {
-	DistinctWheels *bool             `json:"distinct_wheels"`
-	Method         *string           `json:"method"`
-	Seeds          []string          `json:"seeds"`
-	Crib           *string           `json:"crib"`
-	CribPosition   *int              `json:"crib_position"`
-	InitialMeasure *string           `json:"initial_measure"`
-	FinalMeasure   *string           `json:"final_measure"`
-	Stages         []Stage           `json:"stages"`
-	MaxPairs       *int              `json:"max_pairs"`
-	SwitchPairs    *int              `json:"switch_pairs"`
-	BacktrackPairs *int              `json:"backtrack_pairs"`
-	Hold           *int              `json:"hold"`
-	Threads        *int              `json:"threads"`
-	Backend        *string           `json:"backend"`
-	GPUUsage       *int              `json:"gpu_usage"`
-	Tables         map[string]string `json:"tables"`
+	ReflectorStarts *int              `json:"reflector_starts"`
+	DistinctWheels  *bool             `json:"distinct_wheels"`
+	Method          *string           `json:"method"`
+	Seeds           []string          `json:"seeds"`
+	Crib            *string           `json:"crib"`
+	CribPosition    *int              `json:"crib_position"`
+	InitialMeasure  *string           `json:"initial_measure"`
+	FinalMeasure    *string           `json:"final_measure"`
+	Stages          []Stage           `json:"stages"`
+	MaxPairs        *int              `json:"max_pairs"`
+	SwitchPairs     *int              `json:"switch_pairs"`
+	BacktrackPairs  *int              `json:"backtrack_pairs"`
+	Hold            *int              `json:"hold"`
+	Threads         *int              `json:"threads"`
+	Backend         *string           `json:"backend"`
+	GPUUsage        *int              `json:"gpu_usage"`
+	Tables          map[string]string `json:"tables"`
 }
 type Stage struct {
 	Pass        string  `json:"pass"`
@@ -88,3 +92,5 @@ type Stage struct {
 }
 
 func issue(code, field, message string) *Issue { return &Issue{code, message, field} }
+
+func (in Input) SearchesReflector() bool { return in.SearchReflector != nil && *in.SearchReflector }

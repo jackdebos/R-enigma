@@ -26,7 +26,7 @@ func TestWWIICatalog(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &reply); err != nil {
 		t.Fatal(err)
 	}
-	if len(reply.Models) != 6 {
+	if len(reply.Models) != 9 {
 		t.Fatalf("models: %s", w.Body.String())
 	}
 	for i, id := range []string{"enigma-railway", "enigma-g312", "enigma-g260"} {

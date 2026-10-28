@@ -12,6 +12,7 @@ import (
 	"slices"
 	"time"
 
+	"criptografia-enigma/web/internal/attack"
 	"criptografia-enigma/web/internal/engine"
 )
 
@@ -20,13 +21,14 @@ type catalogSlot struct {
 	AllowedWheels []string `json:"allowed_wheels"`
 }
 type catalogModel struct {
-	ID                string          `json:"id"`
-	DefinitionID      string          `json:"definition_id"`
-	Reflectors        []string        `json:"reflectors"`
-	Slots             []catalogSlot   `json:"slots"`
-	Plugboard         bool            `json:"plugboard"`
-	SettableReflector bool            `json:"settable_reflector,omitempty"`
-	FixedSlots        []transformSlot `json:"fixed_slots,omitempty"`
+	RewirableReflector bool            `json:"rewirable_reflector,omitempty"`
+	ID                 string          `json:"id"`
+	DefinitionID       string          `json:"definition_id"`
+	Reflectors         []string        `json:"reflectors"`
+	Slots              []catalogSlot   `json:"slots"`
+	Plugboard          bool            `json:"plugboard"`
+	SettableReflector  bool            `json:"settable_reflector,omitempty"`
+	FixedSlots         []transformSlot `json:"fixed_slots,omitempty"`
 }
 
 // Sources: docs/historical-catalog.md and crates/enigma-core/catalog/*.json.
@@ -56,6 +58,15 @@ func machineCatalog() []catalogModel {
 		}
 		models = append(models, m)
 	}
+	for _, base := range []int{0, 1, 3} {
+		m := models[base]
+		m.ID = map[int]string{0: "enigma-i-ukwd", 1: "enigma-m3-ukwd", 3: "enigma-kd"}[base]
+		m.DefinitionID = m.ID
+		m.Reflectors = []string{"D"}
+		m.RewirableReflector = true
+		m.SettableReflector = false
+		models = append(models, m)
+	}
 	return models
 }
 
@@ -82,12 +93,14 @@ func (s *Server) serveMachines(w http.ResponseWriter, r *http.Request) {
 }
 
 type transformSlot struct {
-	ID       string `json:"id"`
-	Wheel    string `json:"wheel"`
-	Ring     string `json:"ring"`
-	Position string `json:"position"`
+	Pairs    [][]string `json:"pairs,omitempty"`
+	ID       string     `json:"id"`
+	Wheel    string     `json:"wheel"`
+	Ring     string     `json:"ring"`
+	Position string     `json:"position"`
 }
 type transformInput struct {
+	ReflectorPairs    [][]string      `json:"reflector_pairs"`
 	Model             string          `json:"model"`
 	Reflector         string          `json:"reflector"`
 	ReflectorRing     *string         `json:"reflector_ring"`
@@ -120,13 +133,17 @@ func (s *Server) serveTransform(w http.ResponseWriter, r *http.Request) {
 		apiIssue(w, 400, "unknown_model", "Choose a bundled model from the catalog.")
 		return
 	}
+	if !model.RewirableReflector && input.ReflectorPairs != nil {
+		apiIssue(w, 400, "invalid_request", "Expected one transform object with model, reflector, slots, plugboard and text (at most 1 MiB).")
+		return
+	}
 	if !slices.Contains(model.Reflectors, input.Reflector) || len(input.Slots) != len(model.Slots) {
 		apiIssue(w, 400, "invalid_component", "Choose a reflector and all slots from the model catalog.")
 		return
 	}
 	for i, slot := range input.Slots {
 		allowed := model.Slots[i]
-		if slot.ID != allowed.ID || !slices.Contains(allowed.AllowedWheels, slot.Wheel) || !alphabetSymbol(slot.Ring) || !alphabetSymbol(slot.Position) {
+		if slot.Pairs != nil || slot.ID != allowed.ID || !slices.Contains(allowed.AllowedWheels, slot.Wheel) || !alphabetSymbol(slot.Ring) || !alphabetSymbol(slot.Position) {
 			apiIssue(w, 400, "invalid_component", "Slots must follow catalog order, with allowed wheels and uppercase A-Z rings and positions.")
 			return
 		}
@@ -141,6 +158,12 @@ func (s *Server) serveTransform(w http.ResponseWriter, r *http.Request) {
 	} else if input.ReflectorRing != nil || input.ReflectorPosition != nil {
 		apiIssue(w, 400, "invalid_request", "This model has no settable reflector.")
 		return
+	}
+	if model.RewirableReflector {
+		if !attack.ValidateReflectorPairs(input.ReflectorPairs) {
+			apiIssue(w, 400, "invalid_component", "UKW-D requires 12 disjoint BP pairs covering A-Z except fixed B/O.")
+			return
+		}
 	}
 	if !model.Plugboard && len(input.Plugboard) != 0 {
 		apiIssue(w, 400, "invalid_component", "This model has no plugboard.")
@@ -173,7 +196,8 @@ func (s *Server) serveTransform(w http.ResponseWriter, r *http.Request) {
 	// The text reaches the engine exactly as typed; the engine rejects any
 	// symbol outside its alphabet, including lowercase letters.
 	text := *input.Text
-	slots := append([]transformSlot{{ID: "reflector", Wheel: input.Reflector, Ring: ring, Position: position}}, input.Slots...)
+	reflector := transformSlot{ID: "reflector", Wheel: input.Reflector, Ring: ring, Position: position, Pairs: input.ReflectorPairs}
+	slots := append([]transformSlot{reflector}, input.Slots...)
 	slots = append(slots, model.FixedSlots...)
 	request := map[string]any{"protocol_version": 1, "machine": map[string]any{"definition": map[string]string{"kind": "bundled", "id": model.DefinitionID}}, "job": map[string]any{"kind": "transform", "direction": "encrypt", "text": text, "configuration": map[string]any{"slots": slots, "plugboard": input.Plugboard}}}
 	data, err := json.Marshal(request)
