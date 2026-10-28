@@ -269,3 +269,46 @@ func TestRealUKWDTransformAndSearch(t *testing.T) {
 		})
 	}
 }
+
+// A searched-wiring start costs a calibrated multiple of a known-wiring outer key.
+func TestUKWDSearchedWiringEstimateScalesByCalibratedStartCost(t *testing.T) {
+	s, u, c := engineServer(t, filepath.Join(t.TempDir(), "config.json"))
+	estimate := func(b map[string]any) float64 {
+		data, _ := json.Marshal(b)
+		r := httptest.NewRequest("POST", "/api/attack/preview", bytes.NewReader(data))
+		r.Host = u.Host
+		r.Header.Set("Origin", "http://"+u.Host)
+		r.AddCookie(c)
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, r)
+		var p struct {
+			Outer    string  `json:"outer_keys"`
+			Estimate float64 `json:"estimate_seconds"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &p); w.Code != 200 || err != nil || p.Outer != "26" || p.Estimate <= 0 {
+			t.Fatalf("%d %s", w.Code, w.Body.String())
+		}
+		return p.Estimate
+	}
+	for _, tc := range []struct {
+		model  string
+		search bool
+		cost   float64
+	}{{"enigma-i-ukwd", true, 15}, {"enigma-m3-ukwd", true, 15}, {"enigma-kd", false, 35}} {
+		for _, starts := range []int{1, 8} {
+			b := ukwdBody(tc.model)
+			b["slots"].([]any)[2].(map[string]any)["position"] = nil
+			b["plugboard"] = map[string]any{"known": []any{}, "search": tc.search}
+			b["text"] = strings.Repeat("ABCDEFGHIK", 23)
+			b["settings"] = map[string]any{"threads": 1}
+			known := estimate(b)
+			delete(b, "reflector_pairs")
+			b["search_reflector"] = true
+			b["settings"] = map[string]any{"threads": 1, "reflector_starts": starts}
+			got, want := estimate(b), known*float64(starts)*tc.cost
+			if got < want*0.999 || got > want*1.001 {
+				t.Fatalf("%s starts %d: estimate %g, want %g (known %g)", tc.model, starts, got, want, known)
+			}
+		}
+	}
+}

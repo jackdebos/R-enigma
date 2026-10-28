@@ -9,6 +9,10 @@ const (
 	referenceLength = 232
 	// Measured on the reference computer with Weierud 1941 cribs (L15).
 	bombeSecondsPerLetter = 1.3e-6
+	// One searched UKW-D wiring start costs this many ordinary outer keys of the
+	// same text: slope over 1/2/4 starts, 116 and 232 letters, reference computer.
+	ukwdStartCost            = 15
+	ukwdNoPlugboardStartCost = 35
 )
 
 type Model struct {

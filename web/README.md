@@ -285,8 +285,14 @@ switching to CPU. A visible notice asks the user to select CPU; preview, start
 and resume reject GPU with `backend_unavailable` at `settings/backend`, message
 `GPU backend unavailable: the UKW-D wiring search runs on the CPU only`.
 Known-wiring attacks keep GPU available. `settings.reflector_starts` is forbidden
-for known wiring or non-UKW-D machines. The approximate duration scales with the
-starts count, but is not a calibrated UKW-D benchmark.
+for known wiring or non-UKW-D machines. The approximate duration multiplies the
+ordinary estimate by `reflector_starts × 15` (enigma-i-ukwd, enigma-m3-ukwd) or
+`reflector_starts × 35` (enigma-kd, no plugboard): one start costs that many
+ordinary outer keys of the same text. These ratios were measured on the reference
+computer (release, one thread, enigma-i-ukwd and enigma-kd, 116 and 232 letters,
+1/2/4 starts, slope per added start); they ranged 14.1–15.5 and 31.5–38.3, and
+depend on the text and the climb's path. enigma-m3-ukwd was not measured
+separately. Ratios, unlike seconds, carry over to faster or slower hardware.
 
 Known plugboard pairs are fixed; all remaining letters are mutable. With
 `search:false`, the pair cap equals the known pair count. A fully known key with

@@ -428,7 +428,11 @@ func Build(models []Model, in Input, cpus int) (Plan, *Issue) {
 	} else {
 		plan.EstimateSeconds = count * secondsPerKey * float64(factor) * float64(letters) / referenceLength / float64(threads)
 		if in.SearchesReflector() {
-			plan.EstimateSeconds *= float64(starts)
+			cost := ukwdStartCost
+			if model.NoPlugboard {
+				cost = ukwdNoPlugboardStartCost
+			}
+			plan.EstimateSeconds *= float64(starts) * float64(cost)
 		}
 	}
 	return plan, nil
