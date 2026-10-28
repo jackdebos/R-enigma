@@ -175,8 +175,9 @@ the engine catalog does not enforce.
 ### UKW-D wiring
 
 For `enigma-i-ukwd`, `enigma-m3-ukwd` and `enigma-kd`, enter exactly 12
-space-separated, disjoint uppercase wiring pairs covering all 24 free contacts.
-The notation selector defaults to **German**. It converts a valid wiring when
+space-separated, disjoint wiring pairs covering all 24 free contacts. Letters may
+be typed in either case: lowercase means the same contact, and the engine always
+receives uppercase BP pairs. The notation selector defaults to **German**. It converts a valid wiring when
 changed; invalid input is preserved for correction. Validation blocks submission
 and explains missing pairs, repeated contacts, malformed pairs and forbidden
 contacts in Spanish or English. The permanent pair must never be entered.

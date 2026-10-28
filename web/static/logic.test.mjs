@@ -11,6 +11,9 @@ test('UKW-D external vector converts exactly between German and BP, without muta
   const german = germanWiring.split(' ').map(pair => [...pair]);
   assert.deepEqual(parseUKWD(germanWiring), { pairs: bp, error: null });
   assert.deepEqual(parseUKWD(bpWiring, 'bp'), { pairs: bp, error: null });
+  assert.deepEqual(parseUKWD(germanWiring.toLowerCase()), { pairs: bp, error: null });
+  assert.deepEqual(parseUKWD('ab zD Xe WF VG UH TI SK RL QM PN OC'), { pairs: bp, error: null });
+  assert.deepEqual(parseUKWD(bpWiring.toLowerCase(), 'bp'), { pairs: bp, error: null });
   assert.deepEqual(convertUKWDPairs(bp, 'bp', 'german'), german);
   assert.deepEqual(convertUKWDPairs(german, 'german', 'bp'), bp);
   assert.deepEqual(ukwDNotations(bp), { bp: bpWiring, german: germanWiring });
@@ -27,7 +30,7 @@ test('UKW-D rejects incomplete, reused, fixed, absent and malformed contacts', (
     [bpWiring.replace('AZ', 'AO'), 'bp', 'ukwd_bp_contacts'],
     [germanWiring.replace('AB', 'AA'), 'german', 'ukwd_reused'],
     [germanWiring.replace('ZD', 'AD'), 'german', 'ukwd_reused'],
-    [germanWiring.toLowerCase(), 'german', 'ukwd_german_contacts'],
+    [germanWiring.replace('AB', 'aj'), 'german', 'ukwd_german_contacts'],
     [germanWiring.replace('AB', 'A-'), 'german', 'ukwd_german_contacts'],
     [germanWiring.replace('AB', 'ABC'), 'german', 'ukwd_pair'],
   ]) {

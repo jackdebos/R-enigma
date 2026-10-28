@@ -11,7 +11,8 @@ export function convertUKWDPairs(pairs, from, to) {
 // Input pairs are free contacts only; BO is supplied by the engine definition.
 export function parseUKWD(text, notation = 'german') {
   const fail = error => ({ pairs: null, error });
-  const words = text.trim() ? text.trim().split(/\s+/u) : [];
+  // Contacts are letters, so lowercase input means the same wiring.
+  const words = text.trim() ? text.trim().toUpperCase().split(/\s+/u) : [];
   if (words.length !== 12) return fail('ukwd_count');
   if (words.some(pair => Array.from(pair).length !== 2)) return fail('ukwd_pair');
   const contacts = notation === 'bp' ? 'ACDEFGHIJKLMNPQRSTUVWXYZ' : 'ABCDEFGHIKLMNOPQRSTUVWXZ';
