@@ -201,6 +201,8 @@ pub(crate) mod record {
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub(crate) struct Slot {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(crate) pairs: Option<Vec<(char, char)>>,
         pub(crate) id: String,
         pub(crate) wheel: String,
         pub(crate) position: char,
@@ -240,6 +242,7 @@ pub(crate) mod record {
                         .slots()
                         .iter()
                         .map(|slot| Slot {
+                            pairs: slot.pairs().map(<[_]>::to_vec),
                             id: slot.id().into(),
                             wheel: slot.wheel().into(),
                             position: slot.position(),
@@ -268,7 +271,12 @@ pub(crate) mod record {
             let measure = crate::selection::parse_measures(measures)
                 .map_err(|_| CheckpointError("unknown score measure".into()))?[0];
             let slots = self.configuration.slots.iter().map(|slot| {
-                crate::SlotConfiguration::new(&slot.id, &slot.wheel, slot.position, slot.ring)
+                let key =
+                    crate::SlotConfiguration::new(&slot.id, &slot.wheel, slot.position, slot.ring);
+                match &slot.pairs {
+                    Some(pairs) => key.with_pairs(pairs.clone()),
+                    None => key,
+                }
             });
             let configuration = crate::TransformConfiguration::new(
                 slots.collect(),

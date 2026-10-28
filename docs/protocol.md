@@ -124,6 +124,7 @@ By default progress is drawn on stderr when it is a terminal, and the result is
 printed on stdout and saved as a report in the working directory.
 See docs/protocol.md for the contract.
 The CPU-only bombe crib attack is described in docs/crib-attack.md.
+UKW-D wiring search is CPU-only; known wiring supports GPU plugboard attacks.
 ```
 
 Relative paths in every option value use the invocation working directory.
@@ -392,7 +393,7 @@ exactly `alphabet`, `wheels`, `slots`, and `stepping`:
   alphabet symbol for each input symbol; the inverse is derived. `turnovers` contains
   distinct alphabet symbols and refers to displayed pre-step positions, not ring-adjusted
   positions. A wheel used in a reflector slot must be involutive.
-  A **rewirable** wheel (UKW-D, Stage 5; transform implemented, search pending) replaces
+  A **rewirable** wheel (UKW-D, Stage 5; transform and CPU wiring search implemented) replaces
   `wiring` with `rewirable: {"fixed_pairs": [[SYMBOL,SYMBOL],...]}`: disjoint pairs
   wired permanently (possibly empty), leaving an even, nonzero number of free symbols.
   Its key wiring is supplied by the configuration (§3.2) and completes an involution.
@@ -707,10 +708,14 @@ work, total mathematical-board count, rate or backend scheduling cursor is promi
 `outer_index`, `start_index`, `incomplete`, `final_objective_ascent`, and
 `neighborhood_exhausted`. `configuration` uses the complete transform key shape
 (§3.2): resolved initial slots in definition order and the **winning complete**
-plugboard, fixed pairs union committed mutable pairs. It is not the stepped key.
+plugboard, fixed pairs union committed mutable pairs. Rewirable slot entries include
+the winning free wiring `pairs`, oriented and sorted by alphabet indices, in both
+`best` and hold entries. It is not the stepped key.
 `mutable_plugboard` separately contains just the winning mutable remainder. Pairs
 are oriented and sorted by ordered alphabet indices. `start_index` is 0 for direct
-HC and the dense seed index for PE; `outer_index` is absolute, unsliced.
+HC and the dense seed index for PE; with searched reflector wiring it is the
+reflector start index ([search-passes §11](search-passes.md#113-starts)).
+`outer_index` is absolute, unsliced.
 `score` has exactly `measure` (the requested final measure ID), `measured_q32`,
 `ranking_q32`, `measured` and `ranking`; the same shape is used in every hold entry. Ranking is higher-is-better; do not negate measured entropy.
 The three boolean winner flags are independent of each other and of run termination;
@@ -1187,7 +1192,7 @@ Task 17 is the differential-oracle validation task.
 ## 10. Version and status
 
 Engine 0.3.0 adds the Railway, G-312, G-260, and I/M3 UKW-D bundled catalog ids
-and rewirable-wheel transforms (UKW-D search remains pending) under
+and rewirable-wheel transforms and CPU wiring search under
 protocol version 1. Engine 0.2.0 added the optional `space.constraints` member;
 both are additive extensions like `hold` and chained stages.
 

@@ -116,6 +116,7 @@ impl Iterator for CandidateIterator<'_> {
 /// One definition slot's ordered values per dimension, in the frozen `wheel`, `position`,
 /// `ring` order.
 struct SlotAxes {
+    pairs: Option<Vec<(char, char)>>,
     id: String,
     wheels: Vec<String>,
     positions: Vec<char>,
@@ -310,7 +311,24 @@ impl<'a> CandidatePlan<'a> {
             radices.push(wheels.len() as u128);
             radices.push(positions.len() as u128);
             radices.push(rings.len() as u128);
+            let pairs = fixed
+                .and_then(|s| s.pairs())
+                .map(<[_]>::to_vec)
+                .or_else(|| {
+                    domain.filter(|d| d.searches_pairs()).map(|_| {
+                        let name = crate::space::rewirable_slot_wheel(definition, id)
+                            .expect("validated wiring domain");
+                        crate::rewirable::start(
+                            definition.alphabet(),
+                            definition
+                                .rewirable_fixed_pairs(name)
+                                .expect("rewirable wheel"),
+                            0,
+                        )
+                    })
+                });
             slots.push(SlotAxes {
+                pairs,
                 id: id.to_owned(),
                 wheels,
                 positions,
@@ -394,12 +412,16 @@ impl<'a> CandidatePlan<'a> {
         let mut slots = Vec::with_capacity(self.slots.len());
         for (slot_index, axes) in self.slots.iter().enumerate() {
             let base = slot_index * 3;
-            slots.push(SlotConfiguration::new(
+            let slot = SlotConfiguration::new(
                 axes.id.clone(),
                 axes.wheels[digits[base] as usize].clone(),
                 axes.positions[digits[base + 1] as usize],
                 axes.rings[digits[base + 2] as usize],
-            ));
+            );
+            slots.push(match &axes.pairs {
+                Some(pairs) => slot.with_pairs(pairs.clone()),
+                None => slot,
+            });
         }
 
         let mut plugboard = self.fixed_plugboard.clone();

@@ -133,6 +133,8 @@ impl std::error::Error for AcceleratorError {}
 /// Typed reason an exact climb job cannot be expressed by this interface.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClimbUnsupported {
+    /// Rewirable reflector search is CPU-only.
+    ReflectorWiring,
     /// Deductive crib testing is CPU-only.
     Bombe,
     /// Byte rows require at most 256 symbols.
@@ -151,6 +153,7 @@ impl std::fmt::Display for ClimbUnsupported {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Bombe => f.write_str("bombe is CPU-only"),
+            Self::ReflectorWiring => f.write_str("UKW-D wiring search is CPU-only"),
             Self::AlphabetTooLarge => f.write_str("alphabet exceeds 256 symbols"),
             Self::RowDataLimit => f.write_str("text exceeds accelerator row data limit"),
             Self::Objective(id) => write!(f, "unsupported objective {}", id.id()),
@@ -481,6 +484,9 @@ impl AttackRequest {
     /// Check eligibility without evaluations, progress events or outer-key work.
     /// Finalist stages are CPU-owned and do not restrict the outer objectives.
     pub fn climb_job(&self) -> Result<ClimbJob<'_>, ClimbUnsupported> {
+        if self.settings().reflector_starts().is_some() {
+            return Err(ClimbUnsupported::ReflectorWiring);
+        }
         if self.settings().kind() == AttackKind::Bombe {
             return Err(ClimbUnsupported::Bombe);
         }

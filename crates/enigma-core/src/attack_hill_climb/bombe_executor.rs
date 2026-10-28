@@ -39,14 +39,7 @@ impl crate::AttackRequest {
         initial: &ResolvedConfiguration,
         domain: &AttackPlugboardDomain,
     ) -> Result<ResolvedConfiguration, TrialEvaluationError> {
-        let slots = initial
-            .topology()
-            .slots()
-            .iter()
-            .map(|slot| {
-                crate::SlotConfiguration::new(slot.id(), slot.wheel(), slot.position(), slot.ring())
-            })
-            .collect();
+        let slots = initial.key_slots().to_vec();
         crate::TransformConfiguration::new(slots, domain.fixed_pairs().to_vec())
             .resolve(self.definition())
             .map_err(|_| TrialEvaluationError::Invariant("deduced fixed key failed to resolve"))

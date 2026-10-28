@@ -18,6 +18,7 @@ use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
 mod accelerator_executor;
 mod bombe_executor;
+mod reflector_executor;
 
 type MutableBoard = Vec<(char, char)>;
 
@@ -81,15 +82,7 @@ impl DirectOuterOutcome {
                 pairs.push((left, right));
             }
         }
-        let slots = self
-            .initial
-            .topology()
-            .slots()
-            .iter()
-            .map(|slot| {
-                crate::SlotConfiguration::new(slot.id(), slot.wheel(), slot.position(), slot.ring())
-            })
-            .collect();
+        let slots = self.initial.key_slots().to_vec();
         Ok(crate::AttackBest {
             crib_position: None,
             configuration: crate::TransformConfiguration::new(slots, pairs),
@@ -282,6 +275,7 @@ pub(crate) mod block_snapshot {
                 return Err(fail("progress_last_emitted exceeds completed evaluations"));
             }
             let bombe = request.settings().kind() == crate::AttackKind::Bombe;
+            let projected = bombe || request.settings().reflector_starts().is_some();
             if bombe != record.counters.bombe_settings.is_some() {
                 return Err(fail("checkpoint counter kind mismatch"));
             }
@@ -299,7 +293,7 @@ pub(crate) mod block_snapshot {
                     used: record.evaluations_used.0,
                 },
                 best,
-                acceptance: DirectAcceptance((capacity > 1 || bombe).then_some(hold)),
+                acceptance: DirectAcceptance((capacity > 1 || projected).then_some(hold)),
             })
         }
     }
@@ -548,11 +542,36 @@ impl crate::AttackRequest {
                 return Err(CheckpointError("unexpected crib position".into()));
             }
             let raw = block_snapshot::restore_raw(self, entry)?;
-            if initial != raw.initial || entry.score.measure != self.settings().final_measure().id()
-            {
+            let valid_initial = if self.settings().reflector_starts().is_some() {
+                let same_slots =
+                    initial
+                        .key_slots()
+                        .iter()
+                        .zip(raw.initial.key_slots())
+                        .all(|(a, b)| {
+                            a.id() == b.id()
+                                && a.wheel() == b.wheel()
+                                && a.position() == b.position()
+                                && a.ring() == b.ring()
+                        });
+                same_slots
+                    && entry.start_index.0
+                        < u128::from(self.settings().reflector_starts().expect("searched"))
+            } else {
+                initial == raw.initial
+            };
+            if !valid_initial || entry.score.measure != self.settings().final_measure().id() {
                 return Err(CheckpointError("entry key or measure mismatch".into()));
             }
-            let scorer = preparation.evaluator(&initial, index, self.settings().final_measure());
+            // Stored wiring is key material, not the outer plan's start-0 wiring.
+            let scorer = TrialEvaluator::new(
+                &raw.initial,
+                self.domain(),
+                self.text(),
+                Direction::Decrypt,
+                self.settings().final_measure(),
+                self.bound_resource(self.settings().final_measure()),
+            );
             let (plaintext, score) = scorer
                 .evaluate(&entry.mutable_plugboard)
                 .map_err(|error| CheckpointError(format!("entry re-scoring failed: {error}")))?;
@@ -652,11 +671,14 @@ impl crate::AttackRequest {
         });
         if self.settings().kind() == crate::AttackKind::Bombe {
             state.control.enable_bombe();
-            if state.acceptance.0.is_none() {
-                state.acceptance.0 = Some(crate::attack_hold::AttackHold::new(
-                    self.settings().hold_capacity(),
-                ));
-            }
+        }
+        if (self.settings().kind() == crate::AttackKind::Bombe
+            || self.settings().reflector_starts().is_some())
+            && state.acceptance.0.is_none()
+        {
+            state.acceptance.0 = Some(crate::attack_hold::AttackHold::new(
+                self.settings().hold_capacity(),
+            ));
         }
         let block_snapshot::BlockPhaseSnapshot {
             next_outer,
@@ -1067,6 +1089,10 @@ pub(crate) struct DirectRunOutcome {
 
 #[derive(Debug)]
 pub(crate) enum DirectRunError {
+    Reflector {
+        start_index: u128,
+        source: Box<DirectRunError>,
+    },
     Bombe {
         start_index: Option<u128>,
         source: Box<DirectRunError>,
@@ -2207,6 +2233,10 @@ impl ControlledDirectError {
                 start_index,
                 source,
             } => (*source, Some(start_index)),
+            DirectRunError::Reflector {
+                start_index,
+                source,
+            } => (*source, Some(Some(start_index))),
             source => (source, None),
         };
         let start_index = bombe_index.unwrap_or_else(|| match &source {
@@ -2217,7 +2247,9 @@ impl ControlledDirectError {
         });
         let mut projection_error = None;
         let source = match source {
-            DirectRunError::Bombe { .. } => RunPayload::Invariant("nested bombe error"),
+            DirectRunError::Bombe { .. } | DirectRunError::Reflector { .. } => {
+                RunPayload::Invariant("nested start error")
+            }
             DirectRunError::Projection(error) => {
                 projection_error = Some(error);
                 RunPayload::Invariant("accepted best projection failed")
@@ -2644,6 +2676,7 @@ fn run_worker_block<T, E>(
 
 /// A worker's finished block, owned until the coordinator commits it in key order.
 enum PhaseBlock {
+    // Projected complete-key offers: bombe stops or searched-wiring starts.
     Bombe(BlockOutcome<Vec<crate::AttackBest>, DirectRunError>),
     Direct(BlockOutcome<DirectOuterOutcome, DirectRunError>),
     Partial(BlockOutcome<ControlledPartialOutcome, ControlledPartialError>),
@@ -2891,7 +2924,9 @@ impl crate::AttackRequest {
         plan: &crate::attack_blocks::OuterPlan<'_>,
         block: OuterBlock,
     ) -> PhaseBlock {
-        if self.settings().kind() == crate::AttackKind::Bombe {
+        if let Some(starts) = self.settings().reflector_starts() {
+            PhaseBlock::Bombe(self.run_reflector_block(plan, block, starts))
+        } else if self.settings().kind() == crate::AttackKind::Bombe {
             PhaseBlock::Bombe(self.run_bombe_block(preparation, plan, block))
         } else if self.settings().kind() == crate::AttackKind::PartialExhaustion {
             PhaseBlock::Partial(self.run_partial_block(preparation, plan, block))
@@ -3018,7 +3053,7 @@ impl crate::AttackRequest {
                     acceptance
                         .0
                         .as_mut()
-                        .expect("bombe uses projected hold")
+                        .expect("projected blocks use a hold")
                         .offer(offer);
                 }
                 for candidate in candidates {
@@ -3571,6 +3606,41 @@ impl<'a> BoundClimbScoring<'a> {
         )
     }
 
+    fn ascend_board<'c, A: EvaluationAccounting>(
+        &'c self,
+        mut state: ScoringState<'c, 'a>,
+        backtrack_pairs: usize,
+        allowance: &mut A,
+    ) -> Result<(ScoringState<'c, 'a>, bool, bool), A::Error> {
+        let mut final_ascent = false;
+        let exhausted = loop {
+            let selection = NeighborhoodSelection {
+                initial: self.initial,
+                domain: self.domain,
+                evaluator: if state.final_phase {
+                    &self.final_evaluator
+                } else {
+                    &self.initial_evaluator
+                },
+                backtrack_pairs,
+            };
+            match selection.scan(
+                &state.current.board,
+                state.current.score.ranking(),
+                allowance,
+            )? {
+                ScanOutcome::Cancelled => break false,
+                ScanOutcome::Complete(winner) => {
+                    final_ascent |= state.final_phase || self.identical;
+                    let Some(winner) = winner else { break true };
+                    state = state.commit_trial(winner, allowance)?;
+                    allowance.cancelled();
+                }
+            }
+        };
+        Ok((state, exhausted, final_ascent))
+    }
+
     fn climb_accounted<A: EvaluationAccounting>(
         &self,
         board: MutableBoard,
@@ -3587,40 +3657,12 @@ impl<'a> BoundClimbScoring<'a> {
                 neighborhood_exhausted: false,
             });
         }
-        let mut state = self.start(board, allowance)?;
+        let state = self.start(board, allowance)?;
         allowance.transition(AttackControl::record_climb_started)?;
         allowance.cancelled();
-        let mut final_objective_ascent = false;
-        let neighborhood_exhausted = loop {
-            // Build from this state's context, never an independently bound evaluator.
-            let selection = NeighborhoodSelection {
-                initial: self.initial,
-                domain: self.domain,
-                evaluator: if state.final_phase {
-                    &self.final_evaluator
-                } else {
-                    &self.initial_evaluator
-                },
-                backtrack_pairs,
-            };
-            let outcome = selection.scan(
-                &state.current.board,
-                state.current.score.ranking(),
-                allowance,
-            )?;
-            match outcome {
-                ScanOutcome::Cancelled => {
-                    cancelled = true;
-                    break false;
-                }
-                ScanOutcome::Complete(winner) => {
-                    final_objective_ascent |= state.final_phase || self.identical;
-                    let Some(winner) = winner else { break true };
-                    state = state.commit_trial(winner, allowance)?;
-                    allowance.cancelled();
-                }
-            }
-        };
+        let (state, neighborhood_exhausted, final_objective_ascent) =
+            self.ascend_board(state, backtrack_pairs, allowance)?;
+        cancelled |= !neighborhood_exhausted;
         // Final rescoring is required even after cancellation; errors still propagate.
         // Consuming finalization cannot run twice.
         let current = state.finalize(allowance)?;

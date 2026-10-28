@@ -755,7 +755,8 @@ and §4, compared lexicographically; it is unique per climb. Before stages, ever
 entry carries its HC/PE `final_measure` score, so all are comparable.
 
 A duplicate is an offer whose complete key equals a held entry's: every resolved
-slot (wheel, position, ring) and the complete plugboard (fixed plus mutable pairs).
+slot (wheel, position, ring, and wiring `pairs` when rewirable) and the complete
+plugboard (fixed plus mutable pairs).
 Deterministic scoring gives duplicates equal scores, so the held entry has the
 smaller index; the offer is rejected without evicting anything. Otherwise, while
 fewer than N entries are held, the offer is inserted at its ordered position (after
@@ -843,8 +844,10 @@ Deliberate departures from pinned bomm:
 
 ## 11. Rewirable reflector (UKW-D) — Stage 5
 
-Status: **specified, not implemented** (plan `odd/tasks/enigma-wwii-machines.md`,
-T9–T13). Protocol [§3.1](protocol.md#31-machine-definition) and
+Status: **Core transform and CPU wiring search implemented**, including complete
+result/hold keys, stages and checkpoint re-verification (plan
+`odd/tasks/enigma-wwii-machines.md`, T9–T11). Human-report wiring display and web
+controls remain T11/T13 work. Protocol [§3.1](protocol.md#31-machine-definition) and
 [§3.2](protocol.md#32-configuration-and-transform) define the rewirable wheel
 and its `pairs` key; this section defines how an attack searches that key.
 
@@ -874,10 +877,19 @@ job.attack.reflector_starts := INTEGER   (1 to 1000000)
 
 `pairs` is allowed only for a slot whose wheel is rewirable (protocol §3.1),
 exactly once per such slot, and conflicts with a fixed `pairs` in
-`configuration` (`invalid_search_space`, as for any double coverage). A known
-wiring is given in `configuration` and needs no new attack setting.
+`configuration` (`invalid_search_space`, as for any double coverage, at
+`/job/space/slots/<index>/pairs`). An uncovered wiring uses the existing missing
+dimension diagnostic, `invalid_search_space` at `/job/space/slots`. A `pairs`
+domain on a non-rewirable slot is `unknown_field` at that domain's `pairs`;
+malformed domain shape or kind is `invalid_search_space` there. Unknown members
+inside the domain remain `unknown_field` at the member, checked before kind.
+A known wiring is given in `configuration` and needs no new attack setting.
 `reflector_starts` is required when a wiring is searched and forbidden
-otherwise (`invalid_request` at `/job/attack/reflector_starts`). Partially known
+otherwise (`invalid_request` at `/job/attack/reflector_starts`). Like
+`progress_every`, a supplied value that is not a JSON integer in 1..=1000000
+(zero, negative, fractional, exponent form, wrong type, null, overflow) is also
+`invalid_request` at `/job/attack/reflector_starts`; unknown-member validation
+retains precedence. Partially known
 wirings are not supported in this stage: the wiring is either fully fixed or
 fully searched. The legacy subset branch rejects `pairs` domains with
 `invalid_search_space`.

@@ -42,6 +42,21 @@ impl AttackGate {
                 "/job/space/plugboard",
             ));
         }
+        let searched = request.space().slots().iter().any(|s| s.searches_pairs());
+        if searched && settings.kind() != AttackKind::HillClimb {
+            return Err(failure(
+                "unsupported_pass",
+                "searched reflector wiring supports hill_climb only",
+                "/job/passes",
+            ));
+        }
+        if searched != settings.reflector_starts().is_some() {
+            return Err(failure(
+                "invalid_request",
+                "reflector_starts is required exactly when reflector wiring is searched",
+                "/job/attack/reflector_starts",
+            ));
+        }
         let expected = match settings.kind() {
             AttackKind::HillClimb => "hill_climb",
             AttackKind::PartialExhaustion => "partial_exhaustion",
@@ -206,7 +221,7 @@ impl AttackGate {
                         "/job/attack/start",
                     ));
                 }
-                1
+                u128::from(settings.reflector_starts().unwrap_or(1))
             }
             (AttackKind::PartialExhaustion, None, Some(policy)) => {
                 let n = domain.symbols().len() as u128;

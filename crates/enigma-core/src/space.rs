@@ -83,9 +83,15 @@ pub struct SearchFixedSlot {
     wheel: Option<String>,
     position: Option<char>,
     ring: Option<char>,
+    pairs: Option<Vec<(char, char)>>,
 }
 
 impl SearchFixedSlot {
+    /// Complete known free wiring pairs on a rewirable slot.
+    pub fn pairs(&self) -> Option<&[(char, char)]> {
+        self.pairs.as_deref()
+    }
+
     /// Slot identifier; must name a definition slot.
     pub fn id(&self) -> &str {
         &self.id
@@ -141,9 +147,15 @@ pub struct SearchSlotDomain {
     wheels: Option<Vec<String>>,
     positions: Option<Vec<char>>,
     rings: Option<Vec<char>>,
+    pairs: bool,
 }
 
 impl SearchSlotDomain {
+    /// Whether this domain searches the rewirable reflector's free pairs.
+    pub fn searches_pairs(&self) -> bool {
+        self.pairs
+    }
+
     /// Definition slot identifier this domain applies to.
     pub fn id(&self) -> &str {
         &self.id
@@ -417,6 +429,7 @@ pub struct AttackSettings {
     stages: Vec<AttackStage>,
     stage_measure_explicit: Vec<bool>,
     crib: Option<(String, Option<usize>)>,
+    reflector_starts: Option<u64>,
 }
 
 impl AttackSettings {
@@ -481,6 +494,7 @@ impl AttackSettings {
                 "backtrack_pairs",
                 "progress_every",
                 "hold",
+                "reflector_starts",
                 "start",
                 "seeds",
                 if settings.get("kind").and_then(Value::as_str) == Some("bombe") {
@@ -586,6 +600,20 @@ impl AttackSettings {
         };
         let switch_pairs = threshold("switch_pairs")?;
         let backtrack_pairs = threshold("backtrack_pairs")?;
+        let reflector_starts = settings
+            .get("reflector_starts")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .filter(|n| (1..=1_000_000).contains(n))
+                    .ok_or_else(|| {
+                        vec![invalid(
+                            "reflector_starts must be an integer in [1, 1000000]",
+                            child(PATH, "reflector_starts"),
+                        )]
+                    })
+            })
+            .transpose()?;
         let hold_capacity = settings.get("hold").map_or(Ok(100), |value| {
             value
                 .as_u64()
@@ -717,7 +745,13 @@ impl AttackSettings {
             stages,
             stage_measure_explicit,
             crib,
+            reflector_starts,
         })
+    }
+
+    /// Independent wiring starts, present only when reflector wiring is searched.
+    pub fn reflector_starts(&self) -> Option<u64> {
+        self.reflector_starts
     }
 
     /// Supplied crib text and optional fixed scalar position (without normalization).
@@ -1179,6 +1213,24 @@ impl ParsedAttackRequest {
                     Ok((measures, (domain, settings)))
                 },
             )?;
+            let searched = carrier
+                .space()
+                .slots()
+                .iter()
+                .any(SearchSlotDomain::searches_pairs);
+            if searched && settings.kind() != AttackKind::HillClimb {
+                return Err(vec![SearchDiagnostic::new(
+                    "unsupported_pass",
+                    "searched reflector wiring supports hill_climb only",
+                    "/job/passes",
+                )]);
+            }
+            if searched != settings.reflector_starts().is_some() {
+                return Err(vec![invalid(
+                    "reflector_starts is required exactly when reflector wiring is searched",
+                    "/job/attack/reflector_starts",
+                )]);
+            }
             Ok(Self {
                 carrier,
                 domain,
@@ -1408,7 +1460,11 @@ fn parse_configuration(
     for (index, entry) in entries.iter().enumerate() {
         let entry_path = child(&slots_path, &index.to_string());
         let entry = object(entry, &entry_path)?;
-        allow_keys(entry, &["id", "wheel", "position", "ring"], &entry_path)?;
+        allow_keys(
+            entry,
+            &["id", "wheel", "position", "ring", "pairs"],
+            &entry_path,
+        )?;
 
         let id = required_string(entry, "id", &entry_path)?;
         let id_path = child(&entry_path, "id");
@@ -1463,11 +1519,47 @@ fn parse_configuration(
         };
         let position = optional_symbol(entry, "position", &entry_path, definition.alphabet())?;
         let ring = optional_symbol(entry, "ring", &entry_path, definition.alphabet())?;
+        let pairs = entry
+            .get("pairs")
+            .map(|value| {
+                let path = child(&entry_path, "pairs");
+                let name = rewirable_slot_wheel(definition, id).ok_or_else(|| {
+                    vec![SearchDiagnostic::new(
+                        "unknown_field",
+                        "pairs is allowed only on a rewirable slot",
+                        &path,
+                    )]
+                })?;
+                let pairs = parse_pair_array(array(value, &path)?, &path)?;
+                let declared = definition
+                    .wheels()
+                    .iter()
+                    .find(|w| w.name() == name)
+                    .expect("declared wheel");
+                crate::configuration::resolve_rewirable(
+                    definition.alphabet(),
+                    declared,
+                    definition
+                        .rewirable_fixed_pairs(name)
+                        .expect("rewirable wheel"),
+                    &pairs,
+                    &path,
+                )
+                .map_err(|errors| {
+                    errors
+                        .into_iter()
+                        .map(|e| SearchDiagnostic::new(e.code(), e.message(), e.location()))
+                        .collect::<Vec<_>>()
+                })?;
+                Ok::<_, Vec<SearchDiagnostic>>(pairs)
+            })
+            .transpose()?;
         slots.push(SearchFixedSlot {
             id: id.to_owned(),
             wheel,
             position,
             ring,
+            pairs,
         });
     }
 
@@ -1530,12 +1622,14 @@ fn parse_space(
         let mut seen = HashSet::new();
         for (index, entry) in entries.iter().enumerate() {
             let entry_path = child(&slots_path, &index.to_string());
-            slots.push(parse_slot_domain(
-                definition,
-                entry,
-                &entry_path,
-                &mut seen,
-            )?);
+            let domain = parse_slot_domain(definition, entry, &entry_path, &mut seen)?;
+            if domain.searches_pairs() && matches!(plugboard, PlugboardConstruction::LegacyPool) {
+                return Err(vec![invalid_search_space(
+                    "pairs domains require the attack branch",
+                    child(&entry_path, "pairs"),
+                )]);
+            }
+            slots.push(domain);
         }
     }
 
@@ -1596,7 +1690,11 @@ fn parse_slot_domain(
     seen: &mut HashSet<String>,
 ) -> Result<SearchSlotDomain, Vec<SearchDiagnostic>> {
     let entry = object(value, path)?;
-    allow_keys(entry, &["id", "wheels", "positions", "rings"], path)?;
+    allow_keys(
+        entry,
+        &["id", "wheels", "positions", "rings", "pairs"],
+        path,
+    )?;
 
     let id = required_string(entry, "id", path)?;
     let id_path = child(path, "id");
@@ -1666,7 +1764,30 @@ fn parse_slot_domain(
         None => None,
     };
 
-    if wheels.is_none() && positions.is_none() && rings.is_none() {
+    let pairs = if let Some(value) = entry.get("pairs") {
+        let path = child(path, "pairs");
+        if rewirable_slot_wheel(definition, id).is_none() {
+            return Err(vec![SearchDiagnostic::new(
+                "unknown_field",
+                "pairs is allowed only on a rewirable slot",
+                path,
+            )]);
+        }
+        let fields = value
+            .as_object()
+            .ok_or_else(|| vec![invalid_search_space("pairs must be {kind: attack}", &path)])?;
+        allow_keys(fields, &["kind"], &path)?;
+        if fields.get("kind").and_then(Value::as_str) != Some("attack") {
+            return Err(vec![invalid_search_space(
+                "pairs must be {kind: attack}",
+                path,
+            )]);
+        }
+        true
+    } else {
+        false
+    };
+    if wheels.is_none() && positions.is_none() && rings.is_none() && !pairs {
         return Err(vec![invalid_search_space(
             "slot domain must declare at least one of `wheels`, `positions`, or `rings`",
             path,
@@ -1678,7 +1799,16 @@ fn parse_slot_domain(
         wheels,
         positions,
         rings,
+        pairs,
     })
+}
+
+pub(crate) fn rewirable_slot_wheel<'a>(definition: &'a Definition, id: &str) -> Option<&'a str> {
+    let slot = definition.slots().iter().find(|s| s.id() == id)?;
+    let name = slot
+        .wheel()
+        .or_else(|| slot.allowed_wheels().first().map(String::as_str))?;
+    definition.rewirable_fixed_pairs(name).map(|_| name)
 }
 
 fn parse_plugboard_domain(
@@ -1765,6 +1895,17 @@ fn validate_coverage(
                 .and_then(|(_, domain)| domain.rings.as_ref())
                 .is_some(),
         )?;
+
+        if rewirable_slot_wheel(definition, id).is_some() {
+            require_dimension(
+                id,
+                "pairs",
+                "pairs",
+                fixed_slot.and_then(|s| s.pairs()).is_some(),
+                domain_entry.map(|(index, _)| index),
+                domain_entry.is_some_and(|(_, d)| d.searches_pairs()),
+            )?;
+        }
 
         // A structurally fixed wheel has no wheel dimension; declaring wheels for it was
         // already rejected during slot-domain parsing.

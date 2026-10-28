@@ -228,6 +228,7 @@ impl<'a> RunPreparation<'a> {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn evaluator(
         &'a self,
         initial: &'a ResolvedConfiguration,
@@ -253,7 +254,11 @@ impl<'a> RunPreparation<'a> {
             objective,
             self.owner.bound_resource(objective),
         );
-        evaluator.shared = Some((self, outer_index));
+        // Searched-wiring finalists can share an outer index but not a wiring.
+        // Keep their rows local to this evaluator, including chained stages.
+        if self.owner.settings().reflector_starts().is_none() {
+            evaluator.shared = Some((self, outer_index));
+        }
         evaluator
     }
 }
@@ -312,6 +317,22 @@ impl<'a> TrialEvaluator<'a> {
 
     pub(super) fn objective(&self) -> MeasureId {
         self.objective
+    }
+
+    /// One fresh decrypt without building board-free rows. Wiring trials change
+    /// those rows every call, so preparing all alphabet inputs would be wasted work.
+    pub(super) fn evaluate_fresh(
+        &self,
+        mutable: &[(char, char)],
+    ) -> Result<(String, MeasuredScore), TrialEvaluationError> {
+        let board = validated_trial_board(self.initial, self.domain, mutable)
+            .map_err(TrialEvaluationError::Board)?;
+        let mut engine = self.fresh_engine(board)?;
+        let plaintext = engine
+            .transform(self.input, self.direction)
+            .map_err(TrialEvaluationError::Model)?;
+        let score = self.measure(&plaintext)?;
+        Ok((plaintext, score))
     }
 
     pub(super) fn evaluate(

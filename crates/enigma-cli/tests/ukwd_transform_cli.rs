@@ -267,11 +267,11 @@ fn ukwd_search_fails_closed_without_a_wiring_key() {
                 job.insert("attack".into(), json!({"kind":"hill_climb","initial_measure":"ic","final_measure":"ic","switch_pairs":1,"backtrack_pairs":0,"start":[]}));
             }
             let error = single_error(&request);
-            assert_eq!(error["code"], "invalid_slot");
-            assert_eq!(error["location"], "/job/configuration/slots/0/pairs");
+            assert_eq!(error["code"], "invalid_search_space");
+            assert_eq!(error["location"], "/job/space/slots");
             assert_eq!(
                 error["message"],
-                "slot \"reflector\" uses rewirable wheel \"D\" and requires `pairs`"
+                "slot \"reflector\" pairs is neither fixed in configuration nor declared in space.slots; add exactly one path"
             );
         }
     }

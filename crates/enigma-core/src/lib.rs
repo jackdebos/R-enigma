@@ -86,6 +86,7 @@ mod measure;
 mod ngram;
 mod request;
 mod resource;
+mod rewirable;
 
 pub use binding::{BoundResource, MAX_RESOURCE_REFERENCES, MAX_RESOURCE_TOTAL_BYTES};
 pub use resource::{

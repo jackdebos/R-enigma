@@ -273,10 +273,17 @@ impl TransformConfiguration {
             .bind_stepping(&topology)
             .map_err(|error| vec![definition_error(error)])?;
 
+        let mut key_slots = self.slots.clone();
+        for slot in &mut key_slots {
+            if let Some(pairs) = &mut slot.pairs {
+                crate::rewirable::canonical(alphabet, pairs);
+            }
+        }
         Ok(ResolvedConfiguration {
             topology,
             stepping,
             plugboard,
+            key_slots,
         })
     }
 }
@@ -291,9 +298,14 @@ pub struct ResolvedConfiguration {
     topology: MachineTopology,
     stepping: Stepping,
     plugboard: Plugboard,
+    key_slots: Vec<SlotConfiguration>,
 }
 
 impl ResolvedConfiguration {
+    pub(crate) fn key_slots(&self) -> &[SlotConfiguration] {
+        &self.key_slots
+    }
+
     /// The concrete physical machine built from the definition structure and key values.
     pub fn topology(&self) -> &MachineTopology {
         &self.topology
@@ -344,7 +356,7 @@ fn validate_slot_count(
 }
 
 /// Completes the validated permanent pairs with a full, disjoint wiring key.
-fn resolve_rewirable(
+pub(crate) fn resolve_rewirable(
     alphabet: &Alphabet,
     wheel: &Wiring,
     fixed: &[(char, char)],

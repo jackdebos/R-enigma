@@ -163,6 +163,8 @@ struct WinningConfiguration {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct WinningSlot {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pairs: Option<Vec<(char, char)>>,
     id: String,
     wheel: String,
     position: char,
@@ -241,6 +243,7 @@ impl From<&AttackBest> for BestResult {
                     .slots()
                     .iter()
                     .map(|slot| WinningSlot {
+                        pairs: slot.pairs().map(<[_]>::to_vec),
                         id: slot.id().to_owned(),
                         wheel: slot.wheel().to_owned(),
                         position: slot.position(),

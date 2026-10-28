@@ -460,6 +460,7 @@ By default progress is drawn on stderr when it is a terminal, and the result is
 printed on stdout and saved as a report in the working directory.
 See docs/protocol.md for the contract.
 The CPU-only bombe crib attack is described in docs/crib-attack.md.
+UKW-D wiring search is CPU-only; known wiring supports GPU plugboard attacks.
 "#
     )
 }
@@ -676,27 +677,34 @@ fn run_attack_presented<'s>(
         Ok(validated) => {
             let (execution, backend) = execution;
             let gpu = if backend.choice == Some(Backend::Gpu) {
-                let job = match validated.climb_job() {
-                    Ok(job) => job,
-                    // Bombe's CPU-only boundary is a backend capability error;
-                    // retain the existing unsupported_job mapping for HC/PE.
-                    Err(enigma_core::ClimbUnsupported::Bombe) => {
-                        return failure(
+                let job =
+                    match validated.climb_job() {
+                        Ok(job) => job,
+                        // Bombe's CPU-only boundary is a backend capability error;
+                        // retain the existing unsupported_job mapping for HC/PE.
+                        Err(enigma_core::ClimbUnsupported::ReflectorWiring) => return failure(
                             out,
                             "backend_unavailable",
-                            "GPU backend unavailable: the crib attack runs on the CPU only",
+                            "GPU backend unavailable: the UKW-D wiring search runs on the CPU only",
                             "/job/attack",
-                        )
-                    }
-                    Err(reason) => {
-                        return failure(
-                            out,
-                            "unsupported_job",
-                            &format!("--backend gpu does not support this attack: {reason}"),
-                            "/job/attack",
-                        )
-                    }
-                };
+                        ),
+                        Err(enigma_core::ClimbUnsupported::Bombe) => {
+                            return failure(
+                                out,
+                                "backend_unavailable",
+                                "GPU backend unavailable: the crib attack runs on the CPU only",
+                                "/job/attack",
+                            )
+                        }
+                        Err(reason) => {
+                            return failure(
+                                out,
+                                "unsupported_job",
+                                &format!("--backend gpu does not support this attack: {reason}"),
+                                "/job/attack",
+                            )
+                        }
+                    };
                 let gpu =
                     match enigma_gpu::GpuClimbAccelerator::new(backend.usage.unwrap_or(100), 1) {
                         Ok(gpu) => gpu,

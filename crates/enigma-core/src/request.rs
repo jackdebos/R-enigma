@@ -334,38 +334,6 @@ pub(crate) fn parse_root(json: &str) -> Result<ParsedRoot, Vec<RequestDiagnostic
 
     let job = required(root, "job", "")?.clone();
 
-    // Until search owns wiring keys, reject an omitted key before either search
-    // branch can admit a candidate containing the definition's placeholder wiring.
-    if job.get("kind").and_then(Value::as_str) == Some("search") {
-        for (slot_index, slot) in definition.slots().iter().enumerate() {
-            let wheel = slot
-                .wheel()
-                .or_else(|| slot.allowed_wheels().first().map(String::as_str));
-            let Some(wheel) =
-                wheel.filter(|wheel| definition.rewirable_fixed_pairs(wheel).is_some())
-            else {
-                continue;
-            };
-            let entry = job
-                .pointer("/configuration/slots")
-                .and_then(Value::as_array)
-                .and_then(|entries| {
-                    entries.iter().enumerate().find(|(_, entry)| {
-                        entry.get("id").and_then(Value::as_str) == Some(slot.id())
-                    })
-                });
-            if entry.is_none_or(|(_, entry)| entry.get("pairs").is_none()) {
-                let index = entry.map_or(slot_index, |(index, _)| index);
-                return Err(vec![ConfigurationDiagnostic::missing_rewirable_pairs(
-                    slot.id(),
-                    wheel,
-                    &format!("/job/configuration/slots/{index}/pairs"),
-                )
-                .into()]);
-            }
-        }
-    }
-
     Ok(ParsedRoot { definition, job })
 }
 
