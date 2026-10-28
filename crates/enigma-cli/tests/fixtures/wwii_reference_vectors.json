@@ -164,6 +164,169 @@
     "agreement": true,
     "toledo_ciphertext": "XXHNGOOFTIKOUMTXLHWRPEKCXMOYTPNPADVWQIDEEGUOMNECXIDXTQHQCMNDKIROQAOGZQSMZEALPNYPGUJRYXGSEWNMZBSHZLDPCHKXMHNWPCHISC",
     "palloks_final_positions_ukw_right_middle_left": "ACZG",
-    "provenance": "External simulators only; no repository engine. See docs/historical-catalog.md, WWII additions. Palloks ciphertext is the reference; Toledo disagreement on G is retained, not reconciled by changing either simulator."
+    "provenance": "External simulators only; no repository engine. See docs/historical-catalog.md, WWII additions. Palloks ciphertext is the reference; Toledo disagreement on G is retained, not reconciled by changing either simulator.",
+    "reflector_pairs": [
+      "AK",
+      "CT",
+      "DV",
+      "EP",
+      "FN",
+      "GL",
+      "HM",
+      "IJ",
+      "QW",
+      "RY",
+      "SX",
+      "UZ"
+    ],
+    "german_pairs": [
+      "AQ",
+      "ZH",
+      "XF",
+      "WM",
+      "VN",
+      "UP",
+      "TO",
+      "SR",
+      "LE",
+      "KC",
+      "ID",
+      "GB"
+    ]
+  },
+  {
+    "id": "enigma-i-ukwd-nontrivial",
+    "machine": "enigma-i-ukwd",
+    "rotor_order": [
+      "5",
+      "3",
+      "2"
+    ],
+    "rings": {
+      "ukw": "A",
+      "rotors": [
+        "F",
+        "C",
+        "P"
+      ]
+    },
+    "positions": {
+      "ukw": "A",
+      "rotors": [
+        "K",
+        "U",
+        "D"
+      ]
+    },
+    "reflector_pairs": [
+      "AZ",
+      "CX",
+      "DW",
+      "EV",
+      "FU",
+      "GT",
+      "HS",
+      "IR",
+      "JQ",
+      "KP",
+      "LN",
+      "MY"
+    ],
+    "german_pairs": [
+      "AB",
+      "ZD",
+      "XE",
+      "WF",
+      "VG",
+      "UH",
+      "TI",
+      "SK",
+      "RL",
+      "QM",
+      "PN",
+      "OC"
+    ],
+    "plugboard": [
+      "AV",
+      "BS",
+      "CG",
+      "DL",
+      "FU",
+      "HZ"
+    ],
+    "plaintext": "DIEAUFKLAERUNGSMELDUNGWIRDNOCHHEUTEANSHAUPTQUARTIERUEBERMITTELTXALLEEINHEITENBLEIBENBISZUMMORGENAUFIHRENSTELLUNGEN",
+    "ciphertext": "WABRLZBBNJWQWSFOYYUZPMLGOYRSIXZTDCFLUOWQMMSFXNBHYCORSSFLPCJVJFWTPIQWQOWZHOYXBYNMHCTPAYMHYNPGWYQDTIOUTHOVFYPPTKOFLT",
+    "simulators": [
+      "Palloks Universal Enigma v2.6.2 (headless extraction)",
+      "Toledo CJ Odenthal enigma.py (Python-3 compatibility port; M3 with custom UKW-D permutation)"
+    ],
+    "agreement": true,
+    "toledo_ciphertext": "WABRLZBBNJWQWSFOYYUZPMLGOYRSIXZTDCFLUOWQMMSFXNBHYCORSSFLPCJVJFWTPIQWQOWZHOYXBYNMHCTPAYMHYNPGWYQDTIOUTHOVFYPPTKOFLT",
+    "palloks_final_positions_ukw_right_middle_left": "ANAL",
+    "provenance": "External simulators only; no repository engine. Retrieved 2026-10-28: https://people.physik.hu-berlin.de/~palloks/js/enigma/enigma-u_v262_en.html and https://www.math.utoledo.edu/~codenth/Cryptanalysis/python/enigma/enigma.py (unversioned), enigma_configs.py, permutations.py. BP ABCDEFGHIJKLMNOPQRSTUVWXYZ maps to German A-ZXWVUTSRQPON-MLKIHGFEDCB. German pairs converted with upstream ud2bp(false), then pairs2ukw; BO supplied by ud2bp. Conversion first verified against existing KD ciphertext. Toledo uses unchanged M3 cipher/stepping with custom complete reflector, identity ETW and supplied plugboard. See docs/historical-catalog.md for reproduction."
+  },
+  {
+    "id": "enigma-m3-ukwd-nontrivial",
+    "machine": "enigma-m3-ukwd",
+    "rotor_order": [
+      "8",
+      "6",
+      "4"
+    ],
+    "rings": {
+      "ukw": "A",
+      "rotors": [
+        "F",
+        "C",
+        "P"
+      ]
+    },
+    "positions": {
+      "ukw": "A",
+      "rotors": [
+        "R",
+        "L",
+        "I"
+      ]
+    },
+    "reflector_pairs": [
+      "AZ",
+      "CX",
+      "DW",
+      "EV",
+      "FU",
+      "GT",
+      "HS",
+      "IR",
+      "JQ",
+      "KP",
+      "LN",
+      "MY"
+    ],
+    "german_pairs": [
+      "AB",
+      "ZD",
+      "XE",
+      "WF",
+      "VG",
+      "UH",
+      "TI",
+      "SK",
+      "RL",
+      "QM",
+      "PN",
+      "OC"
+    ],
+    "plugboard": [],
+    "plaintext": "DIEAUFKLAERUNGSMELDUNGWIRDNOCHHEUTEANSHAUPTQUARTIERUEBERMITTELTXALLEEINHEITENBLEIBENBISZUMMORGENAUFIHRENSTELLUNGEN",
+    "ciphertext": "JABBXOOFHLOIIBMKFENPUKFMHTUDHMUXJMWVBATYEZUGWXEOPLBTVRJXTSZIGHJFWQNRKVRGTWFHKXZRCJGZOSPFVDEJDAYINMBYIBGBDBIAFAWQYU",
+    "simulators": [
+      "Palloks Universal Enigma v2.6.2 (headless extraction)",
+      "Toledo CJ Odenthal enigma.py (Python-3 compatibility port; M3 with custom UKW-D permutation)"
+    ],
+    "agreement": true,
+    "toledo_ciphertext": "JABBXOOFHLOIIBMKFENPUKFMHTUDHMUXJMWVBATYEZUGWXEOPLBTVRJXTSZIGHJFWQNRKVRGTWFHKXZRCJGZOSPFVDEJDAYINMBYIBGBDBIAFAWQYU",
+    "palloks_final_positions_ukw_right_middle_left": "ASRS",
+    "provenance": "External simulators only; no repository engine. Retrieved 2026-10-28: https://people.physik.hu-berlin.de/~palloks/js/enigma/enigma-u_v262_en.html and https://www.math.utoledo.edu/~codenth/Cryptanalysis/python/enigma/enigma.py (unversioned), enigma_configs.py, permutations.py. BP ABCDEFGHIJKLMNOPQRSTUVWXYZ maps to German A-ZXWVUTSRQPON-MLKIHGFEDCB. German pairs converted with upstream ud2bp(false), then pairs2ukw; BO supplied by ud2bp. Conversion first verified against existing KD ciphertext. Toledo uses unchanged M3 cipher/stepping with custom complete reflector, identity ETW and supplied plugboard. See docs/historical-catalog.md for reproduction."
   }
 ]

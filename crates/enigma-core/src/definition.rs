@@ -159,6 +159,7 @@ pub(crate) fn bundled_catalog_json(id: &str) -> Option<&'static str> {
         "enigma-m3" => Some(include_str!("../catalog/enigma-m3.json")),
         "enigma-i-ukwd" => Some(include_str!("../catalog/enigma-i-ukwd.json")),
         "enigma-m3-ukwd" => Some(include_str!("../catalog/enigma-m3-ukwd.json")),
+        "enigma-kd" => Some(include_str!("../catalog/enigma-kd.json")),
         "enigma-m4" => Some(include_str!("../catalog/enigma-m4.json")),
         "enigma-railway" => Some(include_str!("../catalog/enigma-railway.json")),
         "enigma-g312" => Some(include_str!("../catalog/enigma-g312.json")),

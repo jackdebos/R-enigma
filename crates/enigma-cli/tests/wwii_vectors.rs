@@ -1,4 +1,4 @@
-//! Independent WWII vectors: Palloks for G, Palloks and Toledo for Railway.
+//! Independent WWII vectors: Palloks for G, Palloks and Toledo for Railway/KD/UKW-D.
 //! See docs/historical-catalog.md for conventions and the retained G disagreement.
 use serde_json::{json, Value};
 use std::io::Write;
@@ -7,20 +7,53 @@ use std::process::{Command, Stdio};
 fn transform(vector: &Value, text: &str, direction: &str) -> String {
     let mut slots = vec![json!({"id":"reflector", "wheel":"UKW",
         "position":vector["positions"]["ukw"], "ring":vector["rings"]["ukw"]})];
+    if let Some(pairs) = vector.get("reflector_pairs") {
+        slots[0]["wheel"] = json!("D");
+        slots[0]["pairs"] = json!(pairs
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p
+                .as_str()
+                .unwrap()
+                .chars()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>())
+            .collect::<Vec<_>>());
+    }
     for (i, id) in ["left", "middle", "right"].iter().enumerate() {
         let wheel = match vector["rotor_order"][i].as_str().unwrap() {
             "1" => "I",
             "2" => "II",
             "3" => "III",
+            "4" => "IV",
+            "5" => "V",
+            "6" => "VI",
+            "7" => "VII",
+            "8" => "VIII",
             other => panic!("unknown wheel {other}"),
         };
         slots.push(json!({"id":id, "wheel":wheel,
             "position":vector["positions"]["rotors"][i], "ring":vector["rings"]["rotors"][i]}));
     }
-    slots.push(json!({"id":"etw", "wheel":"ETW", "position":vector["etw"]["position"], "ring":vector["etw"]["ring"]}));
+    if let Some(etw) = vector.get("etw") {
+        slots.push(
+            json!({"id":"etw", "wheel":"ETW", "position":etw["position"], "ring":etw["ring"]}),
+        );
+    }
+    let plugboard: Vec<Vec<String>> = vector
+        .get("plugboard")
+        .and_then(Value::as_array)
+        .map(|pairs| {
+            pairs
+                .iter()
+                .map(|p| p.as_str().unwrap().chars().map(|c| c.to_string()).collect())
+                .collect()
+        })
+        .unwrap_or_default();
     let request = json!({"protocol_version":1,
         "machine":{"definition":{"kind":"bundled","id":vector["machine"]}},
-        "job":{"kind":"transform", "configuration":{"slots":slots,"plugboard":[]},
+        "job":{"kind":"transform", "configuration":{"slots":slots,"plugboard":plugboard},
             "text":text,"direction":direction}});
     let mut child = Command::new(env!("CARGO_BIN_EXE_enigma"))
         .args(["--events", "-", "--request", "-"])
@@ -68,7 +101,7 @@ fn check(machine: &str) {
         ciphertext, vector["ciphertext"],
         "{machine}: Palloks reference"
     );
-    if machine == "enigma-railway" {
+    if vector["agreement"] == true {
         assert_eq!(ciphertext, vector["toledo_ciphertext"], "Toledo reference");
     }
     assert_eq!(transform(vector, &ciphertext, "decrypt"), plaintext);
@@ -85,4 +118,17 @@ fn g312_reference_and_round_trip() {
 #[test]
 fn g260_reference_and_round_trip() {
     check("enigma-g260");
+}
+
+#[test]
+fn kd_reference_and_round_trip() {
+    check("enigma-kd");
+}
+#[test]
+fn i_ukwd_reference_and_round_trip() {
+    check("enigma-i-ukwd");
+}
+#[test]
+fn m3_ukwd_reference_and_round_trip() {
+    check("enigma-m3-ukwd");
 }

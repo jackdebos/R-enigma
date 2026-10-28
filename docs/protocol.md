@@ -378,8 +378,13 @@ custom  := {"kind":"custom", "value": DEFINITION_OBJECT}
 The bundled `id` resolves to an immutable catalog entry shipped with the engine. The
 catalog includes historically sourced Enigma I (`enigma-i`), M3 (`enigma-m3`),
 M4 (`enigma-m4`), Railway (`enigma-railway`), G-312 (`enigma-g312`),
-G-260 (`enigma-g260`), and UKW-D variants (`enigma-i-ukwd`, `enigma-m3-ukwd`)
-definitions. See [historical catalog evidence](historical-catalog.md)
+G-260 (`enigma-g260`), KD (`enigma-kd`, FRA wiring with documented Mil Amt
+uncertainty), and UKW-D variants (`enigma-i-ukwd`, `enigma-m3-ukwd`)
+definitions. KD has a fixed rewirable `D` reflector (permanent BP `BO` pair),
+standard double stepping, and a fixed inverse-QWERTZ ETW slot configured A/A.
+Its UKW-D historical setting is also A/A. KD, Railway and G have no historical
+plugboard: use `configuration.plugboard: []` and `max_pairs: 0` for attacks;
+the definition schema itself does not enforce a no-plugboard restriction. See [historical catalog evidence](historical-catalog.md)
 for sources, exact wiring conventions, ETW/reflector settings, and deferred variants.
 Each bundled definition is JSON conforming to the same `DEFINITION_OBJECT` schema as a
 custom definition. Catalog authors must document authoritative historical sources for

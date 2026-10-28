@@ -49,7 +49,7 @@ because of its size limit and is not cited as supporting evidence.
   exactly 12 free pairs in the transform key. The historical reflector setting is
   position A, ring A; other settings are representable but non-historical.
   For German-sheet conversion see **UKW-D facts** below. The original I/M3
-  catalog bytes are unchanged. UKW-D search remains pending (T10/T11).
+  catalog bytes are unchanged. CPU UKW-D wiring search is implemented (T10/T11).
 - `enigma-m4` contains rotors I–VIII, Beta/Gamma, and UKW Thin-B/Thin-C. Its moving
   slots accept I–VIII; a separate fixed `role: "rotor"` Greek slot admits Beta/Gamma
   and is not treated as an entry wheel. The leftmost reflector admits only Thin-B/C.
@@ -66,6 +66,17 @@ because of its size limit and is not cited as supporting evidence.
   position or ring is supplied by these definitions. `enigma-g228` is deferred
   because its published rotor-II wiring is invalid and its attribution disputed;
   no corrected wiring is guessed. See **WWII additions** for sources and vectors.
+- `enigma-kd` contains the FRA I/II/III rotors, each with nine displayed
+  turnovers `SUYAEHLNQ`, standard military stepping including the double step,
+  a structurally fixed rewirable reflector `D` with permanent BP `BO`, and the
+  same fixed inverse-QWERTZ ETW slot as Railway. Both ETW and UKW-D have historical
+  position/ring A/A; other representable values are non-historical. Supply the
+  12 free UKW-D pairs explicitly, not the FRA sample wiring as a machine default.
+  KD has no plugboard, like Railway/G: use `configuration.plugboard: []` and
+  attack `max_pairs: 0`. The generic definition schema has no plugboard flag and
+  does not itself prohibit non-historical plugboard configurations. CM-W/CM-KD
+  supply the rotor/mechanical facts; see the verbatim **KD caveat** below for the
+  unresolved Mil Amt attribution and the vector section for simulator evidence.
 - In the existing I/M3/M4 definitions, the entry/ETW wheel is not represented as a slot. Although the cited sources identify
   its alphabet wiring (identity for M3/M4), this engine's generic slot traversal would
   treat a slot as a position/ring-configurable wheel; using a slot for the ETW would
@@ -95,8 +106,8 @@ embedded definitions; their bundled status does not bypass validation.
 
 ## WWII additions
 
-Railway, G-312 and G-260 are bundled as of engine 0.3.0. KD remains planned
-for T12, after UKW-D support; its data below is evidence, not a bundled entry.
+Railway, G-312, G-260 and KD are bundled in engine 0.3.0. KD uses the
+rewirable UKW-D support; its FRA wiring is not confirmed as Mil Amt wiring.
 This section covers S5/S6/S9; the
 ETW and G stepping representation follows S7/S8. The fixture contains external
 ciphertexts, not output of this repository's engine. G-228 remains blocked by an
@@ -219,7 +230,9 @@ advance the left wheel. Palloks `engage_gear` implements this nested carry.
 KD has standard Enigma stepping, nine turnovers per wheel and UKW-D; Mil Amt
 had six rotors, only these three are documented. The FRA UKW wiring is one
 explicit key, not a fixed KD structural reflector. In the simulator KD's UKW-D
-is fixed at A/A, not ring/position adjustable.
+is fixed at A/A, not ring/position adjustable. The bundled definition fixes
+its movement and wheel `D`, not its active wiring; the historical A/A setting
+is an explicit key convention, not a default enforced by the generic schema.
 
 **UKW-D facts:** CM-D documents 12 patch cables with BP `BO` permanently wired;
 the German index omits J and Y. Against BP `ABCDEFGHIJKLMNOPQRSTUVWXYZ`, the
@@ -237,10 +250,12 @@ also** UKW-D wiring, every three weeks. Preserve that qualification.
 ### Independent vectors and reproduction
 
 `crates/enigma-cli/tests/fixtures/wwii_reference_vectors.json` is an array of
-four vectors. Every vector records the complete key, plaintext, Palloks
-ciphertext, Toledo ciphertext, agreement flag and provenance. All use wheel
-order III–II–I, rings F/C/P, and 114 letters of normalized German text (spaces
-removed, X separator); none is a historical intercept. G-228 is intentionally
+six vectors. Every vector records the complete key, plaintext, Palloks
+ciphertext, Toledo ciphertext, agreement flag and provenance. All use rings
+F/C/P and 114 letters of normalized German text (spaces removed, X separator);
+the original four use wheel order III–II–I. None is a historical intercept.
+The CLI tests encrypt and round-trip all six through their bundled definitions,
+including KD (not just a custom equivalent). G-228 is intentionally
 absent, not silently substituted with another network's wiring.
 
 | Machine | UKW ring/position | Rotor start L/M/R | External result |
@@ -249,6 +264,8 @@ absent, not silently substituted with another network's wiring.
 | G-312 | D/J | U/S/A | Palloks reference; Toledo disagrees |
 | G-260 | D/J | U/S/A | Palloks reference; Toledo disagrees |
 | KD | A/A, fixed | K/Q/S | Both agree; Toledo custom configuration |
+| Enigma I UKW-D | A/A, fixed | K/U/D | Both agree; V–III–II, plugboard AV BS CG DL FU HZ |
+| M3 UKW-D (also M4 in M3 mode) | A/A, fixed | R/L/I | Both agree; VIII–VI–IV, empty plugboard |
 
 Railway's first three post-step states (UKW,L,M,R) are `JKDN`, `JKEO`,
 `JLFP`: the middle wheel steps twice consecutively. G begins `KVTB`, `KWUC`,
@@ -279,8 +296,10 @@ Notation mapping:
   encryption. A simulator accepting the non-bijective II string would not
   constitute valid independent evidence.
 
-Downloads live only in ignored `target/wwii-ref/dl/`; reproducibility tools live
-in `target/wwii-ref/tools/`. No downloaded program is run in `dl/`. `prepare.py`
+The original T2 collection used ignored `target/wwii-ref/dl/` downloads and
+`target/wwii-ref/tools/` harnesses (local artifacts, not shipped tools). For new
+collections, use a fresh system temporary directory (`mktemp -d`), never the
+worktree, and run downloaded/extracted JS only with Node there. `prepare.py`
 ports Toledo's Python-2 syntax, eager map/range, types aliases, reduce import
 and integer division without changing cipher logic. No lib2to3 is available
 on this Python 3.13 host, so the compatibility conversions are explicit.
@@ -303,3 +322,63 @@ runner twice and compare its outputs byte-for-byte; compare ciphertexts between
 implementations separately (G disagreements are expected and documented).
 Source reconciliation and fixture collection are passive documentation/data work;
 the bundled catalog behavior is separately covered by core and CLI vector tests.
+
+#### T12 UKW-D collection (2026-10-28)
+
+Palloks v2.6.2 was fetched anew from the URL above and extracted/run headlessly
+with Node v24.22.1 in a fresh system temp directory. Only the upstream functions
+listed above were extracted; `effRot`'s DOM-only status assignment was removed.
+The harness supplies keys/state, not cipher or stepping logic. Both new keys use
+BP free pairs `AZ CX DW EV FU GT HS IR JQ KP LN MY` (plus permanent `BO`),
+different from KD's FRA setting. The fixture stores every rotor/ring/position,
+plugboard, both ciphertexts, final Palloks state and provenance.
+
+To reproduce without relying on the old local harness:
+
+1. Download the Palloks HTML and Toledo `enigma.py`, `enigma_configs.py`,
+   `permutations.py` from the source URLs into a fresh `mktemp -d` directory.
+   Extract Palloks `engage`, `engage_lever`, `engage_gear`, `kodieren`, `rot`,
+   `effRot`, `srepl`, `pairs2ukw`, `ud2bp` as described above, retaining attribution
+   and modification notices. Do not execute the HTML or any downloaded JS in the
+   repository. Treat downloads as source data until the named functions are extracted.
+2. Use the fixture keys only as simulator input. Set `abc` to lowercase A–Z,
+   `udlabels` to `a-zxwvutsrqpon-mlkihgfedcb`, and convert German free-pair strings
+   with upstream `ud2bp(s, false)` (which prepends `bo`), then `pairs2ukw`.
+   BP→German conversion is the character at the same index in
+   `ABCDEFGHIJKLMNOPQRSTUVWXYZ` and `A-ZXWVUTSRQPON-MLKIHGFEDCB`.
+   KD's BP pairs `AK CT DV EP FN GL HM IJ QW RY SX UZ` become
+   `AQ ZH XF WM VN UP TO SR LE KC ID GB`. First run that conversion through KD
+   with walze 40–42 and inverse-QWERTZ ETW: it reproduces the entire existing
+   KD ciphertext and final state `ACZG`, and the converted permutation equals
+   `KOTVPNLMJIAGHFBEWYXCZDQSRU`. This guards against a reversed notation map.
+3. The new BP pairs become German `AB ZD XE WF VG UH TI SK RL QM PN OC`.
+   Use Palloks walze 1–8 for military rotors and identity ETW. Reverse the fixture
+   rotor arrays into Palloks indices 1/2/3 (fast/middle/slow); UKW is 0. Set
+   `wout` to displayed ASCII letters, `r` to zero-based rings, each `w[i]` to
+   `rot(wiring, (position-ring+26)%26)`, and `wstep` to the alphabet with the
+   rotor's displayed turnover letters capitalized. Set `gear=false`, `urot=false`,
+   `ukm4=''`, `monitor=false`, `PLH='-'`; UKW-D position/ring stay A/A.
+   For I set `stecker=true`, `swp=pairs2ukw('avbscgdlfuhz')`; for M3 set
+   `stecker=false`. For each plaintext letter call `engage()` then `kodieren()`.
+   Outputs begin `WABRLZBBNJ` (I) and `JABBXOOFHL` (M3); full ciphertexts are in
+   the fixture, with final states `ANAL` and `ASRS` (UKW/right/middle/left).
+4. Toledo is unversioned and has no UKW-D preset or German-pair interface, but
+   supports a custom full reflector via `Rotor(permutation)`. Use its unchanged
+   `M3` preset with `UKWs={'A': Rotor(full_BP_involution)}`, `UKW='A'`, identity
+   ETW, normal double stepping, no UKW ring/motion, and the fixture order/rings/
+   starts. For I restrict selection to I–V and pass `stecker='AVBSCGDLFUHZ'`;
+   for the empty-board M3 set `stecker=False` in the custom preset to avoid its
+   interactive prompt. KD uses the sourced custom equipment described above.
+   Port only Python-2 compatibility syntax as above, then run with Python 3.13.5
+   isolated mode and bytecode disabled (`python3 -I -B`). Both new ciphertexts
+   agree fully with Palloks. This is independent cipher/stepping confirmation,
+   not independent archival confirmation of UKW-D history.
+5. Run each simulator twice and compare outputs byte-for-byte; both repetitions
+   were identical for KD/I/M3, and all three ciphertexts agreed between simulators.
+   No repository engine was used to produce these ciphertexts. Temporary harnesses
+   and downloaded code are intentionally not committed.
+
+Palloks HTML SHA-256:
+`f16d01126f3ca44bb35f94416bec84447f2f717ed6cc7dd61192fabc885f0b0d`.
+Toledo's compatibility port is not a new upstream version; the URL and exact
+porting restrictions above identify the unversioned source and the adaptation.
