@@ -412,6 +412,106 @@ fn cancel_checkpoint_then_resume_with_other_threads_matches_uninterrupted() {
 }
 
 #[test]
+fn searched_ukwd_cancel_resume_and_tampered_best() {
+    let dir = Scratch::new();
+    let value = json!({"protocol_version":1,
+        "machine":{"definition":{"kind":"bundled","id":"enigma-i-ukwd"}},
+        "job":{"kind":"search","configuration":{"slots":[
+            {"id":"reflector","wheel":"D","position":"A","ring":"A"},
+            {"id":"left","wheel":"I","position":"A","ring":"A"},
+            {"id":"middle","wheel":"II","position":"A","ring":"A"},
+            {"id":"right","wheel":"III","position":"A","ring":"A"}],"plugboard":[]},
+        "text":"AA","space":{"slots":[
+            {"id":"reflector","pairs":{"kind":"attack"}}],
+            "plugboard":{"kind":"attack","symbols":["A","B"],"max_pairs":0}},
+        "passes":["hill_climb"],"measures":["ic"],"attack":{"kind":"hill_climb",
+            "initial_measure":"ic","final_measure":"ic","switch_pairs":0,
+            "backtrack_pairs":0,"start":[],"reflector_starts":2,"hold":2,"progress_every":1}}});
+    // Stop at the initial safe boundary to avoid 128 expensive historical-size
+    // wiring climbs. Nonempty retained-state coverage is exercised on replay below.
+    dir.write("marker", "cancel");
+    let output = dir.run(
+        &[
+            "--request",
+            "-",
+            "--checkpoint",
+            "save",
+            "--cancel-file",
+            "marker",
+            "--threads",
+            "1",
+        ],
+        &value,
+    );
+    let stopped = events(&output);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stderr, b"");
+    assert_eq!(stopped.last().unwrap()["reason"], "cancelled");
+    let saved = std::fs::read_to_string(dir.0.join("save")).unwrap();
+    CheckpointRecord::parse_json(&saved).unwrap();
+    let stored: Value = serde_json::from_str(&saved).unwrap();
+    assert_eq!(stored["phase"], "outer");
+    assert_eq!(stored["next_outer"], "0");
+    assert_eq!(stored["best"], Value::Null);
+    assert_eq!(stored["hold"], json!([]));
+    let stopped_result = stopped.iter().find(|e| e["event"] == "result").unwrap();
+    assert_eq!(stored["best"], stopped_result["best"]);
+    assert_eq!(stored["counters"], stopped_result["counters"]);
+    dir.unchanged("marker", "cancel");
+
+    // The marker is invocation-specific: resume without --cancel-file.
+    let baseline = dir.run(&["--request", "-", "--threads", "1"], &value);
+    let resumed = dir.run(
+        &["--request", "-", "--resume", "save", "--threads", "2"],
+        &value,
+    );
+    for output in [&baseline, &resumed] {
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(output.stderr, b"");
+    }
+    let terminal = |output: &Output| {
+        events(output)
+            .into_iter()
+            .filter(|event| event["event"] == "result" || event["event"] == "done")
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(terminal(&resumed), terminal(&baseline));
+    assert_eq!(terminal(&resumed).last().unwrap()["reason"], "completed");
+    let resumed_events = events(&resumed);
+    assert_eq!(resumed_events[1]["counters"], stored["counters"]);
+    assert!(!dir.0.join("save.tmp").exists());
+
+    // Replay a nonempty checkpoint, including its retained winning wiring/hold.
+    let complete = std::fs::read_to_string(dir.0.join("save")).unwrap();
+    let complete: Value = serde_json::from_str(&complete).unwrap();
+    assert_eq!(
+        complete["best"]["configuration"]["slots"][0]["pairs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        12
+    );
+    assert_eq!(complete["hold"].as_array().unwrap().len(), 2);
+    let replay = dir.run(&["--request", "-", "--resume", "save"], &value);
+    assert_eq!(replay.status.code(), Some(0));
+    assert_eq!(replay.stderr, b"");
+    assert_eq!(terminal(&replay), terminal(&baseline));
+
+    // Changing only stored best.pairs is caught before work and leaves every byte intact.
+    let mut tampered = complete;
+    tampered["best"]["configuration"]["slots"][0]["pairs"][0] = json!(["B", "O"]);
+    let tampered = tampered.to_string();
+    dir.write("bad", &tampered);
+    dir.reject(
+        &["--request", "-", "--resume", "bad"],
+        &value,
+        "invalid checkpoint \"bad\": state_digest mismatch",
+    );
+    dir.unchanged("bad", &tampered);
+    assert!(!dir.0.join("bad.tmp").exists());
+}
+
+#[test]
 fn foreign_destination_after_started_survives_cancel_and_reports_exact_failure() {
     let dir = Scratch::new();
     let mut value = request();

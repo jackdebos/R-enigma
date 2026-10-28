@@ -846,8 +846,8 @@ Deliberate departures from pinned bomm:
 
 Status: **Core transform and CPU wiring search implemented**, including complete
 result/hold keys, stages and checkpoint re-verification (plan
-`odd/tasks/enigma-wwii-machines.md`, T9–T11). Human-report wiring display and web
-controls remain T11/T13 work. Protocol [§3.1](protocol.md#31-machine-definition) and
+`odd/tasks/enigma-wwii-machines.md`, T9–T11). Human reports display the winning
+wiring; web controls remain T13 work. Protocol [§3.1](protocol.md#31-machine-definition) and
 [§3.2](protocol.md#32-configuration-and-transform) define the rewirable wheel
 and its `pairs` key; this section defines how an attack searches that key.
 

@@ -286,6 +286,50 @@ fn searched_wiring_pass_and_gpu_rejections() {
     assert_eq!(output.stderr,b"backend_unavailable: GPU backend unavailable: the UKW-D wiring search runs on the CPU only\n");
 }
 #[test]
+fn human_report_shows_each_winning_reflector_wiring() {
+    let value = request(true);
+    let observed = success(&run(&value, &["--threads", "1"]));
+    let held = result(&observed)["hold"].as_array().unwrap();
+    assert_eq!(held.len(), 2);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_enigma"))
+        .args(["--request", "-", "--no-report", "--threads", "1"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(value.to_string().as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stderr, b"");
+    let report = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<_> = report
+        .lines()
+        .filter(|line| line.starts_with("    Wheels:"))
+        .collect();
+    let expected: Vec<_> = held
+        .iter()
+        .map(|candidate| {
+            let pairs = candidate["configuration"]["slots"][0]["pairs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|pair| format!("{}{}", pair[0].as_str().unwrap(), pair[1].as_str().unwrap()))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("    Wheels:     D (pairs: {pairs}) I II III")
+        })
+        .collect();
+    assert_eq!(lines, expected);
+    assert!(!report.contains("\"event\""));
+}
+
+#[test]
 fn recovery_of_known_ukwd_wiring() {
     let source: Value = serde_json::from_str(include_str!(
         "../../../e2e/bomm/m4-u264-attack-positions/case.json"

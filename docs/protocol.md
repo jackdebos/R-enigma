@@ -229,6 +229,13 @@ Measure:      ngram
 - The key uses the configuration slots in definition order: `Wheels` lists each
   slot's wheel ID separated by spaces, `Rings` and `Positions` concatenate each slot's
   symbol, and `Plugboard` lists the complete pairs (`none` when empty).
+  A slot with `pairs` appends ` (pairs: <pairs>)` immediately after its wheel ID
+  on the same `Wheels` line, in attack and transform reports. Each pair is its
+  two symbols concatenated; pairs are separated by one space. Attack results use
+  the winning free pairs in canonical alphabet order, without the permanently
+  wired pair. For example (four-space attack indentation shown):
+  `    Wheels:     D (pairs: AC DE FG HI JK LM NP QR ST UV WX YZ) I II III`.
+  Slots without `pairs` have no suffix; non-rewirable reports are unchanged.
 - The plaintext is split into groups of five symbols separated by one space, ten
   groups per line; continuation lines are indented to the first group.
 - A `CANCELLED` report ends with a `Resume:` line. When the run used `--checkpoint`

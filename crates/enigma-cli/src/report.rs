@@ -88,7 +88,22 @@ fn key(configuration: &Value, indent: &str) -> String {
         .expect("validated configuration");
     let wheels = slots
         .iter()
-        .map(|s| text(&s["wheel"]))
+        .map(|s| {
+            let wheel = text(&s["wheel"]);
+            match s.get("pairs") {
+                Some(pairs) => {
+                    let pairs = pairs
+                        .as_array()
+                        .expect("validated wiring")
+                        .iter()
+                        .map(|pair| format!("{}{}", text(&pair[0]), text(&pair[1])))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    format!("{wheel} (pairs: {pairs})")
+                }
+                None => wheel.to_owned(),
+            }
+        })
         .collect::<Vec<_>>()
         .join(" ");
     let rings = slots.iter().map(|s| text(&s["ring"])).collect::<String>();
