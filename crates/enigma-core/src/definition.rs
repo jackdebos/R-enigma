@@ -208,7 +208,7 @@ impl Definition {
     /// Binds the definition's stepping rules to a concrete, resolved topology.
     ///
     /// This is intentionally performed after selecting every allowed wheel so the
-    /// resulting rules are bound to the actual Task 6 machine rather than a placeholder.
+    /// resulting rules are bound to the actual machine rather than a placeholder.
     pub fn bind_stepping(&self, topology: &MachineTopology) -> Result<Stepping, ModelError> {
         Stepping::new(topology, self.stepping_rules.clone())
     }

@@ -1843,33 +1843,6 @@ impl crate::AttackRequest {
         result
     }
 
-    /// Spike-only oracle: the production climb and its production accounting.
-    #[cfg(feature = "gpu-spike")]
-    pub(crate) fn spike_climb(&self, index: u128) -> Result<crate::gpu_spike::ClimbResult, String> {
-        let initial = crate::gpu_spike::resolve_outer(self, index)?;
-        let (scoring, start) = self
-            .direct_scoring(&initial)
-            .map_err(|e| format!("{e:?}"))?;
-        let mut accounting = BlockAccounting::default();
-        let outcome = scoring
-            .climb_accounted(start, self.settings().backtrack_pairs(), &mut accounting)
-            .map_err(|e| format!("{e:?}"))?;
-        let current = outcome.current.ok_or("climb returned no board")?;
-        let alphabet = initial.topology().alphabet();
-        let mut mapping: Vec<u32> = (0..alphabet.len() as u32).collect();
-        for &(a, b) in self.domain().fixed_pairs().iter().chain(&current.board) {
-            let a = alphabet.index_of(a).expect("validated board");
-            let b = alphabet.index_of(b).expect("validated board");
-            mapping[a] = b as u32;
-            mapping[b] = a as u32;
-        }
-        Ok(crate::gpu_spike::ClimbResult {
-            mapping,
-            score: current.score.ranking().units(),
-            evaluations: accounting.used,
-        })
-    }
-
     /// Both direct entry points bind the same owner, objectives and owned start.
     fn direct_scoring<'a>(
         &'a self,
@@ -3274,7 +3247,7 @@ impl<T, E> OuterExecution<T, E> {
 
 /// All evaluation mutations stay local until ordered commit. Callbacks remain
 /// synchronous in this serial adapter: buffering them would change cancellation
-/// when a progress callback requests a stop (T6/T7 change those boundaries).
+/// when a progress callback requests a stop (parallel execution changes those boundaries).
 #[cfg(test)]
 fn execute_outer<T, E, O: CounterObserver>(
     mut allowance: EvaluationAllowance,
@@ -13306,7 +13279,7 @@ mod tests {
                         .project_public(control.snapshot(), domain, measure)
                 }
                 .unwrap();
-                // Task 13: the single winner runs the stage loop without
+                // Chained stages: the single winner runs the stage loop without
                 // introducing internal public boundary notifications.
                 if expected.termination == crate::AttackTermination::Completed
                     && expected.best.is_some()

@@ -92,7 +92,7 @@ try {
   console.log('PASS Railway attack through Attack page; preview = started = 26; max_pairs = 0');
   await evaluate(set('language', 'es'));
   assert.equal(await evaluate(`document.getElementById('attack-model').selectedOptions[0].textContent`), 'Enigma Railway (Reichsbahn)');
-  // L26 independent wiring/key, entered in the default German notation.
+  // Independent external wiring/key, entered in the default German notation.
   const ukwd = JSON.parse(await readFile('crates/enigma-cli/tests/fixtures/wwii_reference_vectors.json', 'utf8')).find(v => v.machine === 'enigma-i-ukwd');
   await evaluate(set('language', 'en') + `document.getElementById('view-machine').click()`);
   await evaluate(set('model', ukwd.machine));
@@ -106,7 +106,7 @@ try {
   const cli = spawnSync(engineBin, ['--events', '-', '--request', '-'], { input: JSON.stringify({ protocol_version: 1, machine: { definition: { kind: 'bundled', id: ukwd.machine } }, job: { kind: 'transform', direction: 'encrypt', text: ukwd.plaintext, configuration: { slots, plugboard: ukwd.plugboard.map(p => [...p]) } } }), encoding: 'utf8' });
   assert.equal(cli.status, 0, cli.stderr);
   assert.equal(JSON.parse(cli.stdout.trim().split('\n')[1]).output, await evaluate(`document.getElementById('output').value`));
-  console.log('PASS German-default UKW-D L26 transform = external vector = CLI');
+  console.log('PASS German-default UKW-D transform = external vector = CLI');
   await evaluate(set('machine-notation', 'bp'));
   assert.equal(await evaluate(`document.getElementById('machine-wiring').value`), ukwd.reflector_pairs.join(' '));
   await evaluate(set('machine-wiring', 'AB', 'input'));

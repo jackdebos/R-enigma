@@ -15,7 +15,7 @@ conversion remains available. The CLI uses shared strict `ParsedRequest` dispatc
 loads bounded external resources, and binds search contents before execution.
 Core HC/PE execution and fallible wire projections feed the shared production CLI
 adapter. See protocol
-[current availability](protocol.md#41-planned-hcpe-search-events--task-127) for
+[current availability](protocol.md#41-hcpe-search-events) for
 HC/PE lifecycle, Core-owned global evaluation-count progress (`progress_every`,
 default 100000) and legacy unsupported search.
 UTC timestamps and monotonic elapsed time are separate; no timer delivery is promised.
@@ -53,7 +53,7 @@ combined score, implicit sum, or combined ranking.
 
 This is a search-job fragment, not a complete executable request. The enclosing
 request must supply the definition, configuration, space, passes, and text required
-by [protocol §3.3](protocol.md#33-search-job-boundary-task-9-grammar).
+by [protocol §3.3](protocol.md#33-search-job-boundary).
 
 ```json
 {

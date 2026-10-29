@@ -7,7 +7,7 @@ declared outer key and admissible crib position, and finishes every stop with th
 existing hill climb, the stop's deduced plugboard facts fixed.
 [Protocol](protocol.md), [search passes](search-passes.md) and
 [scoring/resources](scoring-resources.md) stay normative except where this document
-extends them. Tracking: `odd/tasks/enigma-crib-bombe.md`.
+extends them.
 
 Basis: the crib pipeline of current Enigma projects (crib dragging with the crash
 rule, menu, bombe with the diagonal board, stops, finishing climb with the deduced
@@ -34,10 +34,10 @@ The crib attack is a new pass on the attack branch of
 ```
 
 - `job.passes` starts with exactly one `bombe`, optionally followed by the chained
-  stages of [search passes §9](search-passes.md#9-chained-stages--task-13); the §9.1
+  stages of [search passes §9](search-passes.md#9-chained-stages); the §9.1
   shape gains `bombe` as a third leading pass. Hold, stages, `progress_every` and
   their defaults keep their [§2](search-passes.md#2-one-executable-pass-and-explicit-settings)
-  and [§10](search-passes.md#10-hold-list--task-14) meaning.
+  and [§10](search-passes.md#10-hold-list) meaning.
 - `job.attack.kind` equals `"bombe"`. `initial_measure`, `final_measure`,
   `switch_pairs` and `backtrack_pairs` configure the finishing climb (§5) exactly as
   for `hill_climb`. `start` and `seeds` are forbidden members (`invalid_request`):
@@ -176,13 +176,13 @@ evaluations do today.
 
 Cancellation, signals, `--threads` and the cancel file behave as for HC
 ([protocol §5](protocol.md#5-control)). Checkpoints use the outer-block cursor of
-[protocol §6](protocol.md#6-checkpoint-and-resume-task-16). The crib is part of the job,
+[protocol §6](protocol.md#6-checkpoint-and-resume). The crib is part of the job,
 so it is part of the checkpoint identity; the counters of §6 are saved and restored.
 On a runtime error the hold keeps the stops of earlier outers and the earlier stops of
 the failing outer, and the counters include the failing outer's partial work; when
 outer-completion accounting overflows, that outer's offers are discarded with it. No
 checkpoint is written for the failing block ([search passes §10.2](search-passes.md#102-entry-rule),
-[protocol §4.1](protocol.md#41-planned-hcpe-search-events--task-127)).
+[protocol §4.1](protocol.md#41-hcpe-search-events)).
 `--backend gpu` with a `bombe` job fails before work with `backend_unavailable`,
 at `/job/attack`, with message `GPU backend unavailable: the crib attack runs on the CPU only`
 and exit 1; there is no silent CPU fallback. A GPU bombe is later work.

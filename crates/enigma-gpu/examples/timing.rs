@@ -22,7 +22,7 @@ fn request(limit: Option<usize>) -> Result<AttackRequest, Box<dyn Error>> {
     if let Some(limit) = limit {
         request["job"]["space"]["limit"] = json!(limit);
     }
-    // Same pure JSON conversion as the spike oracle; no converted files written.
+    // Pure in-memory JSON conversion; no converted files written.
     let text = read("e2e/bomm/frequencies/enigma1941-trigram.txt")?;
     let fields: Vec<_> = text.split_whitespace().collect();
     if !fields.len().is_multiple_of(2) {
@@ -135,9 +135,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             after.idle_time - before.idle_time
         );
         report(&samples.lock().unwrap());
-        if !tune {
-            println!("Historical references (different timing boundary): L25 long-dispatch GPU 4.837 s (no finalist stages/setup); CLI 14.888 s. GPU wall / L25: {:.3}x", wall.as_secs_f64() / 4.837);
-        }
         if !exact {
             return Err("GPU AttackResult differs from CPU".into());
         }

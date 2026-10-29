@@ -383,7 +383,7 @@ fn bombe_parallel_and_checkpoint_resume() {
     );
 }
 
-#[test] // S2/S3/S4/S6: public execution vs an independent exhaustive-board witness.
+#[test] // Public execution vs an independent exhaustive-board witness.
 fn verifier_stop_counts_across_outer_positions_rings_and_capacities() {
     use enigma_core::{DefinitionSource, Direction, SlotConfiguration, TransformConfiguration};
     // Enumerate all four-symbol functions, retain involutions (10 complete boards).
@@ -470,7 +470,7 @@ fn verifier_stop_counts_across_outer_positions_rings_and_capacities() {
     );
 }
 
-#[test] // S3/S9: inclusive last placement, one-symbol crib, scalar rather than byte offsets.
+#[test] // Inclusive last placement, one-symbol crib, scalar rather than byte offsets.
 fn verifier_last_position_and_unicode_symbols() {
     let mut v = fixture();
     v["machine"]["definition"]["value"]["alphabet"] = json!(["é", "🦀", "C", "D"]);
@@ -495,7 +495,7 @@ fn verifier_last_position_and_unicode_symbols() {
     assert_eq!(run(&v, 1), result);
 }
 
-#[test] // S2/S4/S6: M3, filtered wheel order, position/ring order, finishing/stage facts.
+#[test] // M3, filtered wheel order, position/ring order, finishing/stage facts.
 fn verifier_m3_outer_order_and_deduced_facts() {
     let (mut v, plaintext, configuration) = recovery_fixture(false);
     v["machine"]["definition"]["id"] = json!("enigma-m3");

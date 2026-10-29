@@ -1,9 +1,9 @@
-//! Capability registry and search-job preflight framework (Task 9, slice 9.4).
+//! Capability registry and search-job preflight framework.
 //!
 //! The frozen `docs/protocol.md` §3.3 boundary states that unsupported topology, pass,
 //! measure, and resource combinations fail preflight before enumeration. This module owns
 //! the registry of recognized Stage 1 passes and their topology requirements, plus the
-//! extension framework Task 10 seeds with concrete measure and resource rules.
+//! extension framework that carries the concrete measure and resource rules.
 //!
 //! Only the boundary is modeled here: no pass executes, no measure is scored, and no
 //! resource semantic is implemented.
@@ -40,13 +40,13 @@ impl PassSupport {
     }
 }
 
-/// Compatibility policy for a boundary field whose concrete rules Task 10 defines.
+/// Compatibility policy for a boundary field with its own concrete rules.
 ///
 /// `Deferred` accepts every value, which is the Stage 1 default; `Allowlist` is the
-/// extension point Task 10 seeds with concrete measure and resource identifiers.
+/// extension point that lists the concrete measure and resource identifiers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CapabilityPolicy {
-    /// Accepts every value; concrete rules are deferred to Task 10.
+    /// Accepts every value; no concrete rule applies.
     Deferred,
     /// Accepts only the listed identifiers.
     Allowlist(Vec<String>),
@@ -64,8 +64,8 @@ impl CapabilityPolicy {
 /// Registry of recognized passes and the measure and resource compatibility policies.
 ///
 /// [`Capabilities::stage1`] is the concrete Stage 1 registry whose
-/// [`Capabilities::preflight`] gate consumes a parsed search request. Tasks 11–13 extend
-/// the pass list; Task 10 seeds the measure and resource policies.
+/// [`Capabilities::preflight`] gate consumes a parsed search request, with the
+/// recognized passes and the measure and resource policies.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Capabilities {
     passes: Vec<PassSupport>,

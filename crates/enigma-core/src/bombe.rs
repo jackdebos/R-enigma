@@ -1018,7 +1018,7 @@ mod tests {
 mod independent_contract_probes {
     use super::*;
 
-    #[test] // S3, contract §2
+    #[test] // crib-attack contract §2
     fn bombe_probe_drag_boundaries() {
         assert_eq!(
             admissible_positions(&[3, 0, 2, 1], &[0, 1], None),
@@ -1040,7 +1040,7 @@ mod independent_contract_probes {
         assert_eq!(admissible_positions(&[], &[], None), Err(CribError::Empty));
     }
 
-    #[test] // S2, contract §3: parallel-edge degree and component order
+    #[test] // crib-attack contract §3: parallel-edge degree and component order
     fn bombe_probe_menu_degrees() {
         let menu = Menu::new(6, &[4, 2, 2, 0, 3], &[5, 5, 5, 3, 3, 1, 4], 2).unwrap();
         assert_eq!(
@@ -1059,7 +1059,7 @@ mod independent_contract_probes {
         );
     }
 
-    #[test] // S2, contract §§3–4: independent total-map enumeration
+    #[test] // crib-attack contract §§3–4: independent total-map enumeration
     fn bombe_probe_six_symbol_boards() {
         const N: usize = 6;
         // Enumerate ALL functions, retain involutions. No assign/closure/menu logic.

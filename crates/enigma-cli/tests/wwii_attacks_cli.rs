@@ -1,4 +1,4 @@
-//! S10: public CLI no-plugboard recovery; also exercises S7 ETW and S8 G carries.
+//! Public CLI no-plugboard recovery; also exercises the ETW and the G carries.
 //! Synthetic ciphertext, NOT a historical attack/reference vector. German text
 //! comes from the tracked e2e/bomm U-264 fixture (its provenance remains there).
 //! Search-passes §§3–5: slots are enumerated, never climbed. With max_pairs=0

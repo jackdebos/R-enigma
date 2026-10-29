@@ -591,7 +591,7 @@ node web/e2e/wwii.mjs
 ```
 
 This transforms the independent Railway vector and starts a 26-key attack through
-page controls, comparing preview and engine counts. It then enters the L26 Enigma I
+page controls, comparing preview and engine counts. It then enters the Enigma I
 UKW-D vector in German notation and compares the web output with the real CLI and
 external fixture; runs a small unknown-wiring KD attack to completion; and checks
 both result notations, explicit GPU blocking, fixed ETW/reflector controls,

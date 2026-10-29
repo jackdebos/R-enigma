@@ -8,7 +8,7 @@ use crate::{AttackGate, ResolvedConfiguration, SearchDiagnostic, SearchRequest};
 /// Design B takes ~72 s for 17,576 outer keys (~4.1 ms/key), so 128 keys
 /// target ~0.52 s/block, leaving headroom below the typical one-second stop
 /// latency target. Small A/A2 spaces simply use a partial block. This is not a
-/// time guarantee for expensive keys; T6/T7 can tune this single policy constant.
+/// time guarantee for expensive keys; this single policy constant is the tuning point.
 pub(crate) const OUTER_BLOCK_KEYS: u128 = 128;
 
 /// A selected-range-relative block number and an absolute flat key range.

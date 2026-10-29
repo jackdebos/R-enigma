@@ -67,7 +67,7 @@ func asAny(t *testing.T, data []byte) any {
 	return v
 }
 
-// web-attacks S8 PRESERVE: opting out reproduces the tested U-264 design B request.
+// Opting out reproduces the tested U-264 design B request.
 func TestDefaultsReproduceDesignB(t *testing.T) {
 	data, err := os.ReadFile("../../../e2e/bomm/m4-u264-attack-design-b/case.json")
 	if err != nil {
@@ -106,7 +106,7 @@ func mustJSON(v any) []byte {
 	return data
 }
 
-// S7: the text reaches the request exactly as typed.
+// The text reaches the request exactly as typed.
 func TestTextUnchanged(t *testing.T) {
 	plan := build(t, designB(`ab c\u00e9!`))
 	job := asAny(t, plan.Request).(map[string]any)["job"].(map[string]any)
@@ -115,7 +115,7 @@ func TestTextUnchanged(t *testing.T) {
 	}
 }
 
-// web-attacks S2/S6 PRESERVE: opt-out keeps full domains and repeated wheels.
+// Opt-out keeps full domains and repeated wheels.
 func TestUnknownDomainsAndCount(t *testing.T) {
 	body := `{"model":"enigma-m4","reflector":null,"slots":[` +
 		`{"id":"greek","wheel":null,"ring":null,"position":null},` +

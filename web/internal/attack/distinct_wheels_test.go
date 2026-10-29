@@ -34,7 +34,7 @@ func withDistinct(t *testing.T, in Input, enabled bool) Input {
 	return result
 }
 
-// distinct-wheels S7: exact IDs, definition order, filtered counts and estimates.
+// Distinct wheels: exact IDs, definition order, filtered counts and estimates.
 func TestDistinctWheelsDefaults(t *testing.T) {
 	for i, model := range catalog() {
 		t.Run(model.ID, func(t *testing.T) {
@@ -70,7 +70,7 @@ func TestDistinctWheelsDefaults(t *testing.T) {
 	}
 }
 
-// distinct-wheels S7 / S5: known wheels exclude themselves; repeats fail before a request exists.
+// Distinct wheels: known wheels exclude themselves; repeats fail before a request exists.
 func TestDistinctWheelsKnownAndImpossible(t *testing.T) {
 	in := wheelInput(catalog()[0])
 	one := "I"
@@ -94,7 +94,7 @@ func TestDistinctWheelsKnownAndImpossible(t *testing.T) {
 	}
 }
 
-// distinct-wheels S7: do not send a constraint when no rotor domains overlap.
+// Distinct wheels: do not send a constraint when no rotor domains overlap.
 func TestDistinctWheelsDisjointSlots(t *testing.T) {
 	model := Model{ID: "disjoint", Reflectors: []string{"B"}, Slots: []Slot{{"first", []string{"I"}}, {"second", []string{"II"}}}}
 	plan, p := Build([]Model{model}, wheelInput(model), 2)
@@ -110,7 +110,7 @@ func TestDistinctWheelsDisjointSlots(t *testing.T) {
 	}
 }
 
-// distinct-wheels S7 PRESERVE: these byte fixtures were captured from the builder
+// Distinct wheels: these byte fixtures were captured from the builder
 // before adding the setting. No JSON reserialization is allowed in this comparison.
 func TestDistinctWheelsOffOriginalBytes(t *testing.T) {
 	for _, model := range catalog() {
@@ -133,7 +133,7 @@ func TestDistinctWheelsOffOriginalBytes(t *testing.T) {
 	}
 }
 
-// distinct-wheels S7: real engine count must match preview, not an independent estimate.
+// Distinct wheels: real engine count must match preview, not an independent estimate.
 func TestRealEngineDistinctWheelsCount(t *testing.T) {
 	path := os.Getenv("ENIGMA_TEST_BIN")
 	if path == "" {

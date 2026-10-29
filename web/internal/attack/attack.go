@@ -7,7 +7,7 @@ const (
 	secondsPerKey   = 0.004235
 	peFactor        = 20
 	referenceLength = 232
-	// Measured on the reference computer with Weierud 1941 cribs (L15).
+	// Measured on the reference computer with Weierud 1941 cribs.
 	bombeSecondsPerLetter = 1.3e-6
 	// One searched UKW-D wiring start costs this many ordinary outer keys of the
 	// same text: slope over 1/2/4 starts, 116 and 232 letters, reference computer.

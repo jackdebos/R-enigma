@@ -1,4 +1,4 @@
-//! Deterministic candidate resolver for a validated search space (Task 9, slice 9.3).
+//! Deterministic candidate resolver for a validated search space.
 //!
 //! A validated [`SearchRequest`] fixes an explicit set of variable key dimensions; this
 //! module turns it into a lazy, deterministic sequence of concrete

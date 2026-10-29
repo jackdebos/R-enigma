@@ -196,7 +196,7 @@ impl PlugboardDomain {
     }
 }
 
-/// A validated Task 11 attack-domain fragment, not an executable search request.
+/// A validated plugboard attack-domain fragment, not an executable search request.
 ///
 /// This model is deliberately separate from [`PlugboardDomain`] and [`SearchSpace`].
 /// It cannot grant candidate enumeration or full attack-request acceptance.
@@ -252,7 +252,7 @@ impl AttackPlugboardDomain {
     ) -> Result<Self, Vec<SearchDiagnostic>> {
         const PATH: &str = "/job/space/plugboard";
         // Existing utilities keep their legacy codes; only this fragment boundary
-        // translates malformed-domain diagnostics to the Task 11 contract.
+        // translates malformed-domain diagnostics to the attack contract (`docs/search-passes.md`).
         let result = (|| {
             validate_disjoint_pairs(fixed_pairs, "/job/configuration/plugboard", alphabet)?;
             let domain = object(value, PATH)?;

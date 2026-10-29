@@ -6,7 +6,7 @@
 //! binds the definition's stepping rules to it, and assembles the [`Plugboard`] before a
 //! [`crate::Engine`] is constructed. This module performs no JSON parsing: request-schema
 //! validation, unknown-field rejection, direction handling, and text decoding belong to
-//! the protocol layer (Task 7).
+//! the protocol layer (`request`).
 //!
 //! Diagnostics use request-relative JSON Pointers under `/job/configuration`, matching
 //! the protocol's location example, so the protocol layer can forward them verbatim.

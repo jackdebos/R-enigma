@@ -77,7 +77,7 @@ impl MeasuredScore {
         }
     }
 
-    // T4 re-scores restored entries before authorizing execution.
+    // Checkpoint resume re-scores restored entries before authorizing execution.
     #[allow(dead_code)]
     pub(crate) const fn from_checkpoint_units(measured: i128, ranking: i128) -> Self {
         Self {

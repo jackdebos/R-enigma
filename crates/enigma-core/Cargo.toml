@@ -6,10 +6,6 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
-[features]
-# Hidden seam for the GPU scoring spike (odd/tasks/enigma-gpu.md T3); not a supported API.
-gpu-spike = []
-
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }

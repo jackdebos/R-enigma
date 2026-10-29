@@ -1,4 +1,4 @@
-//! L38: backend selection is host configuration, never silent CPU fallback.
+//! Backend selection is host configuration, never silent CPU fallback.
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::PathBuf;

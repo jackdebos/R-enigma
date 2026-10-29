@@ -739,7 +739,7 @@ fn malformed_events_arguments_are_usage_errors() {
     assert!(!dir.path("x").exists());
 }
 
-// S6/S7: save messages identify the actual file and containing directory.
+// Save messages identify the actual file and containing directory.
 #[test]
 fn nested_and_absolute_report_messages_identify_saved_location() {
     for absolute in [false, true] {
@@ -767,7 +767,7 @@ fn nested_and_absolute_report_messages_identify_saved_location() {
     }
 }
 
-// S6/S7: default collisions and explicit preflight never follow live links
+// Default collisions and explicit preflight never follow live links
 // or replace directories.
 #[cfg(unix)]
 #[test]
@@ -842,7 +842,7 @@ fn checkpoint_failure_does_not_deliver_human_report() {
     assert!(!dir.path("bad.txt").exists());
 }
 
-// S8: the printed Resume command runs even after saving events or a named report.
+// The printed Resume command runs even after saving events or a named report.
 #[cfg(unix)]
 #[test]
 fn printed_resume_is_usable_after_saving_events_or_an_explicit_report() {

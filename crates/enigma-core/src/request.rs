@@ -231,11 +231,6 @@ impl TransformRequest {
         self.direction
     }
 
-    #[cfg(feature = "gpu-spike")]
-    pub(crate) fn into_parts(self) -> (Engine, String, Direction) {
-        (self.engine, self.text, self.direction)
-    }
-
     /// Runs the transform with the already validated engine and returns the result.
     pub fn transform(mut self) -> Result<String, ModelError> {
         self.engine.transform(&self.text, self.direction)

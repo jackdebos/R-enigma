@@ -64,7 +64,7 @@ impl AttackControl {
         }
     }
 
-    // T4 consumes these at the coordinator's checkpoint boundary, not in workers.
+    // Consumed at the coordinator's checkpoint boundary, not in workers.
     #[allow(dead_code)]
     pub(crate) fn checkpoint_progress(&self) -> u64 {
         self.last_emitted

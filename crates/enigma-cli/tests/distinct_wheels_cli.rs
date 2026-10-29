@@ -1,4 +1,4 @@
-//! DISTINCT WHEELS T4: public CLI evidence for S3, S4 and S6 (plus S5 errors).
+//! Distinct wheels: public CLI evidence for the constraint, its counts, results and errors.
 mod support;
 
 use serde_json::{json, Value};

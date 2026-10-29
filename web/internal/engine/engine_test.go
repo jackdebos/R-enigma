@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// WWII S11: the advertised catalog requires engine 0.3.0 / protocol 1.
+// The advertised catalog requires engine 0.3.0 / protocol 1.
 func TestDistinctWheelsVersionGate(t *testing.T) {
 	supported := []Version{{Version: "0.3.0", Protocol: 1}}
 	if !reflect.DeepEqual(SupportedVersions(), supported) {

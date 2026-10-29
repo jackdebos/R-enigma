@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// L40 / S21, S28: exact legacy CPU argv, GPU flags and usage boundaries.
+// Exact legacy CPU argv, GPU flags and usage boundaries.
 func TestAttackBackendCommand(t *testing.T) {
 	for _, tc := range []struct{ name, settings, suffix string }{
 		{"legacy", `"threads":2`, ""},
@@ -72,7 +72,7 @@ func TestAttackBackendCommand(t *testing.T) {
 	}
 }
 
-// L40 / S21, S28: preview and start reject before touching stored state.
+// Preview and start reject before touching stored state.
 func TestAttackBackendValidation(t *testing.T) {
 	s, u, c, dir := configureAttack(t, fakeStarted+fakeResult+`echo '{"event":"done","reason":"completed"}'`)
 	attackCall(t, s, u, c, "POST", "/api/attack", attackForm, 202, "")
@@ -106,7 +106,7 @@ func TestAttackBackendValidation(t *testing.T) {
 	}
 }
 
-// L40 / S26: resume chooses host settings without rewriting the engine request.
+// Resume chooses host settings without rewriting the engine request.
 func TestAttackBackendResume(t *testing.T) {
 	script := `case "$*" in
 '--events - --request request.json --checkpoint checkpoint.json --cancel-file cancel-1 --threads 2 --report report-1.txt')

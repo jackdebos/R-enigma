@@ -1,60 +1,60 @@
-# Plugboard attack contract — Task 11
+# Plugboard attack contract
 
 Status: **Core HC/PE execution and the shared production CLI JSONL adapter ship.**
-[Current availability](protocol.md#41-planned-hcpe-search-events--task-127) describes
+[Current availability](protocol.md#41-hcpe-search-events) describes
 validated HC/PE execution, legacy unsupported search and Core evaluation-count progress.
-Task 11.2a provides only `AttackPlugboardDomain::parse_json`: strict typed fragment
+`AttackPlugboardDomain::parse_json` provides only strict typed fragment
 validation with immutable known fixed pairs. It is separate from legacy search
 spaces and grants neither complete request acceptance nor candidate enumeration.
-Task 11.2b adds isolated `AttackSettings::parse_json` validation for common
+`AttackSettings::parse_json` adds isolated validation for common
 settings, exact declared objectives and direct hill-climb starts, bound to the
 domain's ordered alphabet, plus typed partial-exhaustion `empty_single` all/touching
-seed policies. Task 11.2c adds `AttackGate::check` over a borrowed resource-bound
+seed policies. `AttackGate::check` runs over a borrowed resource-bound
 `SearchRequest` and explicit typed domain/settings. It rechecks compatibility and
 returns privately constructed full/sliced outer and per-outer start counts, not an
 executable request. Counts describe the full selected work.
-Task 11.2d.5 exposes `ParsedAttackRequest::parse_json` and supplied-content binding,
+The public API exposes `ParsedAttackRequest::parse_json` and supplied-content binding,
 plus resource-free `AttackRequest::parse_json`. Both promotion routes check eligibility
 before returning privately owned inputs, retained models and counts. Owned result
 carriers and the HC facade are exposed; raw candidate APIs remain private. Public root dispatch selects this owner only when
 `job.space.plugboard.kind` is `"attack"`, with wire kind still `"search"`.
 The CLI loads resources once, binds and checks eligibility/counts before
 HC/PE execution through §6.2; failures remain seq1-only errors.
-Task 11.4a adds private complete-neighborhood best-improvement selection only.
-Task 11.4b.1 adds a private bound scoring lifecycle: start-phase selection,
+The climb is built from private layers: complete-neighborhood best-improvement selection.
+A private bound scoring lifecycle adds start-phase selection,
 committed-board objective switching and once-only finalization, without an ascent loop.
-Task 11.4b.2 adds a private single-climb driver repeating complete strict-improvement scans,
+A private single-climb driver repeats complete strict-improvement scans,
 with final-scored committed outcomes on completion or cancellation. Interrupted scans
 never commit provisional winners; final rescoring alone does not count as final-objective ascent.
-Task 11.5a adds private lazy empty/single mutable seed generation with dense local indices.
-Task 11.5b adds private ordered independent known-scrambler seed climbs with one shared
+Seeds come from private lazy empty/single mutable generation with dense local indices.
+Known-scrambler seed climbs are private, ordered and independent, with one shared
 allowance and stable final-score selection, including interrupted committed boards.
-Task 11.6a adds private lazy outer-candidate projection with absolute `u128` indices,
+Outer candidates come from a private lazy projection with absolute `u128` indices,
 resolved slot assignments and fixed plugboard facts, preserving indexed resolution errors.
-Task 11.6b.1 binds one internally supplied resolved outer/index to the owner's direct-HC
+Direct HC binds one internally supplied resolved outer/index to the owner's direct-HC
 settings and retained resources, returning owned initial facts, committed outcome and shared
 usage, or an indexed original evaluation error. Partial exhaustion is rejected before work.
-Task 11.6b.2 privately schedules same-owner ordered direct-HC outers with one allowance,
+A private scheduler runs same-owner ordered direct-HC outers with one allowance,
 checked counters, stable final-score best ownership and independent aggregate termination.
 Original indexed resolution/evaluation errors retain cumulative usage; PE remains rejected.
-Task 11.6c.1 binds one internally supplied resolved outer/index to retained PE settings and
+PE binds one internally supplied resolved outer/index to retained PE settings and
 resources, preserving independent seed outcomes, winner flags, run counts and cumulative
-usage or the indexed original evaluator error. Task 11.6c.2 privately schedules ordered
+usage or the indexed original evaluator error. A private scheduler runs ordered
 same-owner PE outers with one allowance, checked aggregate counts and stable committed
 final-score best ownership. Whole seed-run completion stays independent of winner flags;
 original indexed resolution/evaluation errors retain cumulative usage.
 Private HC/PE aggregates, the public Core HC/PE facade and fallible wire result
 projections are implemented and used by the production CLI adapter.
-Task 12.9a privately retains the best earlier successful, final-scored seed when a
+The private PE runtime retains the best earlier successful, final-scored seed when a
 later seed fails. Its error envelope owns the original resolved initial key separately
 from the committed mutable board, preserving the failure source/index and charged usage.
 Failed climbs, provisional scan winners and failed final rescoring never supply that best.
-Task 12.9b privately retains earlier accepted outers and eligible earlier seeds in
+It also retains earlier accepted outers and eligible earlier seeds in
 failing outers, selecting strictly better final scores and preserving earliest ties.
 Outer-completion accounting precedes acceptance: overflow retains only the prior aggregate.
 Private owned PE projections preserve terminal usage/counters, nullable failure indices,
 original causes and separate malformed-best errors. Public HC is unchanged;
-Task 12.9c exposes these PE projections through the same public run facade.
+These PE projections are exposed through the same public run facade.
 
 For this settings fragment, malformed raw JSON (including duplicate keys, trailing
 input and nonobjects), missing fields and invalid kind/objectives use
@@ -69,15 +69,15 @@ index. The 4 MiB raw-byte ceiling and incompatible ordered alphabets use
 `invalid_request` at `/job/attack`. Raw validation precedes alphabet compatibility,
 then exact-field and required/type checks. These fragment-local choices do not
 change existing root/domain diagnostic policies.
-Task 11 first validates a known scrambler with unknown plugboard, then nests the
+The attack contract first validates a known scrambler with unknown plugboard, then nests the
 same attack inside outer scrambler enumeration. Current CLI availability is
 summarized above; private HC/PE drivers and outer schedulers are implemented.
 [Protocol](protocol.md) and [scoring/resources](scoring-resources.md) remain normative.
 This document specifies `hill_climb` and `partial_exhaustion`, plus the implemented private
 control contract in §6.1 and public Core HC/PE facade in §6.2;
-[protocol §4.1](protocol.md#41-planned-hcpe-search-events--task-127) defines first-release
+[protocol §4.1](protocol.md#41-hcpe-search-events) defines first-release
 lifecycle/results/progress, now delivered by the CLI for HC/PE. Chained stages are
-specified in [§9](#9-chained-stages--task-13) and the hold list in [§10](#10-hold-list--task-14);
+specified in [§9](#9-chained-stages) and the hold list in [§10](#10-hold-list);
 checkpoints remain separate work; multi-variant search is not planned.
 The Stage 3 `bombe` pass, which reuses this attack branch with a crib and a
 finishing climb, is specified in [crib-attack.md](crib-attack.md).
@@ -86,11 +86,11 @@ finishing climb, is specified in [crib-attack.md](crib-attack.md).
 
 Retain the existing `space.plugboard = {candidates, size}` branch exactly:
 a pre-disjoint pool, positive fixed subset size, published combination order and
-coverage rules. It is structurally valid legacy search, **not a Task 11 attack
-domain**. Task 11 execution rejects that branch with `unsupported_pass`; it never
+coverage rules. It is structurally valid legacy search, **not an attack
+domain**. Attack execution rejects that branch with `unsupported_pass`; it never
 reinterprets pool pairs as overlapping seeds or changes their enumeration.
 
-The additive Task 11 branch is exactly:
+The additive attack branch is exactly:
 
 ```text
 space.plugboard := {"kind":"attack", "symbols":[SYMBOL,...], "max_pairs":INTEGER}
@@ -119,7 +119,7 @@ Also require max_pairs <= fixed_pair_count + floor(symbols.len() / 2).
 Zero is valid only with no fixed pairs; it explicitly permits only the empty board.
 
 An absent `space.plugboard` still means a complete fixed board, including fixed
-empty `[]`, never an unconstrained unknown board. Task 11 requires the attack
+empty `[]`, never an unconstrained unknown board. The contract requires the attack
 branch even when its only permissible remainder is empty. Fixed configuration,
 seed and every trial board must satisfy the existing definition/resolver
 plugboard admissibility (currently alphabet membership and disjoint symmetry).
@@ -128,7 +128,7 @@ All slot coverage and fixed/variable conflicts retain protocol §3.2–3.3 rules
 
 ## 2. One executable pass and explicit settings
 
-`job.passes` retains its array of unique identifier strings. Task 11 execution
+`job.passes` retains its array of unique identifier strings. Attack execution
 requires exactly one identifier, `hill_climb` or `partial_exhaustion`. Add required
 `job.attack` **only for this attack branch**, with the following strict fields:
 
@@ -160,13 +160,12 @@ conflict, not deduplication. `start: []` explicitly starts with known pairs only
 Malformed starts/domains/thresholds use `invalid_search_space` at the offending
 path; unknown keys use `unknown_field`. Missing/mismatched attack settings are
 `invalid_request`. Recognized but deferred `reswapping`, `trie`, and `measure`
-remain structurally recognized, but are `unsupported_pass` for Task 11 execution.
+remain structurally recognized, but are `unsupported_pass` for attack execution.
 Mixed passes likewise fail before work; no cross-pass hold/objective state exists.
-(Task 13 supersedes this for chained stages after the sole HC/PE pass: §9; Task 14
-hold: §10.)
+(Chained stages after the sole HC/PE pass supersede this: §9; hold list: §10.)
 Legacy structural requests without `attack` keep their existing parsing meaning.
 
-Both objectives use already declared and retained Task 10 scorers. All selected
+Both objectives use already declared and retained scorers ([scoring and resources](scoring-resources.md)). All selected
 measures, including those not used as objectives, must satisfy existing minimum
 text lengths and resource binding rules before execution. No model rereads, score
 sum, implicit trie base score, or new smoothing is introduced (sole trie-stage
@@ -174,13 +173,13 @@ exception: §9.4). Compare checked
 Q32 **ranking** values, maximizing them; entropy uses negative measured entropy.
 Initial and final raw scores are not directly compared across different measures.
 Unused *resource references* remain invalid; non-objective declared measures are
-allowed, but Task 11 need not evaluate them for its internal result.
+allowed, but the attack need not evaluate them for its internal result.
 
 ## 3. Pre-execution gates and outer order
 
 Before the first evaluation, validate strict syntax, full coverage, starts/seeds,
 all topology and scoring/resource compatibility, and integer/count bounds.
-Task 11 supports decrypting any topology already resolvable by the universal
+The attack supports decrypting any topology already resolvable by the universal
 engine under its existing resource limits: one or more rotors, optional leftmost
 reflector, fixed/movable slots and validated declarative stepping. There is **no
 global reflector requirement**. Unsupported concrete combinations fail early,
@@ -189,7 +188,7 @@ never get silently skipped. Search always decrypts `job.text`; no search
 
 If a supported existing domain reports `candidate_count() == None`, return
 `resource_limit` before execution, even with a small offset/limit. Never execute
-`candidate.rs`'s overflow placeholder radix as if it were a real subset. Task 11
+`candidate.rs`'s overflow placeholder radix as if it were a real subset. The attack
 does not repair unrelated >u128 enumeration. Attack outer products must likewise
 have checked representable u128 counts; seed and evaluation counters are checked.
 
@@ -314,18 +313,18 @@ otherwise count the fresh final-objective call normally. Never report an unscore
 board as a competitive winner; failed final rescoring remains an error.
 Cancellation discards an unfinished neighborhood's provisional winner and retains
 only the committed board (§6.1). Public events are specified by
-[protocol §4.1](protocol.md#41-planned-hcpe-search-events--task-127).
+[protocol §4.1](protocol.md#41-hcpe-search-events).
 
-### 6.1 Private progress and cancellation — Task 12
+### 6.1 Private progress and cancellation
 
 **Core HC and PE execution is publicly available through `AttackRequest::run` (§6.2).**
 Single climbs, HC outer scheduling, PE seeds/resolved owners and PE outer scheduling
 share checked accounting, counter snapshots and cooperative cancellation.
 Both controlled paths use fresh per-invocation control and evaluation accounting.
 Fallible JSONL projections and the shared synchronous HC/PE adapter ship in the CLI.
-The CLI `--cancel-file` marker (Task12.12) and platform signals (Task12.13) are
-the external cancellation sources; checkpoint cadence remains deferred.
-Checkpoint/resume belongs to Task 16 and the hold list to Task 14 (§10); Task 12 is done.
+The CLI `--cancel-file` marker and platform signals are the external cancellation
+sources. Checkpoint/resume is [protocol §6](protocol.md#6-checkpoint-and-resume); the
+hold list is §10.
 
 #### Accounting and completion
 
@@ -431,10 +430,10 @@ independently polled cancellation. Broken output or hard process exit can preven
 terminal delivery. No timer thread or wall-clock delivery bound is promised.
 External cancellation uses the optional `--cancel-file` marker and platform signals
 ([protocol §5](protocol.md#5-control)).
-[Protocol control](protocol.md#5-control) retains its public obligations; Task 16
-still owns checkpoint/resume design and implementation.
+[Protocol control](protocol.md#5-control) retains its public obligations;
+checkpoint/resume is specified in [protocol §6](protocol.md#6-checkpoint-and-resume).
 
-### 6.2 Public Core HC API — Task 12.8
+### 6.2 Public Core HC API
 
 **`AttackRequest::run` executes HC or PE on an already validated, resource-bound owner.**
 Owned `AttackProgress`, `AttackResult`, `AttackBest`, `AttackTermination` and
@@ -495,7 +494,7 @@ Q32 strings with `FixedScore` values and null with `Option`. `AttackTermination`
 variants are `Completed`, `OuterSliceEnd`, `Cancelled`.
 
 `completed`, `outer_slice_end`, `cancelled` have exactly the
-[wire stop meanings](protocol.md#41-planned-hcpe-search-events--task-127). The public
+[wire stop meanings](protocol.md#41-hcpe-search-events). The public
 facade and production CLI use the corresponding controlled HC/PE path.
 No current-climb result exists before initial success; a failed final rescore cannot
 make that board eligible. Errors dominate cancellation and preserve charged usage.
@@ -504,10 +503,11 @@ u64/u128/i128 values and Q32 units. Transport failures latch cancellation withou
 turning the infallible observer into a fallible evaluator or hiding a runtime error.
 
 First-release JSONL is `started`, initial/cadence/terminal `progress`, final `result`, then `done`
-or runtime `error`; validation errors remain seq1-only. Task 14 specifies the hold,
+or runtime `error`; validation errors remain seq1-only. §10 specifies the hold,
 delivered once as the final `result.hold` array (§10); no candidate/hold/checkpoint event
-is promised. Task16 owns checkpoint/resume. File and POSIX/Windows adapters are
-separately unstarted under [protocol control](protocol.md#5-control); none is shipped.
+is promised. Checkpoint/resume is [protocol §6](protocol.md#6-checkpoint-and-resume); the
+cancel-file and POSIX/Windows signal adapters are specified under
+[protocol control](protocol.md#5-control).
 
 ## 7. Minimal core result, examples and limits
 
@@ -574,13 +574,13 @@ checked Q32 scoring, no-reflector decrypt support and checked shared accounting.
 No floating-point score/trajectory parity or guaranteed key recovery is promised.
 Duet/quartet, DFS, mutable fixed facts and additional attacks remain out of scope.
 Public lifecycle/result transport is frozen above and implemented in the production
-HC/PE adapter; the hold is §10 (Task 14) and checkpoint controls remain Task16 work.
-Differential oracle remains Task17.
+HC/PE adapter; the hold is §10 and checkpoint controls are [protocol §6](protocol.md#6-checkpoint-and-resume).
+The differential oracle is [protocol §9](protocol.md#9-bomm-parity).
 
-## 9. Chained stages — Task 13
+## 9. Chained stages
 
 Status: **reswapping, measure and trie implemented** after HC/PE, in listed order.
-Task 13 supersedes, for this
+Chained stages supersede, for this
 branch only, the §2 sentences rejecting `reswapping`, `trie`, `measure` and mixed
 passes; §1–§8 otherwise stay normative. Pinned bomm basis:
 [attack.c, lines 81–91](https://github.com/ffraenz/bomm/blob/aeb2f2bf00dfdee68e972f90ae7e83b387b188e9/src/attack.c#L81-L91),
@@ -628,8 +628,8 @@ Here `measure` uses default `ic`, so `job.measures` must declare `ic`,
 Stages run sequentially in `job.passes` order on **one** key: the HC/PE run's
 committed best (§7), only when that run terminated `completed` with a best. Each
 stage receives the previous stage's committed key and score and hands on its own.
-Task 14 repeats this pipeline per hold entry (§10.5); there is no checkpoint
-(Task 16), RNG or parallelism; the pipeline is fully deterministic. Every evaluation is a fresh full-message decrypt of
+The hold list repeats this pipeline per hold entry (§10.5); there is no checkpoint
+inside a stage, RNG or parallelism; the pipeline is fully deterministic. Every evaluation is a fresh full-message decrypt of
 `job.text` from the key's initial positions; slot choices never change, and the
 winner's `outer_index`/`start_index` and HC/PE flags are retained unchanged.
 
@@ -653,7 +653,7 @@ holds (a winning pure removal shrinks it by one); the §5 backtrack/switch thres
 do not apply. Like pinned bomm, the identity and pure-removal trials are evaluated
 and counted.
 
-Decision (Task 13.3b): a started reswapping stage that stops early (cancellation
+Decision: a started reswapping stage that stops early (cancellation
 or evaluation error) reports the committed S as its history `score`;
 the score is `null` only when its initial evaluation fails, and best then stays as
 before the stage.
@@ -703,7 +703,7 @@ with one entry per started stage, in order, each exactly `pass`, `measure`,
 no entry: a stage starts at its first evaluation admission, so cancellation
 preventing that admission leaves no history entry. Core mirrors this on `AttackResult`.
 
-## 10. Hold list — Task 14
+## 10. Hold list
 
 Status: **implemented in Core and the CLI.** A run keeps the top-N committed
 candidates instead of one best, polishes them with the §9 stages and delivers them
@@ -741,7 +741,7 @@ This includes cancellation-interrupted climbs (flag `incomplete`), whose require
 final score was established successfully. Provisional scan winners, failed climbs, failed
 final rescores and climbs that never obtained an initial score offer nothing; a
 §6.1 safe stop offers no further climb. On a runtime error the hold keeps exactly
-the earlier offers that the Task 12.9a/b retention rules keep for the single best
+the earlier offers that the PE retention rules (opening section) keep for the single best
 (earlier outers and eligible earlier seeds of a failing outer); when outer-completion
 accounting overflows, offers of that outer are discarded with it. Stages (§10.5) do
 not offer new entries; they replace existing ones.
@@ -766,7 +766,7 @@ candidates are never reconsidered. The flags and indices of a kept entry are its
 
 ### 10.4 Compatibility invariant
 
-With N = 1 the run reproduces Task 13 exactly: the same `best`, `stages`,
+With N = 1 the run reproduces a single-winner run (§9) exactly: the same `best`, `stages`,
 termination, counters, usage and runtime-error context. Without listed stages,
 `best` is the first entry for every N and equals today's strict-`>` earliest best.
 
@@ -807,17 +807,17 @@ committed key and score as the partial entry; the hold is retained.
 A stop or error never discards held entries: cancellation returns the retained hold
 (§10.2 during HC/PE, §10.5 states during stages) in the final `result`; a runtime
 error returns it in the error's `result`. Precedence is errors > exhaustion >
-cancellation (§6.1). Stage cost grows with N; `hold: 1` keeps the Task 13 cost.
+cancellation (§6.1). Stage cost grows with N; `hold: 1` keeps the single-winner cost.
 
 ### 10.7 Result and wire projection
 
 `result` gains an additive `hold` array, in final order (§10.5); it is empty exactly
 when `best` is null. Each entry has exactly the nine `best` fields of
-[protocol §4.1](protocol.md#41-planned-hcpe-search-events--task-127) plus `stages`,
+[protocol §4.1](protocol.md#41-hcpe-search-events) plus `stages`,
 the entry's own stage history in the §9.6 shape (empty when unpolished or without
 stages). The array position is the rank; no separate rank field exists. `best`
 equals the first entry without `stages`, and top-level `result.stages` equals the
-first entry's `stages`, so both keep their Task 13 meaning for N = 1. Entries may
+first entry's `stages`, so both keep their single-winner (§9) meaning for N = 1. Entries may
 carry different `score.measure` values; clients must not compare scores across
 measures. Runtime `error` context keeps the §4.1 shape; for a stage error its
 `outer_index`/`start_index` are the failing finalist's. Core mirrors this on
@@ -826,9 +826,9 @@ measures. Runtime `error` context keeps the §4.1 shape; for a stage error its
 
 ### 10.8 Non-goals and departures from bomm
 
-Not in Task 14: multi-variant search (not planned; run one request per machine),
+Not in the hold list: multi-variant search (not planned; run one request per machine),
 live or periodic `hold` events, threads or a shared concurrent hold, and
-checkpointing (Task 16).
+checkpointing inside the hold.
 
 Deliberate departures from pinned bomm:
 
@@ -845,9 +845,8 @@ Deliberate departures from pinned bomm:
 ## 11. Rewirable reflector (UKW-D) — Stage 5
 
 Status: **Core transform and CPU wiring search implemented**, including complete
-result/hold keys, stages and checkpoint re-verification (plan
-`odd/tasks/enigma-wwii-machines.md`, T9–T11). Human reports display the winning
-wiring; web controls remain T13 work. Protocol [§3.1](protocol.md#31-machine-definition) and
+result/hold keys, stages and checkpoint re-verification. Human reports and the
+web client display the winning wiring. Protocol [§3.1](protocol.md#31-machine-definition) and
 [§3.2](protocol.md#32-configuration-and-transform) define the rewirable wheel
 and its `pairs` key; this section defines how an attack searches that key.
 
@@ -860,7 +859,7 @@ German key sheets label the same contacts `A-ZXWVUTSRQPON-MLKIHGFEDCB`
 (hyphens are the fixed contacts); converting a German sheet is a client
 concern, documented in [historical catalog](historical-catalog.md), never an
 engine alias. UKW-D is offered by separate bundled machines (`enigma-i-ukwd`,
-`enigma-m3-ukwd`, and `enigma-kd` in T12), so the `enigma-i`/`enigma-m3`
+and `enigma-kd`), so the `enigma-i`/`enigma-m3`
 catalog bytes and their checkpoints do not change. The M4 replaced UKW-B and
 the Greek wheel with UKW-D, which is structurally `enigma-m3-ukwd`. The
 historical setting of the UKW-D slot is position `A`, ring `A`; other values
@@ -949,5 +948,5 @@ one seq 1 `backend_unavailable` at `/job/attack`, message
 `GPU backend unavailable: the UKW-D wiring search runs on the CPU only`, exit 1,
 before device initialization. With a **known** wiring the GPU plugboard attack
 is supported unchanged, because the CPU prepares rows from the resolved
-reflector. Deferred options (L13): a hybrid where the CPU climbs W and the GPU
+reflector. Deferred options: a hybrid where the CPU climbs W and the GPU
 climbs the board on rows prepared per wiring, or a GPU kernel that climbs W.

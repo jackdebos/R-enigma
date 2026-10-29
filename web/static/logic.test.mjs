@@ -212,7 +212,7 @@ test('saved attack input round trips all advanced settings and null dimensions f
   }
 });
 
-// distinct-wheels S7: default checked, explicit opt-out and saved-input loading.
+// Distinct wheels: default checked, explicit opt-out and saved-input loading.
 test('distinct wheels defaults on and preserves an explicit opt-out without changing text', () => {
   const state = { model: 'enigma-i', reflector: 'B', slots: [], plugboard: [], search: true, text: ' aZ é!\n', advanced: {} };
   const before = structuredClone(state);

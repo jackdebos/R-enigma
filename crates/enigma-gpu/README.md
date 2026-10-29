@@ -165,11 +165,11 @@ threads: CPU once, GPU at 100% once and GPU at 50% once, budget 1. All hold/fina
 stages are included. Parsing, device setup and 128-key warmups are excluded.
 Every `AttackResult` field is compared via its derived Debug representation
 (the type does not implement `PartialEq`). It reports wall time, dispatch count,
-maximum, p99 and median host dispatch duration, and the historical L25 references.
-The example converts the checked-in trigram table in memory, like the spike;
+maximum, p99 and median host dispatch duration.
+The example converts the checked-in trigram table in memory;
 it writes no converted resource or scratch files.
 
-### RX 580 measurement (after L34 optimization)
+### RX 580 measurement
 
 Single release sample per configuration, all 17,576 keys; whole-result equality
 passed at both usage percentages. CPU-6 wall time in the same invocation was
@@ -183,12 +183,15 @@ passed at both usage percentages. CPU-6 wall time in the same invocation was
 Chosen geometry: **512 keys, budget 1, 128 whole-pair lanes per slice**, with a
 smaller final batch. `--tune` (512 keys, 25%) was exact with budgets 1, 2 and 4
 (maximum 3.2-3.7 ms). Maximums include readback and host scheduling; this is an
-approximately-8-ms target, not a hard deadline. Interleaved repeat samples and
-rejected settings are in `DIAGNOSIS.md`.
+approximately-8-ms target, not a hard deadline. A larger 512 x 256 geometry finished slightly
+sooner (3.94 s against 4.10 s) but raised p99 dispatch time to 5.34 ms, so it was
+rejected.
 
-At 100% the GPU run is about 3.5-4.0x the six-thread CPU and 0.88x the L25 spike's
-4.837 s, while including finalist stages and core commits that the spike omitted.
-The earlier Stage B setting (512 keys, 35-pair action-slot slices, no job
+At 100% the GPU run is about 3.5-4.0x the six-thread CPU, including finalist stages.
+The earlier setting (512 keys, 35-pair action-slot slices, no job
 specialization, full-state readback per dispatch) took 16.722646321 s at 100%
 (7340 dispatches, maximum 7.492814 ms) and 32.025874485 s at 50%.
-No asynchronous or unlimited mode exists; see `DIAGNOSIS.md` for why it was not added.
+No asynchronous or unlimited mode exists. Single dispatches already peak at
+5.5-7.3 ms, so two in flight could form bursts of about 11-15 ms, above the ~8-ms
+target, for at most about 0.9 s of remaining host gap. Accepting longer GPU bursts
+(whole-climb dispatches measured 208-354 ms) would trade away screen smoothness.

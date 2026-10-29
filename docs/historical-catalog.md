@@ -49,7 +49,7 @@ because of its size limit and is not cited as supporting evidence.
   exactly 12 free pairs in the transform key. The historical reflector setting is
   position A, ring A; other settings are representable but non-historical.
   For German-sheet conversion see **UKW-D facts** below. The original I/M3
-  catalog bytes are unchanged. CPU UKW-D wiring search is implemented (T10/T11).
+  catalog bytes are unchanged. CPU UKW-D wiring search is implemented.
 - `enigma-m4` contains rotors I–VIII, Beta/Gamma, and UKW Thin-B/Thin-C. Its moving
   slots accept I–VIII; a separate fixed `role: "rotor"` Greek slot admits Beta/Gamma
   and is not treated as an entry wheel. The leftmost reflector admits only Thin-B/C.
@@ -108,8 +108,8 @@ embedded definitions; their bundled status does not bypass validation.
 
 Railway, G-312, G-260 and KD are bundled in engine 0.3.0. KD uses the
 rewirable UKW-D support; its FRA wiring is not confirmed as Mil Amt wiring.
-This section covers S5/S6/S9; the
-ETW and G stepping representation follows S7/S8. The fixture contains external
+This section covers sources, machine facts and independent reference vectors;
+the ETW and G stepping representations are described with each machine below. The fixture contains external
 ciphertexts, not output of this repository's engine. G-228 remains blocked by an
 invalid sourced rotor-II permutation; do not manufacture a corrected wiring.
 
@@ -140,7 +140,7 @@ archival confirmation of each wiring.
 
 | Entry | Source status | Resolution for this feature |
 |---|---|---|
-| Railway | CM-W + Toledo agree on the S6 strings and N/E/Y; Palloks preset 10 agrees | Use that explicitly identified BP-equivalent parameterization, not Palloks preset 11 (original wiring) |
+| Railway | CM-W + Toledo agree on the wiring strings and N/E/Y; Palloks preset 10 agrees | Use that explicitly identified BP-equivalent parameterization, not Palloks preset 11 (original wiring) |
 | G-312 | CM-W/CM-G + Toledo agree; Palloks preset 17 agrees on equipment | Dual-publication wiring agreement; simulator stepping disagreement below |
 | G-260 | CM-W/CM-G + Toledo agree; Palloks preset 16 agrees on equipment | Dual-publication wiring agreement; simulator stepping disagreement below |
 | G-228 (Green/Grün) | CM-W/CM-G only; absent from Toledo and Palloks presets | Single historical source; III confirmed in both CM table and drawing index, but II is invalid as printed |
@@ -202,7 +202,7 @@ lists "G 227 – G 228 — Germany, OKW/Ag WNV/Fu II b, special wiring GD,
 (10.07.1943)", and GD as UKW Ch 15 Tz 115 with I–III Ch 15 Tz 123 a–c, not
 Tz 125. G-228 is deferred until corrected primary evidence exists.
 
-**Railway caveat:** CM-W labels its S6 table original, while Palloks labels the
+**Railway caveat:** CM-W labels its wiring table original, while Palloks labels the
 same electrical strings BP wiring without correction (preset 10); preset 11
 uses `EVLPKUDJHTGSZFRABWYICOXNMQ`, `HXMQKGJTSCZFLBERNAWYIDOVPU`,
 `JHDBSKYPZNMVXURECLIGQOAWTF`, UKW `DNSAJQIPGEXRWBVHFLCZYOMKUT`
@@ -211,7 +211,7 @@ measured from K438 in 2023. CM-W explains BP-recovered and original wiring are
 equivalent with appropriate ring adjustments, and I/III turnover differences
 arose from BP misidentification, not German swapping of alphabet rings;
 see Philip Marks, Cryptologia 39 (2015), issue 1. The fixture deliberately pins
-S6/Toledo/Palloks-10 conventions; it is not a recovered historical daily key.
+CM-W/Toledo/Palloks-10 conventions; it is not a recovered historical daily key.
 Railway has standard military double stepping and a settable, ring-adjustable,
 non-moving reflector. CM-R explicitly rejects Friedman's moving-UKW claim.
 
@@ -219,7 +219,7 @@ non-moving reflector. CM-R explicitly rejects Friedman's moving-UKW claim.
 “No double-stepping anomaly”, and a driven UKW that moves during encipherment.
 The wheel notch counts are 17/15/11 for I/II/III. Both rotor rings and reflector
 ring/position are settable; Toledo explicitly says “Settable UKW, UKW also has
-ring setting” and “UKW also rotates”. The S8 encoding evaluates all turnovers
+ring setting” and “UKW also rotates”. The catalog encoding evaluates all turnovers
 before motion: right always, middle iff right at turnover, left iff right AND
 middle, reflector iff right AND middle AND left. A middle notch alone cannot
 advance the left wheel. Palloks `engage_gear` implements this nested carry.
@@ -274,7 +274,7 @@ long text encounters multiple notches. Toledo instead gives `KVTB`, `KWUC`,
 `LWVD`, `LXVE`. Its `__step1` uses independently tested `turnSets/holdSets`
 rather than nested carries: at the third key it advances UKW even though the
 left wheel III's displayed W is not a turnover. Neither simulator was changed
-to force agreement. Palloks matches the sourced cog mechanism and S8; Toledo
+to force agreement. Palloks matches the sourced cog mechanism and that encoding; Toledo
 is **not** a second confirming G oracle. Both alternate ciphertexts are retained.
 
 Notation mapping:
@@ -296,7 +296,7 @@ Notation mapping:
   encryption. A simulator accepting the non-bijective II string would not
   constitute valid independent evidence.
 
-The original T2 collection used ignored `target/wwii-ref/dl/` downloads and
+The original collection used ignored `target/wwii-ref/dl/` downloads and
 `target/wwii-ref/tools/` harnesses (local artifacts, not shipped tools). For new
 collections, use a fresh system temporary directory (`mktemp -d`), never the
 worktree, and run downloaded/extracted JS only with Node there. `prepare.py`
@@ -323,7 +323,7 @@ implementations separately (G disagreements are expected and documented).
 Source reconciliation and fixture collection are passive documentation/data work;
 the bundled catalog behavior is separately covered by core and CLI vector tests.
 
-#### T12 UKW-D collection (2026-10-28)
+#### UKW-D collection (2026-10-28)
 
 Palloks v2.6.2 was fetched anew from the URL above and extracted/run headlessly
 with Node v24.22.1 in a fresh system temp directory. Only the upstream functions

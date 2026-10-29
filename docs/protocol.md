@@ -3,7 +3,7 @@
 Status: **Protocol v1 is unpublished; transform and validated HC/PE/bombe execution ship
 in Rust. Legacy search and deferred controls remain unimplemented.** It replaces the former superset-of-`bomm` proposal. It makes no promise to
 accept `bomm` query files unchanged; `bomm` remains a differential oracle. See
-`odd/tasks/enigma-engine.md` for task status. The engine has no UI; the Stage 2 web
+The engine has no UI; the Stage 2 web
 client is a separate program that drives this CLI (§8).
 
 ## 1. Normative boundary
@@ -19,11 +19,11 @@ validation.
 
 This document marks protocol requirements as normative. Search-space grammar is
 specified in §3.3 and §7; [Scoring and external resources](scoring-resources.md)
-specifies the normative Task 10 measure/resource contract. Pass execution fields
-remain deferred to their implementation tasks; the checkpoint record is specified in §6.
-[Core HC API](search-passes.md#62-public-core-hc-api--task-128) freezes the
+specifies the normative measure/resource contract. Other pass execution fields
+remain deferred; the checkpoint record is specified in §6.
+[Core HC API](search-passes.md#62-public-core-hc-api) freezes the
 first public HC/PE adapter contract; §4.1 specifies its shipped JSONL lifecycle.
-[Task 11 plugboard attacks](search-passes.md) freezes the planned additive attack
+[Plugboard attacks](search-passes.md) freezes the planned additive attack
 branch and pass settings; strict attack parsing, CLI validation and HC/PE execution
 are supported. Illustrative
 search concepts below are not executable request examples. Representability does not imply catalog availability or
@@ -35,8 +35,7 @@ search support.
 | --- | --- | --- | --- |
 | `stdio` (default) | scripts, tests, the web client (§8) | — | 1 |
 
-**Status:** §2.1-§2.4 and the additive §4.1 fields ship in the CLI
-(`odd/tasks/enigma-human-output.md`).
+**Status:** §2.1-§2.4 and the additive §4.1 fields ship in the CLI.
 
 Stage 1 is one command-line process (§2.1). By default it runs in **human mode**
 (§2.2): a progress bar on stderr, a readable report at the end and a saved report
@@ -478,7 +477,7 @@ absence of `space.plugboard`, never by `[]` alone.
 The definition contains no position, ring, active wheel selection, or plugboard key.
 Configuration resolution combines definition structure and explicit configuration into
 a concrete topology, stepping rules, and plugboard. `Engine::new` consumes that resolved
-combination; this protocol redesign does not change Task 4's model boundary.
+combination; this protocol redesign does not change the engine model boundary.
 
 For each symbol, step once before electrical traversal, independent of direction. Let
 `N` be alphabet length, `p` position index, `r` ring index, and `o=(p-r) mod N`. A wheel
@@ -490,15 +489,15 @@ traversal and produce the same transform. Without reflector, encrypt traverses f
 right-to-left and decrypt reverse left-to-right, with plugboard at both ends. No
 universal involution or no-self-encryption claim is made.
 
-### 3.3 Search job boundary (Task 9 grammar)
+### 3.3 Search job boundary
 
 A search job has `kind: "search"` and exactly `configuration`, `text`, `space`,
 `passes`, `measures`, and optional `resources`. `configuration` carries the fixed
 known choices (§3.2), `space` carries the explicit variable domains and bounds,
 `passes` and `measures` select behavior, and `resources` parameterizes it. This
 section is normative for the §3.2/§3.3 structure only; execution is specified by
-the pass contracts (HC/PE attacks and the Task 13 chained stages of
-[search-passes §9](search-passes.md#9-chained-stages--task-13) execute; §4.1).
+the pass contracts (HC/PE attacks and the chained stages of
+[search-passes §9](search-passes.md#9-chained-stages) execute; §4.1).
 
 `space` is an object allowing exactly `slots`, `plugboard`, `offset`, `limit`, and
 `constraints`; all five are optional, so an empty object means the fixed choices are
@@ -513,7 +512,7 @@ already complete.
   must be present. On a rewirable slot (§3.1) the attack branch also accepts
   `pairs: {"kind":"attack"}`, a searched wiring
   ([search-passes §11](search-passes.md#112-request)), which then counts as a member.
-- `plugboard`: the retained Task 9 subset branch is an object with exactly `candidates` and `size`. `candidates` is a non-empty
+- `plugboard`: the retained legacy subset branch is an object with exactly `candidates` and `size`. `candidates` is a non-empty
   unique array of disjoint two-symbol pairs drawn from the alphabet; `size` is a
   positive integer no greater than `candidates.len()`, the number of additional pairs
   to draw from that pool. Known pairs in `configuration.plugboard` must be disjoint
@@ -594,8 +593,8 @@ canonicalization, or sandbox restriction is introduced.
 **Implementation status:** Current execution availability is summarized in §4.1.
 Engine 0.2.0 implements `space.constraints` (`distinct_wheels`);
 older engines reject it as `unknown_field`.
-Task 9 implements the structural boundary and capability
-framework. Task 10 implements deterministic IC, Shannon entropy, Sinkov n-gram and
+The engine implements the structural boundary and capability
+framework, plus deterministic IC, Shannon entropy, Sinkov n-gram and
 weighted trie scoring, strict external resource parsers, typed measure/resource
 selection, pure content binding, and bounded CLI loading. The CLI uses shared strict
 dispatch to validate and bind search resources before execution. Legacy search still
@@ -603,7 +602,7 @@ returns one `unsupported_job` error without work events; resource errors precede
 that result. Validated HC/PE attacks execute through the shared adapter. Transform
 never loads resources; its grammar and events are unchanged.
 
-[Task 11](search-passes.md) adds strict attack dispatch when
+[Plugboard attacks](search-passes.md) add strict attack dispatch when
 `job.space.plugboard.kind` is `"attack"`, still with `job.kind = "search"`.
 The CLI loads and binds resources and checks eligibility and counts before
 execution. Structural, loading, model-binding and eligibility failures emit only a
@@ -616,7 +615,7 @@ Stage 1 plans `hill_climb`, `partial_exhaustion` with backtracking, `reswapping`
 and `measure`; measures include index of coincidence, Sinkov n-gram statistics,
 Shannon entropy, and trie scoring. This plan does not assert parser or search support.
 The chained `reswapping`/`trie`/`measure` stages are specified and implemented in
-[search-passes §9](search-passes.md#9-chained-stages--task-13).
+[search-passes §9](search-passes.md#9-chained-stages).
 Representability by the definition schema does not imply algorithm support for arbitrary
 alphabet, wheel count, stepping rule, or topology.
 
@@ -633,8 +632,8 @@ then exactly one terminal `done`; runtime failure emits terminal `error`. Search
 emit `progress`, `candidate`, `checkpoint`, and `hold` according to job lifecycle.
 The first HC/PE release instead uses only `progress` and final `result` (§4.1);
 `candidate` and `hold` remain eventual Stage 1 requirements, not part
-of that release; `checkpoint` is specified in §6.5 (Task 16). Task 14 implements the hold delivered once, as the
-final `result.hold` array ([search-passes §10](search-passes.md#10-hold-list--task-14));
+of that release; `checkpoint` is specified in §6.5. The hold is delivered once, as the
+final `result.hold` array ([search-passes §10](search-passes.md#10-hold-list));
 no live `hold` event. Transform emits no candidate, hold, or checkpoint event. A validated `transform` job
 emits `started`, then exactly one `output` whose `output` member is the transformed
 text, then exactly one terminal `done` with `reason: "completed"`. `done` remains
@@ -661,7 +660,7 @@ internal runtime failure after `started` (including evaluation, resolution or co
 invariants); it is never a request-validation failure.
 Syntax errors point to the closest available containing path.
 
-### 4.1 Planned HC/PE search events — Task 12.7
+### 4.1 HC/PE search events
 
 **Current availability:** Transform and validated HC/PE/bombe attacks execute
 in the production CLI. HC/PE/bombe share the synchronous JSONL adapter and fallible Core
@@ -682,7 +681,7 @@ which retains the original runtime cause and separate best-projection cause;
 only genuine absence becomes null. These projection helpers read no clocks and
 perform no I/O or orchestration; the private adapter supplies that boundary.
 One leading attack pass, `hill_climb`, `partial_exhaustion` or `bombe`, is eligible, optionally
-followed by the executable [Task 13 chained stages](search-passes.md#9-chained-stages--task-13)
+followed by the executable [chained stages](search-passes.md#9-chained-stages)
 `measure`, `trie` and `reswapping`; recognition of other passes is not support, and
 mixed/deferred/legacy rejection is unchanged. `result.stages` is live: it lists the
 started stages in pipeline order (§9.6 there), empty when none started.
@@ -690,7 +689,7 @@ started stages in pipeline order (§9.6 there), empty when none started.
 After all parsing, resource loading/binding, eligibility and count validation,
 emit `started`, initial/cadence/terminal `progress`, one `result`, then exactly one terminal
 `done` or runtime `error`. Preflight failures retain the existing seq1 `error` only.
-Task12.8 exposes Core HC; Task12.9c adds Core PE through the same synchronous API.
+Core exposes HC and PE through the same synchronous API.
 The lifecycle below is implemented by the shared production HC/PE adapter;
 legacy search remains unsupported.
 On runtime error, `result` retains the earlier eligible committed finalists in
@@ -698,7 +697,7 @@ On runtime error, `result` retains the earlier eligible committed finalists in
 climb. Stage errors retain the failing finalist's last committed key per
 [search-passes §10.5](search-passes.md#105-stages-over-the-hold).
 No `done` follows error. `result` is final, not a stream of provisional trials;
-its `hold` array is the implemented Task 14 hold ([search-passes §10.7](search-passes.md#107-result-and-wire-projection)).
+its `hold` array is the implemented hold ([search-passes §10.7](search-passes.md#107-result-and-wire-projection)).
 
 Payloads below supplement the existing event envelope; `done` stays reason-only:
 
@@ -706,7 +705,7 @@ Payloads below supplement the existing event envelope; `done` stays reason-only:
 | --- | --- |
 | `started` | `outers_selected` (HC/PE only; transform `started` is unchanged) |
 | `progress` | `counters`, `elapsed_ms` |
-| `result` | `stages`, `best` (object or null), `hold` (Task 14 array), `counters`, `elapsed_ms`, `threads`, `started_at`, `finished_at` |
+| `result` | `stages`, `best` (object or null), `hold` (array), `counters`, `elapsed_ms`, `threads`, `started_at`, `finished_at` |
 | `done` | `reason`: `completed`, `outer_slice_end`, or `cancelled` |
 | Runtime `error` | Existing `code`, `message`, `location`; additionally `context` |
 
@@ -775,7 +774,7 @@ on success, cooperative cancellation or returned error. Optional
 `invalid_request` at `/job/attack/progress_every`; unknown-member validation retains
 precedence. HC and Partial Exhaustion (PE) share this grammar.
 The outer phase runs selected outer keys in fixed blocks of 128 consecutive keys in
-key order ([search-passes §6.1](search-passes.md#61-private-progress-and-cancellation--task-12)).
+key order ([search-passes §6.1](search-passes.md#61-private-progress-and-cancellation)).
 After a block's work is committed, Core emits one snapshot if at least X evaluations
 completed since the previously emitted snapshot (the initial one counts as 0), even
 when the block crossed several multiples of X; nothing is emitted inside a block.
@@ -833,14 +832,14 @@ ordering applies only while delivery succeeds, including final result write/flus
 | Cancel (first HC/PE release) | `--cancel-file <path>` marker or a platform signal (`SIGINT`/`SIGTERM`/`SIGHUP`, Windows Ctrl+C/Break); both shipped | Cooperative safe-stop, final `result`, then `done` with `reason: "cancelled"`; retained `result.hold` per Task 14; with `--checkpoint`/`--resume`, a checkpoint is written first (§6.2) |
 | Parallel HC/PE outer keys | `--threads <n>`, default half the logical CPUs; outer-key blocks run on that many worker threads | Same public output as one thread for completed runs; see the `--threads` contract below |
 | Pause/resume live job | Not in Stage 1 | Future extension |
-| Save and resume HC/PE | `--checkpoint <path>`, `--resume <path>` (Task 16) | Periodic, end-of-outer-phase and cancellation checkpoints; resume with any `--threads`; see §6 |
+| Save and resume HC/PE | `--checkpoint <path>`, `--resume <path>` | Periodic, end-of-outer-phase and cancellation checkpoints; resume with any `--threads`; see §6 |
 | Bound HC/PE search | `space.offset`/`space.limit` and cancellation | §4.1 slice/exhaustion/cancellation reasons; slices bound outer keys only; no new `--max-keys` attack control |
 | Other future bounded search | Planned `--max-keys` | Legacy planned `limit_reached`/`offset_end`, not HC/PE mappings |
 
 Transform has no search progress, cancellation, hold, or checkpoint contract in v1.
 
-[Task 12 private integration](search-passes.md#61-private-progress-and-cancellation--task-12)
-implements shared accounting, counter-only snapshots and cooperative cancellation
+[Private progress and cancellation](search-passes.md#61-private-progress-and-cancellation)
+implement shared accounting, counter-only snapshots and cooperative cancellation
 for private HC climbs/outer scheduling and PE seeds/resolved owners/outer scheduling.
 Admitted evaluations are nonpreemptive; errors > established exhaustion > cancellation.
 Stops retain committed results and required final rescoring when the final score is
@@ -850,8 +849,8 @@ not necessarily short. Use offset/limit to bound outer keys or cancellation to s
 remaining work.
 Core runtime, fallible JSONL projections and the synchronous HC/PE adapter ship in the
 production CLI (§4.1), including the final retained hold. Live hold events remain
-unimplemented; checkpoint cadence is specified in §6.2 (Task 16).
-Task12.12 ships `--cancel-file` and Task12.13 platform signals as the external
+unimplemented; checkpoint cadence is specified in §6.2.
+The CLI ships `--cancel-file` and platform signals as the external
 cancellation sources, per the contracts below; they combine by OR, both sticky.
 Without either, cancellation stays false. Signal handlers only feed a sticky
 cancellation request, never perform evaluation or JSONL writes.
@@ -1002,9 +1001,9 @@ are bounded to keep the display responsive; below 100 the runtime idles between
 dispatches to approximate the requested wall-time duty cycle, not a hardware
 utilization guarantee. Usage never changes results. No new event fields are added.
 
-## 6. Checkpoint and resume (Task 16)
+## 6. Checkpoint and resume
 
-**Status:** shipped for validated HC/PE attacks (`odd/tasks/enigma-checkpoints.md`).
+**Status:** shipped for validated HC/PE attacks.
 
 Only a resumable search may write checkpoints. A transform has no Stage 1 checkpoint.
 Checkpoint identity binds a canonical digest of the resolved definition **content**
@@ -1138,7 +1137,7 @@ events depend on where the stops happened and are not part of that promise.
 ## 7. Determinism
 
 Enumeration order is completely defined by the resolved search space; offset/limit
-address that order. The Task 9 base order is a flat lexicographic order over the
+address that order. The base order is a flat lexicographic order over the
 assignment tuple: dimensions are visited in definition slot order (left to right), and
 within a slot in the order `wheel`, `position`, `ring`; the plugboard remainder is the
 last dimension. Later dimensions vary fastest (odometer), so the rightmost slot and
@@ -1154,8 +1153,8 @@ could vary, otherwise results are bit-identical. Unordered reductions do not aff
 scores; each candidate is scored independently. Stochastic passes record seed and RNG
 state. Holds order by `(score desc, enumeration index asc)`; for attacks the index is
 (outer, start) and stages re-rank per
-[search-passes §10](search-passes.md#10-hold-list--task-14). These obligations apply
-only to implemented search jobs. The planned Task 11 attack branch retains the
+[search-passes §10](search-passes.md#10-hold-list). These obligations apply
+only to implemented search jobs. The attack branch retains the
 per-slot order but slices outer scramblers only; seed/action indices are separate,
 as specified in [attack order](search-passes.md#3-pre-execution-gates-and-outer-order).
 With `space.constraints.distinct_wheels`, the outer order is that same order with every
@@ -1201,7 +1200,7 @@ No compatibility with `bomm` query JSON is required. Each differential case expr
 equivalent machine, key, input, pass, and score configuration in each tool's own format.
 Compare resulting key/plaintext and compare scores only when measure, resources, and
 passes are equivalent. Shared acceptance of one JSON file is not evidence of parity.
-Task 17 is the differential-oracle validation task.
+The `e2e/bomm/` cases are that differential-oracle validation.
 
 ## 10. Version and status
 
@@ -1213,8 +1212,8 @@ both are additive extensions like `hold` and chained stages.
 `protocol_version: 1` denotes this unpublished contract. Unknown
 versions and fields fail before work. Incompatible changes to field meaning,
 validation, traversal, or event ordering after v1 ships require a version bump. Detailed
-pass execution fields other than the [Task 11 contract](search-passes.md)
-(whose HC/PE attacks and [Task 13 chained stages](search-passes.md#9-chained-stages--task-13)
+pass execution fields other than the [plugboard attack contract](search-passes.md)
+(whose HC/PE attacks and [chained stages](search-passes.md#9-chained-stages)
 execute) remain deferred; the checkpoint record is specified in §6.3. They must be specified
 before their implementation, not presumed executable or imported from `bomm`.
 Search-space and [measure/resource schemas](scoring-resources.md) are specified as

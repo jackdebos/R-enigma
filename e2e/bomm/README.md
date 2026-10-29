@@ -79,7 +79,7 @@ Per-evaluation search time divides by each engine's own count. There are no timi
 ### Design A2: unknown middle/right positions
 
 A2 is a step between design A (1 key) and design B (all three
-rotating positions unknown, 17,576 keys; Task 17.7).
+rotating positions unknown, 17,576 keys).
 
 `m4-u264-attack-positions` is A with only middle/right positions unknown:
 `*` in bomm, A–Z domains in our request, for 676 outer keys. All wheels, rings,
@@ -182,9 +182,18 @@ Tests verify entry counts and rejection of malformed input.
 
 ## Capture
 
-With `$R` the reference checkout (build details: `odd/tasks/enigma-engine-bomm-oracle.md`),
-binary `$R/build/bomm` SHA-256 `58f236fc648638a21d7c1be7e4a355c0a9aeca7edcbbfc2743ebd8cdb81895b5`,
-run from the repository root:
+With `$R` a bomm checkout at commit `aeb2f2bf00dfdee68e972f90ae7e83b387b188e9`
+and [Jansson](https://github.com/akheron/jansson) 2.15.1 installed statically inside
+it (`./configure --prefix=$R/build/deps/jansson --disable-shared --enable-static`,
+`make`, `make install`), the reference was built with GCC 14.2 as
+
+    make -B -j2 build RELEASE_CFLAGS="-I$R/build/deps/jansson/include -O3 -std=c11 -pthread -pedantic -Wall -Wextra" LDFLAGS="-L$R/build/deps/jansson/lib"
+
+This is the upstream `RELEASE_CFLAGS` without `-Werror`: GCC 14 reports two false
+positives (`-Wstringop-overflow` in `src/key.c`, `-Wmaybe-uninitialized` in
+`src/passes/reswapping.c`), neither in encryption or IC code. The resulting
+binary `$R/build/bomm` has SHA-256 `58f236fc648638a21d7c1be7e4a355c0a9aeca7edcbbfc2743ebd8cdb81895b5`.
+Run captures from the repository root:
 
     $R/build/bomm -q -t 1 -n 1 e2e/bomm/<case>/query.json
 
@@ -230,4 +239,4 @@ Measured before setting the Sinkov tolerance (Q32 units divided by `2^32`):
 
 ## Coverage and remaining work
 
-Covered: known-key decryption and resource-free IC on Enigma I, M3 (two-notch VI–VIII) and M4 (thin reflectors, Beta/Gamma), with nonzero rings, plugboards and middle-wheel double steps inside the preview, plus one historical message and German Enigma1941 bigram/trigram Sinkov scoring on its correct and wrong keys. The opt-in design A case adds unknown-plugboard hill-climb/reswapping outcome coverage with fixed outer settings. Not covered: text beyond 64 letters against bomm itself, scores beyond display precision, other n-gram orders/tables, general search/plugboard exploration, stage trajectories, hold-list ordering and outer ordering. Those are separate Task17 slices; attack comparisons must use real German text with a known plaintext. A source-linked helper calling bomm's functions directly would lift the 64-letter and six-decimal limits if needed.
+Covered: known-key decryption and resource-free IC on Enigma I, M3 (two-notch VI–VIII) and M4 (thin reflectors, Beta/Gamma), with nonzero rings, plugboards and middle-wheel double steps inside the preview, plus one historical message and German Enigma1941 bigram/trigram Sinkov scoring on its correct and wrong keys. The opt-in design A case adds unknown-plugboard hill-climb/reswapping outcome coverage with fixed outer settings. Not covered: text beyond 64 letters against bomm itself, scores beyond display precision, other n-gram orders/tables, general search/plugboard exploration, stage trajectories, hold-list ordering and outer ordering. Those are separate future slices; attack comparisons must use real German text with a known plaintext. A source-linked helper calling bomm's functions directly would lift the 64-letter and six-decimal limits if needed.
