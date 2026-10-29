@@ -24,7 +24,7 @@ use std::fmt;
 ///
 /// A request is bounded by this limit before its JSON tree is built. An embedded
 /// `machine.definition` is additionally bounded by the crate's 1 MiB definition limit
-/// ([`MAX_DEFINITION_BYTES`]) so it cannot smuggle a larger document past the standalone
+/// (`MAX_DEFINITION_BYTES`) so it cannot smuggle a larger document past the standalone
 /// definition check.
 pub const MAX_REQUEST_BYTES: usize = 4_194_304;
 

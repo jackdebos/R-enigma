@@ -62,7 +62,7 @@ impl Engine {
     /// [`ModelError::PlugboardAlphabetMismatch`]. It also evaluates the initial step plan
     /// against the topology, so a [`Stepping`] rule set built for another topology fails
     /// closed with [`ModelError::SteppingTopologyMismatch`]. Initial displayed positions
-    /// are taken from each [`Slot::position`].
+    /// are taken from each [`Slot::position`](crate::Slot::position).
     pub fn new(
         topology: MachineTopology,
         stepping: Stepping,
