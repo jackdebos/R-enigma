@@ -89,6 +89,9 @@ cd web && go test ./...
 
 ## Créditos
 
+- Desarrollado con [Gentle Shell](https://github.com/Gentleman-Programming/gentle-shell).
+  Gracias a [Gentleman Programming](https://gentlemanprogramming.com/) (Alan Buscaglia)
+  y a su comunidad de colaboradores.
 - [bomm](https://github.com/ffraenz/bomm), de Fränz Friederes (MIT), es la
   referencia diferencial de este motor y la fuente de sus tablas de frecuencias
   de 1941 incluidas.

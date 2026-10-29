@@ -87,6 +87,9 @@ cd web && go test ./...
 
 ## Credits
 
+- Developed with [Gentle Shell](https://github.com/Gentleman-Programming/gentle-shell).
+  Thanks to [Gentleman Programming](https://gentlemanprogramming.com/) (Alan Buscaglia)
+  and its community of contributors.
 - [bomm](https://github.com/ffraenz/bomm) by Fränz Friederes (MIT) is the
   differential reference for this engine and the source of its built-in 1941
   frequency tables.
