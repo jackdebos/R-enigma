@@ -96,7 +96,8 @@ cd web && go test ./...
   referencia diferencial de este motor y la fuente de sus tablas de frecuencias
   de 1941 incluidas.
 - Esas tablas derivan de descifrados de mensajes Enigma de 1941 publicados por
-  Frode Weierud, [CryptoCellar](https://cryptocellar.org/bgac/keyofE.html).
+  Frode Weierud, [CryptoCellar](https://cryptocellar.org/bgac/keyofE.html). Gracias a
+  Frode Weierud por autorizar el uso de estas tablas.
 - Los cableados y vectores de referencia provienen de Crypto Museum, el Universal
   Enigma de Daniel Palloks y otras fuentes citadas en
   [docs/historical-catalog.md](docs/historical-catalog.md).

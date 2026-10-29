@@ -5,8 +5,10 @@
 `data/frequencies/` in bomm commit `aeb2f2bf00dfdee68e972f90ae7e83b387b188e9`,
 https://github.com/ffraenz/bomm), converted to the engine JSON v1 n-gram format.
 bomm's README credits raw 1941 Enigma message decrypt tables published by Frode
-Weierud, CryptoCellar (https://cryptocellar.org/bgac/keyofE.html); no separate data
-licence is stated. bomm is distributed under the MIT License below.
+Weierud, CryptoCellar (https://cryptocellar.org/bgac/keyofE.html). bomm is
+distributed under the MIT License below.
+
+Thanks to Frode Weierud for granting permission to use these tables in R-enigma.
 
 Regenerate from the repository root (then write each file compact, with no
 whitespace and one final newline):

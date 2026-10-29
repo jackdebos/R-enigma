@@ -94,7 +94,8 @@ cd web && go test ./...
   differential reference for this engine and the source of its built-in 1941
   frequency tables.
 - Those tables derive from 1941 Enigma message decrypts published by Frode Weierud,
-  [CryptoCellar](https://cryptocellar.org/bgac/keyofE.html).
+  [CryptoCellar](https://cryptocellar.org/bgac/keyofE.html). Thanks to Frode Weierud
+  for granting permission to use these tables.
 - Machine wirings and reference vectors come from Crypto Museum, Daniel Palloks'
   Universal Enigma and other sources cited in
   [docs/historical-catalog.md](docs/historical-catalog.md).
